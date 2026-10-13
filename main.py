@@ -346,6 +346,37 @@ def cmd_dream(args):
     print(f"    Dominant Mutators: {summary.get('dominant_mutators', [])}")
 
 
+def cmd_caldera(args):
+    """Exports or pushes findings to Caldera adversary emulation platform."""
+    from engine.caldera_bridge import CalderaBridge
+
+    bridge = CalderaBridge(db_path=args.db)
+    if args.export:
+        print(f"[*] Exporting Caldera plugin to {args.export}...")
+        res = bridge.export_plugin(output_dir=args.export)
+        print(f"[+] Caldera plugin successfully exported to {res['plugin_path']}:")
+        print(f"    Abilities generated: {res['abilities_count']}")
+        print(f"    Adversaries generated: {res['adversaries_count']}")
+        print(f"    Custom non-MITRE tactics: {', '.join(res['tactics'])}")
+    elif args.push:
+        if not args.api_key:
+            print("[!] Error: --api-key is required when using --push")
+            sys.exit(1)
+        print(f"[*] Pushing abilities to Caldera at {args.push}...")
+        findings = bridge.fetch_confirmed_findings_from_db()
+        abilities = [bridge.generate_ability(f) for f in findings]
+        adversary = bridge.generate_adversary(abilities) if abilities else None
+        res = bridge.push_to_caldera(args.push, args.api_key, abilities=abilities, adversary=adversary)
+        print(f"[+] Caldera API Push Result: {res['pushed_abilities']} abilities, {res['pushed_adversaries']} adversaries pushed.")
+        if res["errors"]:
+            print(f"[!] Warnings/Errors encountered during API push: {res['errors']}")
+    else:
+        # Default: export to ./caldera_export
+        print("[*] No action specified. Exporting to default directory: ./caldera_export...")
+        res = bridge.export_plugin(output_dir="caldera_export")
+        print(f"[+] Caldera plugin successfully exported to {res['plugin_path']} ({res['abilities_count']} abilities).")
+
+
 def main():
     parser = argparse.ArgumentParser(description="HTTP Terminator: Autonomous Security Research Engine")
     parser.add_argument("--db", default="terminator.db", help="SQLite database path")
@@ -443,6 +474,12 @@ def main():
     p_dream.add_argument("--generations", type=int, default=3, help="Evolutionary dream generations")
     p_dream.add_argument("--export", default="data/dream_policies.json", help="Path to export evolved policies")
 
+    # Caldera (Adversary Emulation Integration)
+    p_caldera = subparsers.add_parser("caldera", help="Export or push findings to Caldera adversary emulation")
+    p_caldera.add_argument("--export", type=str, default=None, help="Directory to export Caldera plugin structure")
+    p_caldera.add_argument("--push", type=str, default=None, help="Caldera server URL to push abilities live")
+    p_caldera.add_argument("--api-key", type=str, default=None, help="Caldera API key for REST authentication")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -463,6 +500,7 @@ def main():
         "lab": cmd_lab,
         "auto": cmd_auto,
         "dream": cmd_dream,
+        "caldera": cmd_caldera,
     }
 
     dispatch[args.command](args)

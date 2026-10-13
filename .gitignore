@@ -9,6 +9,7 @@ __pycache__/
 *.sqlite3
 logs/
 forensics/
+caldera_export/
 
 # Compressed Archives
 *.zip

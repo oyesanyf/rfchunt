@@ -725,6 +725,9 @@ USAGE EXAMPLES:
     parser.add_argument("--dream-rsi", action="store_true", help="Enable Open Dream-RSI: recursive off-policy self-improvement between cycles")
     parser.add_argument("--dream-rollouts", type=int, default=300, help="Number of simulated rollouts per dream generation (default: 300)")
     parser.add_argument("--dream-export", type=str, default="data/dream_policies.json", help="Path to export evolved Dream-RSI policies")
+    parser.add_argument("--export-caldera", type=str, default=None, help="Directory to export Caldera plugin structure after swarm run")
+    parser.add_argument("--caldera-url", type=str, default=None, help="Caldera server URL to push confirmed findings live")
+    parser.add_argument("--caldera-key", type=str, default=None, help="Caldera API key for REST authentication")
     args = parser.parse_args()
 
     # Target restrictions removed: allow any target specified on the CLI
@@ -822,6 +825,20 @@ USAGE EXAMPLES:
                         print(f"    !!! VULNERABILITY CONFIRMED: {state_update['current_vuln'].vuln_id}")
         except Exception as e:
             print(f"[!] Swarm encountered a critical fault on RFC {rfc_num_str}: {e}")
-            continue
-            
     print("\n[*] Swarm Execution Completed. All evidence saved to DB and Forensics Log.")
+
+    if args.export_caldera:
+        from engine.caldera_bridge import CalderaBridge
+        print(f"\n[*] Exporting verified findings to Caldera plugin at {args.export_caldera}...")
+        bridge = CalderaBridge(db_path="terminator.db")
+        res = bridge.export_plugin(output_dir=args.export_caldera)
+        print(f"[+] Caldera Plugin Exported: {res['abilities_count']} abilities, {res['adversaries_count']} adversaries. Location: {res['plugin_path']}")
+
+    if args.caldera_url and args.caldera_key:
+        from engine.caldera_bridge import CalderaBridge
+        bridge = CalderaBridge(db_path="terminator.db")
+        findings = bridge.fetch_confirmed_findings_from_db()
+        abilities = [bridge.generate_ability(f) for f in findings]
+        adversary = bridge.generate_adversary(abilities) if abilities else None
+        res = bridge.push_to_caldera(args.caldera_url, args.caldera_key, abilities=abilities, adversary=adversary)
+        print(f"[+] Caldera API Push: {res['pushed_abilities']} abilities, {res['pushed_adversaries']} adversaries pushed.")

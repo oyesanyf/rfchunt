@@ -13,11 +13,13 @@ from engine.taxonomy import (
     RFCRequirement,
     RequirementType,
 )
+from engine.caldera_bridge import CalderaBridge
 
 __all__ = [
     "AnomalyCategory",
     "Arm106DefensiveRule",
     "Arm107RegressionTest",
+    "CalderaBridge",
     "ImpactClass",
     "ImplementationAnomaly",
     "NovelTechnique",
@@ -25,3 +27,4 @@ __all__ = [
     "RFCRequirement",
     "RequirementType",
 ]
+
