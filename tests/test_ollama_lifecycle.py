@@ -16,11 +16,11 @@ def test_ollama_binary_detection():
 
 
 def test_no_gemini_api_key_used_by_default(monkeypatch):
-    """Ensures an invalid GEMINI_API_KEY in environment never triggers Gemini cloud client unless USE_GEMINI_CLOUD=1."""
+    """Ensures ModelFusionAdapter has no Gemini cloud client and runs 100% locally via Ollama."""
     monkeypatch.setenv("GEMINI_API_KEY", "INVALID_DUMMY_KEY_12345")
-    monkeypatch.delenv("USE_GEMINI_CLOUD", raising=False)
     adapter = ModelFusionAdapter(use_fusion=False)
-    assert adapter.gemini_client is None
+    assert getattr(adapter, "gemini_client", None) is None
+    assert not hasattr(adapter, "_query_gemini")
 
 
 def test_deterministic_rfc_grammar_fallback():
