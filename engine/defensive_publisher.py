@@ -84,7 +84,15 @@ class DefensiveIntelligencePublisher:
     def _synthesize_arm106_rule(self, vuln: ReproducibleVulnerability, rfc_anchor: str) -> Arm106DefensiveRule:
         """Constructs an Arm 106 parser defense rule (e.g. Rust/Regex/Suricata)."""
         probe_lower = vuln.minimized_probe.lower()
-        rule_id = f"OCTO-ARM106-{len(self.arm106_rules) + 1:04d}"
+        idx = len(self.arm106_rules) + 1
+        if self.db and hasattr(self.db, "conn"):
+            try:
+                cur = self.db.conn.cursor()
+                db_cnt = cur.execute("SELECT COUNT(*) FROM arm106_defensive_rules").fetchone()[0]
+                idx = max(idx, db_cnt + 1)
+            except Exception:
+                pass
+        rule_id = f"OCTO-ARM106-{idx:04d}-{vuln.vuln_id[-4:]}" if len(self.arm106_rules) > 0 or (self.db and hasattr(self.db, "conn")) else f"OCTO-ARM106-{idx:04d}"
 
         if b" :" in probe_lower or b"\t:" in probe_lower:
             rule_type = "RUST_PARSER_GUARD"
@@ -110,7 +118,7 @@ class DefensiveIntelligencePublisher:
             name = "Ingress Null Byte Stripping"
         else:
             rule_type = "WAF_MODSEC"
-            rule_body = f'SecRule REQUEST_HEADERS_NAMES "@rx .*" "id:{rule_id[-4:]},phase:1,deny,status:400"'
+            rule_body = f'SecRule REQUEST_HEADERS_NAMES "@rx .*" "id:{idx:04d},phase:1,deny,status:400"'
             name = f"Hardening Rule for {vuln.impact.value}"
 
         return Arm106DefensiveRule(
@@ -125,7 +133,15 @@ class DefensiveIntelligencePublisher:
 
     def _synthesize_arm107_test(self, vuln: ReproducibleVulnerability) -> Arm107RegressionTest:
         """Constructs an Arm 107 continuous regression assertion."""
-        test_id = f"OCTO-ARM107-TEST-{len(self.arm107_tests) + 1:04d}"
+        idx = len(self.arm107_tests) + 1
+        if self.db and hasattr(self.db, "conn"):
+            try:
+                cur = self.db.conn.cursor()
+                db_cnt = cur.execute("SELECT COUNT(*) FROM arm107_regression_tests").fetchone()[0]
+                idx = max(idx, db_cnt + 1)
+            except Exception:
+                pass
+        test_id = f"OCTO-ARM107-TEST-{idx:04d}-{vuln.vuln_id[-4:]}" if len(self.arm107_tests) > 0 or (self.db and hasattr(self.db, "conn")) else f"OCTO-ARM107-TEST-{idx:04d}"
 
         validation_code = (
             f"# Arm 107 Regression Test for {vuln.vuln_id}\n"
@@ -182,3 +198,41 @@ class DefensiveIntelligencePublisher:
             "arm106_path": str(arm106_file),
             "arm107_path": str(arm107_file),
         }
+
+    def sync_db_findings(self) -> int:
+        """Ensures every confirmed vulnerability in reproducible_vulnerabilities has a corresponding Arm 106 rule and Arm 107 test."""
+        if not self.db or not hasattr(self.db, "conn"):
+            return 0
+        synced = 0
+        try:
+            cur = self.db.conn.cursor()
+            missing_rows = cur.execute(
+                """
+                SELECT vuln_id, anomaly_id, impact, minimized_probe, reproducibility_rate,
+                       verification_attempts, successful_reproductions, delta_debug_steps
+                FROM reproducible_vulnerabilities
+                WHERE vuln_id NOT IN (SELECT vuln_id FROM arm107_regression_tests)
+                """
+            ).fetchall()
+            for row in missing_rows:
+                v_id, a_id, imp_str, min_probe, r_rate, v_att, s_rep, dd_steps = row
+                try:
+                    impact_enum = ImpactClass(imp_str)
+                except Exception:
+                    impact_enum = ImpactClass.PARSER_CONFUSION
+                vuln = ReproducibleVulnerability(
+                    vuln_id=v_id,
+                    anomaly_id=a_id or "ANOM-SYNC",
+                    impact=impact_enum,
+                    minimized_probe=(min_probe or "").encode("latin-1", errors="replace"),
+                    reproducibility_rate=float(r_rate or 1.0),
+                    verification_attempts=int(v_att or 3),
+                    successful_reproductions=int(s_rep or 3),
+                    delta_debug_steps=int(dd_steps or 1),
+                )
+                self.publish_finding(vuln, rfc_anchor="RFC9112", evidence_verified=True, auto_export=False)
+                synced += 1
+        except Exception:
+            pass
+        return synced
+

@@ -84,6 +84,9 @@ def build_step_database(db_path: str = "terminator.db") -> Tuple[bool, str]:
         if missing:
             return False, f"Database is missing tables: {', '.join(missing)}"
 
+        from engine.defensive_publisher import DefensiveIntelligencePublisher
+        DefensiveIntelligencePublisher(db=db).sync_db_findings()
+
         return True, f"Database verified ({len(tables)} tables active, thread-safe locks initialized)."
     except Exception as e:
         return False, f"Database verification failure: {e}"

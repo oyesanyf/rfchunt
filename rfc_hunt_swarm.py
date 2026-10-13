@@ -229,6 +229,7 @@ class ProtocolResearchSwarm:
         self.boundary = CrossProtocolBoundaryAnalyzer()
         self.knowledge_graph = ResearchKnowledgeGraph()
         self.publisher = DefensiveIntelligencePublisher(db=self.db)
+        self.publisher.sync_db_findings()
 
         # Open Dream-RSI Engine (Modules 13-15)
         self.dream_world_model = ProtocolWorldModel(target_host=host, target_port=port)
