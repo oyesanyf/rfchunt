@@ -808,12 +808,16 @@ USAGE EXAMPLES:
 
 12. Protocol Ruler mode (measure front-end byte transformations using backend length limits):
     python -u rfc_hunt_swarm.py --mode ruler --host 127.0.0.1 --port 8080 --debug
+
+13. List all 25 Terminator RFC Specifications and 25 Wire/Chunk Terminator Mutators:
+    python -u rfc_hunt_swarm.py --list-terminators
 ===============================================================================
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--rfc", type=str, default="9112", help="Specific RFC ID to analyze (e.g. 9112)")
     parser.add_argument("--mode", type=str, choices=["single", "terminator", "corpus", "all", "pqc", "ruler"], default="single", help="Scan mode: single RFC, terminator (curated HTTP Terminator suite), Kettle corpus, all protocol RFCs, pqc, or ruler")
+    parser.add_argument("--list-terminators", action="store_true", help="Print the complete catalog of 25 Terminator RFC specifications and 25 wire/chunk/cross-protocol terminator mutators and exit")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Target host (domain or IP)")
     parser.add_argument("--port", type=int, default=5006, help="Target port")
     parser.add_argument("--tls", action="store_true", help="Enable TLS/HTTPS for remote host (auto-enabled if port is 443)")
@@ -842,6 +846,29 @@ USAGE EXAMPLES:
     parser.add_argument("--caldera-key", type=str, default=None, help="Optional Caldera API key for REST authentication")
     parser.add_argument("--concurrency", "--threads", type=int, default=4, help="Maximum concurrent probe execution threads (bounded by semaphore, default: 4)")
     args = parser.parse_args()
+
+    if args.list_terminators:
+        from engine.terminator_rfc_selector import TerminatorRFCSelector
+        specs = TerminatorRFCSelector.get_terminator_specs()
+        print("\n" + "=" * 78)
+        print(f"  HTTP TERMINATOR RFC SUITE ({len(specs)} SPECIFICATIONS)")
+        print("=" * 78)
+        for idx, sp in enumerate(specs, 1):
+            print(f"  {idx:2d}. {sp.rfc_id:<8} (Weight: {sp.weight:.2f}) [{sp.category}]")
+            print(f"      Title : {sp.title}")
+            print(f"      Focus : {sp.discrepancy_focus}")
+        perm = VectorPermutator()
+        muts = perm.get_terminator_mutators()
+        print("\n" + "=" * 78)
+        print(f"  WIRE, CHUNK & CROSS-PROTOCOL TERMINATOR MUTATORS ({len(muts)} MUTATORS)")
+        print("=" * 78)
+        sample_req = "POST / HTTP/1.1\r\nHost: target.local\r\nContent-Length: 10\r\n\r\n$PAYLOAD"
+        for idx, fn in enumerate(muts, 1):
+            _, m_name = fn(sample_req)
+            doc = (fn.__doc__ or "").strip().splitlines()[0] if fn.__doc__ else ""
+            print(f"  {idx:2d}. {m_name or fn.__name__:<45} - {doc}")
+        print("=" * 78 + "\n")
+        sys.exit(0)
 
     # Authorize and validate target host specified on the CLI
     from mcp_server import TargetAuthorizationGate
