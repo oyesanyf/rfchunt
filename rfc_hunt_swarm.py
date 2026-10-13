@@ -90,8 +90,77 @@ def format_kettle_http_bytes(raw_bytes: bytes, max_len: int = 4000, is_debug: bo
     text = re.sub(r'([^\r\n])\1{23,}', _replacer, text)
     
     if len(text) > max_len and not is_debug:
-        return text[:max_len] + f"\n... [truncated {len(text)-max_len} bytes; use --debug for full body]"
+        return text[:max_len] + f"\n... [truncated {len(text)-max_len} bytes; use -v/--verbose for full body]"
     return text.rstrip()
+
+
+def format_clean_kettle_response(resp_bytes: bytes, latency_ms: float = 0.0, sock_error: Optional[str] = None, is_verbose: bool = False) -> Tuple[str, str]:
+    """
+    Parses and sanitizes server response bytes in James Kettle's publication style:
+    - Never dumps minified HTML/CSS/JS or analytics tracking blobs.
+    - Accurately identifies whether bytes are a true HTTP status line or an unaligned body leak.
+    - Preserves vital protocol headers (Server, Content-Type, Content-Length, Connection, Transfer-Encoding).
+    """
+    if not resp_bytes:
+        if sock_error:
+            return f"[{sock_error}]", ""
+        return f"[0 bytes / Connection closed by server in {latency_ms:.1f}ms]", ""
+
+    # Check if this begins with an HTTP status line
+    if resp_bytes.startswith(b"HTTP/1.") or resp_bytes.startswith(b"HTTP/2.") or resp_bytes.startswith(b"HTTP/0.9"):
+        parts = resp_bytes.split(b"\r\n\r\n", 1)
+        header_block = parts[0]
+        body_block = parts[1] if len(parts) > 1 else b""
+        
+        header_lines = header_block.split(b"\r\n")
+        status_line = header_lines[0].decode("latin-1", errors="replace").strip()
+        
+        # Filter for relevant protocol headers only (drop noisy CSP, Nel, GTM, cookies)
+        key_headers = []
+        for line in header_lines[1:]:
+            line_str = line.decode("latin-1", errors="replace").strip()
+            lower = line_str.lower()
+            if any(lower.startswith(k) for k in [
+                "server:", "content-type:", "content-length:", "connection:",
+                "transfer-encoding:", "location:", "x-amzn-trace-id:", "trace-id:"
+            ]):
+                key_headers.append(line_str)
+                
+        # Handle body cleanly
+        body_display = ""
+        if body_block:
+            if is_verbose:
+                body_display = body_block.decode("latin-1", errors="replace").rstrip()
+            else:
+                body_lower = body_block[:500].lower()
+                if b"<!doctype" in body_lower or b"<html" in body_lower or b"<head" in body_lower:
+                    title_match = re.search(r'<title>(.*?)</title>', body_block.decode("latin-1", errors="replace"), re.IGNORECASE)
+                    title_str = f' "{title_match.group(1).strip()}"' if title_match else ""
+                    body_display = f"[HTML Document{title_str}: {len(body_block):,} bytes]"
+                elif b"{" in body_block and b"}" in body_block and len(body_block) < 300:
+                    body_display = body_block.decode("latin-1", errors="replace").strip()
+                elif len(body_block) < 200 and not any(c in body_block for c in b"<>{};"):
+                    body_display = body_block.decode("latin-1", errors="replace").strip()
+                else:
+                    body_display = f"[Body Payload: {len(body_block):,} bytes]"
+                
+        details = "\n".join(key_headers)
+        if body_display:
+            details = (details + "\n" + body_display).strip() if details else body_display
+            
+        summary = f"{status_line} (in {latency_ms:.1f}ms)"
+        return summary, details
+
+    # Not an HTTP status line -> It's a pipeline body leak from an earlier request!
+    body_lower = resp_bytes[:300].lower()
+    if b"<" in body_lower and (b"meta" in body_lower or b"div" in body_lower or b"html" in body_lower or b"style" in body_lower or b"script" in body_lower):
+        summary = f"[Residual Pipeline Leak: {len(resp_bytes):,} bytes in {latency_ms:.1f}ms]"
+        details = f"[Residual HTML body fragment from previous request: {len(resp_bytes):,} bytes]"
+    else:
+        summary = f"[Residual Data Leak: {len(resp_bytes):,} bytes in {latency_ms:.1f}ms]"
+        details = f"[Non-HTTP data: {len(resp_bytes):,} bytes]"
+        
+    return summary, details
 
 
 class ProtocolResearchSwarm:
@@ -239,14 +308,10 @@ class ProtocolResearchSwarm:
             latency_ms = 0.0
             sock_err = seq_report.details or "No response"
 
-        # Format human-readable response summary
-        if resp_bytes:
-            first_line = resp_bytes.split(b"\r\n")[0].decode("latin-1", errors="replace").strip()
-            resp_summary = f"{first_line} ({len(resp_bytes)} bytes in {latency_ms:.1f}ms)"
-        elif sock_err:
-            resp_summary = f"[{sock_err}] ({latency_ms:.1f}ms)"
-        else:
-            resp_summary = f"[0 bytes / Connection closed by server] ({latency_ms:.1f}ms)"
+        # Format human-readable response summary and sanitized details
+        resp_summary, resp_details = format_clean_kettle_response(
+            resp_bytes, latency_ms=latency_ms, sock_error=sock_err, is_verbose=self.verbose
+        )
 
         proto_prefix = "https" if self.use_tls else "http"
         
@@ -258,20 +323,16 @@ class ProtocolResearchSwarm:
             print(f"[CONNECT] -> {proto_prefix}://{self.host}:{self.port} (Socket Connected | TLS: {self.use_tls})")
             
             for idx, s in enumerate(seq_report.steps, 1):
-                sent_fmt = format_kettle_http_bytes(s.sent_bytes, max_len=4000, is_debug=True)
-                resp_fmt = format_kettle_http_bytes(s.received_bytes, max_len=4000, is_debug=True)
+                sent_fmt = format_kettle_http_bytes(s.sent_bytes, max_len=2000, is_debug=self.verbose)
+                s_sum, s_det = format_clean_kettle_response(
+                    s.received_bytes, latency_ms=s.latency * 1000, sock_error=s.socket_error, is_verbose=self.verbose
+                )
                 
                 print(f"\n>>> [REQ {idx}: {s.step_name.upper()}] ({len(s.sent_bytes)} bytes)")
                 print(sent_fmt)
-                
-                if s.received_bytes:
-                    first_line = s.received_bytes.split(b"\r\n")[0].decode("latin-1", errors="replace").strip()
-                    print(f"\n<<< [RESP {idx}] {first_line} ({len(s.received_bytes)} bytes in {s.latency*1000:.1f}ms)")
-                    print(resp_fmt)
-                elif s.socket_error:
-                    print(f"\n<<< [RESP {idx}] [Socket Error: {s.socket_error}] ({s.latency*1000:.1f}ms)")
-                else:
-                    print(f"\n<<< [RESP {idx}] [0 bytes / Connection closed by server] ({s.latency*1000:.1f}ms)")
+                print(f"\n<<< [RESP {idx}] {s_sum}")
+                if s_det:
+                    print(s_det)
             
             print(f"\n--- SEQUENCE EVALUATION ---")
             print(f"  Desynchronization : {seq_report.has_desynchronization}")
@@ -284,10 +345,8 @@ class ProtocolResearchSwarm:
             print(f"--- Raw Probe Sent ({len(probe_bytes)} bytes) ---")
             print(format_kettle_http_bytes(probe_bytes, max_len=2000, is_debug=self.verbose))
             print(f"--- Host Response: {resp_summary} ---")
-            if resp_bytes:
-                print(format_kettle_http_bytes(resp_bytes, max_len=2000, is_debug=self.verbose))
-            else:
-                print(f"[{sock_err or '0 bytes received / Connection closed'}]")
+            if resp_details:
+                print(resp_details)
             print(f"{'='*76}\n")
 
         anomaly = None
