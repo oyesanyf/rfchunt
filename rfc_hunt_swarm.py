@@ -745,30 +745,35 @@ class ProtocolResearchSwarm:
         return builder.compile()
 
 if __name__ == "__main__":
+    ALL_MODES = [
+        "single", "terminator", "corpus", "all", "pqc", "ruler",
+        "build", "lab", "mcp", "hunt", "auto",
+        "fetch", "chunk", "generate", "permute", "evaluate",
+        "weaponize", "cascade", "dream", "caldera",
+    ]
+
     parser = argparse.ArgumentParser(
         description="""
 ===============================================================================
-RFC HUNT SWARM: Specification-Driven Autonomous Protocol Research Engine
+RFC HUNT SWARM: Unified Autonomous Protocol Research & Compliance Engine
 ===============================================================================
-A LangGraph-orchestrated 12-agent research swarm implementing the autonomous
-protocol research paradigm by James Kettle (Director of Research, PortSwigger):
-  "Can AI Do Novel Security Research?" (October 2026)
-  https://portswigger.net/research/can-ai-do-novel-security-research
+The unified primary CLI entrypoint combining:
+  - 12-Agent LangGraph Protocol Research Swarm (rfc_hunt_swarm.py)
+  - One-Click Local Test Lab Auto-Launcher & Continuous Flaw Hunter (start.py)
+  - Modular Pipeline, Build-All Verification, Dream-RSI & Caldera CLI (main.py)
 
-Core Architecture:
-  1. Fetches and parses normative RFC specifications and ABNF grammars.
-  2. Generates novel protocol edge-cases using ModelFusion (Gemma + Foundation-Sec).
-  3. Executes stateful pipelined sequences and metamorphic differential oracles.
-  4. Automatically delta-debugs, minimizes, and verifies reproducible vulnerabilities.
-  5. Formulates novel architectural concepts and publishes Arm 106 & 107 defenses.
+Based on the autonomous protocol research methodology by James Kettle
+(Director of Research, PortSwigger):
+  "Can AI Do Novel Security Research? Meet the HTTP Terminator"
+  https://portswigger.net/research/can-ai-do-novel-security-research
 """,
         epilog="""
 ===============================================================================
-USAGE EXAMPLES:
+USAGE EXAMPLES (All run directly via rfc_hunt_swarm.py):
 ===============================================================================
 
-1. Scan the primary HTTP/1.1 Line & Chunk Terminator spec (RFC 9112):
-   python -u rfc_hunt_swarm.py --mode single --rfc 9112
+1. Scan RFC 9112 against a local or remote HTTPS target:
+   python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host target.example.com --port 443 --tls --debug
 
 2. Scan the full 25-RFC Terminator & Gateway Suite (HTTP/1.1, H2, H3, WebSockets,
    Caching, Forwarded, Early-Data, Capsule, Structured Fields, HPACK/QPACK):
@@ -784,46 +789,83 @@ USAGE EXAMPLES:
 4. High-speed multithreaded evaluation with 8 concurrent socket threads (Semaphore-bounded):
    python -u rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 8080 --concurrency 8
 
-5. Scan the curated James Kettle Research Corpus (138 core HTTP/SMTP RFCs):
-   python -u rfc_hunt_swarm.py --mode corpus
+5. One-Click Local Test Lab + Swarm (auto-starts local TestLabServer if port is free):
+   python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host 127.0.0.1 --port 8080
 
-6. Scan ALL active IETF protocol specifications (HTTP, TLS, WebSockets, etc.):
-   python -u rfc_hunt_swarm.py --mode all
+6. Offline RFC ingestion & probe generation into terminator.db (no packets sent to any host):
+   python -u rfc_hunt_swarm.py --mode terminator --comb-only --max-rfcs 25
 
-7. Research POST-QUANTUM Cryptography (PQC, ML-KEM, HPKE, Quantum-Resistant TLS):
+7. Filter active RFCs by keyword (e.g. chunked, trailer, websocket):
+   python -u rfc_hunt_swarm.py --mode all --keywords "chunked,trailer,websocket" --max-rfcs 10
+
+8. Scan James Kettle's 138-RFC Corpus or Post-Quantum Cryptography (PQC) RFCs:
+   python -u rfc_hunt_swarm.py --mode corpus --timeout 0
    python -u rfc_hunt_swarm.py --mode pqc
 
-8. Scan with an extended 15-minute timeout or UNLIMITED timeout (0) for large models:
-   python -u rfc_hunt_swarm.py --mode corpus --timeout 900
-   python -u rfc_hunt_swarm.py --mode corpus --timeout 0
+9. Protocol Ruler mode (measure front-end byte transformations using backend length limits):
+   python -u rfc_hunt_swarm.py --mode ruler --host target.example.com --port 443 --tls --debug
+   python -u rfc_hunt_swarm.py --mode ruler --host 127.0.0.1 --port 8080 --sequence "\\xc0\\x8a" --name "Overlong-LF"
 
-9. Use a faster 4.7GB secondary security specialist model:
-   python -u rfc_hunt_swarm.py --mode terminator --sec-model qwen2.5:7b
+10. Unified 'Build All' pipeline (syntax check, DB schema, 25 RFC cache, Caldera, Dream-RSI, pytest):
+    python -u rfc_hunt_swarm.py --mode build
+    python -u rfc_hunt_swarm.py build --skip-tests
 
-10. Run against a REMOTE HTTPS / TLS host with full debug pipeline telemetry:
-    python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host target.example.com --port 443 --tls --debug
+11. Modular pipeline stages & standalone services (formerly in main.py / start.py):
+    python -u rfc_hunt_swarm.py --mode lab --host 127.0.0.1 --port 8080
+    python -u rfc_hunt_swarm.py --mode mcp
+    python -u rfc_hunt_swarm.py --mode hunt --host 127.0.0.1 --port 8080 --max-rfcs 15
+    python -u rfc_hunt_swarm.py --mode auto --host 127.0.0.1 --port 8080 --concurrency 4
+    python -u rfc_hunt_swarm.py --mode dream --dream-rollouts 300
+    python -u rfc_hunt_swarm.py --mode caldera --export-caldera ./caldera_export
 
-11. Run an intensive deep-search with 10 mutation cycles & 500 Dream-RSI rollouts:
-    python -u rfc_hunt_swarm.py --mode terminator --cycles 10 --dream-rollouts 500
-
-12. Protocol Ruler mode (measure front-end byte transformations using backend length limits):
-    python -u rfc_hunt_swarm.py --mode ruler --host 127.0.0.1 --port 8080 --debug
-
-13. List all 25 Terminator RFC Specifications and 25 Wire/Chunk Terminator Mutators:
+12. List all 25 Terminator RFC Specifications and 25 Wire/Chunk Terminator Mutators:
     python -u rfc_hunt_swarm.py --list-terminators
 ===============================================================================
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--rfc", type=str, default="9112", help="Specific RFC ID to analyze (e.g. 9112)")
-    parser.add_argument("--mode", type=str, choices=["single", "terminator", "corpus", "all", "pqc", "ruler"], default="single", help="Scan mode: single RFC, terminator (curated HTTP Terminator suite), Kettle corpus, all protocol RFCs, pqc, or ruler")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=ALL_MODES,
+        default=None,
+        help="Optional positional mode/subcommand (e.g. build, ruler, lab, mcp, hunt, auto, terminator)",
+    )
+    parser.add_argument("--rfc", type=str, default="9112", help="Specific RFC ID to analyze (e.g. 9112 or MCP)")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=ALL_MODES,
+        default="single",
+        help="Execution mode: single, terminator, corpus, all, pqc, ruler, build, lab, mcp, hunt, auto, fetch, chunk, generate, permute, evaluate, weaponize, cascade, dream, caldera",
+    )
     parser.add_argument("--list-terminators", action="store_true", help="Print the complete catalog of 25 Terminator RFC specifications and 25 wire/chunk/cross-protocol terminator mutators and exit")
-    parser.add_argument("--host", type=str, default="127.0.0.1", help="Target host (domain or IP)")
-    parser.add_argument("--port", type=int, default=5006, help="Target port")
+    parser.add_argument("--host", "--target", dest="host", type=str, default="127.0.0.1", help="Target host (domain or IP, default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=5006, help="Target port (default: 5006)")
     parser.add_argument("--tls", action="store_true", help="Enable TLS/HTTPS for remote host (auto-enabled if port is 443)")
     parser.add_argument("--cycles", type=int, default=3, help="Max mutation cycles to run per RFC")
     parser.add_argument("--timeout", type=float, default=900.0, help="Ollama LLM inference timeout in seconds (default: 900.0 = 15m; 0 for unlimited)")
+    parser.add_argument("--model", type=str, default="gemma2:2b", help="Preferred primary base model (default: gemma2:2b)")
     parser.add_argument("--sec-model", type=str, default=None, help="Secondary security specialist model (e.g. fenkohq/foundation-sec-8b:latest, qwen2.5:7b, strix-qwen:latest)")
+    parser.add_argument("--no-fusion", dest="fusion", action="store_false", default=True, help="Disable multi-model panel fusion")
+    parser.add_argument("--db", type=str, default="terminator.db", help="SQLite database path (default: terminator.db)")
+    parser.add_argument("--cache-dir", type=str, default="rfcs", help="Local directory to cache RFCs (default: rfcs)")
+    parser.add_argument("--max-rfcs", "--count", dest="max_rfcs", type=int, default=None, help="Maximum number of RFCs to cycle through")
+    parser.add_argument("--keywords", type=str, default=None, help="Comma-separated keywords to filter active RFCs (e.g. 'chunked,trailer,websocket')")
+    parser.add_argument("--comb-only", "--offline", dest="comb_only", action="store_true", help="Offline RFC ingestion & probe generation into database without sending packets to any host")
+    parser.add_argument("--no-lab", action="store_true", help="Do not auto-spawn the built-in local TestLabServer when targeting localhost/127.0.0.1")
+    parser.add_argument("--mcp", action="store_true", help="Shortcut to launch the Model Context Protocol (MCP) JSON-RPC server over stdio")
+    parser.add_argument("--build", action="store_true", help="Shortcut to run the unified 'Build All' verification pipeline")
+    parser.add_argument("--skip-tests", action="store_true", help="Skip running pytest when executing --mode build / --build")
+    parser.add_argument("--sequence", type=str, default=None, help="Custom byte sequence to test in Protocol Ruler mode (e.g. '\\xc0\\x8a')")
+    parser.add_argument("--name", type=str, default="Custom Probe", help="Name for custom sequence in Protocol Ruler mode")
+    parser.add_argument("--max-size", type=int, default=131072, help="Max header length to test in Protocol Ruler mode (default: 131072)")
+    parser.add_argument("--sentences", type=int, default=2, help="Sentences per chunk in chunk/auto modes (default: 2)")
+    parser.add_argument("--limit", "--fragments", dest="limit", type=int, default=5, help="Max fragments/probes to process in modular modes (default: 5)")
+    parser.add_argument("--variants", type=int, default=3, help="Permutation variants per probe (default: 3)")
+    parser.add_argument("--discover-recent", type=int, default=0, help="Discover recent RFCs from index in fetch/auto modes")
+    parser.add_argument("--keep-going", action="store_true", help="Continue hunting after finding first flaw in hunt mode")
+    parser.add_argument("--generations", type=int, default=3, help="Evolutionary dream generations (default: 3)")
     parser.add_argument("--debug", action="store_true", help="Enable comprehensive debugging mode (prints raw host responses, socket telemetry, and sequence pipeline steps)")
     parser.add_argument("--show-response", action="store_true", help="Print full raw HTTP/TLS responses received from the target host")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose execution telemetry and full payload/response tracing")
@@ -838,14 +880,21 @@ USAGE EXAMPLES:
     )
     parser.add_argument("--dream-rsi", dest="dream_rsi", action="store_true", default=True, help="Enable Open Dream-RSI: recursive off-policy self-improvement between cycles (enabled by default)")
     parser.add_argument("--no-dream-rsi", dest="dream_rsi", action="store_false", help="Disable default Open Dream-RSI evolution cycle")
-    parser.add_argument("--dream-rollouts", type=int, default=300, help="Number of simulated rollouts per dream generation (default: 300)")
-    parser.add_argument("--dream-export", type=str, default="data/dream_policies.json", help="Path to export evolved Dream-RSI policies")
+    parser.add_argument("--dream-rollouts", "--rollouts", dest="dream_rollouts", type=int, default=300, help="Number of simulated rollouts per dream generation (default: 300)")
+    parser.add_argument("--dream-export", "--export", dest="dream_export", type=str, default="data/dream_policies.json", help="Path to export evolved Dream-RSI policies")
     parser.add_argument("--export-caldera", type=str, default="caldera_export", help="Directory to export Caldera plugin structure (default: caldera_export, runs automatically)")
     parser.add_argument("--no-caldera", action="store_true", help="Disable default Caldera export")
-    parser.add_argument("--caldera-url", type=str, default=None, help="Optional Caldera server URL to push confirmed findings live")
-    parser.add_argument("--caldera-key", type=str, default=None, help="Optional Caldera API key for REST authentication")
+    parser.add_argument("--caldera-url", "--push", dest="caldera_url", type=str, default=None, help="Optional Caldera server URL to push confirmed findings live")
+    parser.add_argument("--caldera-key", "--api-key", dest="caldera_key", type=str, default=None, help="Optional Caldera API key for REST authentication")
     parser.add_argument("--concurrency", "--threads", type=int, default=4, help="Maximum concurrent probe execution threads (bounded by semaphore, default: 4)")
     args = parser.parse_args()
+
+    # Resolve positional command / shortcut flags into active_mode
+    active_mode = args.command or args.mode
+    if args.build:
+        active_mode = "build"
+    elif args.mcp:
+        active_mode = "mcp"
 
     if args.list_terminators:
         from engine.terminator_rfc_selector import TerminatorRFCSelector
@@ -870,6 +919,18 @@ USAGE EXAMPLES:
         print("=" * 78 + "\n")
         sys.exit(0)
 
+    # Handle standalone modes that do not require target authorization first
+    if active_mode == "build":
+        from build_all import run_full_build
+        ok = run_full_build(skip_tests=args.skip_tests)
+        sys.exit(0 if ok else 1)
+
+    if active_mode == "mcp":
+        from mcp_server import TerminatorMCPServer
+        print("[+] Launching Model Context Protocol (MCP) Server over JSON-RPC stdio...")
+        TerminatorMCPServer().run_stdio()
+        sys.exit(0)
+
     # Authorize and validate target host specified on the CLI
     from mcp_server import TargetAuthorizationGate
     TargetAuthorizationGate.authorize_target(args.host)
@@ -879,12 +940,25 @@ USAGE EXAMPLES:
         sys.exit(1)
 
     import os
+    import socket as _sock
     os.environ["OLLAMA_TIMEOUT"] = str(args.timeout)
 
     use_tls = bool(args.tls or (args.port == 443))
     proto_str = "https" if use_tls else "http"
 
-    if args.mode == "ruler":
+    if active_mode == "lab":
+        from test_lab_server import TestLabServer
+        server = TestLabServer(host=args.host, port=args.port)
+        server.start()
+        print(f"[*] Standalone Test Lab Server running on http://{args.host}:{args.port}. Press Ctrl+C to stop.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            server.stop()
+        sys.exit(0)
+
+    if active_mode == "ruler":
         from protocol_ruler import ProtocolRuler
         print(f"\n{'='*75}")
         print(f"[*] LAUNCHING PROTOCOL RULER ENGINE (James Kettle Benchmark Technique)")
@@ -898,8 +972,96 @@ USAGE EXAMPLES:
             verbose=args.verbose,
             debug=args.debug,
         )
-        ruler.run_comprehensive_audit()
+        custom_seqs = None
+        if args.sequence:
+            seq_str = args.sequence
+            if seq_str.startswith("\\x"):
+                seq_bytes = bytes.fromhex(seq_str.replace("\\x", ""))
+            else:
+                try:
+                    seq_bytes = bytes.fromhex(seq_str)
+                except ValueError:
+                    seq_bytes = seq_str.encode("latin-1")
+            custom_seqs = [(args.name, seq_bytes, f"Custom sequence: {seq_str}")]
+        ruler.run_comprehensive_audit(custom_sequences=custom_seqs, max_size=args.max_size)
         print("\n[*] Protocol Ruler Audit Completed.")
+        sys.exit(0)
+
+    # Delegate modular pipeline subcommands from main.py if selected
+    if active_mode in ("fetch", "chunk", "generate", "permute", "evaluate", "weaponize", "cascade", "dream", "caldera", "auto"):
+        import main as _main_cli
+        # Map unified args to main.py namespace expectations
+        args.target = args.host
+        args.count = args.max_rfcs or 3
+        args.fragments = args.limit
+        args.rollouts = args.dream_rollouts
+        args.export = args.export_caldera if active_mode == "caldera" else args.dream_export
+        args.push = args.caldera_url
+        args.api_key = args.caldera_key
+        dispatch_map = {
+            "fetch": _main_cli.cmd_fetch,
+            "chunk": _main_cli.cmd_chunk,
+            "generate": _main_cli.cmd_generate,
+            "permute": _main_cli.cmd_permute,
+            "evaluate": _main_cli.cmd_evaluate,
+            "weaponize": _main_cli.cmd_weaponize,
+            "cascade": _main_cli.cmd_cascade,
+            "dream": _main_cli.cmd_dream,
+            "caldera": _main_cli.cmd_caldera,
+            "auto": _main_cli.cmd_auto,
+        }
+        dispatch_map[active_mode](args)
+        sys.exit(0)
+
+    # Auto-spawn local TestLabServer if targeting localhost/127.0.0.1 and nothing is listening on args.port
+    bg_lab_server = None
+    is_local_host = args.host in ("127.0.0.1", "localhost", "::1", "[::1]")
+    if is_local_host and not use_tls and not args.no_lab and not args.comb_only:
+        port_open = False
+        try:
+            with _sock.create_connection((args.host, args.port), timeout=0.4):
+                port_open = True
+        except Exception:
+            port_open = False
+        if not port_open:
+            from test_lab_server import TestLabServer
+            bg_lab_server = TestLabServer(host=args.host, port=args.port)
+            try:
+                bg_lab_server.start()
+                time.sleep(0.25)
+                print(f"[+] Auto-started local Protocol Test Lab Server on http://{args.host}:{args.port}")
+            except Exception as e:
+                print(f"[!] Could not auto-start local Test Lab Server on {args.host}:{args.port}: {e}")
+                bg_lab_server = None
+
+    if active_mode == "hunt" or args.comb_only:
+        from continuous_scanner import ContinuousFlawHunter
+        kw_list = [k.strip() for k in args.keywords.split(",") if k.strip()] if args.keywords else None
+        hunter = ContinuousFlawHunter(
+            target_host=args.host,
+            target_port=args.port,
+            use_tls=use_tls,
+            preferred_model=args.model,
+            use_fusion=args.fusion,
+            db_path=args.db,
+            verbose=args.verbose or args.debug,
+            sec_model=args.sec_model,
+        )
+        try:
+            hunter.run_until_flaw(
+                max_rfcs=args.max_rfcs or 15,
+                fragments_per_rfc=args.limit,
+                permutations_per_probe=args.variants,
+                stop_on_first_flaw=not args.keep_going,
+                all_active=(active_mode == "all"),
+                kettle=(active_mode != "all"),
+                keywords=kw_list,
+                target_rfc=args.rfc if active_mode == "single" else None,
+                comb_only=args.comb_only,
+            )
+        finally:
+            if bg_lab_server:
+                bg_lab_server.stop()
         sys.exit(0)
 
     print(f"[*] Initializing Full LangGraph Swarm against {proto_str}://{args.host}:{args.port} (TLS: {use_tls}, Concurrency: {args.concurrency} threads, LLM Timeout: {'Unlimited' if args.timeout <= 0 else f'{args.timeout}s'})")
@@ -910,7 +1072,7 @@ USAGE EXAMPLES:
     swarm = ProtocolResearchSwarm(
         host=args.host,
         port=args.port,
-        db_path="terminator.db",
+        db_path=args.db,
         sec_model=args.sec_model,
         use_tls=use_tls,
         show_response=args.show_response,
@@ -921,57 +1083,69 @@ USAGE EXAMPLES:
     graph = swarm.build_graph()
     
     # Determine which RFCs to scan based on the selected mode
-    if args.mode == "single":
+    kw_list = [k.strip() for k in args.keywords.split(",") if k.strip()] if args.keywords else None
+    if active_mode == "single":
         rfcs_to_scan = [args.rfc.replace("RFC", "")]
-    elif args.mode == "terminator":
-        print("[*] Resolving Terminator Core RFC Suite (HTTP/1.1 Framing, Intermediaries & Line Terminators)...")
-        rfcs_to_scan = swarm.fetcher.get_terminator_corpus()
-    elif args.mode == "corpus":
+    elif active_mode == "terminator":
+        print("[*] Resolving Terminator Core RFC Suite (25 HTTP/1.1, H2, H3, Gateway & Framing Specs)...")
+        rfcs_to_scan = swarm.fetcher.get_terminator_corpus(max_rfcs=args.max_rfcs)
+    elif active_mode == "corpus":
         print("[*] Resolving James Kettle Research Corpus...")
-        rfcs_to_scan = swarm.fetcher.get_kettle_corpus()
-    elif args.mode == "all":
-        print("[*] Discovering all active protocol RFCs from IETF registry...")
-        rfcs_to_scan = swarm.fetcher.discover_active_protocol_rfcs(unrestricted=False)
-    elif args.mode == "pqc":
+        rfcs_to_scan = swarm.fetcher.get_kettle_corpus(max_rfcs=args.max_rfcs or 138)
+    elif active_mode == "all":
+        if kw_list:
+            print(f"[*] Discovering active RFCs matching keywords: {kw_list}...")
+            rfcs_to_scan = swarm.fetcher.get_all_active_rfcs(keywords=kw_list, max_rfcs=args.max_rfcs, reverse=True)
+        else:
+            print("[*] Discovering all active protocol RFCs from IETF registry...")
+            rfcs_to_scan = swarm.fetcher.discover_active_protocol_rfcs(unrestricted=False, max_rfcs=args.max_rfcs)
+    elif active_mode == "pqc":
         print("[*] Resolving Post-Quantum Cryptography (PQC) & Hybrid TLS Specifications...")
         rfcs_to_scan = swarm.fetcher.get_pqc_corpus()
+        if args.max_rfcs:
+            rfcs_to_scan = rfcs_to_scan[:args.max_rfcs]
         
     print(f"\n[*] Queue ready: {len(rfcs_to_scan)} RFC(s) scheduled for Swarm processing.\n" + "="*60)
 
-    for rfc_item in rfcs_to_scan:
-        rfc_num_str = str(rfc_item)
-        print(f"\n[*] --- Initiating Swarm Cycle for RFC {rfc_num_str} ---")
-        
-        initial_state = {
-            "rfc_num": rfc_num_str,
-            "rfc_text": "",
-            "fragments": [],
-            "current_fragment": "",
-            "generated_candidates": [],
-            "current_probe": b"",
-            "reward": 0.0,
-            "current_anomaly": None,
-            "current_vuln": None,
-            "novel_technique_found": None,
-            "cascade_results": None,
-            "cycle_count": 0,
-            "max_cycles": args.cycles,
-            "baseline_resp": b"",
-            "enable_dream_rsi": bool(args.dream_rsi),
-            "dream_rollouts": args.dream_rollouts,
-            "current_dream_policy": None,
-            "history": []
-        }
+    try:
+        for rfc_item in rfcs_to_scan:
+            rfc_num_str = str(rfc_item)
+            print(f"\n[*] --- Initiating Swarm Cycle for RFC {rfc_num_str} ---")
+            
+            initial_state = {
+                "rfc_num": rfc_num_str,
+                "rfc_text": "",
+                "fragments": [],
+                "current_fragment": "",
+                "generated_candidates": [],
+                "current_probe": b"",
+                "reward": 0.0,
+                "current_anomaly": None,
+                "current_vuln": None,
+                "novel_technique_found": None,
+                "cascade_results": None,
+                "cycle_count": 0,
+                "max_cycles": args.cycles,
+                "baseline_resp": b"",
+                "enable_dream_rsi": bool(args.dream_rsi),
+                "dream_rollouts": args.dream_rollouts,
+                "current_dream_policy": None,
+                "history": []
+            }
 
-        try:
-            for event in graph.stream(initial_state, {"recursion_limit": 5000}):
-                for node_name, state_update in event.items():
-                    last_hist = state_update.get('history', [])[-1] if state_update.get('history') else ''
-                    print(f"[{node_name}] -> {last_hist}")
-                    if "current_vuln" in state_update and state_update["current_vuln"]:
-                        print(f"    !!! VULNERABILITY CONFIRMED: {state_update['current_vuln'].vuln_id}")
-        except Exception as e:
-            print(f"[!] Swarm encountered a critical fault on RFC {rfc_num_str}: {e}")
+            try:
+                for event in graph.stream(initial_state, {"recursion_limit": 5000}):
+                    for node_name, state_update in event.items():
+                        last_hist = state_update.get('history', [])[-1] if state_update.get('history') else ''
+                        print(f"[{node_name}] -> {last_hist}")
+                        if "current_vuln" in state_update and state_update["current_vuln"]:
+                            print(f"    !!! VULNERABILITY CONFIRMED: {state_update['current_vuln'].vuln_id}")
+            except Exception as e:
+                print(f"[!] Swarm encountered a critical fault on RFC {rfc_num_str}: {e}")
+    finally:
+        if bg_lab_server:
+            bg_lab_server.stop()
+
     print("\n[*] Swarm Execution Completed. All evidence saved to DB and Forensics Log.")
 
     # Caldera Auto-Sync: Runs by default on every run without requiring any flags
@@ -979,7 +1153,7 @@ USAGE EXAMPLES:
         from engine.caldera_bridge import CalderaBridge
         caldera_dir = args.export_caldera or "caldera_export"
         print(f"\n[*] [Caldera Auto-Sync] Syncing verified findings to Caldera plugin at {caldera_dir}...")
-        bridge = CalderaBridge(db_path="terminator.db")
+        bridge = CalderaBridge(db_path=args.db)
         res = bridge.export_plugin(output_dir=caldera_dir)
         # Also sync in-tree caldera_plugin directory
         bridge.export_plugin(output_dir=".")
@@ -987,7 +1161,7 @@ USAGE EXAMPLES:
 
     if args.caldera_url:
         from engine.caldera_bridge import CalderaBridge
-        bridge = CalderaBridge(db_path="terminator.db")
+        bridge = CalderaBridge(db_path=args.db)
         findings = bridge.fetch_confirmed_findings_from_db()
         abilities = [bridge.generate_ability(f) for f in findings]
         adversary = bridge.generate_adversary(abilities) if abilities else None
