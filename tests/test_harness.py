@@ -150,6 +150,8 @@ def test_anomaly_detector_status_line_and_range_and_baseline():
 
 def test_other_terminator_permutations():
     permutator = VectorPermutator()
+    assert len(permutator.get_terminator_mutators()) == 25
+
     base_req = "POST / HTTP/1.1\r\nHost: target.local\r\nX-Custom: val\r\n\r\n$PAYLOAD"
 
     bare_lf, _ = permutator._mutate_line_terminator_bare_lf(base_req)
@@ -161,6 +163,9 @@ def test_other_terminator_permutations():
     double_cr, _ = permutator._mutate_line_terminator_double_cr(base_req)
     assert "\r\r\n" in double_cr
 
+    lfcr, _ = permutator._mutate_line_terminator_lfcr(base_req)
+    assert "\n\rX-Inverted-LFCR: 1" in lfcr
+
     obs_fold, _ = permutator._mutate_obs_fold_terminator(base_req)
     assert "\r\n \t" in obs_fold
 
@@ -169,6 +174,39 @@ def test_other_terminator_permutations():
 
     intermediary, _ = permutator._mutate_intermediary_terminator_headers(base_req)
     assert "Early-Data: 1" in intermediary and "Max-Forwards: 0" in intermediary
+
+    vt_ff, _ = permutator._mutate_control_char_vt_ff_terminator(base_req)
+    assert "\x0bchunked" in vt_ff and "\x0c1" in vt_ff
+
+    nul_term, _ = permutator._mutate_null_byte_header_terminator(base_req)
+    assert "\x00Content-Length: 0" in nul_term
+
+    chunk_ext, _ = permutator._mutate_chunked_extension_semicolon_terminator(base_req)
+    assert "0;last-ext=1\r\n\r\n" in chunk_ext
+
+    chunk_lf, _ = permutator._mutate_chunked_bare_lf_terminator(base_req)
+    assert "0\n\n" in chunk_lf
+
+    trailer, _ = permutator._mutate_chunked_trailer_terminator(base_req)
+    assert "Trailer: X-Trailer-Term" in trailer and "0\r\nX-Trailer-Term: 1\r\n\r\n" in trailer
+
+    mime_term, _ = permutator._mutate_mime_boundary_closing_terminator(base_req)
+    assert "--BOUND--\r\n" in mime_term
+
+    smtp_term, _ = permutator._mutate_smtp_dot_bdat_terminator(base_req)
+    assert "BDAT 0 LAST\r\n.\r\n" in smtp_term
+
+    ws_term, _ = permutator._mutate_websocket_upgrade_terminator(base_req)
+    assert "Upgrade: websocket" in ws_term
+
+    expect_term, _ = permutator._mutate_early_hints_103_expect_terminator(base_req)
+    assert "Expect: 100-continue" in expect_term
+
+    capsule_term, _ = permutator._mutate_capsule_datagram_terminator(base_req)
+    assert "Capsule-Protocol: ?1" in capsule_term
+
+    nel_term, _ = permutator._mutate_iso8859_nel_separator_terminator(base_req)
+    assert "\x85" in nel_term and "\x1e" in nel_term
 
     combined = permutator.combine_triggers(
         {"raw_request": base_req, "rationale": "A"},

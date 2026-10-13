@@ -9,14 +9,16 @@ from build_all import build_step_syntax_check, build_step_dependencies, build_st
 
 
 def test_terminator_core_rfcs_priority():
-    """Verifies that RFC 9112 is guaranteed at position 0 and RFC-MCP is not in the default terminator queue."""
+    """Verifies that RFC 9112 is guaranteed at position 0 and all 25 Terminator RFCs are registered."""
     corpus = TerminatorRFCSelector.get_terminator_corpus()
-    assert len(corpus) >= 10
+    assert len(corpus) == 25
     assert corpus[0] == 9112, "RFC 9112 (HTTP/1.1 Message Syntax & Framing) MUST be position 0"
     assert corpus[1] == 9110, "RFC 9110 (HTTP Semantics & Intermediaries) MUST be position 1"
     assert corpus[2] == 7230, "RFC 7230 (Predecessor Proxy Standard) MUST be position 2"
     assert corpus[3] == 2616, "RFC 2616 (Historic Baseline) MUST be position 3"
     assert corpus[4] == 9113, "RFC 9113 (HTTP/2 Gateway Translation) MUST be position 4"
+    for rfc_num in (9111, 7239, 8470, 6455, 8441, 9220, 9297, 9298, 9651, 9421, 7541, 9204, 9209, 8297):
+        assert rfc_num in corpus
 
     # Ensure RFC-MCP (num 0) is excluded from the core Terminator RFC suite
     assert 0 not in corpus, "RFC-MCP (num 0) must not be in the HTTP Terminator corpus"
