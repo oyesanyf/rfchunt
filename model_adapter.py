@@ -47,13 +47,13 @@ class ModelFusionAdapter:
         self.sec_model = sec_model
         self.available_tags = self._fetch_available_tags()
         self.active_model = self._resolve_model(self.preferred_model)
-        timeout_env = os.environ.get("OLLAMA_TIMEOUT", "30.0")
+        timeout_env = os.environ.get("OLLAMA_TIMEOUT", "120.0")
         self.timeout = float(timeout_env) if float(timeout_env) > 0 else None
-        self.client = httpx.Client(timeout=httpx.Timeout(self.timeout, connect=2.0))
+        self.client = httpx.Client(timeout=httpx.Timeout(self.timeout, connect=10.0))
 
-        # Gemini Cloud client fallback
+        # Gemini Cloud client fallback (strictly opt-in via USE_GEMINI_CLOUD=1; local runs never require an API key)
         self.gemini_client = None
-        if HAS_GENAI and os.environ.get("GEMINI_API_KEY"):
+        if HAS_GENAI and os.environ.get("USE_GEMINI_CLOUD") == "1" and os.environ.get("GEMINI_API_KEY"):
             try:
                 self.gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
             except Exception as e:
@@ -99,14 +99,18 @@ class ModelFusionAdapter:
         return "qwen2.5:1.5b"
 
     def _fetch_available_tags(self) -> List[str]:
-        """Enforces strict 400ms health probe timeout."""
+        """Probes Ollama and auto-installs/auto-starts the daemon if missing."""
         try:
-            resp = httpx.get(f"{self.endpoint}/api/tags", timeout=0.4)
-            if resp.status_code == 200:
-                data = resp.json()
-                return [m["name"] for m in data.get("models", []) if "name" in m]
+            from ollama_manager import OllamaLifecycleManager
+            return OllamaLifecycleManager.ensure_ollama_ready(endpoint=self.endpoint)
         except Exception:
-            pass
+            try:
+                resp = httpx.get(f"{self.endpoint}/api/tags", timeout=0.4)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return [m["name"] for m in data.get("models", []) if "name" in m]
+            except Exception:
+                pass
         return []
 
     def _resolve_model(self, preferred: str) -> str:
@@ -144,21 +148,23 @@ class ModelFusionAdapter:
 
     def generate_json(self, system_instruction: str, user_prompt: str) -> List[Dict[str, Any]]:
         """
-        Executes structured JSON generation using local Ollama model(s) or Gemini fallback.
+        Executes structured JSON generation using local Ollama model(s).
         If use_fusion is enabled, runs panel fusion across Gemma and secondary models.
         """
-        if self.use_fusion and self.available_tags:
+        if not self.available_tags:
+            self.available_tags = self._fetch_available_tags()
+
+        if self.use_fusion:
             res = self._run_panel_fusion(system_instruction, user_prompt)
             if res:
                 return res
 
         # Primary: Local Ollama model
-        if self.available_tags:
-            result = self._query_ollama(self.active_model, system_instruction, user_prompt)
-            if result:
-                return result
+        result = self._query_ollama(self.active_model, system_instruction, user_prompt)
+        if result:
+            return result
 
-        # Secondary: Gemini Cloud Fallback if available
+        # Optional: Gemini Cloud Fallback only if explicitly opted in via USE_GEMINI_CLOUD=1
         if self.gemini_client:
             return self._query_gemini(system_instruction, user_prompt)
 
@@ -166,13 +172,12 @@ class ModelFusionAdapter:
 
     def _query_ollama(self, model: str, system_instruction: str, user_prompt: str) -> List[Dict[str, Any]]:
         if not self.available_tags:
-            return []
+            self.available_tags = self._fetch_available_tags()
 
         full_prompt = (
             f"### SYSTEM INSTRUCTION:\n{system_instruction}\n\n"
             f"### TASK PROMPT:\n{user_prompt}\n\n"
-            f"CRITICAL: Output ONLY a valid JSON array of objects with keys 'rationale', 'raw_request', 'is_clean'. "
-            f"No conversational text outside the JSON array."
+            f"CRITICAL: Output ONLY valid JSON: {{\"probes\": [{{\"rationale\": \"...\", \"raw_request\": \"...\", \"is_clean\": false}}]}}."
         )
 
         payload = {
@@ -183,7 +188,7 @@ class ModelFusionAdapter:
             "keep_alive": "60m",
             "options": {
                 "temperature": 0.7,
-                "num_predict": 512,
+                "num_predict": 160,
             },
         }
 
@@ -191,7 +196,7 @@ class ModelFusionAdapter:
             resp = self.client.post(
                 f"{self.endpoint}/api/generate",
                 json=payload,
-                timeout=httpx.Timeout(self.timeout, connect=2.0),
+                timeout=httpx.Timeout(self.timeout, connect=10.0),
             )
             if resp.status_code == 200:
                 raw_text = resp.json().get("response", "").strip()
@@ -207,9 +212,9 @@ class ModelFusionAdapter:
         cross-pollinating their candidate probes to maximize novelty at zero cost.
         """
         if not self.available_tags:
-            return []
+            self.available_tags = self._fetch_available_tags()
 
-        gemma_model = None
+        gemma_model = "gemma2:2b"
         for tag in ["gemma2:2b", "gemma2:9b"]:
             matched = [t for t in self.available_tags if tag in t]
             if matched:
@@ -219,7 +224,7 @@ class ModelFusionAdapter:
         if hasattr(self, "sec_model") and self.sec_model:
             sec_model = self.sec_model
         else:
-            sec_model = None
+            sec_model = "fenkohq/foundation-sec-8b:latest"
             for tag in ["fenkohq/foundation-sec-8b:latest", self.sized_qwen, "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "deepseek-r1:1.5b"]:
                 matched = [t for t in self.available_tags if tag == t or tag.split(":")[0] in t]
                 if matched:
@@ -248,9 +253,13 @@ class ModelFusionAdapter:
             for p in probes:
                 if not isinstance(p, dict):
                     continue
-                raw_req = p.get("raw_request", "").strip()
+                raw_val = p.get("raw_request", "")
+                if isinstance(raw_val, dict):
+                    raw_val = raw_val.get("raw_request", raw_val.get("request", ""))
+                raw_req = str(raw_val).strip()
                 if raw_req and raw_req not in seen_requests:
                     seen_requests.add(raw_req)
+                    p["raw_request"] = raw_req
                     p["fused_model"] = model
                     all_probes.append(p)
 

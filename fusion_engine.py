@@ -88,9 +88,9 @@ class FusionArbiter:
     ):
         self.endpoint = endpoint or os.environ.get("OLLAMA_ENDPOINT", self.DEFAULT_OLLAMA_ENDPOINT)
         self.db = db
-        timeout_env = os.environ.get("OLLAMA_TIMEOUT", "30.0")
+        timeout_env = os.environ.get("OLLAMA_TIMEOUT", "120.0")
         self.timeout = float(timeout_env) if float(timeout_env) > 0 else None
-        self.client = httpx.Client(timeout=httpx.Timeout(self.timeout, connect=2.0))
+        self.client = httpx.Client(timeout=httpx.Timeout(self.timeout, connect=10.0))
         self.available_tags = self._fetch_available_tags()
         self.free_ram_gb = self._get_free_memory_gb()
         sized_qwen = self._size_qwen_for_free_memory(self.free_ram_gb)
@@ -154,14 +154,18 @@ class FusionArbiter:
         return "qwen2.5:1.5b"
 
     def _fetch_available_tags(self) -> List[str]:
-        """Enforces strict 400ms health probe timeout."""
+        """Probes Ollama and auto-installs/auto-starts the daemon if missing."""
         try:
-            resp = httpx.get(f"{self.endpoint}/api/tags", timeout=0.4)
-            if resp.status_code == 200:
-                data = resp.json()
-                return [m["name"] for m in data.get("models", []) if "name" in m]
+            from ollama_manager import OllamaLifecycleManager
+            return OllamaLifecycleManager.ensure_ollama_ready(endpoint=self.endpoint)
         except Exception:
-            pass
+            try:
+                resp = httpx.get(f"{self.endpoint}/api/tags", timeout=0.4)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return [m["name"] for m in data.get("models", []) if "name" in m]
+            except Exception:
+                pass
         return []
 
     def _resolve_model(self, candidates: List[str], fallback: str) -> str:
@@ -188,18 +192,23 @@ class FusionArbiter:
 
     def _query_model(self, model: str, prompt: str, system_prompt: str) -> str:
         if not self.available_tags:
-            return ""
-        # Ensure target model exists in available_tags or fall back to an installed tag
+            self.available_tags = self._fetch_available_tags()
+
         target_model = model
-        if target_model not in self.available_tags:
+        if self.available_tags and target_model not in self.available_tags:
+            try:
+                from ollama_manager import OllamaLifecycleManager
+                OllamaLifecycleManager.trigger_background_pull(target_model, endpoint=self.endpoint)
+            except Exception:
+                pass
             target_model = self._resolve_model([model], fallback=self.available_tags[0])
 
         payload: Dict[str, Any] = {
             "model": target_model,
-            "prompt": f"### SYSTEM:\n{system_prompt}\n\n### INSTRUCTION:\n{prompt}",
+            "prompt": f"{system_prompt}\n{prompt}" if "foundation-sec" in target_model.lower() else f"### SYSTEM:\n{system_prompt}\n\n### INSTRUCTION:\n{prompt}",
             "stream": False,
             "keep_alive": "60m",
-            "options": {"temperature": 0.7, "num_predict": 256},
+            "options": {"temperature": 0.7, "num_predict": 110, "stop": ["<|end_of_text|>", "###"]},
         }
         if "deepseek-r1" not in target_model.lower():
             payload["format"] = "json"
@@ -207,7 +216,7 @@ class FusionArbiter:
             resp = self.client.post(
                 f"{self.endpoint}/api/generate",
                 json=payload,
-                timeout=httpx.Timeout(self.timeout, connect=2.0),
+                timeout=httpx.Timeout(self.timeout, connect=10.0),
             )
             if resp.status_code == 200:
                 return resp.json().get("response", "").strip()
@@ -215,7 +224,7 @@ class FusionArbiter:
             logger.warning("Ollama query failed for %s: %s", target_model, e)
             # Resilient fallback: try fast lightweight model if available
             for fb in ("gemma2:2b", "qwen2.5:1.5b", "qwen2.5:3b", "qwen2.5:7b", "deepseek-r1:1.5b"):
-                if fb != target_model and fb in self.available_tags:
+                if fb != target_model and (not self.available_tags or fb in self.available_tags):
                     try:
                         payload["model"] = fb
                         if "deepseek-r1" in fb.lower():
@@ -223,7 +232,7 @@ class FusionArbiter:
                         resp = self.client.post(
                             f"{self.endpoint}/api/generate",
                             json=payload,
-                            timeout=httpx.Timeout(min(self.timeout or 15.0, 15.0), connect=1.0),
+                            timeout=httpx.Timeout(min(self.timeout or 30.0, 30.0), connect=5.0),
                         )
                         if resp.status_code == 200:
                             return resp.json().get("response", "").strip()
@@ -231,6 +240,14 @@ class FusionArbiter:
                         pass
                     break
         return ""
+
+    @staticmethod
+    def _is_valid_http_template(req: str) -> bool:
+        s = (req or "").strip()
+        if len(s) < 14 or s == "...":
+            return False
+        u = s.upper()
+        return "HTTP/" in u or any(u.startswith(m) for m in ("GET ", "POST ", "HEAD ", "OPTIONS ", "CONNECT ", "PUT ", "DELETE ", "TRACE ", "PRI "))
 
     def run_fusion_pipeline(self, rfc_fragment: str, fragment_id: Optional[int] = None) -> FusionArbitrationResult:
         """
@@ -245,31 +262,24 @@ class FusionArbiter:
         proposals: List[CandidateProposal] = []
 
         gemma_sys = (
-            "You are a network protocol specification researcher (James Kettle DEF CON 34 methodology). "
-            "The RFC snippet is a source of CLUES, but vulnerabilities are NOT written in the RFC. "
-            "Identify subtle state-machine rules, constraints, or delimiter parsing behaviors in the snippet. "
-            "CORE DISCOVERY HEURISTIC (Rule Inversion): "
-            "1. If the snippet specifies rules for HTTP RESPONSES (e.g. status lines, 304/204 body suppression, "
-            "   HEAD response handling, chunked response termination, trailers), INVERT it into an inbound client REQUEST "
-            "   to test if the server/proxy uses a shared parser that mistakenly applies response rules to requests (Shared-Parser Confusion). "
-            "2. If the snippet specifies SMTP/MIME rules (BDAT chunks, dot-stuffing, line folding), adapt the delimiter into an HTTP probe. "
-            "Construct raw HTTP/1.1 requests using explicit '\\r\\n' line delimiters, host 'target.local', and '$PAYLOAD' placeholder. "
-            "Output JSON: {\"probes\": [{\"rationale\": \"...\", \"raw_request\": \"...\", \"is_clean\": true}]}"
+            "You are a protocol security researcher (James Kettle HTTP Terminator methodology). "
+            "Invert RFC response/framing rules into an incoming client HTTP/1.1 request (Shared-Parser Confusion)."
         )
-        gemma_prompt = f"RFC Snippet:\n\"\"\"{rfc_fragment}\"\"\"\nGenerate 1-2 raw HTTP protocol edge-case templates applying Rule Inversion."
+        gemma_prompt = (
+            f"RFC Clue: {rfc_fragment}\n"
+            "Task: Output a single-line JSON object with keys rationale, raw_request (starting with POST / HTTP/1.1\\r\\nHost: target.local and ending with \\r\\n\\r\\n$PAYLOAD), and is_clean.\n"
+            "JSON: "
+        )
 
         sec_sys = (
-            "You are an offensive HTTP framing specialist (Cisco Foundation-Sec / PortSwigger methodology). "
-            "The RFC provides clues to structural parser weaknesses. Construct boundary mismatch triggers, "
-            "dual-header conflicts, and parser-confusion mutations. "
-            "CORE EXPLOIT HEURISTIC: "
-            "1. Response-to-Request Inversion: Test if front-end or back-end servers apply response parsing logic to incoming requests (Shared-Parser Confusion). "
-            "2. SMTP/MIME Cross-Protocol Inversion: Test if gateways or reverse proxies confuse SMTP framing (BDAT, foldings, dot delimiters) with HTTP. "
-            "3. Framing Discrepancies: Exploit dual Content-Length, Transfer-Encoding mutations, trailing whitespace, or null bytes. "
-            "Produce raw HTTP requests with '\\r\\n', host 'target.local', and '$PAYLOAD'. "
-            "Output JSON: {\"probes\": [{\"rationale\": \"...\", \"raw_request\": \"...\", \"is_clean\": false}]}"
+            "You are an HTTP framing boundary specialist (Cisco Foundation-Sec / PortSwigger methodology). "
+            "Construct a parser-confusion or framing-discrepancy HTTP/1.1 request from the RFC clue."
         )
-        sec_prompt = f"RFC Snippet:\n\"\"\"{rfc_fragment}\"\"\"\nGenerate 1-2 boundary confusion probes applying Cross-Context Inversion."
+        sec_prompt = (
+            f"RFC Clue: {rfc_fragment}\n"
+            "Task: Output a single-line JSON object with keys rationale, raw_request (starting with POST / HTTP/1.1\\r\\nHost: target.local and ending with \\r\\n\\r\\n$PAYLOAD), and is_clean.\n"
+            "JSON: "
+        )
 
         t_start = time.time()
         print(
@@ -287,14 +297,17 @@ class FusionArbiter:
         gemma_count = 0
         for item in self._parse_json(gemma_out):
             norm_req = self._normalize_crlf(item.get("raw_request", ""))
-            if not norm_req.strip():
+            if not self._is_valid_http_template(norm_req):
                 continue
             gemma_count += 1
+            rat = str(item.get("rationale", "")).strip()
+            if not rat or rat == "...":
+                rat = "Gemma protocol state-machine edge-case"
             proposals.append(CandidateProposal(
                 candidate_id=f"cand_gemma_{len(proposals)+1}",
                 model=self.gemma_model,
                 specialist_type="Protocol Specialist",
-                rationale=item.get("rationale", "Gemma protocol edge-case"),
+                rationale=rat,
                 raw_request=norm_req,
                 is_clean=bool(item.get("is_clean", True)),
             ))
@@ -302,14 +315,17 @@ class FusionArbiter:
         sec_count = 0
         for item in self._parse_json(sec_out):
             norm_req = self._normalize_crlf(item.get("raw_request", ""))
-            if not norm_req.strip():
+            if not self._is_valid_http_template(norm_req):
                 continue
             sec_count += 1
+            rat = str(item.get("rationale", "")).strip()
+            if not rat or rat == "...":
+                rat = "Foundation-Sec boundary discrepancy probe"
             proposals.append(CandidateProposal(
                 candidate_id=f"cand_sec_{len(proposals)+1}",
                 model=self.sec_model,
                 specialist_type="Boundary Specialist",
-                rationale=item.get("rationale", "Security boundary probe"),
+                rationale=rat,
                 raw_request=norm_req,
                 is_clean=bool(item.get("is_clean", False)),
             ))
@@ -362,8 +378,8 @@ class FusionArbiter:
             "Remember: The vulnerability was NOT written in the RFC. The RFC supplies a clue; the attack concept comes from "
             "inverting protocol expectations—especially testing whether servers apply response parsing rules to incoming requests (Shared-Parser Confusion), "
             "or whether reverse proxies disagree with backends on framing. "
-            "Perform rigorous reasoning inside <think> tags. Synthesize the most potent, novel unified probe combining nuance and boundary manipulation. "
-            "Output JSON: [{\"rationale\": \"...\", \"raw_request\": \"...\", \"is_clean\": true/false}]"
+            "Perform brief reasoning inside <think> tags. Synthesize 1 potent unified HTTP/1.1 probe combining nuance and boundary manipulation. "
+            "Return JSON with keys 'rationale', 'raw_request', and 'is_clean'."
         )
 
         arbiter_prompt = (
@@ -386,7 +402,7 @@ class FusionArbiter:
                 if not isinstance(sp, dict):
                     continue
                 raw = self._normalize_crlf(sp.get("raw_request", ""))
-                if raw:
+                if self._is_valid_http_template(raw):
                     final_fused.append({
                         "id": f"fused_arbiter_{len(final_fused)+1}",
                         "model": f"{self.arbiter_model} [Fused: {self.gemma_model} + {self.sec_model}]",

@@ -109,11 +109,87 @@ Remember:
 
                 validated_probes.append(probe_dict)
 
-            return validated_probes
+            if validated_probes:
+                return validated_probes
 
         except Exception as e:
             print(f"[!] Error in LLM probe generation: {e}")
-            return []
+
+        return self._synthesize_rfc_grammar_probes(rfc_fragment, fragment_id)
+
+    def _synthesize_rfc_grammar_probes(self, rfc_fragment: str, fragment_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Deterministic RFC-anchored grammar probe synthesizer (Zero-Empty-State guarantee):
+        Constructs targeted HTTP/1.1 Rule-Inversion and Boundary probes from RFC fragment semantics
+        whenever the LLM panel is warming up or returns unparseable JSON.
+        """
+        frag_lower = (rfc_fragment or "").lower()
+        templates = []
+
+        if "connect" in frag_lower or "tunnel" in frag_lower or ":protocol" in frag_lower:
+            templates.append((
+                "CONNECT tunnel / 2xx response-rule inversion probe",
+                "POST / HTTP/1.1\r\nHost: target.local\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Version: 13\r\nContent-Length: 0\r\n\r\n$PAYLOAD",
+                False,
+            ))
+        if "chunk" in frag_lower or "trailer" in frag_lower or "transfer-encoding" in frag_lower:
+            templates.append((
+                "Chunked framing & trailer field boundary probe",
+                "POST / HTTP/1.1\r\nHost: target.local\r\nTransfer-Encoding: chunked\r\nTrailer: X-Forwarded-For\r\nContent-Length: 4\r\n\r\n0\r\nX-Forwarded-For: 127.0.0.1\r\n\r\n$PAYLOAD",
+                False,
+            ))
+        if "multipart" in frag_lower or "boundary" in frag_lower or "smtp" in frag_lower:
+            templates.append((
+                "MIME multipart / cross-protocol delimiter probe",
+                "POST / HTTP/1.1\r\nHost: target.local\r\nContent-Type: multipart/byteranges; boundary=term\r\nContent-Length: 42\r\n\r\n--term\r\nContent-Length: 0\r\n\r\n--term--\r\n$PAYLOAD",
+                False,
+            ))
+        if "cache" in frag_lower or "304" in frag_lower or "range" in frag_lower:
+            templates.append((
+                "Cache / Range / 304 Shared-Parser Confusion probe",
+                "GET / HTTP/1.1\r\nHost: target.local\r\nRange: bytes=0-0, 1-1\r\nIf-None-Match: \"*\"\r\nContent-Length: 0\r\n\r\n$PAYLOAD",
+                True,
+            ))
+        if "capsule" in frag_lower or "early-data" in frag_lower or "forwarded" in frag_lower:
+            templates.append((
+                "Gateway / Capsule / Early-Data intermediary desync probe",
+                "POST / HTTP/1.1\r\nHost: target.local\r\nCapsule-Protocol: ?1\r\nEarly-Data: 1\r\nForwarded: for=127.0.0.1;host=target.local\r\nContent-Length: 0\r\n\r\n$PAYLOAD",
+                False,
+            ))
+
+        if not templates:
+            templates = [
+                (
+                    "Shared-Parser Confusion (Response-to-Request Rule Inversion)",
+                    "POST / HTTP/1.1\r\nHost: target.local\r\nStatus: 304 Not Modified\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n0\r\n\r\n$PAYLOAD",
+                    False,
+                ),
+                (
+                    "HTTP/1.1 Line-Terminator & Content-Length Discrepancy Probe",
+                    "POST / HTTP/1.1\r\nHost: target.local\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n$PAYLOAD",
+                    True,
+                ),
+            ]
+
+        results = []
+        for rationale, raw_req, is_clean in templates[:2]:
+            p_dict = {
+                "fragment_id": fragment_id,
+                "rationale": f"[RFC-Grammar-Synthesizer] {rationale}",
+                "raw_request": raw_req,
+                "is_clean": is_clean,
+                "source_type": "grammar",
+            }
+            if self.db:
+                p_dict["probe_id"] = self.db.save_probe(
+                    fragment_id=fragment_id,
+                    rationale=p_dict["rationale"],
+                    raw_request=raw_req,
+                    is_clean=is_clean,
+                    source_type="grammar",
+                )
+            results.append(p_dict)
+        return results
 
     def _normalize_newlines(self, text: Any) -> str:
         if not text:
