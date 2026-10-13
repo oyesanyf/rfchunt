@@ -401,7 +401,23 @@ class ProtocolRuler:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Protocol Ruler: Measure front-end byte transformations using backend length limits (James Kettle technique)."
+        description="Protocol Ruler: Measure front-end byte transformations using backend length limits (James Kettle technique).",
+        epilog="""
+===============================================================================
+USAGE EXAMPLES:
+===============================================================================
+
+1. Run a full Protocol Ruler audit against a local test server:
+   python protocol_ruler.py --host 127.0.0.1 --port 8080
+
+2. Audit a remote HTTPS reverse proxy / CDN with debug bracket tracing:
+   python protocol_ruler.py --host target.example.com --port 443 --tls --debug
+
+3. Measure a custom hex byte sequence (e.g. overlong UTF-8 LF '\\xc0\\x8a'):
+   python protocol_ruler.py --host target.example.com --port 443 --tls --sequence "\\xc0\\x8a" --name "Overlong-LF"
+===============================================================================
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--host", default="127.0.0.1", help="Target host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8080, help="Target port (default: 8080)")

@@ -30,7 +30,32 @@ if sys.platform == "win32":
 
 def main():
     parser = argparse.ArgumentParser(
-        description="HTTP Terminator: One-Click Dual Launcher (Test Lab + Flaw Hunter / MCP)"
+        description="HTTP Terminator: One-Click Dual Launcher (Test Lab + Flaw Hunter / MCP)",
+        epilog="""
+===============================================================================
+USAGE EXAMPLES:
+===============================================================================
+
+1. Launch local Test Lab Server + Autonomous Flaw Hunter (starts with RFC 9112):
+   python start.py
+
+2. Target a single RFC against the local Test Lab:
+   python start.py --rfc 9112 --variants 4
+
+3. Target a remote HTTPS reverse proxy / terminator (bypasses local mock lab):
+   python start.py --host target.example.com --port 443 --tls --no-lab
+
+4. Offline RFC ingestion & probe generation only (no packets sent to any host):
+   python start.py --comb-only --max-rfcs 25
+
+5. Filter active RFCs by keyword (e.g. chunked, trailer, websocket):
+   python start.py --keywords "chunked,trailer,websocket" --max-rfcs 10
+
+6. Launch the Model Context Protocol (MCP) JSON-RPC server over stdio:
+   python start.py --mcp
+===============================================================================
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--port", type=int, default=8080, help="Test lab server port (default: 8080)")
     parser.add_argument("--host", default="127.0.0.1", help="Target host (default: 127.0.0.1)")

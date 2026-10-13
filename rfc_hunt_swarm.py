@@ -767,49 +767,46 @@ Core Architecture:
 USAGE EXAMPLES:
 ===============================================================================
 
-1. Scan a single RFC against the local target:
+1. Scan the primary HTTP/1.1 Line & Chunk Terminator spec (RFC 9112):
    python -u rfc_hunt_swarm.py --mode single --rfc 9112
 
-2. Scan the curated James Kettle Research Corpus (138 core HTTP/SMTP RFCs):
+2. Scan the full 25-RFC Terminator & Gateway Suite (HTTP/1.1, H2, H3, WebSockets,
+   Caching, Forwarded, Early-Data, Capsule, Structured Fields, HPACK/QPACK):
+   python -u rfc_hunt_swarm.py --mode terminator --host target.example.com --port 443 --tls
+
+3. Test specific Terminator RFCs (Caching, Forwarded, WebSockets, Capsule, Structured Fields):
+   python -u rfc_hunt_swarm.py --mode single --rfc 9111 --host target.example.com --port 443 --tls
+   python -u rfc_hunt_swarm.py --mode single --rfc 7239 --host target.example.com --port 443 --tls
+   python -u rfc_hunt_swarm.py --mode single --rfc 6455 --host target.example.com --port 443 --tls
+   python -u rfc_hunt_swarm.py --mode single --rfc 9297 --host target.example.com --port 443 --tls
+   python -u rfc_hunt_swarm.py --mode single --rfc 9651 --host target.example.com --port 443 --tls
+
+4. High-speed multithreaded evaluation with 8 concurrent socket threads (Semaphore-bounded):
+   python -u rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 8080 --concurrency 8
+
+5. Scan the curated James Kettle Research Corpus (138 core HTTP/SMTP RFCs):
    python -u rfc_hunt_swarm.py --mode corpus
 
-3. Scan ALL active IETF protocol specifications (HTTP, TLS, WebSockets, etc.):
+6. Scan ALL active IETF protocol specifications (HTTP, TLS, WebSockets, etc.):
    python -u rfc_hunt_swarm.py --mode all
 
-4. Research POST-QUANTUM Cryptography (PQC, ML-KEM, HPKE, Quantum-Resistant TLS):
+7. Research POST-QUANTUM Cryptography (PQC, ML-KEM, HPKE, Quantum-Resistant TLS):
    python -u rfc_hunt_swarm.py --mode pqc
 
-5. Scan with an extended 15-minute timeout for large (16GB) security models:
+8. Scan with an extended 15-minute timeout or UNLIMITED timeout (0) for large models:
    python -u rfc_hunt_swarm.py --mode corpus --timeout 900
-
-6. Scan with UNLIMITED timeout (disables timeout aborts completely):
    python -u rfc_hunt_swarm.py --mode corpus --timeout 0
 
-7. Use a faster 4.7GB secondary security specialist model:
-   python -u rfc_hunt_swarm.py --mode corpus --sec-model qwen2.5:7b
+9. Use a faster 4.7GB secondary security specialist model:
+   python -u rfc_hunt_swarm.py --mode terminator --sec-model qwen2.5:7b
 
-8. Target a custom host and port:
-   python -u rfc_hunt_swarm.py --mode single --rfc 7230 --host 127.0.0.1 --port 8080
+10. Run against a REMOTE HTTPS / TLS host with full debug pipeline telemetry:
+    python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host target.example.com --port 443 --tls --debug
 
-9. Run against a REMOTE HTTP host (auto-normalizes Host headers):
-   python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host staging.corp.internal --port 80
+11. Run an intensive deep-search with 10 mutation cycles & 500 Dream-RSI rollouts:
+    python -u rfc_hunt_swarm.py --mode terminator --cycles 10 --dream-rollouts 500
 
-10. Run against a REMOTE HTTPS / TLS host (port 443):
-    python -u rfc_hunt_swarm.py --mode corpus --host target-app.example.com --port 443 --tls
-
-11. Run an intensive deep-search with 10 mutation cycles per RFC:
-    python -u rfc_hunt_swarm.py --mode corpus --cycles 10
-
-12. Print live host HTTP/TLS responses for every probe:
-    python -u rfc_hunt_swarm.py --mode pqc --host 127.0.0.1 --port 8080 --show-response
-
-13. Deep debugging mode (host responses + socket pipeline telemetry):
-    python -u rfc_hunt_swarm.py --mode pqc --host test-lab.internal --port 443 --tls --debug
-
-14. Enable full verbose telemetry and payload tracing:
-    python -u rfc_hunt_swarm.py --mode single --rfc 9112 --verbose
-
-15. Protocol Ruler mode (measure front-end byte transformations using backend length limits):
+12. Protocol Ruler mode (measure front-end byte transformations using backend length limits):
     python -u rfc_hunt_swarm.py --mode ruler --host 127.0.0.1 --port 8080 --debug
 ===============================================================================
 """,

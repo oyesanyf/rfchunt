@@ -451,7 +451,52 @@ def cmd_build(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="HTTP Terminator: Autonomous Security Research Engine")
+    parser = argparse.ArgumentParser(
+        description="""
+===============================================================================
+HTTP TERMINATOR: Autonomous Protocol Compliance & Security Research CLI
+===============================================================================
+Modular command-line interface for fetching IETF RFC specifications, extracting
+terminator-weighted micro-inspiration fragments, generating edge-case protocol
+probes via local LLMs, applying 25 wire/chunk/cross-protocol terminator
+permutations, and evaluating differential state behavior.
+""",
+        epilog="""
+===============================================================================
+USAGE EXAMPLES:
+===============================================================================
+
+1. Run the unified 'Build All' verification pipeline (syntax, DB, 25 RFC cache, pytest):
+   python main.py build
+
+2. Start the local Test Lab Server on 127.0.0.1:8080:
+   python main.py lab --host 127.0.0.1 --port 8080
+
+3. Run a full autonomous research cycle (Fetch -> Chunk -> Generate -> Permute -> Evaluate -> Dream-RSI):
+   python main.py auto --target 127.0.0.1 --port 8080 --concurrency 4
+
+4. Continuously hunt across Terminator RFCs (starting with RFC 9112):
+   python main.py hunt --target target.example.com --port 443 --tls --max-rfcs 15
+
+5. Step-by-step modular pipeline execution:
+   python main.py fetch --count 5
+   python main.py chunk --sentences 2
+   python main.py generate --limit 5
+   python main.py permute --limit 10 --variants 5
+   python main.py evaluate --target 127.0.0.1 --port 8080 --concurrency 8
+
+6. Measure front-end proxy byte transformations with Protocol Ruler:
+   python main.py ruler --target target.example.com --port 443 --tls --debug
+
+7. Run offline Dream-RSI recursive self-improvement on historical database probes:
+   python main.py dream --db terminator.db --rollouts 300 --generations 3
+
+8. Export confirmed findings to a MITRE Caldera adversary emulation plugin:
+   python main.py caldera --export ./caldera_export
+===============================================================================
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--db", default="terminator.db", help="SQLite database path")
     parser.add_argument("--model", default="gemma2:2b", help="Preferred base model (e.g. gemma2:2b, gemma2:9b, qwen2.5:7b)")
     parser.add_argument("--no-fusion", dest="fusion", action="store_false", help="Disable multi-model panel fusion")
