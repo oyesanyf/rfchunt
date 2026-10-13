@@ -199,7 +199,7 @@ class FusionArbiter:
             "prompt": f"### SYSTEM:\n{system_prompt}\n\n### INSTRUCTION:\n{prompt}",
             "stream": False,
             "keep_alive": "60m",
-            "options": {"temperature": 0.7, "num_predict": 384},
+            "options": {"temperature": 0.7, "num_predict": 256},
         }
         if "deepseek-r1" not in target_model.lower():
             payload["format"] = "json"
@@ -234,18 +234,16 @@ class FusionArbiter:
 
     def run_fusion_pipeline(self, rfc_fragment: str, fragment_id: Optional[int] = None) -> FusionArbitrationResult:
         """
-        Executes the full 4-Gate ModelFusion arbitration protocol:
-        1. Query Google Gemma for protocol edge-cases.
-        2. Query Security Specialist for offensive boundary conditions.
+        Executes the full 4-Gate ModelFusion arbitration protocol with threaded specialist execution:
+        1 & 2. Concurrently query Protocol Specialist (Gemma) and Boundary Specialist (Foundation-Sec).
         3. Evaluate Gate 1 (Single Bypass) & Gate 2 (Unanimous).
         4. Invoke Gate 4 (DeepSeek-R1 Synthesis) to merge insights into novel super-probes.
         """
-        participating_models = []
+        import concurrent.futures
+
+        participating_models = [self.gemma_model, self.sec_model]
         proposals: List[CandidateProposal] = []
 
-        # ------------------------------------------------------------------
-        # Phase 1: Protocol Specialist (Google Gemma)
-        # ------------------------------------------------------------------
         gemma_sys = (
             "You are a network protocol specification researcher (James Kettle DEF CON 34 methodology). "
             "The RFC snippet is a source of CLUES, but vulnerabilities are NOT written in the RFC. "
@@ -256,31 +254,10 @@ class FusionArbiter:
             "   to test if the server/proxy uses a shared parser that mistakenly applies response rules to requests (Shared-Parser Confusion). "
             "2. If the snippet specifies SMTP/MIME rules (BDAT chunks, dot-stuffing, line folding), adapt the delimiter into an HTTP probe. "
             "Construct raw HTTP/1.1 requests using explicit '\\r\\n' line delimiters, host 'target.local', and '$PAYLOAD' placeholder. "
-            "Output JSON: [{\"rationale\": \"...\", \"raw_request\": \"...\", \"is_clean\": true/false}]"
+            "Output JSON: {\"probes\": [{\"rationale\": \"...\", \"raw_request\": \"...\", \"is_clean\": true}]}"
         )
         gemma_prompt = f"RFC Snippet:\n\"\"\"{rfc_fragment}\"\"\"\nGenerate 1-2 raw HTTP protocol edge-case templates applying Rule Inversion."
-        t0 = time.time()
-        print(f"    -> [ModelFusion 1/3] Protocol Specialist ({self.gemma_model}) generating...", end=" ", flush=True)
-        gemma_out = self._query_model(self.gemma_model, gemma_prompt, gemma_sys)
-        participating_models.append(self.gemma_model)
 
-        for item in self._parse_json(gemma_out):
-            norm_req = self._normalize_crlf(item.get("raw_request", ""))
-            if not norm_req.strip():
-                continue
-            proposals.append(CandidateProposal(
-                candidate_id=f"cand_gemma_{len(proposals)+1}",
-                model=self.gemma_model,
-                specialist_type="Protocol Specialist",
-                rationale=item.get("rationale", "Gemma protocol edge-case"),
-                raw_request=norm_req,
-                is_clean=bool(item.get("is_clean", True)),
-            ))
-        print(f"done ({time.time() - t0:.1f}s, {len(proposals)} proposals)", flush=True)
-
-        # ------------------------------------------------------------------
-        # Phase 2: Exploit Boundary Specialist (Foundation-Sec / Qwen)
-        # ------------------------------------------------------------------
         sec_sys = (
             "You are an offensive HTTP framing specialist (Cisco Foundation-Sec / PortSwigger methodology). "
             "The RFC provides clues to structural parser weaknesses. Construct boundary mismatch triggers, "
@@ -290,19 +267,44 @@ class FusionArbiter:
             "2. SMTP/MIME Cross-Protocol Inversion: Test if gateways or reverse proxies confuse SMTP framing (BDAT, foldings, dot delimiters) with HTTP. "
             "3. Framing Discrepancies: Exploit dual Content-Length, Transfer-Encoding mutations, trailing whitespace, or null bytes. "
             "Produce raw HTTP requests with '\\r\\n', host 'target.local', and '$PAYLOAD'. "
-            "Output JSON: [{\"rationale\": \"...\", \"raw_request\": \"...\", \"is_clean\": false}]"
+            "Output JSON: {\"probes\": [{\"rationale\": \"...\", \"raw_request\": \"...\", \"is_clean\": false}]}"
         )
         sec_prompt = f"RFC Snippet:\n\"\"\"{rfc_fragment}\"\"\"\nGenerate 1-2 boundary confusion probes applying Cross-Context Inversion."
-        t1 = time.time()
-        before_sec = len(proposals)
-        print(f"    -> [ModelFusion 2/3] Boundary Specialist ({self.sec_model}) generating...", end=" ", flush=True)
-        sec_out = self._query_model(self.sec_model, sec_prompt, sec_sys)
-        participating_models.append(self.sec_model)
 
+        t_start = time.time()
+        print(
+            f"    -> [ModelFusion 1&2/3] Querying Specialists in parallel "
+            f"({self.gemma_model} + {self.sec_model})...",
+            end=" ",
+            flush=True,
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            fut_gemma = pool.submit(self._query_model, self.gemma_model, gemma_prompt, gemma_sys)
+            fut_sec = pool.submit(self._query_model, self.sec_model, sec_prompt, sec_sys)
+            gemma_out = fut_gemma.result()
+            sec_out = fut_sec.result()
+
+        gemma_count = 0
+        for item in self._parse_json(gemma_out):
+            norm_req = self._normalize_crlf(item.get("raw_request", ""))
+            if not norm_req.strip():
+                continue
+            gemma_count += 1
+            proposals.append(CandidateProposal(
+                candidate_id=f"cand_gemma_{len(proposals)+1}",
+                model=self.gemma_model,
+                specialist_type="Protocol Specialist",
+                rationale=item.get("rationale", "Gemma protocol edge-case"),
+                raw_request=norm_req,
+                is_clean=bool(item.get("is_clean", True)),
+            ))
+
+        sec_count = 0
         for item in self._parse_json(sec_out):
             norm_req = self._normalize_crlf(item.get("raw_request", ""))
             if not norm_req.strip():
                 continue
+            sec_count += 1
             proposals.append(CandidateProposal(
                 candidate_id=f"cand_sec_{len(proposals)+1}",
                 model=self.sec_model,
@@ -311,7 +313,10 @@ class FusionArbiter:
                 raw_request=norm_req,
                 is_clean=bool(item.get("is_clean", False)),
             ))
-        print(f"done ({time.time() - t1:.1f}s, {len(proposals) - before_sec} proposals)", flush=True)
+        print(
+            f"done ({time.time() - t_start:.1f}s | Gemma: {gemma_count}, Sec: {sec_count} proposals)",
+            flush=True,
+        )
 
         # ------------------------------------------------------------------
         # Gate 1: Single Candidate Bypass
@@ -587,9 +592,15 @@ Output strict JSON matching:
                         out.append({"rationale": "Synthesized probe", "raw_request": v, "is_clean": False})
                 return out
             elif isinstance(val, dict):
-                for key in ("probes", "suggested_probes", "candidates", "items"):
+                for key in ("probes", "suggested_probes", "candidates", "items", "requests", "templates", "proposals"):
                     if key in val and isinstance(val[key], list):
-                        return [v for v in val[key] if isinstance(v, dict)]
+                        return [
+                            v if isinstance(v, dict) else {"rationale": "Synthesized probe", "raw_request": str(v), "is_clean": False}
+                            for v in val[key]
+                        ]
+                for v_list in val.values():
+                    if isinstance(v_list, list) and v_list and isinstance(v_list[0], dict):
+                        return v_list
                 return [val]
         except Exception:
             pass

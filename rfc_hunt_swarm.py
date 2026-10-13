@@ -190,7 +190,7 @@ class ProtocolResearchSwarm:
         show_response: bool = False,
         verbose: bool = False,
         debug: bool = False,
-        concurrency: int = 4,
+        concurrency: int = 8,
     ):
         host = re.sub(r"^https?://", "", str(host).strip(), flags=re.IGNORECASE).split("/")[0]
         if ":" in host and not host.startswith("["):
@@ -409,8 +409,8 @@ class ProtocolResearchSwarm:
                         raw_response=resp_bytes,
                     )
 
-            # Fallback to Metamorphic Oracle (Mod 7/4) if no sequence anomaly
-            if not anomaly:
+            # Fallback to Metamorphic Oracle (Mod 7/4) on base probes if no sequence anomaly
+            if not anomaly and candidate.get("source_type") in ("llm", "fusion", None):
                 meta_results = self.metamorphic.test_metamorphic_invariance(
                     self.host, self.port, probe_bytes, use_tls=self.use_tls
                 )
@@ -889,7 +889,7 @@ USAGE EXAMPLES (All run directly via rfc_hunt_swarm.py):
     parser.add_argument("--no-caldera", action="store_true", help="Disable default Caldera export")
     parser.add_argument("--caldera-url", "--push", dest="caldera_url", type=str, default=None, help="Optional Caldera server URL to push confirmed findings live")
     parser.add_argument("--caldera-key", "--api-key", dest="caldera_key", type=str, default=None, help="Optional Caldera API key for REST authentication")
-    parser.add_argument("--concurrency", "--threads", type=int, default=4, help="Maximum concurrent probe execution threads (bounded by semaphore, default: 4)")
+    parser.add_argument("--concurrency", "--threads", type=int, default=8, help="Maximum concurrent probe execution threads (bounded by semaphore, default: 8)")
     args = parser.parse_args()
 
     # Resolve positional command / shortcut flags into active_mode
