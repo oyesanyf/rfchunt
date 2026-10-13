@@ -111,7 +111,26 @@ python -u rfc_hunt_swarm.py --mode corpus --sec-model qwen2.5:7b --timeout 300
 
 ---
 
+## Research Attribution & Acknowledgements
+
+This project implements and expands upon the autonomous protocol research paradigm pioneered by **James Kettle** (Director of Research, PortSwigger):
+
+- **Seminal Research Paper**: [Can AI Do Novel Security Research?](https://portswigger.net/research/can-ai-do-novel-security-research) (PortSwigger Research, October 2026)
+- **Author**: James Kettle ([@albinowax](https://x.com/albinowax) / [jameskettle.com](https://jameskettle.com/))
+- **Reference Tool**: [HTTP Terminator (GitHub)](https://github.com/portswigger/http-terminator)
+
+### Core Methodologies Derived from James Kettle's Research:
+1. **Micro-Inspiration Engine**:
+   Overcoming LLM "context-contamination" and over-anchoring by chunking normative IETF RFC standards into isolated 1–3 sentence prompts rather than asking generic fuzzer questions.
+2. **State Machine Canary Sequences**:
+   Evaluating desync triggers via persistent TCP state machine transitions (`Baseline GET` $\rightarrow$ `Candidate Probe` $\rightarrow$ `Pipelined Canary GET`) to measure boundary contamination without client-side connection-reuse illusions.
+3. **The Protocol-Ruler Technique**:
+   Using backend length limits and delimiter boundaries as a ruler to detect input rewriting, Unicode normalization/mojibake, and header injection.
+4. **The Discovery Cascade**:
+   Systematically interrogating every verified finding with autonomous hypothesis generation to explore adjacent branches of the vulnerability landscape (e.g., *Shared-Parser Confusion*, *Response Forking*, and the *Dangling-Byte Technique*).
+
+---
+
 ## License
 
 Apache 2.0 / MIT.
-"# rfchunt" 
