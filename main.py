@@ -435,6 +435,14 @@ def cmd_caldera(args):
         print(f"[+] Caldera plugin successfully exported to {res['plugin_path']} ({res['abilities_count']} abilities).")
 
 
+def cmd_build(args):
+    """Executes the unified 'Build All' pipeline."""
+    from build_all import run_full_build
+    success = run_full_build(skip_tests=args.skip_tests, skip_zips=args.skip_zips)
+    if not success:
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="HTTP Terminator: Autonomous Security Research Engine")
     parser.add_argument("--db", default="terminator.db", help="SQLite database path")
@@ -544,6 +552,11 @@ def main():
     p_caldera.add_argument("--push", type=str, default=None, help="Caldera server URL to push abilities live")
     p_caldera.add_argument("--api-key", type=str, default=None, help="Caldera API key for REST authentication")
 
+    # Build All Pipeline
+    p_build = subparsers.add_parser("build", help="Build all components, verify database, pre-cache RFCs, and package releases")
+    p_build.add_argument("--skip-tests", action="store_true", help="Skip running the pytest verification suite")
+    p_build.add_argument("--skip-zips", action="store_true", help="Skip creating release zip packages")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -551,6 +564,7 @@ def main():
         sys.exit(0)
 
     dispatch = {
+        "build": cmd_build,
         "ruler": cmd_ruler,
         "hunt": cmd_hunt,
         "mcp": cmd_mcp,

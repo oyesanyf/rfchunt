@@ -65,7 +65,7 @@ def main():
     print("  HTTP TERMINATOR: AUTONOMOUS RESEARCH FACTORY")
     print("  Architecture: PortSwigger DEF CON 34 / Black Hat USA 2026")
     print("  Engine: Google Gemma 2 + ModelFusion via Ollama (Zero Cost 24/7)")
-    print("  Starting Spec: RFC-MCP (Model Context Protocol Architecture)")
+    print("  Starting Spec: RFC 9112 (HTTP/1.1 Message Syntax & Framing - Primary Terminator Spec)")
     print("=" * 70)
 
     # 1. Start the Local Protocol Test Lab Server (Only when targeting default local port 8080 and not explicitly disabled)
@@ -107,7 +107,7 @@ def main():
             mcp_server = TerminatorMCPServer()
             mcp_server.run_stdio()
         else:
-            print(f"\n[+] Step 2: Launching Continuous Flaw Hunter (Starting with RFC-MCP)...")
+            print(f"\n[+] Step 2: Launching Continuous Flaw Hunter (Starting with RFC 9112 - HTTP/1.1 Message Framing)...")
             sec_model = "fenkohq/foundation-sec-8b:latest" if args.cisco else None
             hunter = ContinuousFlawHunter(
                 target_host=args.host,

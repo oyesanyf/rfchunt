@@ -14,6 +14,7 @@ from engine.taxonomy import (
     RequirementType,
 )
 from engine.caldera_bridge import CalderaBridge
+from engine.terminator_rfc_selector import TerminatorRFCSelector, TERMINATOR_CORE_RFCS
 
 __all__ = [
     "AnomalyCategory",
@@ -26,5 +27,7 @@ __all__ = [
     "ReproducibleVulnerability",
     "RFCRequirement",
     "RequirementType",
+    "TerminatorRFCSelector",
+    "TERMINATOR_CORE_RFCS",
 ]
 

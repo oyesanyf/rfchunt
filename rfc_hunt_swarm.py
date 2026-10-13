@@ -764,7 +764,7 @@ USAGE EXAMPLES:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--rfc", type=str, default="9112", help="Specific RFC ID to analyze (e.g. 9112)")
-    parser.add_argument("--mode", type=str, choices=["single", "corpus", "all", "pqc", "ruler"], default="single", help="Scan mode: single RFC, Kettle corpus, all protocol RFCs, pqc, or ruler (Protocol Ruler)")
+    parser.add_argument("--mode", type=str, choices=["single", "terminator", "corpus", "all", "pqc", "ruler"], default="single", help="Scan mode: single RFC, terminator (curated HTTP Terminator suite), Kettle corpus, all protocol RFCs, pqc, or ruler")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Target host (domain or IP)")
     parser.add_argument("--port", type=int, default=5006, help="Target port")
     parser.add_argument("--tls", action="store_true", help="Enable TLS/HTTPS for remote host (auto-enabled if port is 443)")
@@ -844,6 +844,9 @@ USAGE EXAMPLES:
     # Determine which RFCs to scan based on the selected mode
     if args.mode == "single":
         rfcs_to_scan = [args.rfc.replace("RFC", "")]
+    elif args.mode == "terminator":
+        print("[*] Resolving Terminator Core RFC Suite (HTTP/1.1 Framing, Intermediaries & Line Terminators)...")
+        rfcs_to_scan = swarm.fetcher.get_terminator_corpus()
     elif args.mode == "corpus":
         print("[*] Resolving James Kettle Research Corpus...")
         rfcs_to_scan = swarm.fetcher.get_kettle_corpus()
