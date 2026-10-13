@@ -31,7 +31,8 @@ class MetamorphicTestingEngine:
     the server preserves the invariant relationships.
     """
 
-    def __init__(self):
+    def __init__(self, default_timeout: float = 3.0):
+        self.default_timeout = default_timeout
         self.relations: List[MetamorphicRelation] = []
         self._register_default_relations()
 
@@ -84,7 +85,7 @@ class MetamorphicTestingEngine:
         def compare_metamorphic_response(s1: int, b1: bytes, s2: int, b2: bytes) -> Tuple[bool, str]:
             if s1 == s2:
                 return True, f"Invariant preserved: Status codes match ({s1} == {s2})"
-            if s1 == 200 and s2 in (400, 431, 422):
+            if s1 in (200, 301, 302, 303, 307, 308) and s2 in (400, 431, 422):
                 return False, (
                     f"RFC-Compliant Rejection: Base request returned {s1}, but transformed request returned {s2}. "
                     "Under RFC 9112 Section 5.1 and 5.5, servers MAY apply strict grammar validation and reject "
@@ -120,14 +121,15 @@ class MetamorphicTestingEngine:
         )
 
     def test_metamorphic_invariance(
-        self, host: str, port: int, base_probe: bytes, timeout: float = 3.0, use_tls: bool = False
+        self, host: str, port: int, base_probe: bytes, timeout: Optional[float] = None, use_tls: bool = False
     ) -> List[Tuple[MetamorphicRelation, bool, str, Optional[ImplementationAnomaly]]]:
         """
         Executes the base probe, applies each metamorphic relation transform,
         and tests if the relationship holds.
         """
+        eff_timeout = timeout if timeout is not None else self.default_timeout
         results = []
-        base_status, base_body = self._execute_raw(host, port, base_probe, timeout, use_tls=use_tls)
+        base_status, base_body = self._execute_raw(host, port, base_probe, eff_timeout, use_tls=use_tls)
         if base_status == 0:
             # Server unreachable or baseline failed
             return results
@@ -137,7 +139,7 @@ class MetamorphicTestingEngine:
             if trans_probe == base_probe:
                 continue  # Relation not applicable to this probe
 
-            trans_status, trans_body = self._execute_raw(host, port, trans_probe, timeout, use_tls=use_tls)
+            trans_status, trans_body = self._execute_raw(host, port, trans_probe, eff_timeout, use_tls=use_tls)
             is_valid, reason = mr.comparator(base_status, base_body, trans_status, trans_body)
 
             anomaly = None

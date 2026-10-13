@@ -172,7 +172,8 @@ def test_mod6_errata_tracker():
 
 
 def test_mod7_metamorphic_engine():
-    meta = MetamorphicTestingEngine()
+    meta = MetamorphicTestingEngine(default_timeout=2.5)
+    assert meta.default_timeout == 2.5
     assert len(meta.relations) >= 3
 
     # Test Header Case Relation
@@ -190,6 +191,20 @@ def test_mod7_metamorphic_engine():
     invalid, reason = case_mr.comparator(200, b"OK", 500, b"Internal Error")
     assert invalid is False
     assert "Metamorphic Violation" in reason
+
+    # Ensure DeltaDebugger._default_oracle constructs MetamorphicTestingEngine(default_timeout=...) cleanly
+    debugger = DeltaDebugger("127.0.0.1", 5006, default_timeout=2.5)
+    meta_anom = ImplementationAnomaly(
+        anomaly_id="ANOM-META-TEST",
+        target_engine="127.0.0.1:5006",
+        category=AnomalyCategory.METAMORPHIC_VIOLATION,
+        observed_behavior=reason,
+        expected_behavior=case_mr.description,
+        raw_probe=trans,
+        raw_response=b"HTTP/1.1 500 Internal Error\r\n\r\n",
+    )
+    oracle_fn = debugger._default_oracle(meta_anom)
+    assert callable(oracle_fn)
 
 
 def test_mod8_delta_debugger():
