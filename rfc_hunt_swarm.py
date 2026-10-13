@@ -21,9 +21,11 @@ Core Mechanisms:
 """
 
 import argparse
+import concurrent.futures
 import operator
 import re
 import sys
+import threading
 import time
 from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
@@ -187,6 +189,7 @@ class ProtocolResearchSwarm:
         show_response: bool = False,
         verbose: bool = False,
         debug: bool = False,
+        concurrency: int = 4,
     ):
         self.host = host
         self.port = port
@@ -194,6 +197,9 @@ class ProtocolResearchSwarm:
         self.debug = debug
         self.show_response = show_response or debug
         self.verbose = verbose or debug
+        self.concurrency = max(1, concurrency)
+        self.probe_semaphore = threading.BoundedSemaphore(self.concurrency)
+        self.llm_semaphore = threading.BoundedSemaphore(1)
         
         # Original Scanner Core Components
         self.db = Database(db_path)
@@ -263,8 +269,9 @@ class ProtocolResearchSwarm:
         preview = frag_text.strip().replace("\r", " ").replace("\n", " ")[:70]
         print(f"\n[llm_generator_agent] Synthesizing probes for fragment ({len(fragments) + 1} remaining in queue): \"{preview}...\"")
         
-        # Call Local LLM to generate probes based on this RFC fragment
-        llm_probes = self.generator.generate_candidate_probes(frag_text)
+        # Call Local LLM to generate probes based on this RFC fragment (guarded by semaphore)
+        with self.llm_semaphore:
+            llm_probes = self.generator.generate_candidate_probes(frag_text)
         
         # Permutate them
         all_candidates = []
@@ -290,151 +297,190 @@ class ProtocolResearchSwarm:
             return "llm_generator_agent"
         return "execution_oracle_agent"
 
-    # Agent 3: Execution and Differential Oracle (Combines sequence and metamorphic)
+    def _evaluate_single_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        """Worker evaluating an individual candidate probe guarded by self.probe_semaphore."""
+        with self.probe_semaphore:
+            probe_bytes = candidate.get("raw_request", b"")
+            if isinstance(probe_bytes, str):
+                probe_bytes = probe_bytes.encode('latin-1', errors='replace')
+                
+            # Dynamically normalize Host header for remote targets
+            if b"target.local" in probe_bytes and self.host != "127.0.0.1":
+                probe_bytes = probe_bytes.replace(b"target.local", self.host.encode("latin-1", errors="replace"))
+                
+            # Run stateful pipeline engine (Mod 5)
+            seq_report = self.sequence_engine.run_pipelined_canary_sequence(
+                self.host, self.port, probe_bytes, use_tls=self.use_tls
+            )
+            
+            # Telemetry: Extract target host response
+            candidate_step = next((s for s in seq_report.steps if "Candidate" in s.step_name), None)
+            if candidate_step:
+                resp_bytes = candidate_step.received_bytes
+                status_code = candidate_step.status_code
+                latency_ms = candidate_step.latency * 1000
+                sock_err = candidate_step.socket_error
+            elif seq_report.steps:
+                last_step = seq_report.steps[-1]
+                resp_bytes = last_step.received_bytes
+                status_code = last_step.status_code
+                latency_ms = last_step.latency * 1000
+                sock_err = last_step.socket_error
+            else:
+                resp_bytes = b""
+                status_code = 0
+                latency_ms = 0.0
+                sock_err = seq_report.details or "No response"
+
+            # Format human-readable response summary and sanitized details
+            resp_summary, resp_details = format_clean_kettle_response(
+                resp_bytes, latency_ms=latency_ms, sock_error=sock_err, is_verbose=self.verbose
+            )
+
+            anomaly = None
+            if seq_report.has_desynchronization or seq_report.has_pipeline_leak:
+                anomaly = ImplementationAnomaly(
+                    anomaly_id=f"ANOM-SEQ-{int(time.time() * 1000)}",
+                    target_engine=f"{self.host}:{self.port}",
+                    category=AnomalyCategory.PIPELINE_LEAK if seq_report.has_pipeline_leak else AnomalyCategory.PARSER_DIVERGENCE,
+                    observed_behavior=seq_report.details,
+                    expected_behavior="Clean request separation.",
+                    raw_probe=probe_bytes,
+                    raw_response=resp_bytes if resp_bytes else (seq_report.steps[-1].received_bytes if seq_report.steps else b""),
+                )
+                
+            # Fallback to Metamorphic Oracle (Mod 7/4) if no sequence anomaly
+            if not anomaly:
+                meta_results = self.metamorphic.test_metamorphic_invariance(
+                    self.host, self.port, probe_bytes, use_tls=self.use_tls
+                )
+                for mr, is_valid, reason, meta_anomaly in meta_results:
+                    if self.debug:
+                        print(f"[*] METAMORPHIC ORACLE [{mr.relation_id}] -> {reason}")
+                    if not is_valid and meta_anomaly:
+                        anomaly = meta_anomaly
+                        break
+            
+            baseline_step = next((s for s in seq_report.steps if "Baseline" in s.step_name), None)
+            baseline_resp_bytes = baseline_step.received_bytes if baseline_step else b""
+
+            # Record live step in Dream-RSI World Model
+            self.dream_world_model.record_step(
+                probe_bytes=probe_bytes,
+                status_code=status_code,
+                raw_response=resp_bytes,
+                latency=latency_ms / 1000.0,
+                is_anomaly=bool(anomaly),
+                anomaly_category=anomaly.category.value if anomaly else None,
+                is_vulnerability=False,
+                details=resp_summary,
+            )
+
+            return {
+                "candidate": candidate,
+                "probe_bytes": probe_bytes,
+                "seq_report": seq_report,
+                "resp_bytes": resp_bytes,
+                "resp_summary": resp_summary,
+                "resp_details": resp_details,
+                "anomaly": anomaly,
+                "baseline_resp_bytes": baseline_resp_bytes,
+            }
+
+    # Agent 3: Execution and Differential Oracle (Combines sequence and metamorphic with multithreaded semaphore)
     def execution_oracle_agent(self, state: ResearchState) -> dict:
         cands = state.get("generated_candidates", [])
         if not cands:
             return {"history": ["execution_oracle: No candidates to execute."]}
         
-        # Pop one candidate to test
-        candidate = cands.pop(0)
-        probe_bytes = candidate.get("raw_request", b"")
-        if isinstance(probe_bytes, str):
-            probe_bytes = probe_bytes.encode('latin-1', errors='replace')
-            
-        # Dynamically normalize Host header for remote targets
-        if b"target.local" in probe_bytes and self.host != "127.0.0.1":
-            probe_bytes = probe_bytes.replace(b"target.local", self.host.encode("latin-1", errors="replace"))
-            
-        # Run stateful pipeline engine (Mod 5)
-        seq_report = self.sequence_engine.run_pipelined_canary_sequence(
-            self.host, self.port, probe_bytes, use_tls=self.use_tls
-        )
-        
-        # Telemetry: Extract target host response
-        candidate_step = next((s for s in seq_report.steps if "Candidate" in s.step_name), None)
-        if candidate_step:
-            resp_bytes = candidate_step.received_bytes
-            status_code = candidate_step.status_code
-            latency_ms = candidate_step.latency * 1000
-            sock_err = candidate_step.socket_error
-        elif seq_report.steps:
-            last_step = seq_report.steps[-1]
-            resp_bytes = last_step.received_bytes
-            status_code = last_step.status_code
-            latency_ms = last_step.latency * 1000
-            sock_err = last_step.socket_error
-        else:
-            resp_bytes = b""
-            status_code = 0
-            latency_ms = 0.0
-            sock_err = seq_report.details or "No response"
+        # Batch evaluation bounded by semaphore
+        batch_size = min(len(cands), self.concurrency)
+        batch = [cands.pop(0) for _ in range(batch_size)]
 
-        # Format human-readable response summary and sanitized details
-        resp_summary, resp_details = format_clean_kettle_response(
-            resp_bytes, latency_ms=latency_ms, sock_error=sock_err, is_verbose=self.verbose
-        )
+        if self.concurrency > 1 and len(batch) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+                eval_results = list(executor.map(self._evaluate_single_candidate, batch))
+        else:
+            eval_results = [self._evaluate_single_candidate(b) for b in batch]
 
         proto_prefix = "https" if self.use_tls else "http"
-        
-        # Check if user requested Kettle-style deep debug mode
-        if self.debug:
-            print(f"\n{'='*75}")
-            print(f"[*] PROTOCOL EVALUATION TRACE [Kettle Evaluation Oracle]")
-            print(f"{'='*75}")
-            print(f"[CONNECT] -> {proto_prefix}://{self.host}:{self.port} (Socket Connected | TLS: {self.use_tls})")
-            
-            for idx, s in enumerate(seq_report.steps, 1):
-                sent_fmt = format_kettle_http_bytes(s.sent_bytes, max_len=2000, is_debug=self.verbose)
-                s_sum, s_det = format_clean_kettle_response(
-                    s.received_bytes, latency_ms=s.latency * 1000, sock_error=s.socket_error, is_verbose=self.verbose
-                )
-                
-                print(f"\n>>> [REQ {idx}: {s.step_name.upper()}] ({len(s.sent_bytes)} bytes)")
-                print(sent_fmt)
-                print(f"\n<<< [RESP {idx}] {s_sum}")
-                if s_det:
-                    print(s_det)
-            
-            print(f"\n--- SEQUENCE EVALUATION ---")
-            print(f"  Desynchronization : {seq_report.has_desynchronization}")
-            print(f"  Pipeline Leak     : {seq_report.has_pipeline_leak}")
-            print(f"  Verdict           : {seq_report.details}")
-            print(f"{'='*75}\n")
-        elif self.show_response or self.verbose:
-            print(f"\n{'='*28} PROBE TRANSMISSION {'='*28}")
-            print(f"Target: {proto_prefix}://{self.host}:{self.port}")
-            print(f"--- Raw Probe Sent ({len(probe_bytes)} bytes) ---")
-            print(format_kettle_http_bytes(probe_bytes, max_len=2000, is_debug=self.verbose))
-            print(f"--- Host Response: {resp_summary} ---")
-            if resp_details:
-                print(resp_details)
-            print(f"{'='*76}\n")
+        detected_anomaly = None
+        detected_probe = b""
+        detected_baseline = b""
+        first_resp_summary = ""
 
-        anomaly = None
-        if seq_report.has_desynchronization or seq_report.has_pipeline_leak:
-            anomaly = ImplementationAnomaly(
-                anomaly_id=f"ANOM-SEQ-{int(time.time() * 1000)}",
-                target_engine=f"{self.host}:{self.port}",
-                category=AnomalyCategory.PIPELINE_LEAK if seq_report.has_pipeline_leak else AnomalyCategory.PARSER_DIVERGENCE,
-                observed_behavior=seq_report.details,
-                expected_behavior="Clean request separation.",
-                raw_probe=probe_bytes,
-                raw_response=resp_bytes if resp_bytes else (seq_report.steps[-1].received_bytes if seq_report.steps else b""),
-            )
-            
-        # Fallback to Metamorphic Oracle (Mod 7/4) if no sequence anomaly
-        if not anomaly:
-            meta_results = self.metamorphic.test_metamorphic_invariance(
-                self.host, self.port, probe_bytes, use_tls=self.use_tls
-            )
-            for mr, is_valid, reason, meta_anomaly in meta_results:
-                if self.debug:
-                    print(f"[*] METAMORPHIC ORACLE [{mr.relation_id}] -> {reason}")
-                if not is_valid and meta_anomaly:
-                    anomaly = meta_anomaly
-                    break
-        
-        baseline_step = next((s for s in seq_report.steps if "Baseline" in s.step_name), None)
-        baseline_resp_bytes = baseline_step.received_bytes if baseline_step else b""
+        for item in eval_results:
+            p_bytes = item["probe_bytes"]
+            seq_report = item["seq_report"]
+            resp_summary = item["resp_summary"]
+            resp_details = item["resp_details"]
+            anomaly = item["anomaly"]
+            b_resp = item["baseline_resp_bytes"]
 
-        # Record live step in Dream-RSI World Model
-        self.dream_world_model.record_step(
-            probe_bytes=probe_bytes,
-            status_code=status_code,
-            raw_response=resp_bytes,
-            latency=latency_ms / 1000.0,
-            is_anomaly=bool(anomaly),
-            anomaly_category=anomaly.category.value if anomaly else None,
-            is_vulnerability=False,
-            details=resp_summary,
-        )
+            if not first_resp_summary:
+                first_resp_summary = resp_summary
 
-        if anomaly:
-            # SAVE to Database exactly like the original code
+            if self.debug:
+                print(f"\n{'='*75}")
+                print(f"[*] PROTOCOL EVALUATION TRACE [Kettle Evaluation Oracle] (Threaded Semaphore Pool)")
+                print(f"{'='*75}")
+                print(f"[CONNECT] -> {proto_prefix}://{self.host}:{self.port} (Socket Connected | TLS: {self.use_tls})")
+                for idx, s in enumerate(seq_report.steps, 1):
+                    sent_fmt = format_kettle_http_bytes(s.sent_bytes, max_len=2000, is_debug=self.verbose)
+                    s_sum, s_det = format_clean_kettle_response(
+                        s.received_bytes, latency_ms=s.latency * 1000, sock_error=s.socket_error, is_verbose=self.verbose
+                    )
+                    print(f"\n>>> [REQ {idx}: {s.step_name.upper()}] ({len(s.sent_bytes)} bytes)")
+                    print(sent_fmt)
+                    print(f"\n<<< [RESP {idx}] {s_sum}")
+                    if s_det:
+                        print(s_det)
+                print(f"\n--- SEQUENCE EVALUATION ---")
+                print(f"  Desynchronization : {seq_report.has_desynchronization}")
+                print(f"  Pipeline Leak     : {seq_report.has_pipeline_leak}")
+                print(f"  Verdict           : {seq_report.details}")
+                print(f"{'='*75}\n")
+            elif self.show_response or self.verbose:
+                print(f"\n{'='*28} PROBE TRANSMISSION {'='*28}")
+                print(f"Target: {proto_prefix}://{self.host}:{self.port}")
+                print(f"--- Raw Probe Sent ({len(p_bytes)} bytes) ---")
+                print(format_kettle_http_bytes(p_bytes, max_len=2000, is_debug=self.verbose))
+                print(f"--- Host Response: {resp_summary} ---")
+                if resp_details:
+                    print(resp_details)
+                print(f"{'='*76}\n")
+
+            if anomaly and not detected_anomaly:
+                detected_anomaly = anomaly
+                detected_probe = p_bytes
+                detected_baseline = b_resp
+
+        if detected_anomaly:
+            # SAVE to Database thread-safely
             self.db.save_implementation_anomaly(
-                anomaly_id=anomaly.anomaly_id,
-                target_engine=anomaly.target_engine,
-                category=anomaly.category.value,
-                observed_behavior=anomaly.observed_behavior,
-                expected_behavior=anomaly.expected_behavior,
-                raw_probe=anomaly.raw_probe.decode("latin-1", errors="replace"),
-                raw_response=anomaly.raw_response.decode("latin-1", errors="replace"),
+                anomaly_id=detected_anomaly.anomaly_id,
+                target_engine=detected_anomaly.target_engine,
+                category=detected_anomaly.category.value,
+                observed_behavior=detected_anomaly.observed_behavior,
+                expected_behavior=detected_anomaly.expected_behavior,
+                raw_probe=detected_anomaly.raw_probe.decode("latin-1", errors="replace"),
+                raw_response=detected_anomaly.raw_response.decode("latin-1", errors="replace"),
             )
             return {
                 "generated_candidates": cands,
-                "current_probe": probe_bytes,
-                "current_anomaly": anomaly,
-                "baseline_resp": baseline_resp_bytes,
-                "history": [f"execution_oracle: Probed {self.host}:{self.port} -> Host: {resp_summary} | ANOMALY DETECTED! Saved to DB ({anomaly.anomaly_id})."]
+                "current_probe": detected_probe,
+                "current_anomaly": detected_anomaly,
+                "baseline_resp": detected_baseline,
+                "history": [f"execution_oracle (multithreaded): Batch of {len(batch)} probes completed. ANOMALY DETECTED! Saved to DB ({detected_anomaly.anomaly_id})."]
             }
 
+        last_item = eval_results[-1] if eval_results else {}
         return {
             "generated_candidates": cands,
-            "current_probe": probe_bytes,
+            "current_probe": last_item.get("probe_bytes", b""),
             "current_anomaly": None,
-            "baseline_resp": baseline_resp_bytes,
-            "history": [f"execution_oracle: Probed {self.host}:{self.port} -> Host: {resp_summary} | Target healthy/conformant."]
+            "baseline_resp": last_item.get("baseline_resp_bytes", b""),
+            "history": [f"execution_oracle (multithreaded): Batch of {len(batch)} probes evaluated concurrently -> Host: {first_resp_summary} | Target healthy/conformant."]
         }
 
     def route_after_execution(self, state: ResearchState) -> str:
@@ -737,13 +783,15 @@ USAGE EXAMPLES:
         action="store_true",
         help="Explicitly authorize active security testing against remote/public target (e.g. dlptest.com) or allow any target",
     )
-    parser.add_argument("--dream-rsi", action="store_true", help="Enable Open Dream-RSI: recursive off-policy self-improvement between cycles")
+    parser.add_argument("--dream-rsi", dest="dream_rsi", action="store_true", default=True, help="Enable Open Dream-RSI: recursive off-policy self-improvement between cycles (enabled by default)")
+    parser.add_argument("--no-dream-rsi", dest="dream_rsi", action="store_false", help="Disable default Open Dream-RSI evolution cycle")
     parser.add_argument("--dream-rollouts", type=int, default=300, help="Number of simulated rollouts per dream generation (default: 300)")
     parser.add_argument("--dream-export", type=str, default="data/dream_policies.json", help="Path to export evolved Dream-RSI policies")
     parser.add_argument("--export-caldera", type=str, default="caldera_export", help="Directory to export Caldera plugin structure (default: caldera_export, runs automatically)")
     parser.add_argument("--no-caldera", action="store_true", help="Disable default Caldera export")
     parser.add_argument("--caldera-url", type=str, default=None, help="Optional Caldera server URL to push confirmed findings live")
     parser.add_argument("--caldera-key", type=str, default=None, help="Optional Caldera API key for REST authentication")
+    parser.add_argument("--concurrency", "--threads", type=int, default=4, help="Maximum concurrent probe execution threads (bounded by semaphore, default: 4)")
     args = parser.parse_args()
 
     # Target restrictions removed: allow any target specified on the CLI
@@ -775,7 +823,7 @@ USAGE EXAMPLES:
         print("\n[*] Protocol Ruler Audit Completed.")
         sys.exit(0)
 
-    print(f"[*] Initializing Full LangGraph Swarm against {proto_str}://{args.host}:{args.port} (TLS: {use_tls}, LLM Timeout: {'Unlimited' if args.timeout <= 0 else f'{args.timeout}s'})")
+    print(f"[*] Initializing Full LangGraph Swarm against {proto_str}://{args.host}:{args.port} (TLS: {use_tls}, Concurrency: {args.concurrency} threads, LLM Timeout: {'Unlimited' if args.timeout <= 0 else f'{args.timeout}s'})")
     if args.debug:
         print("[*] Deep Swarm Debug Mode: ENABLED (Live Host Responses + Pipeline Telemetry)")
     elif args.show_response or args.verbose:
@@ -789,6 +837,7 @@ USAGE EXAMPLES:
         show_response=args.show_response,
         verbose=args.verbose,
         debug=args.debug,
+        concurrency=args.concurrency,
     )
     graph = swarm.build_graph()
     

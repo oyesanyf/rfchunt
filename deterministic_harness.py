@@ -7,11 +7,13 @@ Implements PortSwigger's core evaluation primitive for desync verification:
 4. Follow-up classification phase (HTTP/777, TRACE, CL.0) to categorize the attack class.
 """
 
+import concurrent.futures
 import re
 import socket
 import ssl
+import threading
 import time
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from anomaly_detector import AnomalyDetector
 from database import Database
@@ -241,3 +243,29 @@ class DeterministicHarness:
                 pass
 
         return "Unclassified Novel Desync Trigger"
+
+    def evaluate_batch_concurrent(
+        self,
+        probes: List[Dict[str, Any]],
+        max_concurrency: int = 4,
+    ) -> List[Tuple[bool, Optional[str], str, Dict[str, Any]]]:
+        """
+        Evaluates a batch of candidate probes concurrently using a bounded thread pool and semaphore.
+        Guarantees that socket I/O is parallelized while strictly enforcing a maximum in-flight socket limit.
+        """
+        sem = threading.BoundedSemaphore(max(1, max_concurrency))
+
+        def _worker(p):
+            with sem:
+                return self.evaluate_probe(p)
+
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_concurrency)) as executor:
+            futures = [executor.submit(_worker, p) for p in probes]
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    results.append(f.result())
+                except Exception as e:
+                    results.append((False, None, f"Execution exception: {e}", {}))
+        return results
+

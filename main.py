@@ -138,24 +138,39 @@ def cmd_evaluate(args):
     print(f"[+] Starting deterministic evaluation of {len(pending)} probes against {args.target}:{args.port} (TLS={args.tls})...")
 
     vulnerable_count = 0
-    for row in pending:
-        probe_dict = dict(row)
-        p_id = probe_dict["probe_id"]
-        print(f"\n[*] Evaluating Probe #{p_id}: {probe_dict['rationale'][:70]}...")
+    concurrency = getattr(args, "concurrency", 4)
+    if concurrency > 1 and len(pending) > 1:
+        print(f"[*] Multithreaded evaluation active: {concurrency} threads (bounded by semaphore)")
+        probes_list = [dict(r) for r in pending]
+        results = harness.evaluate_batch_concurrent(probes_list, max_concurrency=concurrency)
+        for (is_vuln, desync_class, details, meta) in results:
+            if is_vuln:
+                vulnerable_count += 1
+                print(f"    [!] BREAKTHROUGH FINDING: {details} ({desync_class})")
+            else:
+                if meta.get("anomalies"):
+                    for anom in meta["anomalies"]:
+                        print(f"    [~] ANOMALY DETECTED: {anom['type']} - {anom['description']}")
+    else:
+        for row in pending:
+            probe_dict = dict(row)
+            p_id = probe_dict["probe_id"]
+            print(f"\n[*] Evaluating Probe #{p_id}: {probe_dict['rationale'][:70]}...")
 
-        is_vuln, desync_class, details, meta = harness.run_evaluation(probe_dict)
-        if is_vuln:
-            print(f"    [!] BREAKTHROUGH FINDING: {details}")
-            print(f"    [!] Attack Class: {desync_class}")
-            vulnerable_count += 1
-        else:
-            print(f"    [-] Result: {details}")
+            is_vuln, desync_class, details, meta = harness.run_evaluation(probe_dict)
+            if is_vuln:
+                print(f"    [!] BREAKTHROUGH FINDING: {details}")
+                print(f"    [!] Attack Class: {desync_class}")
+                vulnerable_count += 1
+            else:
+                print(f"    [-] Result: {details}")
 
-        if meta.get("anomalies"):
-            for anom in meta["anomalies"]:
-                print(f"    [~] ANOMALY DETECTED: {anom['type']} - {anom['description']}")
+            if meta.get("anomalies"):
+                for anom in meta["anomalies"]:
+                    print(f"    [~] ANOMALY DETECTED: {anom['type']} - {anom['description']}")
 
     print(f"\n[*] Evaluation complete: {vulnerable_count} breakthroughs out of {len(pending)} evaluated.")
+
 
 
 def cmd_weaponize(args):
@@ -271,6 +286,14 @@ def cmd_auto(args):
         except Exception as e:
             print(f"[-] Caldera Auto-Sync notice: {e}")
 
+        # 10. Dream-RSI Auto-Optimization (Default)
+        if not getattr(args, "no_dream_rsi", False):
+            try:
+                print(f"\n[*] Dream-RSI Auto-Optimization [Default]: Evolving off-policy exploration trajectories...")
+                cmd_dream(args)
+            except Exception as e:
+                print(f"[-] Dream-RSI Auto-Optimization notice: {e}")
+
     finally:
         if lab_server:
             lab_server.stop()
@@ -303,6 +326,14 @@ def cmd_hunt(args):
         print(f"[+] Caldera Auto-Sync [Default]: {c_res['abilities_count']} abilities and {c_res['adversaries_count']} adversaries updated.")
     except Exception as e:
         pass
+
+    # Dream-RSI Auto-Optimization (Default)
+    if not getattr(args, "no_dream_rsi", False):
+        try:
+            print(f"\n[*] Dream-RSI Auto-Optimization [Default]: Evolving off-policy exploration trajectories...")
+            cmd_dream(args)
+        except Exception:
+            pass
 
 
 def cmd_mcp(args):
@@ -345,23 +376,30 @@ def cmd_dream(args):
     from engine.dream_rsi_optimizer import DreamRSIOptimizer
     from engine.dream_policy_store import DreamPolicyStore
 
-    print(f"[*] Initializing Dream-RSI World Model from {args.db}...")
-    model = ProtocolWorldModel(target_host=args.target, target_port=args.port)
-    loaded = model.ingest_history_from_db(args.db)
+    db_path = getattr(args, "db", "terminator.db")
+    target_host = getattr(args, "target", "127.0.0.1")
+    target_port = getattr(args, "port", 5006)
+    export_path = getattr(args, "export", "data/dream_policies.json")
+    generations = getattr(args, "generations", 2)
+    rollouts = getattr(args, "rollouts", 200)
+
+    print(f"[*] Initializing Dream-RSI World Model from {db_path}...")
+    model = ProtocolWorldModel(target_host=target_host, target_port=target_port)
+    loaded = model.ingest_history_from_db(db_path)
     print(f"[+] Loaded {loaded} execution trajectories into offline World Model.")
 
     optimizer = DreamRSIOptimizer(model)
-    store = DreamPolicyStore(storage_path=args.export)
+    store = DreamPolicyStore(storage_path=export_path)
 
-    print(f"[*] Executing {args.generations} generations of off-policy dreaming ({args.rollouts} rollouts each)...")
-    for g in range(args.generations):
-        evolved = optimizer.evolve_policy_generation(rollouts_per_candidate=args.rollouts)
+    print(f"[*] Executing {generations} generations of off-policy dreaming ({rollouts} rollouts each)...")
+    for g in range(generations):
+        evolved = optimizer.evolve_policy_generation(rollouts_per_candidate=rollouts)
         store.save_policy(evolved)
         gain_str = f"+{evolved.rsi_gain * 100:.1f}%" if evolved.rsi_gain > 0 else "0.0%"
         print(f"  [Gen {evolved.generation}] Fitness: {evolved.fitness_score:.2f} | RSI Gain: {gain_str} | Yield: {evolved.simulated_yield:.1%}")
 
     summary = store.export_summary()
-    print(f"\n[+] Dream-RSI Optimization Complete. Policies saved to {args.export}.")
+    print(f"\n[+] Dream-RSI Optimization Complete. Policies saved to {export_path}.")
     print(f"    Total Cumulative Gain: {summary.get('cumulative_rsi_gain_pct', 0.0)}%")
     print(f"    Dominant Mutators: {summary.get('dominant_mutators', [])}")
 
@@ -457,6 +495,7 @@ def main():
     p_eval.add_argument("--tls", action="store_true", help="Use TLS")
     p_eval.add_argument("--timeout", type=float, default=3.0, help="Socket timeout")
     p_eval.add_argument("--limit", type=int, default=20, help="Probes to evaluate")
+    p_eval.add_argument("--concurrency", "--threads", type=int, default=4, help="Maximum concurrent probe evaluation threads (default: 4)")
 
     # Weaponize
     p_weap = subparsers.add_parser("weaponize", help="Execute dangling-byte RQP")
@@ -485,6 +524,11 @@ def main():
     p_auto.add_argument("--port", type=int, default=8080, help="Target port")
     p_auto.add_argument("--tls", action="store_true", help="Use TLS")
     p_auto.add_argument("--timeout", type=float, default=3.0, help="Socket timeout")
+    p_auto.add_argument("--concurrency", "--threads", type=int, default=4, help="Maximum concurrent probe evaluation threads (default: 4)")
+    p_auto.add_argument("--no-dream-rsi", action="store_true", help="Disable default Dream-RSI evolution cycle")
+    p_auto.add_argument("--rollouts", type=int, default=200, help="Rollouts per candidate policy (default: 200)")
+    p_auto.add_argument("--generations", type=int, default=2, help="Evolutionary dream generations (default: 2)")
+    p_auto.add_argument("--export", default="data/dream_policies.json", help="Path to export evolved policies")
     # Dream (Open Dream-RSI: Off-Policy Recursive Self-Improvement)
     p_dream = subparsers.add_parser("dream", help="Run offline Dream-RSI policy evolution")
     p_dream.add_argument("--db", default="terminator.db", help="Path to database with exploration history")

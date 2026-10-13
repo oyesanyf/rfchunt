@@ -177,6 +177,8 @@ class DreamRSIOptimizer:
             best_candidate.rsi_gain = gain
             self.active_policy = best_candidate
         else:
+            self.active_policy = copy.deepcopy(self.active_policy)
+            self.active_policy.generation = self.current_generation
             self.active_policy.rsi_gain = 0.0
 
         return self.active_policy

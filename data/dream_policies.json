@@ -1,5 +1,5 @@
 {
-  "total_generations": 2,
+  "total_generations": 5,
   "latest_generation": 2,
   "policies": [
     {
@@ -38,6 +38,63 @@
       "fitness_score": 369.0,
       "rsi_gain": 0.0885,
       "simulated_yield": 0.37,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 1,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.3805693262760935,
+        "PATH_NUL_EARLY_RESPONSE": 0.04514496533165013,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.12330313444080063,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.04514496533165013,
+        "HEADER_TAB_SPACING": 0.04514496533165013,
+        "CRLF_DELIMITER_SPLIT": 0.1253550891378365,
+        "OBS_FOLD_LINE_JOIN": 0.19019258881866885,
+        "OVERLONG_UTF8_NORMALIZATION": 0.04514496533165013
+      },
+      "normative_bias": 0.5364,
+      "delta_aggressiveness": 0.418,
+      "fitness_score": 1177.0,
+      "rsi_gain": 1.7943,
+      "simulated_yield": 0.3933,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 2,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.4144709989856021,
+        "PATH_NUL_EARLY_RESPONSE": 0.11578300389287001,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.06881189829550793,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.062058884009847215,
+        "HEADER_TAB_SPACING": 0.062058884009847215,
+        "CRLF_DELIMITER_SPLIT": 0.14432165254611187,
+        "OBS_FOLD_LINE_JOIN": 0.07043579425036653,
+        "OVERLONG_UTF8_NORMALIZATION": 0.062058884009847215
+      },
+      "normative_bias": 0.4734,
+      "delta_aggressiveness": 0.2,
+      "fitness_score": 1307.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.4367,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 2,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.4144709989856021,
+        "PATH_NUL_EARLY_RESPONSE": 0.11578300389287001,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.06881189829550793,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.062058884009847215,
+        "HEADER_TAB_SPACING": 0.062058884009847215,
+        "CRLF_DELIMITER_SPLIT": 0.14432165254611187,
+        "OBS_FOLD_LINE_JOIN": 0.07043579425036653,
+        "OVERLONG_UTF8_NORMALIZATION": 0.062058884009847215
+      },
+      "normative_bias": 0.4734,
+      "delta_aggressiveness": 0.2,
+      "fitness_score": 1307.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.4367,
       "false_positive_rate": 0.0
     }
   ]
