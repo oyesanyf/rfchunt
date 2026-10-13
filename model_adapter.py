@@ -2,7 +2,7 @@
 Model Adapter & Local Fusion Engine:
 Adapted from ModelFusion (d:\\harfile\\ModelFusion) and Ollama client adapters.
 Enables 24/7 zero-cost local LLM inference using Google Gemma (gemma2:9b, gemma2:2b),
-Qwen (qwen2.5), and Foundation-Sec, with multi-model panel fusion and fallback to Gemini API.
+Qwen (qwen2.5), and Foundation-Sec via local Ollama with multi-model panel fusion.
 """
 
 import json
@@ -13,20 +13,13 @@ import time
 from typing import Any, Dict, List, Optional
 import httpx
 
-try:
-    from google import genai
-    from google.genai import types
-    HAS_GENAI = True
-except ImportError:
-    HAS_GENAI = False
-
 logger = logging.getLogger("terminator.models")
 
 
 class ModelFusionAdapter:
     """
-    Manages local model inference via Ollama and panel fusion across models.
-    Supports Google Gemma, Qwen, Foundation-Sec, and Gemini cloud API.
+    Manages 100% local model inference via Ollama and panel fusion across models.
+    Supports Google Gemma, Qwen, Foundation-Sec, and DeepSeek-R1 locally.
     """
 
     DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434"
@@ -50,14 +43,6 @@ class ModelFusionAdapter:
         timeout_env = os.environ.get("OLLAMA_TIMEOUT", "120.0")
         self.timeout = float(timeout_env) if float(timeout_env) > 0 else None
         self.client = httpx.Client(timeout=httpx.Timeout(self.timeout, connect=10.0))
-
-        # Gemini Cloud client fallback (strictly opt-in via USE_GEMINI_CLOUD=1; local runs never require an API key)
-        self.gemini_client = None
-        if HAS_GENAI and os.environ.get("USE_GEMINI_CLOUD") == "1" and os.environ.get("GEMINI_API_KEY"):
-            try:
-                self.gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-            except Exception as e:
-                logger.debug("Failed to init Gemini client: %s", e)
 
     @staticmethod
     def _get_free_memory_gb() -> float:
@@ -164,10 +149,6 @@ class ModelFusionAdapter:
         if result:
             return result
 
-        # Optional: Gemini Cloud Fallback only if explicitly opted in via USE_GEMINI_CLOUD=1
-        if self.gemini_client:
-            return self._query_gemini(system_instruction, user_prompt)
-
         return []
 
     def _query_ollama(self, model: str, system_instruction: str, user_prompt: str) -> List[Dict[str, Any]]:
@@ -264,34 +245,6 @@ class ModelFusionAdapter:
                     all_probes.append(p)
 
         return all_probes
-
-    def _query_gemini(self, system_instruction: str, user_prompt: str) -> List[Dict[str, Any]]:
-        try:
-            response = self.gemini_client.models.generate_content(
-                model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
-                contents=user_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    response_mime_type="application/json",
-                    response_schema={
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "rationale": {"type": "string"},
-                                "raw_request": {"type": "string"},
-                                "is_clean": {"type": "boolean"},
-                            },
-                            "required": ["rationale", "raw_request", "is_clean"],
-                        },
-                    },
-                    temperature=0.8,
-                ),
-            )
-            return json.loads(response.text)
-        except Exception as e:
-            logger.warning("Gemini query failed: %s", e)
-            return []
 
     def _parse_json_array(self, text: str) -> List[Dict[str, Any]]:
         """Robust parser for JSON arrays in LLM completions."""
