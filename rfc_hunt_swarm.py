@@ -18,6 +18,7 @@ Core Mechanisms:
 import argparse
 import operator
 import re
+import sys
 import time
 from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
@@ -604,12 +605,15 @@ USAGE EXAMPLES:
 
 14. Enable full verbose telemetry and payload tracing:
     python -u rfc_hunt_swarm.py --mode single --rfc 9112 --verbose
+
+15. Protocol Ruler mode (measure front-end byte transformations using backend length limits):
+    python -u rfc_hunt_swarm.py --mode ruler --host 127.0.0.1 --port 8080 --debug
 ===============================================================================
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--rfc", type=str, default="9112", help="Specific RFC ID to analyze (e.g. 9112)")
-    parser.add_argument("--mode", type=str, choices=["single", "corpus", "all", "pqc"], default="single", help="Scan mode: single RFC, Kettle corpus, all protocol RFCs, or pqc (Post-Quantum)")
+    parser.add_argument("--mode", type=str, choices=["single", "corpus", "all", "pqc", "ruler"], default="single", help="Scan mode: single RFC, Kettle corpus, all protocol RFCs, pqc, or ruler (Protocol Ruler)")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Target host (domain or IP)")
     parser.add_argument("--port", type=int, default=5006, help="Target port")
     parser.add_argument("--tls", action="store_true", help="Enable TLS/HTTPS for remote host (auto-enabled if port is 443)")
@@ -626,6 +630,24 @@ USAGE EXAMPLES:
 
     use_tls = bool(args.tls or (args.port == 443))
     proto_str = "https" if use_tls else "http"
+
+    if args.mode == "ruler":
+        from protocol_ruler import ProtocolRuler
+        print(f"\n{'='*75}")
+        print(f"[*] LAUNCHING PROTOCOL RULER ENGINE (James Kettle Benchmark Technique)")
+        print(f"[*] Target: {proto_str}://{args.host}:{args.port}")
+        print(f"{'='*75}")
+        ruler = ProtocolRuler(
+            host=args.host,
+            port=args.port,
+            use_tls=use_tls,
+            timeout=args.timeout if (0 < args.timeout <= 30.0) else 3.5,
+            verbose=args.verbose,
+            debug=args.debug,
+        )
+        ruler.run_comprehensive_audit()
+        print("\n[*] Protocol Ruler Audit Completed.")
+        sys.exit(0)
 
     print(f"[*] Initializing Full LangGraph Swarm against {proto_str}://{args.host}:{args.port} (TLS: {use_tls}, LLM Timeout: {'Unlimited' if args.timeout <= 0 else f'{args.timeout}s'})")
     if args.debug:

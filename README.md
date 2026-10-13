@@ -73,12 +73,21 @@ python -u rfc_hunt_swarm.py --mode corpus --host 127.0.0.1 --port 8080 --cycles 
 python -u rfc_hunt_swarm.py --mode pqc --host test-lab.internal --port 443 --tls
 ```
 
-### 4. Deep Debugging with Live Host Responses & Socket Telemetry
+### 4. Protocol Ruler Engine (Measuring Front-End Byte Transformations)
+```bash
+# Calibrate backend length limits and measure byte-expansion/mojibake across 15 standard sequences
+python -u rfc_hunt_swarm.py --mode ruler --host 127.0.0.1 --port 8080 --debug
+
+# Or using the modular CLI with custom sequence testing
+python main.py ruler --target 127.0.0.1 --port 8080 --sequence "\xc0\x8a" --name "Kettle Overlong UTF-8"
+```
+
+### 5. Deep Debugging with Live Host Responses & Socket Telemetry
 ```bash
 python -u rfc_hunt_swarm.py --mode pqc --host test-lab.internal --port 443 --tls --debug
 ```
 
-### 5. High-Speed Resident Model Scanning
+### 6. High-Speed Resident Model Scanning
 ```bash
 python -u rfc_hunt_swarm.py --mode corpus --sec-model qwen2.5:7b --timeout 300
 ```
@@ -89,7 +98,7 @@ python -u rfc_hunt_swarm.py --mode corpus --sec-model qwen2.5:7b --timeout 300
 
 | Flag | Description | Default |
 | :--- | :--- | :--- |
-| `--mode` | Scan scope: `single`, `corpus` (Kettle 138), `all` (IETF registry), `pqc` (Post-Quantum) | `single` |
+| `--mode` | Scan scope: `single`, `corpus` (Kettle 138), `all` (IETF registry), `pqc` (Post-Quantum), `ruler` (Protocol Ruler) | `single` |
 | `--rfc` | Specific RFC ID to evaluate when in single mode (e.g. `9112`, `7230`, `8446`) | `9112` |
 | `--host` | Target hostname or IP address | `127.0.0.1` |
 | `--port` | Target port | `5006` |

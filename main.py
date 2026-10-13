@@ -292,6 +292,33 @@ def cmd_mcp(args):
     server.run_stdio()
 
 
+def cmd_ruler(args):
+    """Measures front-end transformations using backend header length limits (James Kettle technique)."""
+    from protocol_ruler import ProtocolRuler
+    use_tls = bool(args.tls or (args.port == 443))
+    ruler = ProtocolRuler(
+        host=args.target,
+        port=args.port,
+        use_tls=use_tls,
+        timeout=args.timeout,
+        verbose=args.verbose,
+        debug=args.debug,
+    )
+    custom = []
+    if getattr(args, "sequence", None):
+        seq_str = args.sequence
+        if seq_str.startswith("\\x"):
+            seq_bytes = bytes.fromhex(seq_str.replace("\\x", ""))
+        else:
+            try:
+                seq_bytes = bytes.fromhex(seq_str)
+            except ValueError:
+                seq_bytes = seq_str.encode("latin-1")
+        custom.append((getattr(args, "name", "Custom Probe"), seq_bytes, f"User-supplied test sequence: {seq_str}"))
+
+    ruler.run_comprehensive_audit(custom_sequences=custom, max_size=args.max_size)
+
+
 def main():
     parser = argparse.ArgumentParser(description="HTTP Terminator: Autonomous Security Research Engine")
     parser.add_argument("--db", default="terminator.db", help="SQLite database path")
@@ -300,6 +327,18 @@ def main():
     parser.set_defaults(fusion=True)
 
     subparsers = parser.add_subparsers(dest="command")
+
+    # Protocol Ruler (James Kettle benchmark technique)
+    p_ruler = subparsers.add_parser("ruler", help="Execute Protocol Ruler byte-transformation measurement (James Kettle technique)")
+    p_ruler.add_argument("--target", default="127.0.0.1", help="Target host")
+    p_ruler.add_argument("--port", type=int, default=8080, help="Target port")
+    p_ruler.add_argument("--tls", action="store_true", help="Use TLS")
+    p_ruler.add_argument("--timeout", type=float, default=3.5, help="Socket timeout")
+    p_ruler.add_argument("--max-size", type=int, default=131072, help="Max header length to test in bytes")
+    p_ruler.add_argument("--sequence", type=str, default=None, help="Custom byte sequence to test")
+    p_ruler.add_argument("--name", type=str, default="Custom Probe", help="Name for custom sequence")
+    p_ruler.add_argument("--debug", action="store_true", help="Enable deep bracket and binary search tracing")
+    p_ruler.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
 
     # Hunt (Continuous until flaws found)
     p_hunt = subparsers.add_parser("hunt", help="Continuously fetch RFCs and hunt for flaws")
@@ -377,6 +416,7 @@ def main():
         sys.exit(0)
 
     dispatch = {
+        "ruler": cmd_ruler,
         "hunt": cmd_hunt,
         "mcp": cmd_mcp,
         "fetch": cmd_fetch,
