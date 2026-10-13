@@ -781,7 +781,7 @@ USAGE EXAMPLES:
         "--allow-any",
         dest="authorized",
         action="store_true",
-        help="Explicitly authorize active security testing against remote/public target (e.g. dlptest.com) or allow any target",
+        help="Explicitly authorize active security testing against remote/public target (e.g. target.example.com) or allow any target",
     )
     parser.add_argument("--dream-rsi", dest="dream_rsi", action="store_true", default=True, help="Enable Open Dream-RSI: recursive off-policy self-improvement between cycles (enabled by default)")
     parser.add_argument("--no-dream-rsi", dest="dream_rsi", action="store_false", help="Disable default Open Dream-RSI evolution cycle")

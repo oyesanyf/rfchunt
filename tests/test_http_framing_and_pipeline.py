@@ -2,7 +2,7 @@
 Comprehensive Verification Tests for HTTP Framing Oracle and Pipeline Leak Detection.
 
 Tests:
-1. Multi-chunk Content-Length accounting (including exact 72,682 byte baseline like dlptest.com).
+1. Multi-chunk Content-Length accounting (including exact 72,682 byte large body baseline).
 2. Transfer-Encoding: chunked parsing with extensions and trailers.
 3. 1xx Informational interim responses (100 Continue, 103 Early Hints).
 4. 204 No Content and 304 Not Modified body exclusion per RFC 9112 Section 6.3.
@@ -62,7 +62,7 @@ class MockSocketPair:
 
 def test_content_length_exact_large_body_multi_chunk():
     """
-    Tests exact consumption of large bodies (72,682 bytes, identical to dlptest.com baseline),
+    Tests exact consumption of large bodies (72,682 bytes),
     delivered across multiple small network chunks (18x4096 + 1x3954).
     Verifies that the reader does NOT stop prematurely when \\r\\n\\r\\n is encountered.
     """
@@ -287,12 +287,12 @@ def test_causal_classifier_framing_artifact_detection():
     # Anomaly with residual HTML body fragment (like the user's log)
     anomaly = ImplementationAnomaly(
         anomaly_id="ANOM-SEQ-1791874582716",
-        target_engine="dlptest.com:443",
+        target_engine="target.example.com:443",
         category=AnomalyCategory.PIPELINE_LEAK,
         observed_behavior="Residual Pipeline Leak: 71,877 bytes in 20.4ms",
         expected_behavior="Clean request separation.",
-        raw_probe=b"GET / HTTP/1.1\r\nHost: dlptest.com\r\n\r\n",
-        raw_response=b"<!DOCTYPE html><html><head><title>DLP Test</title></head><body>...",
+        raw_probe=b"GET / HTTP/1.1\r\nHost: target.example.com\r\n\r\n",
+        raw_response=b"<!DOCTYPE html><html><head><title>Generic Target</title></head><body>...",
     )
 
     is_artifact, reason = classifier.is_framing_artifact(anomaly)
@@ -309,7 +309,7 @@ def test_causal_classifier_framing_artifact_detection():
         vuln_id="VULN-REPRO-1791874582716",
         anomaly_id=anomaly.anomaly_id,
         impact=ImpactClass.PARSER_CONFUSION,
-        minimized_probe=b"GET / HTTP/1.1\r\nHost: dlptest.com\r\n\r\n",
+        minimized_probe=b"GET / HTTP/1.1\r\nHost: target.example.com\r\n\r\n",
         reproducibility_rate=1.0,
         verification_attempts=3,
         successful_reproductions=3,
@@ -347,16 +347,16 @@ def test_defensive_publisher_suspends_publication_on_unverified_evidence(tmp_pat
 def test_target_authorization_gate_external_domain():
     """
     Verifies that TargetAuthorizationGate blocks unauthorized testing against
-    external services (like dlptest.com) unless explicitly authorized.
+    external services (like target.example.com) unless explicitly authorized.
     """
-    # dlptest.com should be rejected by default
+    # target.example.com should be rejected by default
     with pytest.raises(PermissionError):
-        TargetAuthorizationGate.check_auth("dlptest.com")
+        TargetAuthorizationGate.check_auth("target.example.com")
 
     # Authorize explicitly
-    TargetAuthorizationGate.authorize_target("dlptest.com")
-    TargetAuthorizationGate.check_auth("dlptest.com")
-    assert "dlptest.com" in TargetAuthorizationGate.get_allowed_targets()
+    TargetAuthorizationGate.authorize_target("target.example.com")
+    TargetAuthorizationGate.check_auth("target.example.com")
+    assert "target.example.com" in TargetAuthorizationGate.get_allowed_targets()
 
 
 def test_metamorphic_validity_gate_rejects_compliant_400():
@@ -386,7 +386,7 @@ def test_metamorphic_validity_gate_rejects_compliant_400():
     classifier = CausalAnomalyClassifier()
     anomaly = ImplementationAnomaly(
         anomaly_id="ANOM-META-TEST",
-        target_engine="dlptest.com:443",
+        target_engine="target.example.com:443",
         category=AnomalyCategory.METAMORPHIC_VIOLATION,
         observed_behavior="Metamorphic Violation: Base request returned 200, but transformed request returned 400",
         expected_behavior=mr_ows.description,

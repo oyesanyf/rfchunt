@@ -210,7 +210,69 @@ python -u rfc_hunt_swarm.py --mode corpus --host 127.0.0.1 --port 8080 --cycles 
 python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host 127.0.0.1 --port 8080 --debug
 ```
 
-### 5. High-Speed Scanning with Fast Security Specialist
+### 5. HTTP Terminator & Intermediary Research (Curated RFC Suite)
+
+The HTTP Terminator research specifically tests how front-end reverse proxies, TLS terminators, and API gateways interpret request boundaries compared to back-end origin servers.
+
+#### Targeted Terminator RFC Specifications
+```bash
+# 1. Primary Line Terminator & Framing Spec (RFC 9112 - CRLF/LF leniency, chunked framing, obs-fold):
+python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host target.example.com --port 443 --tls --debug
+
+# 2. Predecessor Standard (RFC 7230 - standard used by AWS ALB, Nginx, Envoy, Cloudflare):
+python -u rfc_hunt_swarm.py --mode single --rfc 7230 --host target.example.com --port 443 --tls --debug
+
+# 3. HTTP Semantics & Intermediaries (RFC 9110 - Gateways, hop-by-hop headers, Connection handling):
+python -u rfc_hunt_swarm.py --mode single --rfc 9110 --host target.example.com --port 443 --tls --debug
+
+# 4. Historic Baseline & Tolerances (RFC 2616 - Multipart/byteranges & line folding):
+python -u rfc_hunt_swarm.py --mode single --rfc 2616 --host target.example.com --port 443 --tls --debug
+
+# 5. HTTP/2 Gateway Translation (RFC 9113 Section 8 - H2.CL / H2.TE desynchronization):
+python -u rfc_hunt_swarm.py --mode single --rfc 9113 --host target.example.com --port 443 --tls --debug
+
+# 6. TLS 1.3 Terminator (RFC 8446 - TLS handshakes, ALPN negotiation, early data):
+python -u rfc_hunt_swarm.py --mode single --rfc 8446 --host target.example.com --port 443 --tls --debug
+
+# 7. URI Generic Syntax (RFC 3986 - Path normalization & NUL-byte truncation):
+python -u rfc_hunt_swarm.py --mode single --rfc 3986 --host target.example.com --port 443 --tls --debug
+```
+
+#### Run the Entire Curated Terminator RFC Suite in Rank Order
+```bash
+# Cycles automatically through RFC 9112, 9110, 7230, 2616, 9113, 7540, 9114, 8446:
+python -u rfc_hunt_swarm.py --mode terminator --host target.example.com --port 443 --tls --debug
+```
+
+#### Target Other Front-End / Reverse Proxy Terminators
+You can target any intermediary or load balancer tier simply by changing `--host` and `--port`:
+```bash
+# Target an AWS Application Load Balancer / CloudFront distribution:
+python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host staging-alb.example.com --port 443 --tls --debug
+
+# Target an internal Nginx / HAProxy / Envoy ingress proxy:
+python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host proxy.corp.internal --port 80 --debug
+
+# Target an IP address directly:
+python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host 10.0.1.50 --port 80 --debug
+```
+
+### 6. Unified 'Build All' Pipeline
+
+Builds, compiles, pre-caches all 11 Terminator RFCs for offline execution, exports the Caldera plugin, verifies Dream-RSI models, runs the test suite, and packages release zips:
+```bash
+# Run full automated build:
+python build_all.py
+# Or via Windows batch launcher:
+.\build.bat
+# Or via main CLI:
+python main.py build
+
+# Quick build (skips running the test suite):
+python main.py build --skip-tests
+```
+
+### 7. High-Speed Scanning with Fast Security Specialist
 ```bash
 # Uses qwen2.5:7b for fast local evaluation with 5-minute timeout
 python -u rfc_hunt_swarm.py --mode corpus --sec-model qwen2.5:7b --timeout 300
@@ -226,7 +288,7 @@ The main entrypoint executing the 12-agent LangGraph autonomous research swarm.
 
 | Flag / Argument | Type | Default | Description & Engineering Details |
 | :--- | :--- | :--- | :--- |
-| `--mode` | `choice` | `single` | Scan mode: `single` (one RFC), `corpus` (Kettle 138 corpus), `all` (IETF registry), `pqc` (Post-Quantum & TLS 1.3), or `ruler` (Protocol Ruler). |
+| `--mode` | `choice` | `single` | Scan mode: `single` (one RFC), `terminator` (curated HTTP Terminator suite), `corpus` (Kettle 138 corpus), `all` (IETF registry), `pqc` (Post-Quantum & TLS 1.3), or `ruler` (Protocol Ruler). |
 | `--rfc` | `string` | `9112` | Target RFC number when `--mode single` is selected. Automatically normalizes inputs (e.g. `RFC9112` $\rightarrow$ `9112`). |
 | `--host` | `string` | `127.0.0.1` | Target IP address or hostname. Dynamically normalizes `Host: target.local` probes to the real target to prevent gateway rejection. |
 | `--port` | `integer` | `5006` | Target TCP port. If port `443` is specified, TLS is automatically enabled. |
