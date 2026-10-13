@@ -665,13 +665,22 @@ USAGE EXAMPLES:
     parser.add_argument("--debug", action="store_true", help="Enable comprehensive debugging mode (prints raw host responses, socket telemetry, and sequence pipeline steps)")
     parser.add_argument("--show-response", action="store_true", help="Print full raw HTTP/TLS responses received from the target host")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose execution telemetry and full payload/response tracing")
-    parser.add_argument("--authorized", action="store_true", help="Explicitly authorize active security testing against remote/public target (e.g. dlptest.com)")
+    parser.add_argument(
+        "--authorized",
+        "--allow-all",
+        "--allow-target",
+        "--allow-any",
+        dest="authorized",
+        action="store_true",
+        help="Explicitly authorize active security testing against remote/public target (e.g. dlptest.com) or allow any target",
+    )
     args = parser.parse_args()
 
     # Enforce Target Authorization Guard
     from mcp_server import TargetAuthorizationGate
     if args.authorized:
         TargetAuthorizationGate.authorize_target(args.host)
+        TargetAuthorizationGate.authorize_target("*")
     try:
         TargetAuthorizationGate.check_auth(args.host)
     except PermissionError as e:

@@ -37,11 +37,11 @@ class TargetAuthorizationGate:
     @classmethod
     def check_auth(cls, host: str, payload_len: int = 0, is_weaponization: bool = False, is_heavy_hunt: bool = False) -> None:
         allowed = cls.get_allowed_targets()
-        if host not in allowed:
+        if "*" not in allowed and "all" not in allowed and host not in allowed:
             raise PermissionError(
                 f"Target {host} not in allowed targets: {allowed}. "
                 f"Active security testing against public/external services requires explicit authorization "
-                f"(set RFCHUNT_AUTHORIZED_TARGETS={host} or pass --authorized)."
+                f"(pass --authorized, or set RFCHUNT_AUTHORIZED_TARGETS={host} or RFCHUNT_AUTHORIZED_TARGETS=*)."
             )
         if payload_len > cls.MAX_PAYLOAD_KB * 1024:
             raise ValueError(f"Payload too large: {payload_len} bytes")
