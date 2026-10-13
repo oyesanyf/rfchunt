@@ -218,7 +218,7 @@ class TestLabServer:
                             resp = (
                                 b"HTTP/1.1 200 OK\r\n"
                                 b"Content-Type: text/plain\r\n"
-                                b"Content-Length: 15\r\n\r\n"
+                                b"Content-Length: 16\r\n\r\n"
                                 b"Trigger Accepted"
                             )
                             client_sock.sendall(resp)

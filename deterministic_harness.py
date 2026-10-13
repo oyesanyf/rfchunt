@@ -71,6 +71,28 @@ class DeterministicHarness:
         framed = HTTPFramingReader.read_response(sock, timeout=self.timeout)
         return framed.raw_response
 
+    def _prepare_probe_bytes(self, raw_template: str, payload: str) -> bytes:
+        probe_str = raw_template.replace("target.local", self.host)
+        probe_str = probe_str.replace("$PAYLOAD", payload)
+        if "\r\n" not in probe_str and "\\r\\n" in probe_str:
+            try:
+                probe_str = probe_str.encode("utf-8").decode("unicode_escape")
+            except Exception:
+                probe_str = probe_str.replace("\\r\\n", "\r\n")
+        if "\r\n\r\n" in probe_str and re.search(r"Content-Length:\s*(\$LENGTH|N)\b", probe_str, re.IGNORECASE):
+            _, body_part = probe_str.split("\r\n\r\n", 1)
+            body_len = len(body_part.encode("latin-1", errors="replace"))
+            probe_str = re.sub(
+                r"(Content-Length:\s*)(?:\$LENGTH|N)\b",
+                rf"\g<1>{body_len}",
+                probe_str,
+                flags=re.IGNORECASE,
+            )
+        try:
+            return probe_str.encode("latin-1")
+        except UnicodeEncodeError:
+            return probe_str.encode("utf-8", errors="replace")
+
     def run_evaluation(self, probe_dict: Dict[str, Any]) -> Tuple[bool, Optional[str], str, Dict[str, Any]]:
         """
         Runs the full 3-step evaluation primitive and anomaly cascade.
@@ -95,20 +117,9 @@ class DeterministicHarness:
             f"X-Ignore: 1\r\n\r\n"
         )
 
-        probe_str = raw_template.replace("target.local", self.host)
-        probe_str = probe_str.replace("$PAYLOAD", nested_marker)
-        if "\r\n" not in probe_str and "\\r\\n" in probe_str:
-            try:
-                probe_str = probe_str.encode("utf-8").decode("unicode_escape")
-            except Exception:
-                probe_str = probe_str.replace("\\r\\n", "\r\n")
-        try:
-            probe_bytes = probe_str.encode("latin-1")
-        except UnicodeEncodeError:
-            probe_bytes = probe_str.encode("utf-8", errors="replace")
+        probe_bytes = self._prepare_probe_bytes(raw_template, nested_marker)
 
         eval_metadata: Dict[str, Any] = {"anomalies": []}
-        multipass_confirm = 0
 
         try:
             # 1. Establish baseline connection (Victim Connection A)
@@ -125,12 +136,10 @@ class DeterministicHarness:
 
             # Anomaly inspection on attacker response
             attacker_anomalies = AnomalyDetector.analyze_response(
-                attacker_resp, is_clean_probe=is_clean
+                attacker_resp, baseline_response=baseline_resp, is_clean_probe=is_clean, db=self.db
             )
             for anom in attacker_anomalies:
                 eval_metadata["anomalies"].append(anom)
-                if self.db and probe_id:
-                    self.db.record_anomaly(None, anom["type"], anom["description"], attacker_resp)
 
             # 3. Test if Connection A's internal request queue was poisoned
             polluted_resp = self._send_and_receive(conn_victim, baseline_req)
@@ -138,12 +147,10 @@ class DeterministicHarness:
 
             # Anomaly inspection on victim polluted response
             victim_anomalies = AnomalyDetector.analyze_response(
-                polluted_resp, is_clean_probe=False
+                polluted_resp, baseline_response=baseline_resp, is_clean_probe=False, db=self.db
             )
             for anom in victim_anomalies:
                 eval_metadata["anomalies"].append(anom)
-                if self.db and probe_id:
-                    self.db.record_anomaly(None, anom["type"], anom["description"], polluted_resp)
 
             eval_metadata["baseline_resp"] = baseline_resp.decode('latin-1', errors='replace')
             eval_metadata["attacker_resp"] = attacker_resp.decode('latin-1', errors='replace')
@@ -162,6 +169,18 @@ class DeterministicHarness:
                 log_fn(f"        -> Conn A (Re-Test)  : GET / -> {p_line}")
 
             if not polluted_resp:
+                if self.db and probe_id:
+                    eval_id = self.db.record_evaluation(
+                        probe_id=probe_id,
+                        target_host=self.host,
+                        target_port=self.port,
+                        is_vulnerable=False,
+                        desync_class=None,
+                        details="Victim connection reset without state leakage",
+                        raw_evidence="",
+                    )
+                    for anom in attacker_anomalies:
+                        self.db.record_anomaly(eval_id, anom["type"], anom["description"], attacker_resp)
                 return False, None, "Victim connection reset without state leakage", eval_metadata
 
             baseline_status = baseline_resp.split(b"\r\n")[0]
@@ -184,7 +203,7 @@ class DeterministicHarness:
                 )
 
                 if self.db and probe_id:
-                    self.db.record_evaluation(
+                    eval_id = self.db.record_evaluation(
                         probe_id=probe_id,
                         target_host=self.host,
                         target_port=self.port,
@@ -193,10 +212,28 @@ class DeterministicHarness:
                         details=details,
                         raw_evidence=raw_evidence,
                     )
+                    for anom in attacker_anomalies:
+                        self.db.record_anomaly(eval_id, anom["type"], anom["description"], attacker_resp)
+                    for anom in victim_anomalies:
+                        self.db.record_anomaly(eval_id, anom["type"], anom["description"], polluted_resp)
 
                 details = "[LABORATORY_RESEARCH_FINDING] " + details
                 return True, desync_class, details, eval_metadata
 
+            if self.db and probe_id:
+                eval_id = self.db.record_evaluation(
+                    probe_id=probe_id,
+                    target_host=self.host,
+                    target_port=self.port,
+                    is_vulnerable=False,
+                    desync_class=None,
+                    details="No cross-request contamination observed",
+                    raw_evidence="",
+                )
+                for anom in attacker_anomalies:
+                    self.db.record_anomaly(eval_id, anom["type"], anom["description"], attacker_resp)
+                for anom in victim_anomalies:
+                    self.db.record_anomaly(eval_id, anom["type"], anom["description"], polluted_resp)
 
             return False, None, "No cross-request contamination observed", eval_metadata
 
@@ -215,22 +252,12 @@ class DeterministicHarness:
 
         for classification_name, payload_snippet, expected_bytes in test_payloads:
             try:
-                probe_str = candidate_raw_template.replace("target.local", self.host)
-                probe_str = probe_str.replace("$PAYLOAD", payload_snippet)
-                if "\r\n" not in probe_str and "\\r\\n" in probe_str:
-                    try:
-                        probe_str = probe_str.encode("utf-8").decode("unicode_escape")
-                    except Exception:
-                        probe_str = probe_str.replace("\\r\\n", "\r\n")
+                probe_bytes = self._prepare_probe_bytes(candidate_raw_template, payload_snippet)
 
                 conn_v = self._open_connection()
                 _ = self._send_and_receive(conn_v, f"GET / HTTP/1.1\r\nHost: {self.host}\r\n\r\n".encode())
 
                 conn_a = self._open_connection()
-                try:
-                    probe_bytes = probe_str.encode("latin-1")
-                except UnicodeEncodeError:
-                    probe_bytes = probe_str.encode("utf-8", errors="replace")
                 self._send_and_receive(conn_a, probe_bytes)
                 conn_a.close()
 
@@ -243,6 +270,10 @@ class DeterministicHarness:
                 pass
 
         return "Unclassified Novel Desync Trigger"
+
+    def evaluate_probe(self, probe_dict: Dict[str, Any]) -> Tuple[bool, Optional[str], str, Dict[str, Any]]:
+        """Alias for run_evaluation."""
+        return self.run_evaluation(probe_dict)
 
     def evaluate_batch_concurrent(
         self,
@@ -257,7 +288,7 @@ class DeterministicHarness:
 
         def _worker(p):
             with sem:
-                return self.evaluate_probe(p)
+                return self.run_evaluation(p)
 
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, max_concurrency)) as executor:

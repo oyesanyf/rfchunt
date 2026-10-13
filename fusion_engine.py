@@ -88,27 +88,75 @@ class FusionArbiter:
     ):
         self.endpoint = endpoint or os.environ.get("OLLAMA_ENDPOINT", self.DEFAULT_OLLAMA_ENDPOINT)
         self.db = db
-        timeout_env = os.environ.get("OLLAMA_TIMEOUT", "900.0")
+        timeout_env = os.environ.get("OLLAMA_TIMEOUT", "30.0")
         self.timeout = float(timeout_env) if float(timeout_env) > 0 else None
-        self.client = httpx.Client(timeout=httpx.Timeout(self.timeout, connect=60.0))
+        self.client = httpx.Client(timeout=httpx.Timeout(self.timeout, connect=2.0))
         self.available_tags = self._fetch_available_tags()
+        self.free_ram_gb = self._get_free_memory_gb()
+        sized_qwen = self._size_qwen_for_free_memory(self.free_ram_gb)
 
-        # Dynamic Model Assignment matching ModelFusion Tiered Scaling
-        self.gemma_model = self._resolve_model(["gemma2:2b", "gemma2:9b"], fallback="gemma2:2b")
+        # Dynamic Model Assignment matching ModelFusion Tiered Scaling & Free RAM Law
+        self.gemma_model = self._resolve_model(["gemma2:2b", "gemma2:9b", sized_qwen], fallback="gemma2:2b")
         if sec_model:
             self.sec_model = sec_model
         else:
-            self.sec_model = self._resolve_model(["fenkohq/foundation-sec-8b:latest", "qwen2.5:7b", "strix-qwen:latest", "qwen2.5:32b"], fallback="fenkohq/foundation-sec-8b:latest")
-        self.arbiter_model = self._resolve_model(["deepseek-r1:1.5b", "strix-deepseek:latest", "deepseek-r1:32b"], fallback="deepseek-r1:1.5b")
+            self.sec_model = self._resolve_model(
+                [sized_qwen, "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "fenkohq/foundation-sec-8b:latest", "strix-qwen:latest"],
+                fallback=sized_qwen,
+            )
+        self.arbiter_model = self._resolve_model(
+            ["deepseek-r1:1.5b", sized_qwen, "gemma2:2b", "strix-deepseek:latest"],
+            fallback="deepseek-r1:1.5b",
+        )
 
         print(f"[ModelFusion] Panel Initialized:")
         print(f"  - Protocol Specialist : {self.gemma_model}")
         print(f"  - Boundary Specialist : {self.sec_model}")
         print(f"  - Reasoning Arbiter   : {self.arbiter_model}")
 
-    def _fetch_available_tags(self) -> List[str]:
+    @staticmethod
+    def _get_free_memory_gb() -> float:
+        """Evaluates runtime free/available RAM in GB (never total physical RAM)."""
         try:
-            resp = httpx.get(f"{self.endpoint}/api/tags", timeout=1.5)
+            import ctypes
+            if os.name == "nt":
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+                stat = MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                    return stat.ullAvailPhys / (1024 ** 3)
+        except Exception:
+            pass
+        return 8.0
+
+    @staticmethod
+    def _size_qwen_for_free_memory(free_ram_gb: float, free_vram_mb: float = 0.0) -> str:
+        """Sizes Qwen model strictly by runtime available memory."""
+        if free_ram_gb >= 48.0 or free_vram_mb >= 24576.0:
+            return "qwen2.5:32b"
+        if free_ram_gb >= 24.0 or free_vram_mb >= 14336.0:
+            return "qwen2.5:14b"
+        if free_ram_gb >= 12.0 or free_vram_mb >= 4608.0:
+            return "qwen2.5:7b"
+        if free_ram_gb >= 6.0 or free_vram_mb >= 2048.0:
+            return "qwen2.5:3b"
+        return "qwen2.5:1.5b"
+
+    def _fetch_available_tags(self) -> List[str]:
+        """Enforces strict 400ms health probe timeout."""
+        try:
+            resp = httpx.get(f"{self.endpoint}/api/tags", timeout=0.4)
             if resp.status_code == 200:
                 data = resp.json()
                 return [m["name"] for m in data.get("models", []) if "name" in m]
@@ -117,53 +165,67 @@ class FusionArbiter:
         return []
 
     def _resolve_model(self, candidates: List[str], fallback: str) -> str:
+        if not self.available_tags:
+            return fallback
+        # First pass: exact tag match
+        for cand in candidates:
+            for tag in self.available_tags:
+                if cand == tag:
+                    return tag
+        # Second pass: base family match, avoiding oversized 32b/16gb models when free RAM < 24GB
         for cand in candidates:
             cand_base = cand.split(":")[0]
             for tag in self.available_tags:
-                if cand == tag or cand_base == tag.split(":")[0]:
+                if cand_base == tag.split(":")[0]:
+                    if self.free_ram_gb < 24.0 and any(h in tag for h in ("32b", "70b", "strix-deepseek")):
+                        continue
                     return tag
-        return fallback
+        # Third pass: any installed lightweight model
+        for tag in self.available_tags:
+            if not any(h in tag for h in ("32b", "70b", "strix-deepseek")):
+                return tag
+        return self.available_tags[0]
 
     def _query_model(self, model: str, prompt: str, system_prompt: str) -> str:
+        if not self.available_tags:
+            return ""
+        # Ensure target model exists in available_tags or fall back to an installed tag
+        target_model = model
+        if target_model not in self.available_tags:
+            target_model = self._resolve_model([model], fallback=self.available_tags[0])
+
         payload = {
-            "model": model,
+            "model": target_model,
             "prompt": f"### SYSTEM:\n{system_prompt}\n\n### INSTRUCTION:\n{prompt}",
             "stream": False,
             "keep_alive": "60m",
-            "options": {"temperature": 0.7, "num_predict": 1024},
+            "options": {"temperature": 0.7, "num_predict": 512},
         }
-        for attempt in range(2):
-            try:
-                resp = self.client.post(
-                    f"{self.endpoint}/api/generate",
-                    json=payload,
-                    timeout=httpx.Timeout(self.timeout, connect=60.0),
-                )
-                if resp.status_code == 200:
-                    return resp.json().get("response", "").strip()
-            except Exception as e:
-                if attempt == 0 and "timed out" in str(e).lower():
-                    logger.warning(
-                        "Ollama query timed out for %s on initial attempt (likely loading model into VRAM/RAM). Retrying with model now resident...",
-                        model,
-                    )
-                    time.sleep(2.0)
-                    continue
-                logger.warning("Ollama query failed for %s: %s", model, e)
-                # Resilient fallback: if secondary model failed/timed out, try fast Qwen fallback
-                if model != "qwen2.5:7b" and "qwen2.5:7b" in self.available_tags:
+        try:
+            resp = self.client.post(
+                f"{self.endpoint}/api/generate",
+                json=payload,
+                timeout=httpx.Timeout(self.timeout, connect=2.0),
+            )
+            if resp.status_code == 200:
+                return resp.json().get("response", "").strip()
+        except Exception as e:
+            logger.warning("Ollama query failed for %s: %s", target_model, e)
+            # Resilient fallback: try fast lightweight model if available
+            for fb in ("gemma2:2b", "qwen2.5:1.5b", "qwen2.5:3b", "qwen2.5:7b", "deepseek-r1:1.5b"):
+                if fb != target_model and fb in self.available_tags:
                     try:
-                        payload["model"] = "qwen2.5:7b"
+                        payload["model"] = fb
                         resp = self.client.post(
                             f"{self.endpoint}/api/generate",
                             json=payload,
-                            timeout=httpx.Timeout(self.timeout, connect=60.0),
+                            timeout=httpx.Timeout(min(self.timeout or 15.0, 15.0), connect=1.0),
                         )
                         if resp.status_code == 200:
                             return resp.json().get("response", "").strip()
                     except Exception:
                         pass
-                break
+                    break
         return ""
 
     def run_fusion_pipeline(self, rfc_fragment: str, fragment_id: Optional[int] = None) -> FusionArbitrationResult:
@@ -197,12 +259,15 @@ class FusionArbiter:
         participating_models.append(self.gemma_model)
 
         for item in self._parse_json(gemma_out):
+            norm_req = self._normalize_crlf(item.get("raw_request", ""))
+            if not norm_req.strip():
+                continue
             proposals.append(CandidateProposal(
                 candidate_id=f"cand_gemma_{len(proposals)+1}",
                 model=self.gemma_model,
                 specialist_type="Protocol Specialist",
                 rationale=item.get("rationale", "Gemma protocol edge-case"),
-                raw_request=self._normalize_crlf(item.get("raw_request", "")),
+                raw_request=norm_req,
                 is_clean=bool(item.get("is_clean", True)),
             ))
 
@@ -225,12 +290,15 @@ class FusionArbiter:
         participating_models.append(self.sec_model)
 
         for item in self._parse_json(sec_out):
+            norm_req = self._normalize_crlf(item.get("raw_request", ""))
+            if not norm_req.strip():
+                continue
             proposals.append(CandidateProposal(
                 candidate_id=f"cand_sec_{len(proposals)+1}",
                 model=self.sec_model,
                 specialist_type="Boundary Specialist",
                 rationale=item.get("rationale", "Security boundary probe"),
-                raw_request=self._normalize_crlf(item.get("raw_request", "")),
+                raw_request=norm_req,
                 is_clean=bool(item.get("is_clean", False)),
             ))
 
@@ -309,6 +377,7 @@ class FusionArbiter:
                         "is_clean": bool(sp.get("is_clean", False)),
                     })
 
+        if final_fused:
             consensus_type = "ArbiterSynthesized"
             reasoning = f"DeepSeek-R1 successfully synthesized {len(final_fused)} unified probes from Gemma + Security candidates."
         else:
@@ -332,13 +401,14 @@ class FusionArbiter:
         if not self.db:
             return
         for p in probes:
-            self.db.save_probe(
+            p_id = self.db.save_probe(
                 fragment_id=fragment_id,
                 rationale=f"[{consensus_type}] {p.get('rationale', '')}",
                 raw_request=p.get("raw_request", ""),
                 is_clean=p.get("is_clean", False),
                 source_type="fusion",
             )
+            p["probe_id"] = p_id
 
     def explain_vulnerability_concept(
         self,
@@ -406,13 +476,17 @@ Output strict JSON matching:
   "validation_steps": ["step 1", "step 2"]
 }}
 """
+        required_keys = ("concept_name", "architectural_explanation", "rfc_clue_connection", "generalization", "validation_steps")
         try:
             raw_out = self._query_model(self.arbiter_model, user_prompt, sys_prompt)
             parsed = self._parse_json(raw_out)
+            cand = None
             if parsed and isinstance(parsed, list) and isinstance(parsed[0], dict):
-                return parsed[0]
+                cand = parsed[0]
             elif parsed and isinstance(parsed, dict):
-                return parsed
+                cand = parsed
+            if cand and all(k in cand and cand[k] for k in required_keys) and isinstance(cand.get("validation_steps"), list):
+                return cand
         except Exception:
             pass
 
@@ -471,8 +545,10 @@ Output strict JSON matching:
             try:
                 text = text.encode("utf-8").decode("unicode_escape")
             except Exception:
-                text = text.replace("\\r\\n", "\r\n")
-        return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+                text = text.replace("\\r\\n", "\r\n").replace("\\r", "\r").replace("\\n", "\n")
+        if "\r\n" not in text:
+            return text.replace("\n", "\r\n")
+        return text
 
     def _parse_json(self, text: str) -> List[Dict[str, Any]]:
         if not text:
@@ -497,6 +573,9 @@ Output strict JSON matching:
                         out.append({"rationale": "Synthesized probe", "raw_request": v, "is_clean": False})
                 return out
             elif isinstance(val, dict):
+                for key in ("probes", "suggested_probes", "candidates", "items"):
+                    if key in val and isinstance(val[key], list):
+                        return [v for v in val[key] if isinstance(v, dict)]
                 return [val]
         except Exception:
             pass

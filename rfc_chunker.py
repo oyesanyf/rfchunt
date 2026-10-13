@@ -4,7 +4,7 @@ Solves context-contamination and LLM over-anchoring by isolating operative requi
 """
 
 import re
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 OPERATIVE_KEYWORDS = [
@@ -77,7 +77,11 @@ class RFCChunker:
 
     @classmethod
     def chunk_document_for_terminator(
-        cls, rfc_text: str, sentences_per_chunk: int = 2, min_sentence_len: int = 25
+        cls,
+        rfc_text: str,
+        sentences_per_chunk: int = 2,
+        min_sentence_len: int = 25,
+        rfc_num: Optional[int] = None,
     ) -> List[Tuple[str, str, float]]:
         """
         Chunks the document and ranks fragments by their Terminator Discrepancy Score.
@@ -88,12 +92,19 @@ class RFCChunker:
         except ImportError:
             TerminatorRFCSelector = None
 
+        spec_weight = 1.0
+        if TerminatorRFCSelector and rfc_num is not None:
+            spec = TerminatorRFCSelector.get_spec_by_num(rfc_num)
+            if spec:
+                spec_weight = spec.weight
+
         base_chunks = cls.chunk_document(rfc_text, sentences_per_chunk=sentences_per_chunk, min_sentence_len=min_sentence_len)
         scored_chunks: List[Tuple[str, str, float]] = []
 
         for frag_text, kw_csv in base_chunks:
             if TerminatorRFCSelector:
                 score, _ = TerminatorRFCSelector.score_text_for_terminator(frag_text)
+                score = round(score * spec_weight, 3)
             else:
                 score = 1.0
             scored_chunks.append((frag_text, kw_csv, score))
@@ -101,3 +112,4 @@ class RFCChunker:
         # Sort highest terminator relevance first
         scored_chunks.sort(key=lambda x: x[2], reverse=True)
         return scored_chunks
+

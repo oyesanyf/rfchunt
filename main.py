@@ -62,7 +62,11 @@ def cmd_chunk(args):
         try:
             with open(doc_path, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read()
-            fragments = RFCChunker.chunk_document(text, sentences_per_chunk=args.sentences)
+            num_str = "".join(ch for ch in str(rfc_id) if ch.isdigit())
+            rfc_num = int(num_str) if num_str else None
+            fragments = RFCChunker.chunk_document_for_terminator(
+                text, sentences_per_chunk=args.sentences, rfc_num=rfc_num
+            )
             saved = db.save_fragments(rfc_id, fragments)
             total_chunks += saved
             print(f"[+] {rfc_id}: Generated and saved {saved} micro-inspiration fragments.")
@@ -101,7 +105,10 @@ def cmd_generate(args):
 def cmd_permute(args):
     db = Database(args.db)
     cursor = db.conn.cursor()
-    cursor.execute("SELECT probe_id, fragment_id, rationale, raw_request, is_clean FROM probes WHERE source_type = 'llm' LIMIT ?", (args.limit,))
+    cursor.execute(
+        "SELECT probe_id, fragment_id, rationale, raw_request, is_clean FROM probes WHERE source_type IN ('llm', 'fusion') LIMIT ?",
+        (args.limit,),
+    )
     rows = [dict(r) for r in cursor.fetchall()]
 
     if not rows:
@@ -438,7 +445,7 @@ def cmd_caldera(args):
 def cmd_build(args):
     """Executes the unified 'Build All' pipeline."""
     from build_all import run_full_build
-    success = run_full_build(skip_tests=args.skip_tests, skip_zips=args.skip_zips)
+    success = run_full_build(skip_tests=args.skip_tests)
     if not success:
         sys.exit(1)
 
@@ -553,9 +560,8 @@ def main():
     p_caldera.add_argument("--api-key", type=str, default=None, help="Caldera API key for REST authentication")
 
     # Build All Pipeline
-    p_build = subparsers.add_parser("build", help="Build all components, verify database, pre-cache RFCs, and package releases")
+    p_build = subparsers.add_parser("build", help="Build all components, verify database, pre-cache RFCs, and run verification suite")
     p_build.add_argument("--skip-tests", action="store_true", help="Skip running the pytest verification suite")
-    p_build.add_argument("--skip-zips", action="store_true", help="Skip creating release zip packages")
 
     args = parser.parse_args()
 

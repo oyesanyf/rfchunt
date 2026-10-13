@@ -60,20 +60,45 @@ def test_rfc_fetcher_terminator_corpus():
 
 
 def test_chunker_terminator_keywords_and_ranking():
-    """Verifies that RFCChunker extracts and ranks terminator-specific chunks."""
+    """Verifies that RFCChunker extracts and ranks terminator-specific chunks, including rfc_num weighting."""
     doc_text = """
     RFC 9112 HTTP/1.1 June 2022
     Section 2.2: Although the line terminator for fields is the sequence CRLF, a recipient MUST recognize a single LF as a line terminator.
     Section 3.1: The astronomical observatory monitors satellite positioning across equatorial sectors.
     Section 6.1: An intermediary gateway receiving both Transfer-Encoding and Content-Length MUST treat the message body as chunked.
     """
-    scored_chunks = RFCChunker.chunk_document_for_terminator(doc_text, sentences_per_chunk=1)
+    scored_chunks = RFCChunker.chunk_document_for_terminator(doc_text, sentences_per_chunk=1, rfc_num=9112)
     assert len(scored_chunks) >= 2
 
     # Top-ranked chunk should be terminator-related
     top_chunk, top_keywords, top_score = scored_chunks[0]
     assert top_score > 0
     assert any(term in top_keywords.lower() for term in ["terminator", "crlf", "transfer-encoding", "must"])
+
+
+def test_database_save_fragments_3_tuple_and_probe_dedup(tmp_path):
+    """Verifies Database.save_fragments accepts 3-tuples from chunk_document_for_terminator and save_probe deduplicates."""
+    from database import Database
+    db_file = str(tmp_path / "test_term.db")
+    db = Database(db_file)
+    chunks = [
+        ("A recipient MUST recognize a single LF as a line terminator.", "must, line terminator", 42.5),
+        ("Transfer-Encoding overrides Content-Length.", "transfer-encoding, content-length", 30.0),
+    ]
+    saved = db.save_fragments("RFC9112", chunks)
+    assert saved == 2
+
+    p1 = db.save_probe(1, "First rationale", "GET / HTTP/1.1\r\nHost: target.local\r\n\r\n", True, "llm")
+    p2 = db.save_probe(1, "Duplicate rationale", "GET / HTTP/1.1\r\nHost: target.local\r\n\r\n", True, "permutation")
+    assert p1 == p2, "Identical raw_request probes should be deduplicated to the existing probe_id"
+
+
+def test_target_authorization_gate_validate_target():
+    """Verifies TargetAuthorizationGate.validate_target works for CLI and MCP validation."""
+    from mcp_server import TargetAuthorizationGate
+    allowed, reason = TargetAuthorizationGate.validate_target("localhost")
+    assert allowed is True
+    assert "authorized" in reason.lower()
 
 
 def test_build_pipeline_syntax_and_db():

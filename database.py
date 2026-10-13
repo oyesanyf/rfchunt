@@ -157,6 +157,24 @@ class Database:
                     validation_logic TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS anomaly_fingerprints (
+                    fingerprint_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    anomaly_type TEXT NOT NULL,
+                    pattern_regex TEXT NOT NULL UNIQUE,
+                    target_part TEXT DEFAULT 'body', -- 'body', 'headers', 'status_line', 'full'
+                    description TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS dynamic_permutations (
+                    permutation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mutation_name TEXT NOT NULL UNIQUE,
+                    match_pattern TEXT NOT NULL,
+                    replacement_text TEXT NOT NULL,
+                    is_clean BOOLEAN DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             """)
 
     def save_rfc(self, rfc_id: str, title: str, source_url: str, doc_path: str) -> None:
@@ -170,11 +188,19 @@ class Database:
                     (rfc_id, title, source_url, doc_path),
                 )
 
-    def save_fragments(self, rfc_id: str, fragments: List[Tuple[str, str]]) -> int:
+    def save_fragments(self, rfc_id: str, fragments: List[Any]) -> int:
         count = 0
         with self._lock:
             with self.conn:
-                for content, keywords in fragments:
+                for item in fragments:
+                    if isinstance(item, (tuple, list)):
+                        content = str(item[0]) if len(item) > 0 else ""
+                        keywords = str(item[1]) if len(item) > 1 else ""
+                    else:
+                        content = str(item)
+                        keywords = ""
+                    if not content:
+                        continue
                     self.conn.execute(
                         """
                         INSERT INTO fragments (rfc_id, content, keywords)
@@ -228,6 +254,12 @@ class Database:
     ) -> int:
         with self._lock:
             with self.conn:
+                existing = self.conn.execute(
+                    "SELECT probe_id FROM probes WHERE raw_request = ? LIMIT 1",
+                    (raw_request,),
+                ).fetchone()
+                if existing:
+                    return existing[0]
                 cursor = self.conn.execute(
                     """
                     INSERT INTO probes (fragment_id, rationale, raw_request, is_clean, source_type, parent_probe_id)
@@ -442,6 +474,47 @@ class Database:
                 ),
             )
 
+    def save_arm106_defensive_rule(
+        self,
+        rule_id: str,
+        name: str,
+        rule_type: str,
+        target_protocol: str,
+        specification_anchor: str,
+        rule_body: str,
+        severity: str,
+    ) -> None:
+        with self._lock:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO arm106_defensive_rules
+                    (rule_id, name, rule_type, target_protocol, specification_anchor, rule_body, severity)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (rule_id, name, rule_type, target_protocol, specification_anchor, rule_body, severity),
+                )
+
+    def save_arm107_regression_test(
+        self,
+        test_id: str,
+        vuln_id: str,
+        protocol: str,
+        expected_status_rejection: str,
+        probe_bytes_hex: str,
+        validation_logic: str,
+    ) -> None:
+        with self._lock:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO arm107_regression_tests
+                    (test_id, vuln_id, protocol, expected_status_rejection, probe_bytes_hex, validation_logic)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (test_id, vuln_id, protocol, expected_status_rejection, probe_bytes_hex, validation_logic),
+                )
+
     def get_tier_taxonomy_counts(self) -> Dict[str, int]:
         cursor = self.conn.cursor()
         counts = {}
@@ -456,3 +529,62 @@ class Database:
             cursor.execute(f"SELECT COUNT(*) FROM {table}")
             counts[table] = cursor.fetchone()[0]
         return counts
+
+    def save_anomaly_fingerprint(
+        self,
+        anomaly_type: str,
+        pattern_regex: str,
+        target_part: str = "body",
+        description: str = "",
+    ) -> int:
+        with self._lock:
+            with self.conn:
+                cursor = self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO anomaly_fingerprints
+                    (anomaly_type, pattern_regex, target_part, description)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (anomaly_type, pattern_regex, target_part, description),
+                )
+                return cursor.lastrowid
+
+    def get_anomaly_fingerprints(self) -> List[Dict[str, Any]]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT fingerprint_id, anomaly_type, pattern_regex, target_part, description FROM anomaly_fingerprints"
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+    def save_dynamic_permutation(
+        self,
+        mutation_name: str,
+        match_pattern: str,
+        replacement_text: str,
+        is_clean: bool = False,
+    ) -> int:
+        with self._lock:
+            with self.conn:
+                cursor = self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO dynamic_permutations
+                    (mutation_name, match_pattern, replacement_text, is_clean)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (mutation_name, match_pattern, replacement_text, 1 if is_clean else 0),
+                )
+                return cursor.lastrowid
+
+    def get_dynamic_permutations(self) -> List[Dict[str, Any]]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT permutation_id, mutation_name, match_pattern, replacement_text, is_clean FROM dynamic_permutations"
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+    def get_probe_evaluation_count(self, probe_id: int) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM evaluations WHERE probe_id = ?", (probe_id,))
+        row = cursor.fetchone()
+        return row[0] if row else 0
+

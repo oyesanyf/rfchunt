@@ -48,9 +48,17 @@ class ProtocolResearchOrchestrator:
     verification, stateful sequencing, minimization, and defensive arm publishing.
     """
 
-    def __init__(self, primary_host: str = "127.0.0.1", primary_port: int = 5006):
+    def __init__(
+        self,
+        primary_host: str = "127.0.0.1",
+        primary_port: int = 5006,
+        use_tls: bool = False,
+        db: Optional[Any] = None,
+    ):
         self.host = primary_host
         self.port = primary_port
+        self.use_tls = use_tls
+        self.db = db
 
         # Initialize the 12 Modules
         self.abnf = ABNFGrammarEngine()                                 # Mod 1
@@ -62,11 +70,11 @@ class ProtocolResearchOrchestrator:
         self.sequence_engine = StatefulProtocolSequenceEngine()         # Mod 5
         self.errata = RFCEvolutionTracker()                             # Mod 6
         self.metamorphic = MetamorphicTestingEngine()                   # Mod 7
-        self.debugger = DeltaDebugger(primary_host, primary_port)       # Mod 8
+        self.debugger = DeltaDebugger(primary_host, primary_port, use_tls=use_tls)  # Mod 8
         self.classifier = CausalAnomalyClassifier()                     # Mod 9
         self.boundary = CrossProtocolBoundaryAnalyzer()                 # Mod 10
         self.knowledge_graph = ResearchKnowledgeGraph()                 # Mod 11
-        self.publisher = DefensiveIntelligencePublisher()               # Mod 12
+        self.publisher = DefensiveIntelligencePublisher(db=db)          # Mod 12
 
     def ingest_rfc_specification(self, rfc_id: str, rfc_text: str) -> Dict[str, int]:
         """

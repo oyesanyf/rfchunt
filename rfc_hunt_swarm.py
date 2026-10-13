@@ -32,6 +32,7 @@ from typing import Annotated, Any, Dict, List, Optional, TypedDict
 from langgraph.graph import END, StateGraph
 
 # External/Core components from original continuous_scanner
+from anomaly_detector import AnomalyDetector
 from database import Database
 from forensics import ForensicLogger
 from permutator import VectorPermutator
@@ -202,6 +203,7 @@ class ProtocolResearchSwarm:
         self.llm_semaphore = threading.BoundedSemaphore(1)
         
         # Original Scanner Core Components
+        self.db_path = db_path
         self.db = Database(db_path)
         self.fetcher = RFCFetcher(db=self.db)
         self.generator = ProbeGenerator(preferred_model="gemma2:2b", use_fusion=True, db=self.db, sec_model=sec_model)
@@ -223,7 +225,7 @@ class ProtocolResearchSwarm:
         self.classifier = CausalAnomalyClassifier()
         self.boundary = CrossProtocolBoundaryAnalyzer()
         self.knowledge_graph = ResearchKnowledgeGraph()
-        self.publisher = DefensiveIntelligencePublisher()
+        self.publisher = DefensiveIntelligencePublisher(db=self.db)
 
         # Open Dream-RSI Engine (Modules 13-15)
         self.dream_world_model = ProtocolWorldModel(target_host=host, target_port=port)
@@ -236,10 +238,17 @@ class ProtocolResearchSwarm:
 
     # Agent 1: Fetch and Chunk (Replaces manual string entry)
     def fetch_and_chunk_agent(self, state: ResearchState) -> dict:
-        rfc_num = int(state.get("rfc_num", "9112").replace("RFC", ""))
+        raw_rfc = str(state.get("rfc_num", "9112")).strip().upper().replace("RFC-", "").replace("RFC", "")
+        rfc_num = 0 if raw_rfc in ("0", "MCP") or not raw_rfc.isdigit() else int(raw_rfc)
         # Fetch actual text
-        rfc_text = self.fetcher.fetch_rfc_by_number(rfc_num)
-        
+        rfc_text = self.fetcher.fetch_rfc_by_number(rfc_num) or ""
+        if not rfc_text:
+            return {
+                "rfc_text": "",
+                "fragments": [],
+                "history": [f"fetch_and_chunk: RFC{rfc_num} unavailable or empty."],
+            }
+
         # Mod 1 & 3: Extractor / Compiler
         self.knowledge_graph.add_node(f"RFC{rfc_num}", "RFC", f"Specification RFC{rfc_num}")
         abnf_reqs = self.abnf.extract_from_rfc_text(f"RFC{rfc_num}", rfc_text)
@@ -247,8 +256,8 @@ class ProtocolResearchSwarm:
             self.knowledge_graph.add_node(req.requirement_id, "REQUIREMENT", req.raw_statement[:40])
             self.knowledge_graph.add_edge(f"RFC{rfc_num}", req.requirement_id, "DEFINES")
 
-        # Chunk for LLM Generator
-        fragments = RFCChunker.chunk_document(rfc_text)
+        # Chunk for LLM Generator (prioritizing Terminator framing/delimiter fragments)
+        fragments = RFCChunker.chunk_document_for_terminator(rfc_text, rfc_num=rfc_num)
         self.db.save_fragments(f"RFC{rfc_num}", fragments)
         
         return {
@@ -259,40 +268,47 @@ class ProtocolResearchSwarm:
 
     # Agent 2: LLM Probe Generation (Original Generator)
     def llm_generator_agent(self, state: ResearchState) -> dict:
-        fragments = state.get("fragments", [])
+        fragments = list(state.get("fragments", []))
+        new_cycle_count = state.get("cycle_count", 0) + 1
         if not fragments:
-            return {"history": ["llm_generator: No fragments left to process."]}
+            return {
+                "generated_candidates": [],
+                "cycle_count": new_cycle_count,
+                "history": ["llm_generator: No fragments left to process."],
+            }
         
         current_frag_tuple = fragments.pop(0)
         frag_text = current_frag_tuple[0] if isinstance(current_frag_tuple, tuple) else current_frag_tuple
         
         preview = frag_text.strip().replace("\r", " ").replace("\n", " ")[:70]
-        print(f"\n[llm_generator_agent] Synthesizing probes for fragment ({len(fragments) + 1} remaining in queue): \"{preview}...\"")
+        print(f"\n[llm_generator_agent] [Cycle {new_cycle_count}/{state.get('max_cycles', 3)}] Synthesizing probes for fragment ({len(fragments) + 1} remaining in queue): \"{preview}...\"")
         
         # Call Local LLM to generate probes based on this RFC fragment (guarded by semaphore)
         with self.llm_semaphore:
             llm_probes = self.generator.generate_candidate_probes(frag_text)
         
-        # Permutate them
-        all_candidates = []
+        # Retain base LLM probes and append permuted variants
+        all_candidates = list(llm_probes)
         for p in llm_probes:
             perms = self.permutator.permute_probe(p)
             all_candidates.extend(perms)
             
-        print(f"[llm_generator_agent] -> LLM generated {len(llm_probes)} base probes -> {len(all_candidates)} permuted candidates ready for execution.")
+        print(f"[llm_generator_agent] -> LLM generated {len(llm_probes)} base probes -> {len(all_candidates)} total candidates ready for execution.")
         return {
             "fragments": fragments,
             "current_fragment": frag_text,
             "generated_candidates": all_candidates,
-            "history": [f"llm_generator: Fragment processed. LLM yielded {len(llm_probes)} base probes -> {len(all_candidates)} permuted candidates."]
+            "cycle_count": new_cycle_count,
+            "history": [f"llm_generator: Fragment processed (cycle {new_cycle_count}). LLM yielded {len(llm_probes)} base probes -> {len(all_candidates)} total candidates."]
         }
 
     # Route: Check if we have candidates to test
     def route_after_generation(self, state: ResearchState) -> str:
         cands = state.get("generated_candidates", [])
         if not cands:
-            # If no candidates were generated, loop back if fragments remain, else end
-            if not state.get("fragments"):
+            if not state.get("fragments") or state.get("cycle_count", 0) >= state.get("max_cycles", 3):
+                if state.get("enable_dream_rsi", False):
+                    return "dream_rsi_agent"
                 return END
             return "llm_generator_agent"
         return "execution_oracle_agent"
@@ -300,13 +316,31 @@ class ProtocolResearchSwarm:
     def _evaluate_single_candidate(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
         """Worker evaluating an individual candidate probe guarded by self.probe_semaphore."""
         with self.probe_semaphore:
-            probe_bytes = candidate.get("raw_request", b"")
-            if isinstance(probe_bytes, str):
-                probe_bytes = probe_bytes.encode('latin-1', errors='replace')
-                
-            # Dynamically normalize Host header for remote targets
-            if b"target.local" in probe_bytes and self.host != "127.0.0.1":
-                probe_bytes = probe_bytes.replace(b"target.local", self.host.encode("latin-1", errors="replace"))
+            raw_req = candidate.get("raw_request", b"")
+            if isinstance(raw_req, bytes):
+                probe_str = raw_req.decode("latin-1", errors="replace")
+            else:
+                probe_str = str(raw_req)
+
+            if "\r\n" not in probe_str and "\\r\\n" in probe_str:
+                try:
+                    probe_str = probe_str.encode("utf-8").decode("unicode_escape")
+                except Exception:
+                    probe_str = probe_str.replace("\\r\\n", "\r\n")
+
+            probe_str = probe_str.replace("target.local", self.host)
+            nested_marker = f"GET /terminator_marker_8821 HTTP/1.1\r\nHost: {self.host}\r\nX-Ignore: 1\r\n\r\n"
+            probe_str = probe_str.replace("$PAYLOAD", nested_marker)
+            if "\r\n\r\n" in probe_str and re.search(r"Content-Length:\s*(\$LENGTH|N)\b", probe_str, re.IGNORECASE):
+                _, body_part = probe_str.split("\r\n\r\n", 1)
+                body_len = len(body_part.encode("latin-1", errors="replace"))
+                probe_str = re.sub(
+                    r"(Content-Length:\s*)(?:\$LENGTH|N)\b",
+                    rf"\g<1>{body_len}",
+                    probe_str,
+                    flags=re.IGNORECASE,
+                )
+            probe_bytes = probe_str.encode("latin-1", errors="replace")
                 
             # Run stateful pipeline engine (Mod 5)
             seq_report = self.sequence_engine.run_pipelined_canary_sequence(
@@ -337,6 +371,9 @@ class ProtocolResearchSwarm:
                 resp_bytes, latency_ms=latency_ms, sock_error=sock_err, is_verbose=self.verbose
             )
 
+            baseline_step = next((s for s in seq_report.steps if "Baseline" in s.step_name), None)
+            baseline_resp_bytes = baseline_step.received_bytes if baseline_step else b""
+
             anomaly = None
             if seq_report.has_desynchronization or seq_report.has_pipeline_leak:
                 anomaly = ImplementationAnomaly(
@@ -348,7 +385,27 @@ class ProtocolResearchSwarm:
                     raw_probe=probe_bytes,
                     raw_response=resp_bytes if resp_bytes else (seq_report.steps[-1].received_bytes if seq_report.steps else b""),
                 )
-                
+
+            # Check single-response Anomaly Detection Cascade (Text/Binary Blend, Double HTML, Inline Headers, Clean Dual-Response, Status-Line Reflection, Range Cache Mismatch)
+            if not anomaly and resp_bytes:
+                cascade_anoms = AnomalyDetector.analyze_response(
+                    resp_bytes,
+                    baseline_response=baseline_resp_bytes,
+                    is_clean_probe=bool(candidate.get("is_clean", False)),
+                    db=self.db,
+                )
+                if cascade_anoms:
+                    first_anom = cascade_anoms[0]
+                    anomaly = ImplementationAnomaly(
+                        anomaly_id=f"ANOM-CASC-{int(time.time() * 1000)}",
+                        target_engine=f"{self.host}:{self.port}",
+                        category=AnomalyCategory.STATE_DESYNC if first_anom["type"] == "clean_dual_response" else AnomalyCategory.PARSER_DIVERGENCE,
+                        observed_behavior=f"[{first_anom['type']}] {first_anom['description']}",
+                        expected_behavior="Single well-framed HTTP response without structural anomalies.",
+                        raw_probe=probe_bytes,
+                        raw_response=resp_bytes,
+                    )
+
             # Fallback to Metamorphic Oracle (Mod 7/4) if no sequence anomaly
             if not anomaly:
                 meta_results = self.metamorphic.test_metamorphic_invariance(
@@ -360,9 +417,6 @@ class ProtocolResearchSwarm:
                     if not is_valid and meta_anomaly:
                         anomaly = meta_anomaly
                         break
-            
-            baseline_step = next((s for s in seq_report.steps if "Baseline" in s.step_name), None)
-            baseline_resp_bytes = baseline_step.received_bytes if baseline_step else b""
 
             # Record live step in Dream-RSI World Model
             self.dream_world_model.record_step(
@@ -490,9 +544,8 @@ class ProtocolResearchSwarm:
         if state.get("generated_candidates"):
             return "execution_oracle_agent"
         
-        # Cycle count logic
-        cc = state.get("cycle_count", 0) + 1
-        if cc >= state.get("max_cycles", 3):
+        # Cycle count & fragment exhaustion logic
+        if state.get("cycle_count", 0) >= state.get("max_cycles", 3) or not state.get("fragments"):
             if state.get("enable_dream_rsi", False):
                 return "dream_rsi_agent"
             return END
@@ -567,6 +620,10 @@ class ProtocolResearchSwarm:
         # If discarded or failed to reproduce, keep testing
         if state.get("generated_candidates"):
             return "execution_oracle_agent"
+        if state.get("cycle_count", 0) >= state.get("max_cycles", 3) or not state.get("fragments"):
+            if state.get("enable_dream_rsi", False):
+                return "dream_rsi_agent"
+            return END
         return "llm_generator_agent"
 
     # Agent 5: Discovery Cascade, Knowledge Graph, Publish, & Forensics
@@ -575,7 +632,7 @@ class ProtocolResearchSwarm:
         anomaly = state["current_anomaly"]
         baseline_resp = state.get("baseline_resp")
         frag_text = state.get("current_fragment", "")
-        rfc_num = state.get("rfc_num", "9112").replace("RFC", "")
+        rfc_num = str(state.get("rfc_num", "9112")).replace("RFC-", "").replace("RFC", "")
         
         # Evidence Validation Gate:
         # Suspend automatic publication of new detection rules until the evidence validator
@@ -583,10 +640,8 @@ class ProtocolResearchSwarm:
         is_confirmed, validation_reason = self.classifier.validate_evidence(vuln, anomaly, baseline_resp=baseline_resp)
         if not is_confirmed:
             print(f"[*] [SUSPENDED] Automatic rule publication suspended for {vuln.vuln_id}: {validation_reason}")
-            cc = state.get("cycle_count", 0) + 1
             return {
                 "cascade_results": None,
-                "cycle_count": cc,
                 "history": [f"cascade_publish: Suspended automatic publication ({validation_reason})."]
             }
 
@@ -635,11 +690,9 @@ class ProtocolResearchSwarm:
         except Exception:
             pass
 
-        cc = state.get("cycle_count", 0) + 1
         arm_id = arm106.rule_id if arm106 else "SUSPENDED"
         return {
             "cascade_results": cascade_res,
-            "cycle_count": cc,
             "history": [f"cascade_publish: Ran Cascade, Published rules ({arm_id}), and saved Forensic trace!"]
         }
 
@@ -659,13 +712,12 @@ class ProtocolResearchSwarm:
         }
 
     def route_after_publish(self, state: ResearchState) -> str:
-        # Check cycles or go back to testing candidates
-        if state.get("cycle_count", 0) >= state.get("max_cycles", 3):
+        if state.get("generated_candidates"):
+            return "execution_oracle_agent"
+        if state.get("cycle_count", 0) >= state.get("max_cycles", 3) or not state.get("fragments"):
             if state.get("enable_dream_rsi", False):
                 return "dream_rsi_agent"
             return END
-        if state.get("generated_candidates"):
-            return "execution_oracle_agent"
         return "llm_generator_agent"
 
 
@@ -794,10 +846,13 @@ USAGE EXAMPLES:
     parser.add_argument("--concurrency", "--threads", type=int, default=4, help="Maximum concurrent probe execution threads (bounded by semaphore, default: 4)")
     args = parser.parse_args()
 
-    # Target restrictions removed: allow any target specified on the CLI
+    # Authorize and validate target host specified on the CLI
     from mcp_server import TargetAuthorizationGate
-    TargetAuthorizationGate.allow_any_target()
     TargetAuthorizationGate.authorize_target(args.host)
+    is_valid_target, target_reason = TargetAuthorizationGate.validate_target(args.host)
+    if not is_valid_target:
+        print(f"[!] Target validation error: {target_reason}")
+        sys.exit(1)
 
     import os
     os.environ["OLLAMA_TIMEOUT"] = str(args.timeout)

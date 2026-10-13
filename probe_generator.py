@@ -148,5 +148,7 @@ Remember:
             try:
                 text = text.encode("utf-8").decode("unicode_escape")
             except Exception:
-                text = text.replace("\\r\\n", "\r\n")
-        return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+                text = text.replace("\\r\\n", "\r\n").replace("\\r", "\r").replace("\\n", "\n")
+        if "\r\n" not in text:
+            return text.replace("\n", "\r\n")
+        return text

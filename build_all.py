@@ -3,7 +3,7 @@ HTTP Terminator: Unified 'Build All' Automation Pipeline.
 
 Orchestrates full system compilation, dependency auditing, database schema verification,
 offline Terminator RFC pre-caching, Caldera plugin export, Dream-RSI policy generation,
-automated test suite execution, and clean release zip archive packaging.
+and automated test suite execution.
 """
 
 import argparse
@@ -12,7 +12,6 @@ import py_compile
 import subprocess
 import sys
 import time
-import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -150,7 +149,7 @@ def build_step_dream_rsi() -> Tuple[bool, str]:
 def build_step_run_tests() -> Tuple[bool, str]:
     """Executes the complete automated test suite via pytest."""
     try:
-        cmd = [sys.executable, "-m", "pytest", "tests/", "-q"]
+        cmd = [sys.executable, "-m", "pytest", "tests/", "test_protocol_ruler.py", "-q"]
         res = subprocess.run(cmd, cwd=str(ROOT_DIR), capture_output=True, text=True, timeout=300)
         if res.returncode == 0:
             lines = [l for l in res.stdout.strip().splitlines() if "passed" in l or "warning" in l]
@@ -162,38 +161,7 @@ def build_step_run_tests() -> Tuple[bool, str]:
         return False, f"Test suite execution exception: {e}"
 
 
-def build_step_package_zips() -> Tuple[bool, str]:
-    """Generates distribution zip archives."""
-    def _zip_folder(src_dir: Path, zip_file: Path, include_db: bool = False):
-        with zipfile.ZipFile(str(zip_file), "w", zipfile.ZIP_DEFLATED) as z:
-            for root, dirs, files in os.walk(str(src_dir)):
-                dirs[:] = [d for d in dirs if d not in [".git", "__pycache__", ".pytest_cache", ".venv"]]
-                for file in files:
-                    if not include_db and file.endswith(".db"):
-                        continue
-                    if file.endswith(".zip"):
-                        continue
-                    full_p = os.path.join(root, file)
-                    rel_p = os.path.relpath(full_p, str(src_dir))
-                    z.write(full_p, rel_p)
-
-    try:
-        zip1 = ROOT_DIR / "http_terminator.zip"
-        zip2 = ROOT_DIR / "http_terminator_with_db.zip"
-        zip3 = ROOT_DIR.parent / "agent_octopus_source_code.zip"
-
-        _zip_folder(ROOT_DIR, zip1, include_db=False)
-        _zip_folder(ROOT_DIR, zip2, include_db=True)
-        _zip_folder(ROOT_DIR, zip3, include_db=True)
-
-        size1_mb = zip1.stat().st_size / (1024 * 1024)
-        size2_mb = zip2.stat().st_size / (1024 * 1024)
-        return True, f"Distribution archives packaged: http_terminator.zip ({size1_mb:.1f} MB), with_db.zip ({size2_mb:.1f} MB)."
-    except Exception as e:
-        return False, f"Zip packaging failure: {e}"
-
-
-def run_full_build(skip_tests: bool = False, skip_zips: bool = False) -> bool:
+def run_full_build(skip_tests: bool = False) -> bool:
     """Executes the end-to-end build pipeline."""
     start_time = time.time()
     log_header("HTTP Terminator: Unified 'Build All' Pipeline")
@@ -213,9 +181,6 @@ def run_full_build(skip_tests: bool = False, skip_zips: bool = False) -> bool:
     if not skip_tests:
         steps.append(("Full Automated Pytest Verification Suite", build_step_run_tests))
 
-    if not skip_zips:
-        steps.append(("Release Distribution Zip Packaging", build_step_package_zips))
-
     all_passed = True
     for idx, (title, func) in enumerate(steps, 1):
         log_step(idx, title)
@@ -230,7 +195,7 @@ def run_full_build(skip_tests: bool = False, skip_zips: bool = False) -> bool:
     elapsed = time.time() - start_time
     log_header("Build Summary")
     if all_passed:
-        print(f"[SUCCESS] All build targets built, verified, and packaged in {elapsed:.2f} seconds.")
+        print(f"[SUCCESS] All build targets built and verified in {elapsed:.2f} seconds.")
         print("[+] HTTP Terminator is 100% production ready and fully offline-capable.")
         return True
     else:
@@ -241,10 +206,9 @@ def run_full_build(skip_tests: bool = False, skip_zips: bool = False) -> bool:
 def main():
     parser = argparse.ArgumentParser(description="HTTP Terminator: Build All Automation Pipeline")
     parser.add_argument("--skip-tests", action="store_true", help="Skip running the pytest verification suite")
-    parser.add_argument("--skip-zips", action="store_true", help="Skip creating release zip packages")
     args = parser.parse_args()
 
-    success = run_full_build(skip_tests=args.skip_tests, skip_zips=args.skip_zips)
+    success = run_full_build(skip_tests=args.skip_tests)
     sys.exit(0 if success else 1)
 
 

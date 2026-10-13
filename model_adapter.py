@@ -41,13 +41,15 @@ class ModelFusionAdapter:
         self.endpoint = ollama_endpoint or os.environ.get("OLLAMA_ENDPOINT", self.DEFAULT_OLLAMA_ENDPOINT)
         # Model Fusion is enabled by default to ensure multi-model consensus and diversity
         self.use_fusion = use_fusion if os.environ.get("USE_MODEL_FUSION") is None else (os.environ.get("USE_MODEL_FUSION") == "1")
+        self.free_ram_gb = self._get_free_memory_gb()
+        self.sized_qwen = self._size_qwen_for_free_memory(self.free_ram_gb)
         self.preferred_model = preferred_model or os.environ.get("LOCAL_MODEL", "gemma2:2b")
         self.sec_model = sec_model
         self.available_tags = self._fetch_available_tags()
         self.active_model = self._resolve_model(self.preferred_model)
-        timeout_env = os.environ.get("OLLAMA_TIMEOUT", "900.0")
+        timeout_env = os.environ.get("OLLAMA_TIMEOUT", "30.0")
         self.timeout = float(timeout_env) if float(timeout_env) > 0 else None
-        self.client = httpx.Client(timeout=httpx.Timeout(self.timeout, connect=60.0))
+        self.client = httpx.Client(timeout=httpx.Timeout(self.timeout, connect=2.0))
 
         # Gemini Cloud client fallback
         self.gemini_client = None
@@ -57,9 +59,49 @@ class ModelFusionAdapter:
             except Exception as e:
                 logger.debug("Failed to init Gemini client: %s", e)
 
-    def _fetch_available_tags(self) -> List[str]:
+    @staticmethod
+    def _get_free_memory_gb() -> float:
+        """Evaluates runtime free/available RAM in GB (never total physical RAM)."""
         try:
-            resp = httpx.get(f"{self.endpoint}/api/tags", timeout=1.5)
+            import ctypes
+            if os.name == "nt":
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+                stat = MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                    return stat.ullAvailPhys / (1024 ** 3)
+        except Exception:
+            pass
+        return 8.0
+
+    @staticmethod
+    def _size_qwen_for_free_memory(free_ram_gb: float, free_vram_mb: float = 0.0) -> str:
+        """Sizes Qwen model strictly by runtime available memory."""
+        if free_ram_gb >= 48.0 or free_vram_mb >= 24576.0:
+            return "qwen2.5:32b"
+        if free_ram_gb >= 24.0 or free_vram_mb >= 14336.0:
+            return "qwen2.5:14b"
+        if free_ram_gb >= 12.0 or free_vram_mb >= 4608.0:
+            return "qwen2.5:7b"
+        if free_ram_gb >= 6.0 or free_vram_mb >= 2048.0:
+            return "qwen2.5:3b"
+        return "qwen2.5:1.5b"
+
+    def _fetch_available_tags(self) -> List[str]:
+        """Enforces strict 400ms health probe timeout."""
+        try:
+            resp = httpx.get(f"{self.endpoint}/api/tags", timeout=0.4)
             if resp.status_code == 200:
                 data = resp.json()
                 return [m["name"] for m in data.get("models", []) if "name" in m]
@@ -69,8 +111,8 @@ class ModelFusionAdapter:
 
     def _resolve_model(self, preferred: str) -> str:
         """
-        Dynamically resolves a valid model tag to avoid 404 aborts.
-        Hierarchy: Preferred (e.g. gemma2:9b / gemma2:2b) -> qwen2.5 -> first available -> gemma2:2b
+        Dynamically resolves a valid model tag to avoid 404 aborts and OOMs.
+        Hierarchy: Preferred (e.g. gemma2:2b) -> sized_qwen -> first available -> gemma2:2b
         """
         if not self.available_tags:
             return preferred
@@ -84,14 +126,18 @@ class ModelFusionAdapter:
         clean_pref = preferred.split(":")[0]
         for tag in self.available_tags:
             if clean_pref in tag:
+                if self.free_ram_gb < 24.0 and any(h in tag for h in ("32b", "70b", "strix-deepseek")):
+                    continue
                 return tag
 
         # Preference hierarchy for zero-cost local research
-        candidates = ["gemma2:9b", "gemma2:2b", "qwen2.5:7b", "fenkohq/foundation-sec-8b:latest", "qwen2.5:32b", "deepseek-r1:1.5b"]
+        candidates = ["gemma2:2b", self.sized_qwen, "gemma2:9b", "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "deepseek-r1:1.5b"]
         for cand in candidates:
             cand_base = cand.split(":")[0]
             for tag in self.available_tags:
-                if cand_base in tag:
+                if cand == tag or cand_base in tag:
+                    if self.free_ram_gb < 24.0 and any(h in tag for h in ("32b", "70b", "strix-deepseek")):
+                        continue
                     return tag
 
         return self.available_tags[0]
@@ -101,8 +147,10 @@ class ModelFusionAdapter:
         Executes structured JSON generation using local Ollama model(s) or Gemini fallback.
         If use_fusion is enabled, runs panel fusion across Gemma and secondary models.
         """
-        if self.use_fusion:
-            return self._run_panel_fusion(system_instruction, user_prompt)
+        if self.use_fusion and self.available_tags:
+            res = self._run_panel_fusion(system_instruction, user_prompt)
+            if res:
+                return res
 
         # Primary: Local Ollama model
         if self.available_tags:
@@ -117,6 +165,9 @@ class ModelFusionAdapter:
         return []
 
     def _query_ollama(self, model: str, system_instruction: str, user_prompt: str) -> List[Dict[str, Any]]:
+        if not self.available_tags:
+            return []
+
         full_prompt = (
             f"### SYSTEM INSTRUCTION:\n{system_instruction}\n\n"
             f"### TASK PROMPT:\n{user_prompt}\n\n"
@@ -132,30 +183,21 @@ class ModelFusionAdapter:
             "keep_alive": "60m",
             "options": {
                 "temperature": 0.7,
-                "num_predict": 1024,
+                "num_predict": 512,
             },
         }
 
-        for attempt in range(2):
-            try:
-                resp = self.client.post(
-                    f"{self.endpoint}/api/generate",
-                    json=payload,
-                    timeout=httpx.Timeout(self.timeout, connect=60.0),
-                )
-                if resp.status_code == 200:
-                    raw_text = resp.json().get("response", "").strip()
-                    return self._parse_json_array(raw_text)
-            except Exception as e:
-                if attempt == 0 and "timed out" in str(e).lower():
-                    logger.warning(
-                        "Ollama query timed out on %s on initial attempt (likely loading model into VRAM/RAM). Retrying with model now resident...",
-                        model,
-                    )
-                    time.sleep(2.0)
-                    continue
-                logger.warning("Ollama query failed on %s: %s", model, e)
-                break
+        try:
+            resp = self.client.post(
+                f"{self.endpoint}/api/generate",
+                json=payload,
+                timeout=httpx.Timeout(self.timeout, connect=2.0),
+            )
+            if resp.status_code == 200:
+                raw_text = resp.json().get("response", "").strip()
+                return self._parse_json_array(raw_text)
+        except Exception as e:
+            logger.warning("Ollama query failed on %s: %s", model, e)
         return []
 
     def _run_panel_fusion(self, system_instruction: str, user_prompt: str) -> List[Dict[str, Any]]:
@@ -164,6 +206,9 @@ class ModelFusionAdapter:
         AND a secondary security/code model (exploit boundary specialist), merging and
         cross-pollinating their candidate probes to maximize novelty at zero cost.
         """
+        if not self.available_tags:
+            return []
+
         gemma_model = None
         for tag in ["gemma2:2b", "gemma2:9b"]:
             matched = [t for t in self.available_tags if tag in t]
@@ -175,10 +220,13 @@ class ModelFusionAdapter:
             sec_model = self.sec_model
         else:
             sec_model = None
-            for tag in ["qwen2.5:7b", "strix-qwen:latest", "fenkohq/foundation-sec-8b:latest", "deepseek-r1:1.5b", "qwen2.5:32b"]:
-                matched = [t for t in self.available_tags if tag in t or tag.split(":")[0] in t]
+            for tag in [self.sized_qwen, "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "deepseek-r1:1.5b", "fenkohq/foundation-sec-8b:latest"]:
+                matched = [t for t in self.available_tags if tag == t or tag.split(":")[0] in t]
                 if matched:
-                    sec_model = matched[0]
+                    cand_tag = matched[0]
+                    if self.free_ram_gb < 24.0 and any(h in cand_tag for h in ("32b", "70b", "strix-deepseek")):
+                        continue
+                    sec_model = cand_tag
                     break
 
         fusion_panel = []

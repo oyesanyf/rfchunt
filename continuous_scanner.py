@@ -71,7 +71,10 @@ class ContinuousFlawHunter:
             preferred_model=preferred_model, use_fusion=use_fusion, db=self.db
         )
         self.research_engine = ProtocolResearchOrchestrator(
-            primary_host=target_host, primary_port=target_port
+            primary_host=target_host,
+            primary_port=target_port,
+            use_tls=use_tls,
+            db=self.db,
         )
 
         self._stop_requested = False
@@ -166,8 +169,8 @@ class ContinuousFlawHunter:
             if not rfc_text:
                 continue
 
-            # 2. Micro-Inspiration Chunking
-            fragments = RFCChunker.chunk_document(rfc_text, sentences_per_chunk=2)
+            # 2. Micro-Inspiration Chunking (Weighted by Terminator RFC Selector)
+            fragments = RFCChunker.chunk_document_for_terminator(rfc_text, sentences_per_chunk=2, rfc_num=rfc_num)
             if not fragments:
                 self.on_progress(f"[-] No operative fragments found in RFC {rfc_num}. Continuing...")
                 continue
@@ -185,7 +188,8 @@ class ContinuousFlawHunter:
             # Sample top operative fragments
             selected_fragments = fragments[:fragments_per_rfc]
 
-            for frag_text, keywords in selected_fragments:
+            for frag_tuple in selected_fragments:
+                frag_text, keywords = frag_tuple[0], frag_tuple[1]
                 if self._stop_requested:
                     break
 
@@ -302,13 +306,18 @@ class ContinuousFlawHunter:
 
                         # 7.5 Specification-Driven 4-Tier Taxonomy Triage & Arm 106/107 Publishing
                         anom_id = f"ANOM-RFC{rfc_num}-{int(time.time()*1000)}"
+                        raw_req_str = candidate.get("raw_request", "").replace("target.local", self.target_host)
+                        raw_req_str = raw_req_str.replace(
+                            "$PAYLOAD",
+                            f"GET /terminator_marker_8821 HTTP/1.1\r\nHost: {self.target_host}\r\nX-Ignore: 1\r\n\r\n",
+                        )
                         anom_obj = ImplementationAnomaly(
                             anomaly_id=anom_id,
                             target_engine=f"{self.target_host}:{self.target_port}",
                             category=AnomalyCategory.PARSER_DIVERGENCE,
                             observed_behavior=details,
                             expected_behavior="Strict specification conformance",
-                            raw_probe=candidate.get("raw_request", "").encode("latin-1", errors="replace"),
+                            raw_probe=raw_req_str.encode("latin-1", errors="replace"),
                             raw_response=meta.get("attacker_resp", "").encode("latin-1", errors="replace"),
                         )
                         self.db.save_implementation_anomaly(

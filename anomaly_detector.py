@@ -24,9 +24,10 @@ class AnomalyDetector:
         baseline_response: Optional[bytes] = None,
         is_clean_probe: bool = False,
         separate_responses_count: int = 1,
+        db: Optional[object] = None,
     ) -> List[Dict[str, str]]:
-        # dummy baseline subtraction
-        if baseline_response and len(baseline_response) > 0 and len(raw_response) == len(baseline_response):
+        # Exact baseline subtraction (only suppress when response bytes are identical to baseline)
+        if baseline_response and raw_response == baseline_response:
             return []
 
         anomalies: List[Dict[str, str]] = []
@@ -65,12 +66,78 @@ class AnomalyDetector:
                 "description": "Clean (RFC-compliant) request triggered multiple HTTP responses on one connection!",
             })
 
+        # 5. Check for Status-Line Reflection / HTTP/0.9 downgrade
+        is_status_refl, status_refl_details = cls._check_status_line_reflection(raw_response)
+        if is_status_refl:
+            anomalies.append({
+                "type": "status_line_reflection",
+                "description": f"Status-Line Reflection / Downgrade detected: {status_refl_details}",
+            })
+
+        # 6. Check for Range Cache Mismatch (200 OK with Content-Range or multipart/byteranges)
+        is_range_mismatch, range_details = cls._check_range_cache_mismatch(raw_response)
+        if is_range_mismatch:
+            anomalies.append({
+                "type": "range_cache_mismatch",
+                "description": f"Range Cache Mismatch detected: {range_details}",
+            })
+
+        # 7. Check database-registered custom anomaly fingerprints if db is provided
+        if db is not None and hasattr(db, "get_anomaly_fingerprints"):
+            try:
+                text_resp = raw_response.decode("latin-1", errors="ignore")
+                for fp in db.get_anomaly_fingerprints():
+                    pat = fp.get("pattern", "")
+                    if pat and re.search(pat, text_resp, re.IGNORECASE):
+                        anomalies.append({
+                            "type": fp.get("name", "custom_fingerprint"),
+                            "description": fp.get("description", f"Matched custom fingerprint: {pat}"),
+                        })
+            except Exception:
+                pass
+
         return anomalies
 
     @staticmethod
     def _count_http_status_lines(data: bytes) -> int:
         status_pattern = re.compile(rb"HTTP/\d\.\d\s+\d{3}\s+[^\r\n]*\r\n")
         return len(status_pattern.findall(data))
+
+    @staticmethod
+    def _check_status_line_reflection(data: bytes) -> Tuple[bool, str]:
+        """
+        Detects reflected non-standard protocol tokens in the response status line
+        or unexpected HTTP/0.9 status lines (from Status-line Injection / HTTP/0.9 section of the paper).
+        """
+        first_line = data.split(b"\r\n", 1)[0].strip()
+        if not first_line:
+            return False, ""
+        if first_line.startswith(b"HTTP/0.9"):
+            return True, f"HTTP/0.9 status line returned: {first_line.decode('latin-1', errors='ignore')}"
+        # Match non-standard protocol prefix before a 3-digit status code (e.g., 'COW< 200 OK')
+        if not first_line.startswith((b"HTTP/1.0", b"HTTP/1.1", b"HTTP/2", b"HTTP/3")):
+            m = re.match(rb"^([A-Za-z0-9_<>/\.\-]+)\s+(\d{3})\s+", first_line)
+            if m:
+                return True, f"Reflected/non-standard status-line protocol token: {first_line.decode('latin-1', errors='ignore')}"
+        return False, ""
+
+    @staticmethod
+    def _check_range_cache_mismatch(data: bytes) -> Tuple[bool, str]:
+        """
+        Detects HTTP 200 OK responses that unexpectedly include Content-Range headers
+        or multipart/byteranges framing (Range Cache Poisoning indicator).
+        """
+        parts = data.split(b"\r\n\r\n", 1)
+        header_block = parts[0].decode("latin-1", errors="ignore")
+        lines = header_block.split("\r\n")
+        if not lines:
+            return False, ""
+        status_line = lines[0]
+        if re.match(r"^HTTP/\d\.\d\s+200\b", status_line):
+            lower_headers = header_block.lower()
+            if "\r\ncontent-range:" in lower_headers or "multipart/byteranges" in lower_headers:
+                return True, "HTTP 200 OK response contains Content-Range / multipart/byteranges framing instead of 206 Partial Content"
+        return False, ""
 
     @classmethod
     def _check_text_binary_blend(cls, data: bytes) -> Tuple[bool, str]:
