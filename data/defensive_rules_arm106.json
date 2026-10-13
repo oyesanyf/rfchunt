@@ -1,0 +1,18 @@
+[
+  {
+    "rule_id": "OCTO-ARM106-0001",
+    "name": "Hardening Rule for PARSER_CONFUSION",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC10042",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0001,phase:1,deny,status:400\"",
+    "severity": "HIGH"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0002",
+    "name": "Hardening Rule for PARSER_CONFUSION",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC10042",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0002,phase:1,deny,status:400\"",
+    "severity": "HIGH"
+  }
+]
