@@ -280,7 +280,7 @@ class TerminatorMCPServer:
             },
             {
                 "name": "generate_probes",
-                "description": "Generates novel raw HTTP candidate probes from a micro-inspiration fragment using local Google Gemma (Ollama) or Gemini API without buzzword contamination.",
+                "description": "Generates novel raw HTTP candidate probes from a micro-inspiration fragment using 100% local Ollama models (Gemma 2, Foundation-Sec, DeepSeek-R1) without buzzword contamination.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
