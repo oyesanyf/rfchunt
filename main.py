@@ -261,6 +261,16 @@ def cmd_auto(args):
         # 8. Cascade
         cmd_cascade(args)
 
+        # 9. Caldera Auto-Sync (Default)
+        try:
+            from engine.caldera_bridge import CalderaBridge
+            bridge = CalderaBridge(db_path=args.db)
+            c_res = bridge.export_plugin(output_dir="caldera_export")
+            bridge.export_plugin(output_dir=".")
+            print(f"\n[+] Caldera Auto-Sync [Default]: {c_res['abilities_count']} abilities and {c_res['adversaries_count']} adversaries updated.")
+        except Exception as e:
+            print(f"[-] Caldera Auto-Sync notice: {e}")
+
     finally:
         if lab_server:
             lab_server.stop()
@@ -283,6 +293,16 @@ def cmd_hunt(args):
         stop_on_first_flaw=not args.keep_going,
     )
     print(f"\n[*] Hunt complete. Total flaws/anomalies found: {len(flaws)}")
+
+    # Caldera Auto-Sync (Default)
+    try:
+        from engine.caldera_bridge import CalderaBridge
+        bridge = CalderaBridge(db_path=args.db)
+        c_res = bridge.export_plugin(output_dir="caldera_export")
+        bridge.export_plugin(output_dir=".")
+        print(f"[+] Caldera Auto-Sync [Default]: {c_res['abilities_count']} abilities and {c_res['adversaries_count']} adversaries updated.")
+    except Exception as e:
+        pass
 
 
 def cmd_mcp(args):
