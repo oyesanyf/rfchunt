@@ -2,13 +2,18 @@
 RFC HUNT SWARM: Specification-Driven Autonomous Protocol Research Engine
 ========================================================================
 
-An autonomous 12-agent research swarm orchestrated via LangGraph. Implements and extends
-the autonomous security research paradigm pioneered by James Kettle (Director of Research, PortSwigger):
+An autonomous, 12-agent research swarm orchestrated via LangGraph that extracts
+normative grammar rules and micro-inspiration from Post-Quantum Cryptography (PQC)
+and IETF RFC specifications, synthesizes novel boundary and desynchronization probes via
+ModelFusion, executes stateful pipelined canary sequences against live HTTP/TLS endpoints,
+and delta-debugs reproducible anomalies.
+
+Inspired by James Kettle (Director of Research, PortSwigger):
   "Can AI Do Novel Security Research?" (PortSwigger Research, October 2026)
   https://portswigger.net/research/can-ai-do-novel-security-research
 
 Core Mechanisms:
-  - Micro-inspiration chunking from normative IETF RFC specifications
+  - Micro-inspiration chunking from Post-Quantum (PQC) and IETF RFC specifications
   - ModelFusion multi-model consensus (Protocol Specialist + Boundary Specialist + Reasoning Arbiter)
   - Stateful pipelined canary sequences (Baseline GET -> Candidate Probe -> Canary GET)
   - Metamorphic differential oracles & hierarchical delta-debugging
