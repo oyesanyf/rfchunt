@@ -194,13 +194,15 @@ class FusionArbiter:
         if target_model not in self.available_tags:
             target_model = self._resolve_model([model], fallback=self.available_tags[0])
 
-        payload = {
+        payload: Dict[str, Any] = {
             "model": target_model,
             "prompt": f"### SYSTEM:\n{system_prompt}\n\n### INSTRUCTION:\n{prompt}",
             "stream": False,
             "keep_alive": "60m",
-            "options": {"temperature": 0.7, "num_predict": 512},
+            "options": {"temperature": 0.7, "num_predict": 384},
         }
+        if "deepseek-r1" not in target_model.lower():
+            payload["format"] = "json"
         try:
             resp = self.client.post(
                 f"{self.endpoint}/api/generate",
@@ -216,6 +218,8 @@ class FusionArbiter:
                 if fb != target_model and fb in self.available_tags:
                     try:
                         payload["model"] = fb
+                        if "deepseek-r1" in fb.lower():
+                            payload.pop("format", None)
                         resp = self.client.post(
                             f"{self.endpoint}/api/generate",
                             json=payload,
@@ -255,6 +259,8 @@ class FusionArbiter:
             "Output JSON: [{\"rationale\": \"...\", \"raw_request\": \"...\", \"is_clean\": true/false}]"
         )
         gemma_prompt = f"RFC Snippet:\n\"\"\"{rfc_fragment}\"\"\"\nGenerate 1-2 raw HTTP protocol edge-case templates applying Rule Inversion."
+        t0 = time.time()
+        print(f"    -> [ModelFusion 1/3] Protocol Specialist ({self.gemma_model}) generating...", end=" ", flush=True)
         gemma_out = self._query_model(self.gemma_model, gemma_prompt, gemma_sys)
         participating_models.append(self.gemma_model)
 
@@ -270,6 +276,7 @@ class FusionArbiter:
                 raw_request=norm_req,
                 is_clean=bool(item.get("is_clean", True)),
             ))
+        print(f"done ({time.time() - t0:.1f}s, {len(proposals)} proposals)", flush=True)
 
         # ------------------------------------------------------------------
         # Phase 2: Exploit Boundary Specialist (Foundation-Sec / Qwen)
@@ -286,6 +293,9 @@ class FusionArbiter:
             "Output JSON: [{\"rationale\": \"...\", \"raw_request\": \"...\", \"is_clean\": false}]"
         )
         sec_prompt = f"RFC Snippet:\n\"\"\"{rfc_fragment}\"\"\"\nGenerate 1-2 boundary confusion probes applying Cross-Context Inversion."
+        t1 = time.time()
+        before_sec = len(proposals)
+        print(f"    -> [ModelFusion 2/3] Boundary Specialist ({self.sec_model}) generating...", end=" ", flush=True)
         sec_out = self._query_model(self.sec_model, sec_prompt, sec_sys)
         participating_models.append(self.sec_model)
 
@@ -301,6 +311,7 @@ class FusionArbiter:
                 raw_request=norm_req,
                 is_clean=bool(item.get("is_clean", False)),
             ))
+        print(f"done ({time.time() - t1:.1f}s, {len(proposals) - before_sec} proposals)", flush=True)
 
         # ------------------------------------------------------------------
         # Gate 1: Single Candidate Bypass
@@ -356,8 +367,11 @@ class FusionArbiter:
             f"Synthesize the optimal consensus probe."
         )
 
+        t2 = time.time()
+        print(f"    -> [ModelFusion 3/3] Reasoning Arbiter ({self.arbiter_model}) synthesizing...", end=" ", flush=True)
         arbiter_out = self._query_model(self.arbiter_model, arbiter_prompt, arbiter_sys)
         synthesized_probes = self._parse_json(arbiter_out)
+        print(f"done ({time.time() - t2:.1f}s)", flush=True)
 
         final_fused: List[Dict[str, Any]] = []
 

@@ -192,6 +192,9 @@ class ProtocolResearchSwarm:
         debug: bool = False,
         concurrency: int = 4,
     ):
+        host = re.sub(r"^https?://", "", str(host).strip(), flags=re.IGNORECASE).split("/")[0]
+        if ":" in host and not host.startswith("["):
+            host = host.split(":")[0]
         self.host = host
         self.port = port
         self.use_tls = use_tls
@@ -930,6 +933,16 @@ USAGE EXAMPLES (All run directly via rfc_hunt_swarm.py):
         print("[+] Launching Model Context Protocol (MCP) Server over JSON-RPC stdio...")
         TerminatorMCPServer().run_stdio()
         sys.exit(0)
+
+    # Normalize args.host (strip http://, https://, trailing slashes/paths, and inline :port)
+    if args.host:
+        raw_h = str(args.host).strip()
+        if raw_h.lower().startswith("https://"):
+            args.tls = True
+        clean_h = re.sub(r"^https?://", "", raw_h, flags=re.IGNORECASE).split("/")[0]
+        if ":" in clean_h and not clean_h.startswith("["):
+            clean_h = clean_h.split(":")[0]
+        args.host = clean_h
 
     # Authorize and validate target host specified on the CLI
     from mcp_server import TargetAuthorizationGate
