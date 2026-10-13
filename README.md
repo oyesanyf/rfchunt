@@ -48,18 +48,34 @@ Traditional fuzzer and LLM security audits fail on network protocols because the
 **RFC Hunt Swarm** solves this using James Kettle's micro-inspiration discipline:
 
 ```mermaid
-flowchart LR
-    A["IETF RFC Standards\n(HTTP, SMTP, PQC)"] --> B["RFC Chunker\n(1-3 Sentence Micro-Fragments)"]
-    B --> C["ModelFusion Panel\n(Gemma 2 + Foundation-Sec + R1)"]
-    C --> D["Vector Permutator\n(Line Endings, Headers, Delimiters)"]
-    D --> E["Stateful Sequence Engine\n(Req 1 Baseline ➔ Req 2 Probe ➔ Req 3 Canary)"]
-    E --> F{"Anomaly Detected?"}
-    F -- Yes --> G["Delta-Debugging Triage\n(Byte-by-Byte Minimization)"]
-    G --> H["Autonomous Discovery Cascade\n(Second-Order Hypotheses)"]
-    H --> C
-    G --> I["Defensive Publisher\n(Snort/Suricata & Pytest Suites)"]
-    F -- No --> J["Next RFC Fragment"]
+flowchart TD
+    subgraph INGEST ["1. Specification Ingestion & Micro-Inspiration"]
+        direction TB
+        A["IETF RFC Standards\n(HTTP, SMTP, Post-Quantum PQC)"] --> B["RFC Chunker\n(1-3 Sentence Micro-Fragments)"]
+    end
+
+    subgraph GEN ["2. Consensus Synthesis & Mutation"]
+        direction TB
+        B --> C["ModelFusion Consensus Panel\n(Gemma 2 + Foundation-Sec + DeepSeek R1)"]
+        C --> D["Vector Permutator\n(Line Endings, Delimiters, Obsolete Foldings)"]
+    end
+
+    subgraph EXEC ["3. Stateful Verification & Differential Oracle"]
+        direction TB
+        D --> E["Stateful Sequence Engine\n(Req 1 Baseline ➔ Req 2 Probe ➔ Req 3 Canary)"]
+        E --> F{"Anomaly or Leak\nDetected?"}
+    end
+
+    subgraph TRIAGE ["4. Triage & Defensive Intelligence"]
+        direction TB
+        F -- "Yes" --> G["Delta-Debugging Triage\n(Byte-by-Byte Minimization)"]
+        G --> H["Autonomous Discovery Cascade\n(Second-Order Hypotheses)"]
+        G --> I["Defensive Publisher\n(Snort/Suricata & Pytest Suites)"]
+    end
+
+    F -- "No" --> J["Next Specification Fragment"]
     J --> C
+    H --> C
 ```
 
 1. **Micro-Inspiration Engine**: Normative RFC specifications are split into isolated 1–3 sentence grammatical clues. Zero buzzwords (*"desync"*, *"smuggling"*) are used in prompts, forcing models to derive state-machine anomalies from first principles.
