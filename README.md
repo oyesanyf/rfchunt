@@ -18,7 +18,9 @@
 [![James Kettle Research](https://img.shields.io/badge/Research-James%20Kettle%20DEF%20CON%2034-red.svg?style=for-the-badge)](https://portswigger.net/research/can-ai-do-novel-security-research)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-green.svg?style=for-the-badge)](LICENSE)
 
-*An autonomous 12-agent research swarm and differential ruler implementing the methodologies of James Kettle (Director of Research, PortSwigger) from **"Can AI Do Novel Security Research?"** (October 2026).*
+> [!IMPORTANT]
+> **Inspired by James Kettle's Seminal Research ([Can AI Do Novel Security Research?](https://portswigger.net/research/can-ai-do-novel-security-research))**:
+> An autonomous, 12-agent research swarm orchestrated via LangGraph that extracts normative grammar rules and micro-inspiration from IETF RFC specifications, synthesizes novel boundary and desynchronization probes via ModelFusion, executes stateful pipelined canary sequences against live HTTP/TLS endpoints, and delta-debugs reproducible anomalies.
 
 </div>
 
@@ -298,7 +300,8 @@ Modular toolkit providing discrete CLI commands for each phase of the research f
 
 ## Research Attribution & Citations
 
-This repository is built upon the protocol research methodologies pioneered by **James Kettle** (Director of Research, PortSwigger):
+This project was inspired by James Kettle's research ([Can AI Do Novel Security Research?](https://portswigger.net/research/can-ai-do-novel-security-research), October 2026):
+> *An autonomous, 12-agent research swarm orchestrated via LangGraph that extracts normative grammar rules and micro-inspiration from IETF RFC specifications, synthesizes novel boundary and desynchronization probes via ModelFusion, executes stateful pipelined canary sequences against live HTTP/TLS endpoints, and delta-debugs reproducible anomalies.*
 
 - **Seminal Research Paper**: [Can AI Do Novel Security Research?](https://portswigger.net/research/can-ai-do-novel-security-research) (PortSwigger Research, October 2026)
 - **Author**: James Kettle ([@albinowax](https://x.com/albinowax) / [jameskettle.com](https://jameskettle.com/))
