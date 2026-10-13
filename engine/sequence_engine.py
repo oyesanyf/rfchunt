@@ -186,10 +186,30 @@ class StatefulProtocolSequenceEngine:
                 report.has_pipeline_leak = False
                 report.details = "Normal: Canary request routed cleanly without boundary leakage."
             elif b"400 bad request" in resp3.lower() and status1 == 200:
-                # Possible prefix contamination: probe residual bytes broke canary syntax
-                report.has_pipeline_leak = True
-                report.has_desynchronization = True
-                report.details = "Pipeline Leak: Residual probe bytes corrupted the subsequent canary request."
+                # Check if probe was an un-framed client body (RFC 9112 Section 6.1 framing omission)
+                probe_lower = candidate_probe.lower()
+                has_cl = b"content-length:" in probe_lower or b"content-length :" in probe_lower
+                has_te = b"transfer-encoding:" in probe_lower or b"transfer-encoding :" in probe_lower
+                has_body = False
+                if b"\r\n\r\n" in candidate_probe:
+                    _, body_part = candidate_probe.split(b"\r\n\r\n", 1)
+                    has_body = len(body_part.strip()) > 0
+
+                if has_body and not has_cl and not has_te:
+                    # Client sent un-framed body without Content-Length or Transfer-Encoding.
+                    # Under RFC 9112 Section 6.1, message body length is zero.
+                    # Trailing bytes remained on socket; server 400 rejection is conforming behavior, not a vulnerability!
+                    report.has_pipeline_leak = False
+                    report.has_desynchronization = False
+                    report.details = (
+                        "Client Framing Omission: Candidate probe sent un-framed body without Content-Length "
+                        "or Transfer-Encoding; server treated body length as 0 (RFC 9112 Section 6.1) and rejected "
+                        "trailing socket bytes with 400 Bad Request. Conforming HTTP behavior, not a pipeline leak."
+                    )
+                else:
+                    report.has_pipeline_leak = True
+                    report.has_desynchronization = True
+                    report.details = "Pipeline Leak: Residual probe bytes corrupted the subsequent canary request."
             elif b"terminator_marker" in resp3.lower() or b"x-smuggle" in resp3.lower():
                 report.has_desynchronization = True
                 report.details = "Queue Desynchronization: Candidate probe response or body bled directly into canary stream."

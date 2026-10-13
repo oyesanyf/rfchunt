@@ -82,6 +82,16 @@ class CausalAnomalyClassifier:
                 or "premature connection termination before canary" in obs_lower
             ):
                 return True, "Ordinary RFC 9112 Section 9.3 connection teardown on client error rejection; not a vulnerability."
+            if "client framing omission" in obs_lower:
+                return True, "Client sent un-framed body without Content-Length or Transfer-Encoding; trailing bytes are an RFC 9112 §6.1 framing omission, not a pipeline leak."
+
+        # Check if probe sent un-framed body without Content-Length or Transfer-Encoding
+        raw_probe = anomaly.raw_probe or b""
+        if b"\r\n\r\n" in raw_probe:
+            probe_lower = raw_probe.lower()
+            _, body = raw_probe.split(b"\r\n\r\n", 1)
+            if len(body.strip()) > 0 and b"content-length" not in probe_lower and b"transfer-encoding" not in probe_lower:
+                return True, "Probe contains body without Content-Length or Transfer-Encoding; trailing bytes are un-framed per RFC 9112 Section 6.1, not a server vulnerability."
 
         return False, ""
 
@@ -117,13 +127,20 @@ class CausalAnomalyClassifier:
                 )
 
         # For pipeline leaks / queue desync, verify that desynchronization was actually demonstrated
-        if vuln.impact in (ImpactClass.QUEUE_POISONING, ImpactClass.DESYNCHRONIZATION):
+        if (
+            vuln.impact in (ImpactClass.QUEUE_POISONING, ImpactClass.DESYNCHRONIZATION)
+            or anomaly.category == AnomalyCategory.PIPELINE_LEAK
+            or "pipeline leak" in anomaly.observed_behavior.lower()
+        ):
             probe_lower = vuln.minimized_probe.lower()
             has_desync_vectors = (
-                b"transfer-encoding" in probe_lower and b"content-length" in probe_lower
-            ) or b"canary" in probe_lower or b"terminator_marker" in probe_lower
-            if not has_desync_vectors and anomaly.category == AnomalyCategory.PIPELINE_LEAK:
-                return False, "Unvalidated pipeline leak: does not exhibit verified cross-request queue desynchronization."
+                (b"transfer-encoding" in probe_lower and b"content-length" in probe_lower)
+                or b"canary" in probe_lower
+                or b"terminator_marker" in probe_lower
+                or (b"transfer-encoding" in probe_lower and b"chunk" in probe_lower)
+            )
+            if not has_desync_vectors:
+                return False, "Unvalidated pipeline leak: does not exhibit verified cross-request queue desynchronization or conflicting framing headers."
 
         return True, "Evidence verified: anomaly cannot be explained by ordinary response framing."
 
