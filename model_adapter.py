@@ -220,7 +220,7 @@ class ModelFusionAdapter:
             sec_model = self.sec_model
         else:
             sec_model = None
-            for tag in [self.sized_qwen, "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "deepseek-r1:1.5b", "fenkohq/foundation-sec-8b:latest"]:
+            for tag in ["fenkohq/foundation-sec-8b:latest", self.sized_qwen, "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "deepseek-r1:1.5b"]:
                 matched = [t for t in self.available_tags if tag == t or tag.split(":")[0] in t]
                 if matched:
                     cand_tag = matched[0]

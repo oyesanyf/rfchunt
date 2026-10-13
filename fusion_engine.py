@@ -95,14 +95,14 @@ class FusionArbiter:
         self.free_ram_gb = self._get_free_memory_gb()
         sized_qwen = self._size_qwen_for_free_memory(self.free_ram_gb)
 
-        # Dynamic Model Assignment matching ModelFusion Tiered Scaling & Free RAM Law
+        # Dynamic Model Assignment: Foundation-Sec-8B is the primary Security/Boundary Specialist
         self.gemma_model = self._resolve_model(["gemma2:2b", "gemma2:9b", sized_qwen], fallback="gemma2:2b")
         if sec_model:
             self.sec_model = sec_model
         else:
             self.sec_model = self._resolve_model(
-                [sized_qwen, "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "fenkohq/foundation-sec-8b:latest", "strix-qwen:latest"],
-                fallback=sized_qwen,
+                ["fenkohq/foundation-sec-8b:latest", sized_qwen, "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "strix-qwen:latest"],
+                fallback="fenkohq/foundation-sec-8b:latest",
             )
         self.arbiter_model = self._resolve_model(
             ["deepseek-r1:1.5b", sized_qwen, "gemma2:2b", "strix-deepseek:latest"],
