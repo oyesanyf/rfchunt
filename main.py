@@ -319,6 +319,33 @@ def cmd_ruler(args):
     ruler.run_comprehensive_audit(custom_sequences=custom, max_size=args.max_size)
 
 
+def cmd_dream(args):
+    """Executes offline Dream-RSI policy evolution over accumulated database trajectories."""
+    from engine.dream_world_model import ProtocolWorldModel
+    from engine.dream_rsi_optimizer import DreamRSIOptimizer
+    from engine.dream_policy_store import DreamPolicyStore
+
+    print(f"[*] Initializing Dream-RSI World Model from {args.db}...")
+    model = ProtocolWorldModel(target_host=args.target, target_port=args.port)
+    loaded = model.ingest_history_from_db(args.db)
+    print(f"[+] Loaded {loaded} execution trajectories into offline World Model.")
+
+    optimizer = DreamRSIOptimizer(model)
+    store = DreamPolicyStore(storage_path=args.export)
+
+    print(f"[*] Executing {args.generations} generations of off-policy dreaming ({args.rollouts} rollouts each)...")
+    for g in range(args.generations):
+        evolved = optimizer.evolve_policy_generation(rollouts_per_candidate=args.rollouts)
+        store.save_policy(evolved)
+        gain_str = f"+{evolved.rsi_gain * 100:.1f}%" if evolved.rsi_gain > 0 else "0.0%"
+        print(f"  [Gen {evolved.generation}] Fitness: {evolved.fitness_score:.2f} | RSI Gain: {gain_str} | Yield: {evolved.simulated_yield:.1%}")
+
+    summary = store.export_summary()
+    print(f"\n[+] Dream-RSI Optimization Complete. Policies saved to {args.export}.")
+    print(f"    Total Cumulative Gain: {summary.get('cumulative_rsi_gain_pct', 0.0)}%")
+    print(f"    Dominant Mutators: {summary.get('dominant_mutators', [])}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="HTTP Terminator: Autonomous Security Research Engine")
     parser.add_argument("--db", default="terminator.db", help="SQLite database path")
@@ -407,7 +434,14 @@ def main():
     p_auto.add_argument("--port", type=int, default=8080, help="Target port")
     p_auto.add_argument("--tls", action="store_true", help="Use TLS")
     p_auto.add_argument("--timeout", type=float, default=3.0, help="Socket timeout")
-    p_auto.add_argument("--demo", action="store_true", help="Enable cascade demo if needed")
+    # Dream (Open Dream-RSI: Off-Policy Recursive Self-Improvement)
+    p_dream = subparsers.add_parser("dream", help="Run offline Dream-RSI policy evolution")
+    p_dream.add_argument("--db", default="terminator.db", help="Path to database with exploration history")
+    p_dream.add_argument("--target", default="127.0.0.1", help="Target host")
+    p_dream.add_argument("--port", type=int, default=5006, help="Target port")
+    p_dream.add_argument("--rollouts", type=int, default=300, help="Rollouts per candidate policy")
+    p_dream.add_argument("--generations", type=int, default=3, help="Evolutionary dream generations")
+    p_dream.add_argument("--export", default="data/dream_policies.json", help="Path to export evolved policies")
 
     args = parser.parse_args()
 
@@ -428,6 +462,7 @@ def main():
         "cascade": cmd_cascade,
         "lab": cmd_lab,
         "auto": cmd_auto,
+        "dream": cmd_dream,
     }
 
     dispatch[args.command](args)

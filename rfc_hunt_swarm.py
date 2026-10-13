@@ -57,8 +57,11 @@ from engine.taxonomy import (
     NovelTechnique,
     ReproducibleVulnerability,
 )
+from engine.dream_world_model import ProtocolWorldModel
+from engine.dream_rsi_optimizer import DreamRSIOptimizer, DreamPolicy
+from engine.dream_policy_store import DreamPolicyStore
 
-# 1. State Definition (Encompassing all original functionality)
+# 1. State Definition (Encompassing all original functionality + Dream-RSI)
 class ResearchState(TypedDict):
     rfc_num: str
     rfc_text: str
@@ -74,6 +77,9 @@ class ResearchState(TypedDict):
     cycle_count: int
     max_cycles: int
     baseline_resp: Optional[bytes]
+    enable_dream_rsi: bool
+    dream_rollouts: int
+    current_dream_policy: Optional[Dict[str, Any]]
     history: Annotated[List[str], operator.add]
 
 
@@ -212,6 +218,15 @@ class ProtocolResearchSwarm:
         self.boundary = CrossProtocolBoundaryAnalyzer()
         self.knowledge_graph = ResearchKnowledgeGraph()
         self.publisher = DefensiveIntelligencePublisher()
+
+        # Open Dream-RSI Engine (Modules 13-15)
+        self.dream_world_model = ProtocolWorldModel(target_host=host, target_port=port)
+        self.dream_world_model.ingest_history_from_db(db_path=db_path)
+        self.dream_optimizer = DreamRSIOptimizer(self.dream_world_model)
+        self.dream_store = DreamPolicyStore()
+        latest_pol = self.dream_store.get_latest_policy()
+        if latest_pol:
+            self.bandit.apply_dream_policy(latest_pol)
 
     # Agent 1: Fetch and Chunk (Replaces manual string entry)
     def fetch_and_chunk_agent(self, state: ResearchState) -> dict:
@@ -383,6 +398,18 @@ class ProtocolResearchSwarm:
         baseline_step = next((s for s in seq_report.steps if "Baseline" in s.step_name), None)
         baseline_resp_bytes = baseline_step.received_bytes if baseline_step else b""
 
+        # Record live step in Dream-RSI World Model
+        self.dream_world_model.record_step(
+            probe_bytes=probe_bytes,
+            status_code=status_code,
+            raw_response=resp_bytes,
+            latency=latency_ms / 1000.0,
+            is_anomaly=bool(anomaly),
+            anomaly_category=anomaly.category.value if anomaly else None,
+            is_vulnerability=False,
+            details=resp_summary,
+        )
+
         if anomaly:
             # SAVE to Database exactly like the original code
             self.db.save_implementation_anomaly(
@@ -420,6 +447,8 @@ class ProtocolResearchSwarm:
         # Cycle count logic
         cc = state.get("cycle_count", 0) + 1
         if cc >= state.get("max_cycles", 3):
+            if state.get("enable_dream_rsi", False):
+                return "dream_rsi_agent"
             return END
             
         # Get more from LLM
@@ -553,9 +582,26 @@ class ProtocolResearchSwarm:
             "history": [f"cascade_publish: Ran Cascade, Published rules ({arm_id}), and saved Forensic trace!"]
         }
 
+    # Agent 13: Dream-RSI (Recursive Self-Improvement through Evolving Worlds)
+    def dream_rsi_agent(self, state: ResearchState) -> dict:
+        rollouts = state.get("dream_rollouts", 300)
+        print(f"\n[*] [DREAM-RSI] Initiating Off-Policy Dreaming Cycle ({rollouts} rollouts)...")
+        evolved_policy = self.dream_optimizer.evolve_policy_generation(rollouts_per_candidate=rollouts)
+        self.dream_store.save_policy(evolved_policy)
+        self.bandit.apply_dream_policy(evolved_policy)
+
+        gain_str = f"+{evolved_policy.rsi_gain * 100:.1f}%" if evolved_policy.rsi_gain > 0 else "0.0%"
+        print(f"[+] [DREAM-RSI] Policy Evolved: Gen {evolved_policy.generation} | RSI Gain: {gain_str} | Hot-reloaded into Swarm Scheduler.")
+        return {
+            "current_dream_policy": evolved_policy.to_dict(),
+            "history": [f"dream_rsi: Evolved Gen {evolved_policy.generation} policy (gain: {gain_str})."]
+        }
+
     def route_after_publish(self, state: ResearchState) -> str:
         # Check cycles or go back to testing candidates
         if state.get("cycle_count", 0) >= state.get("max_cycles", 3):
+            if state.get("enable_dream_rsi", False):
+                return "dream_rsi_agent"
             return END
         if state.get("generated_candidates"):
             return "execution_oracle_agent"
@@ -571,10 +617,12 @@ class ProtocolResearchSwarm:
         builder.add_node("execution_oracle_agent", self.execution_oracle_agent)
         builder.add_node("triage_debugger_agent", self.triage_debugger_agent)
         builder.add_node("cascade_and_publish_agent", self.cascade_and_publish_agent)
+        builder.add_node("dream_rsi_agent", self.dream_rsi_agent)
 
         # Edges
         builder.set_entry_point("fetch_and_chunk_agent")
         builder.add_edge("fetch_and_chunk_agent", "llm_generator_agent")
+        builder.add_edge("dream_rsi_agent", END)
         
         builder.add_conditional_edges("llm_generator_agent", self.route_after_generation)
         builder.add_conditional_edges("execution_oracle_agent", self.route_after_execution)
@@ -674,6 +722,9 @@ USAGE EXAMPLES:
         action="store_true",
         help="Explicitly authorize active security testing against remote/public target (e.g. dlptest.com) or allow any target",
     )
+    parser.add_argument("--dream-rsi", action="store_true", help="Enable Open Dream-RSI: recursive off-policy self-improvement between cycles")
+    parser.add_argument("--dream-rollouts", type=int, default=300, help="Number of simulated rollouts per dream generation (default: 300)")
+    parser.add_argument("--dream-export", type=str, default="data/dream_policies.json", help="Path to export evolved Dream-RSI policies")
     args = parser.parse_args()
 
     # Target restrictions removed: allow any target specified on the CLI
@@ -756,6 +807,9 @@ USAGE EXAMPLES:
             "cycle_count": 0,
             "max_cycles": args.cycles,
             "baseline_resp": b"",
+            "enable_dream_rsi": bool(args.dream_rsi),
+            "dream_rollouts": args.dream_rollouts,
+            "current_dream_policy": None,
             "history": []
         }
 
