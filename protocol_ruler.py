@@ -31,6 +31,7 @@ import ssl
 import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from engine.http_framing import HTTPFramingReader
 
 
 def format_kettle_ruler_bytes(raw_bytes: bytes, max_len: int = 120) -> str:
@@ -122,25 +123,11 @@ class ProtocolRuler:
         try:
             sock = self._open_socket()
             sock.sendall(request_bytes)
-            sock.settimeout(self.timeout)
-            buf = bytearray()
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                buf.extend(chunk)
-                if b"\r\n\r\n" in buf or len(buf) >= 16384:
-                    break
+            framed = HTTPFramingReader.read_response(sock, timeout=self.timeout)
             sock.close()
-            response_bytes = bytes(buf)
+            status_code = framed.status_code
+            response_bytes = framed.raw_response
             latency = (time.time() - t0) * 1000
-
-            # Extract HTTP status code
-            if response_bytes.startswith(b"HTTP/1.") or response_bytes.startswith(b"HTTP/2.") or response_bytes.startswith(b"HTTP/0.9"):
-                first_line = response_bytes.split(b"\r\n", 1)[0].decode("latin-1", errors="ignore")
-                parts = first_line.split()
-                if len(parts) >= 2 and parts[1].isdigit():
-                    status_code = int(parts[1])
             return status_code, response_bytes, latency
         except Exception:
             latency = (time.time() - t0) * 1000

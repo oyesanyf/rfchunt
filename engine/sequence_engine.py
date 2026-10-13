@@ -12,6 +12,7 @@ import ssl
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+from engine.http_framing import HTTPFramingReader
 from engine.taxonomy import AnomalyCategory, ImplementationAnomaly
 
 
@@ -49,7 +50,7 @@ class StatefulProtocolSequenceEngine:
     ) -> SequenceExecutionReport:
         """
         Executes a 3-step sequence on a SINGLE persistent TCP connection:
-        1. Baseline request -> ensure connection is clean and open.
+        1. Baseline request -> ensure connection is clean, open, and response body completely consumed.
         2. Candidate probe -> ambiguous boundary or mutated rule.
         3. Canary request -> detects if probe residual bytes leaked into canary.
         """
@@ -78,8 +79,10 @@ class StatefulProtocolSequenceEngine:
             start_t = time.time()
             baseline_req = f"GET / HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n".encode()
             sock.sendall(baseline_req)
-            resp1 = self._read_socket_available(sock, timeout=2.0)
-            status1 = self._extract_status_code(resp1)
+            framed1 = HTTPFramingReader.read_response(sock, timeout=self.default_timeout, request_method="GET")
+            resp1 = framed1.raw_response
+            status1 = framed1.status_code
+            latency1 = time.time() - start_t
 
             report.steps.append(
                 SequenceStepResult(
@@ -87,15 +90,33 @@ class StatefulProtocolSequenceEngine:
                     sent_bytes=baseline_req,
                     received_bytes=resp1,
                     status_code=status1,
-                    latency=time.time() - start_t,
+                    latency=latency1,
+                    socket_error=framed1.error,
                 )
             )
+
+            # Invariant: Baseline response must be fully consumed and valid
+            if not framed1.is_complete:
+                report.has_desynchronization = False
+                report.has_pipeline_leak = False
+                report.details = f"Baseline response incomplete or timed out: {framed1.error or 'framing incomplete'}"
+                return report
+
+            if framed1.is_connection_closed:
+                report.has_desynchronization = False
+                report.has_pipeline_leak = False
+                report.details = "Baseline response closed connection (Connection: close or EOF); persistent pipelining not supported."
+                return report
 
             # Step 2: Send Candidate Probe
             start_t = time.time()
             sock.sendall(candidate_probe)
-            resp2 = self._read_socket_available(sock, timeout=2.0)
-            status2 = self._extract_status_code(resp2)
+            framed2 = HTTPFramingReader.read_response(
+                sock, timeout=self.default_timeout, initial_bytes=framed1.unconsumed_bytes
+            )
+            resp2 = framed2.raw_response
+            status2 = framed2.status_code
+            latency2 = time.time() - start_t
 
             report.steps.append(
                 SequenceStepResult(
@@ -103,15 +124,48 @@ class StatefulProtocolSequenceEngine:
                     sent_bytes=candidate_probe,
                     received_bytes=resp2,
                     status_code=status2,
-                    latency=time.time() - start_t,
+                    latency=latency2,
+                    socket_error=framed2.error,
                 )
             )
 
+            # Check if Step 2 received leftover baseline HTML bytes (scanner artifact guard)
+            if framed1.body and resp2 and (resp2 in framed1.body or framed1.body.startswith(resp2[:100])):
+                report.has_desynchronization = False
+                report.has_pipeline_leak = False
+                report.details = "Scanner Artifact: Residual baseline response bytes detected on socket; not a pipeline leak."
+                return report
+
+            # Check if server closed connection following candidate probe (RFC 9112 Section 9.3 client error closure)
+            server_closed_after_probe = framed2.is_connection_closed or status2 in (400, 431, 500, 501, 505)
+
             # Step 3: Canary Request
+            if server_closed_after_probe:
+                # Connection was cleanly closed by the server due to malformed probe rejection.
+                # Do not treat standard error connection teardown as a pipeline leak!
+                report.steps.append(
+                    SequenceStepResult(
+                        step_name="Step 3: Canary Check",
+                        sent_bytes=canary_request,
+                        received_bytes=b"",
+                        status_code=0,
+                        latency=0.0,
+                        socket_error="Connection closed by server after candidate probe",
+                    )
+                )
+                report.has_desynchronization = False
+                report.has_pipeline_leak = False
+                report.details = f"Connection closed by server after candidate probe ({status2} rejection); expected HTTP error behavior, not a pipeline leak."
+                return report
+
             start_t = time.time()
             sock.sendall(canary_request)
-            resp3 = self._read_socket_available(sock, timeout=2.5)
-            status3 = self._extract_status_code(resp3)
+            framed3 = HTTPFramingReader.read_response(
+                sock, timeout=self.default_timeout, initial_bytes=framed2.unconsumed_bytes
+            )
+            resp3 = framed3.raw_response
+            status3 = framed3.status_code
+            latency3 = time.time() - start_t
 
             report.steps.append(
                 SequenceStepResult(
@@ -119,27 +173,39 @@ class StatefulProtocolSequenceEngine:
                     sent_bytes=canary_request,
                     received_bytes=resp3,
                     status_code=status3,
-                    latency=time.time() - start_t,
+                    latency=latency3,
+                    socket_error=framed3.error,
                 )
             )
 
             # Analyze sequence anomalies
             canary_bytes_lower = resp3.lower()
-            if canary_token.lower().encode() in canary_bytes_lower and b"404" in resp3:
+            if canary_token.lower().encode() in canary_bytes_lower and (b"404" in resp3 or status3 == 404):
                 # Normal: server processed canary route cleanly
                 report.has_desynchronization = False
+                report.has_pipeline_leak = False
                 report.details = "Normal: Canary request routed cleanly without boundary leakage."
             elif b"400 bad request" in resp3.lower() and status1 == 200:
-                # Possible prefix contamination: probe bytes broke canary syntax
+                # Possible prefix contamination: probe residual bytes broke canary syntax
                 report.has_pipeline_leak = True
                 report.has_desynchronization = True
                 report.details = "Pipeline Leak: Residual probe bytes corrupted the subsequent canary request."
-            elif resp3 == b"" and len(resp2) > 0:
-                report.has_pipeline_leak = True
-                report.details = "Connection Dropped: Candidate probe caused premature connection termination before canary."
             elif b"terminator_marker" in resp3.lower() or b"x-smuggle" in resp3.lower():
                 report.has_desynchronization = True
                 report.details = "Queue Desynchronization: Candidate probe response or body bled directly into canary stream."
+            elif resp3 == b"" and len(resp2) > 0:
+                # Normal connection drop if status was an error
+                if status2 in (400, 431, 500, 501, 505):
+                    report.has_pipeline_leak = False
+                    report.has_desynchronization = False
+                    report.details = f"Connection closed by server after candidate probe ({status2}); expected HTTP error behavior."
+                else:
+                    report.has_pipeline_leak = False
+                    report.details = "Connection Dropped: Candidate probe caused connection termination before canary."
+            else:
+                report.has_desynchronization = False
+                report.has_pipeline_leak = False
+                report.details = "Normal: No stateful boundary contamination observed."
 
         except socket.timeout:
             report.details = "Socket Timeout during pipelined sequence execution."
@@ -157,29 +223,10 @@ class StatefulProtocolSequenceEngine:
         return report
 
     def _read_socket_available(self, sock: socket.socket, timeout: float = 2.0) -> bytes:
-        """Reads whatever data is currently ready on the socket."""
-        sock.settimeout(timeout)
-        buf = b""
-        while True:
-            try:
-                data = sock.recv(4096)
-                if not data:
-                    break
-                buf += data
-                if b"\r\n\r\n" in buf and len(buf) > 1024:
-                    break
-            except socket.timeout:
-                break
-            except Exception:
-                break
-        return buf
+        """Reads a fully framed HTTP response from the socket per RFC 9112."""
+        framed = HTTPFramingReader.read_response(sock, timeout=timeout)
+        return framed.raw_response
 
     def _extract_status_code(self, data: bytes) -> int:
-        try:
-            first_line = data.split(b"\r\n", 1)[0].decode("latin-1", errors="replace")
-            parts = first_line.split(" ", 2)
-            if len(parts) > 1 and parts[1].isdigit():
-                return int(parts[1])
-        except Exception:
-            pass
-        return 0
+        return HTTPFramingReader._parse_headers(data)[0]
+

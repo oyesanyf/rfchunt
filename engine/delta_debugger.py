@@ -10,7 +10,8 @@ import socket
 import ssl
 import time
 from typing import Callable, List, Optional, Tuple
-from engine.taxonomy import ImpactClass, ImplementationAnomaly, ReproducibleVulnerability
+from engine.http_framing import HTTPFramingReader
+from engine.taxonomy import AnomalyCategory, ImpactClass, ImplementationAnomaly, ReproducibleVulnerability
 
 
 class DeltaDebugger:
@@ -116,7 +117,23 @@ class DeltaDebugger:
         return current_probe, steps
 
     def _default_oracle(self, anomaly: ImplementationAnomaly) -> Callable[[bytes], bool]:
-        """Creates a socket test oracle that tests if the target reproduces the anomaly status code."""
+        """Creates a socket test oracle that tests if the target reproduces the anomaly behavior."""
+        if anomaly.category == AnomalyCategory.PIPELINE_LEAK:
+            # Pipelined sequence verification: verify that candidate probe causes genuine pipeline leak / desync
+            from engine.sequence_engine import StatefulProtocolSequenceEngine
+            seq_engine = StatefulProtocolSequenceEngine(default_timeout=self.timeout)
+
+            def pipeline_oracle(test_bytes: bytes) -> bool:
+                try:
+                    report = seq_engine.run_pipelined_canary_sequence(
+                        self.host, self.port, test_bytes, use_tls=self.use_tls
+                    )
+                    return report.has_pipeline_leak or report.has_desynchronization
+                except Exception:
+                    return False
+
+            return pipeline_oracle
+
         def oracle(test_bytes: bytes) -> bool:
             sock = None
             try:
@@ -127,21 +144,14 @@ class DeltaDebugger:
                     context.verify_mode = ssl.CERT_NONE
                     sock = context.wrap_socket(sock, server_hostname=self.host)
                 sock.sendall(test_bytes)
-                sock.settimeout(self.timeout)
-                resp = b""
-                while True:
-                    data = sock.recv(4096)
-                    if not data:
-                        break
-                    resp += data
-                    if b"\r\n\r\n" in resp:
-                        break
-                # Check if behavior matches anomalous pattern
-                if b"400 Bad Request" in resp or b"500 Internal" in resp or len(resp) == 0:
+                framed = HTTPFramingReader.read_response(sock, timeout=self.timeout)
+                resp = framed.raw_response
+                # Check if behavior matches anomalous pattern (e.g. server crash or 500 error)
+                if framed.status_code == 500 or b"500 Internal" in resp:
                     return True
                 return False
             except (socket.timeout, ConnectionResetError):
-                return True
+                return False
             except Exception:
                 return False
             finally:

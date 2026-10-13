@@ -31,12 +31,17 @@ class DefensiveIntelligencePublisher:
         self.arm107_tests: List[Arm107RegressionTest] = []
 
     def publish_finding(
-        self, vuln: ReproducibleVulnerability, rfc_anchor: str = "RFC9112"
-    ) -> Tuple[Arm106DefensiveRule, Arm107RegressionTest]:
+        self, vuln: ReproducibleVulnerability, rfc_anchor: str = "RFC9112", evidence_verified: bool = True
+    ) -> Tuple[Optional[Arm106DefensiveRule], Optional[Arm107RegressionTest]]:
         """
         Processes a confirmed reproducible vulnerability and synthesizes both
         defensive hardening rules and continuous regression tests.
+        Suspends automatic publication if evidence is not confirmed.
         """
+        if not evidence_verified:
+            print(f"[!] [SUSPENDED] Automatic publication suspended for {vuln.vuln_id}: unverified evidence or framing artifact.")
+            return None, None
+
         # 1. Synthesize Arm 106 Defensive Hardening Rule
         arm106_rule = self._synthesize_arm106_rule(vuln, rfc_anchor)
         self.arm106_rules.append(arm106_rule)

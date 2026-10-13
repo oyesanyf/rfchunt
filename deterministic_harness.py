@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from anomaly_detector import AnomalyDetector
 from database import Database
+from engine.http_framing import HTTPFramingReader
 
 
 class DeterministicHarness:
@@ -52,29 +53,21 @@ class DeterministicHarness:
 
     def _send_and_receive(self, sock: socket.socket, data: bytes, read_until_close: bool = False) -> bytes:
         sock.sendall(data)
-        buffer = bytearray()
-        sock.settimeout(self.timeout)
-        try:
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                buffer.extend(chunk)
-                if not read_until_close:
-                    if b"\r\n\r\n" in buffer:
-                        header_part, body_part = bytes(buffer).split(b"\r\n\r\n", 1)
-                        lower_h = header_part.lower()
-                        if b"content-length:" in lower_h:
-                            m = re.search(rb"content-length:\s*(\d+)", lower_h)
-                            if m and len(body_part) >= int(m.group(1)):
-                                break
-                        elif b"transfer-encoding: chunked" in lower_h and b"0\r\n\r\n" in body_part:
-                            break
-        except socket.timeout:
-            pass
-        except (ConnectionResetError, ConnectionAbortedError):
-            pass
-        return bytes(buffer)
+        if read_until_close:
+            buffer = bytearray()
+            sock.settimeout(self.timeout)
+            try:
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    buffer.extend(chunk)
+            except (socket.timeout, ConnectionResetError, ConnectionAbortedError):
+                pass
+            return bytes(buffer)
+
+        framed = HTTPFramingReader.read_response(sock, timeout=self.timeout)
+        return framed.raw_response
 
     def run_evaluation(self, probe_dict: Dict[str, Any]) -> Tuple[bool, Optional[str], str, Dict[str, Any]]:
         """

@@ -73,6 +73,7 @@ class ResearchState(TypedDict):
     cascade_results: Optional[Dict[str, Any]]
     cycle_count: int
     max_cycles: int
+    baseline_resp: Optional[bytes]
     history: Annotated[List[str], operator.add]
 
 
@@ -157,13 +158,13 @@ def format_clean_kettle_response(resp_bytes: bytes, latency_ms: float = 0.0, soc
         summary = f"{status_line} (in {latency_ms:.1f}ms)"
         return summary, details
 
-    # Not an HTTP status line -> It's a pipeline body leak from an earlier request!
+    # Not an HTTP status line -> It's non-HTTP data or unconsumed response body
     body_lower = resp_bytes[:300].lower()
-    if b"<" in body_lower and (b"meta" in body_lower or b"div" in body_lower or b"html" in body_lower or b"style" in body_lower or b"script" in body_lower):
-        summary = f"[Residual Pipeline Leak: {len(resp_bytes):,} bytes in {latency_ms:.1f}ms]"
-        details = f"[Residual HTML body fragment from previous request: {len(resp_bytes):,} bytes]"
+    if b"<" in body_lower and (b"meta" in body_lower or b"div" in body_lower or b"html" in body_lower or b"style" in body_lower or b"script" in body_lower or b"!doctype" in body_lower):
+        summary = f"[Unconsumed Response Body: {len(resp_bytes):,} bytes in {latency_ms:.1f}ms]"
+        details = f"[Residual HTML body fragment from socket buffer: {len(resp_bytes):,} bytes]"
     else:
-        summary = f"[Residual Data Leak: {len(resp_bytes):,} bytes in {latency_ms:.1f}ms]"
+        summary = f"[Non-HTTP Socket Data: {len(resp_bytes):,} bytes in {latency_ms:.1f}ms]"
         details = f"[Non-HTTP data: {len(resp_bytes):,} bytes]"
         
     return summary, details
@@ -379,6 +380,9 @@ class ProtocolResearchSwarm:
                     anomaly = meta_anomaly
                     break
         
+        baseline_step = next((s for s in seq_report.steps if "Baseline" in s.step_name), None)
+        baseline_resp_bytes = baseline_step.received_bytes if baseline_step else b""
+
         if anomaly:
             # SAVE to Database exactly like the original code
             self.db.save_implementation_anomaly(
@@ -394,6 +398,7 @@ class ProtocolResearchSwarm:
                 "generated_candidates": cands,
                 "current_probe": probe_bytes,
                 "current_anomaly": anomaly,
+                "baseline_resp": baseline_resp_bytes,
                 "history": [f"execution_oracle: Probed {self.host}:{self.port} -> Host: {resp_summary} | ANOMALY DETECTED! Saved to DB ({anomaly.anomaly_id})."]
             }
 
@@ -401,6 +406,7 @@ class ProtocolResearchSwarm:
             "generated_candidates": cands,
             "current_probe": probe_bytes,
             "current_anomaly": None,
+            "baseline_resp": baseline_resp_bytes,
             "history": [f"execution_oracle: Probed {self.host}:{self.port} -> Host: {resp_summary} | Target healthy/conformant."]
         }
 
@@ -422,15 +428,31 @@ class ProtocolResearchSwarm:
     # Agent 4: Triage & Delta Debugger (Mods 8 & 9)
     def triage_debugger_agent(self, state: ResearchState) -> dict:
         anomaly = state["current_anomaly"]
+        baseline_resp = state.get("baseline_resp")
         
-        # Noise filter
-        is_noise = self.classifier.filter_environmental_noise(anomaly, baseline_is_healthy=True)
+        # 1. Framing Artifact / Leftover Baseline Guard:
+        # Never classify leftover baseline-response bytes as a confirmed vulnerability
+        is_artifact, artifact_reason = self.classifier.is_framing_artifact(anomaly, baseline_resp=baseline_resp)
+        if is_artifact:
+            return {"current_anomaly": None, "current_vuln": None, "history": [f"triage_debugger: Discarded anomaly: {artifact_reason}"]}
+
+        # 2. Environmental Noise Filter
+        is_noise = self.classifier.filter_environmental_noise(anomaly, baseline_is_healthy=True, baseline_resp=baseline_resp)
         if is_noise:
-            return {"current_anomaly": None, "history": ["triage_debugger: Discarded anomaly as environmental noise."]}
+            return {"current_anomaly": None, "current_vuln": None, "history": ["triage_debugger: Discarded anomaly as environmental noise / framing artifact."]}
             
-        # Minimize (Mod 8)
+        # 3. Minimize & Reproduce (Mod 8)
         vuln = self.debugger.minimize_and_reproduce(anomaly, max_verification_trials=3)
         if vuln.reproducibility_rate >= 0.66:
+            # 4. Evidence Validation Gate: Confirm finding cannot be explained by ordinary framing
+            is_valid_evidence, evidence_reason = self.classifier.validate_evidence(vuln, anomaly, baseline_resp=baseline_resp)
+            if not is_valid_evidence:
+                return {
+                    "current_anomaly": None,
+                    "current_vuln": None,
+                    "history": [f"triage_debugger: Discarded finding: evidence validator rejected ({evidence_reason})."]
+                }
+
             # SAVE to Database
             self.db.save_reproducible_vulnerability(
                 vuln_id=vuln.vuln_id,
@@ -476,9 +498,23 @@ class ProtocolResearchSwarm:
     def cascade_and_publish_agent(self, state: ResearchState) -> dict:
         vuln = state["current_vuln"]
         anomaly = state["current_anomaly"]
+        baseline_resp = state.get("baseline_resp")
         frag_text = state.get("current_fragment", "")
         rfc_num = state.get("rfc_num", "9112").replace("RFC", "")
         
+        # Evidence Validation Gate:
+        # Suspend automatic publication of new detection rules until the evidence validator
+        # confirms that the anomalous bytes cannot be explained by ordinary response framing.
+        is_confirmed, validation_reason = self.classifier.validate_evidence(vuln, anomaly, baseline_resp=baseline_resp)
+        if not is_confirmed:
+            print(f"[*] [SUSPENDED] Automatic rule publication suspended for {vuln.vuln_id}: {validation_reason}")
+            cc = state.get("cycle_count", 0) + 1
+            return {
+                "cascade_results": None,
+                "cycle_count": cc,
+                "history": [f"cascade_publish: Suspended automatic publication ({validation_reason})."]
+            }
+
         # 1. Cascade (LLM extrapolation)
         cascade_res = self.cascade_engine.cascade_from_finding({
             "rationale": "Swarm detected vulnerability.",
@@ -491,7 +527,7 @@ class ProtocolResearchSwarm:
         self.knowledge_graph.add_edge(anomaly.anomaly_id, vuln.vuln_id, "PROVES_VULN")
         
         # 3. Publish Arm 106 & 107 (Mod 12)
-        arm106, arm107 = self.publisher.publish_finding(vuln, rfc_anchor=f"RFC{rfc_num}")
+        arm106, arm107 = self.publisher.publish_finding(vuln, rfc_anchor=f"RFC{rfc_num}", evidence_verified=True)
         
         # 4. Forensic Logging (Original functionality)
         self.forensics.record_finding(
@@ -502,7 +538,7 @@ class ProtocolResearchSwarm:
             is_vuln=True,
             desync_class=vuln.impact.value,
             details=anomaly.observed_behavior,
-            metadata={"arm106": arm106.rule_id, "arm107": arm107.test_id},
+            metadata={"arm106": arm106.rule_id if arm106 else "", "arm107": arm107.test_id if arm107 else ""},
             weaponization=None,
             cascade=cascade_res,
             concept_analysis=None
@@ -510,10 +546,11 @@ class ProtocolResearchSwarm:
         self.forensics.save_forensic_report()
 
         cc = state.get("cycle_count", 0) + 1
+        arm_id = arm106.rule_id if arm106 else "SUSPENDED"
         return {
             "cascade_results": cascade_res,
             "cycle_count": cc,
-            "history": [f"cascade_publish: Ran Cascade, Published rules ({arm106.rule_id}), and saved Forensic trace!"]
+            "history": [f"cascade_publish: Ran Cascade, Published rules ({arm_id}), and saved Forensic trace!"]
         }
 
     def route_after_publish(self, state: ResearchState) -> str:
@@ -628,7 +665,19 @@ USAGE EXAMPLES:
     parser.add_argument("--debug", action="store_true", help="Enable comprehensive debugging mode (prints raw host responses, socket telemetry, and sequence pipeline steps)")
     parser.add_argument("--show-response", action="store_true", help="Print full raw HTTP/TLS responses received from the target host")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose execution telemetry and full payload/response tracing")
+    parser.add_argument("--authorized", action="store_true", help="Explicitly authorize active security testing against remote/public target (e.g. dlptest.com)")
     args = parser.parse_args()
+
+    # Enforce Target Authorization Guard
+    from mcp_server import TargetAuthorizationGate
+    if args.authorized:
+        TargetAuthorizationGate.authorize_target(args.host)
+    try:
+        TargetAuthorizationGate.check_auth(args.host)
+    except PermissionError as e:
+        print(f"\n[!] TARGET AUTHORIZATION ERROR: {e}")
+        print("[!] To test an external service like dlptest.com, specify --authorized or set RFCHUNT_AUTHORIZED_TARGETS.\n")
+        sys.exit(1)
 
     import os
     os.environ["OLLAMA_TIMEOUT"] = str(args.timeout)
@@ -704,6 +753,7 @@ USAGE EXAMPLES:
             "cascade_results": None,
             "cycle_count": 0,
             "max_cycles": args.cycles,
+            "baseline_resp": b"",
             "history": []
         }
 
