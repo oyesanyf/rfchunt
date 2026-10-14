@@ -222,5 +222,13 @@
     "anchor": "RFC9583",
     "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0122,phase:1,deny,status:400\"",
     "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0123-9472",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9583",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0123,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
   }
 ]

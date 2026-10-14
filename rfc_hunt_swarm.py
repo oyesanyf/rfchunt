@@ -880,8 +880,8 @@ class ProtocolResearchSwarm:
             f"  TOTAL WIRE PROBES EXECUTED    : {total_exec}",
             f"  [+] PASSED (Target Conformant): {passed} ({pass_pct:.1f}%)",
             f"  [-] FAILED (Anomaly Triggered): {failed_anom} ({fail_pct:.1f}%)",
-            f"      ├─ Triage Filtered/Benign : {triage_disc} (Compliant rejection / framing noise)",
-            f"      └─ CONFIRMED VULNS (MRE)  : {len(vulns)} (Verified across >=3 trials)",
+            f"      |- Triage Filtered/Benign : {triage_disc} (Compliant rejection / framing noise)",
+            f"      +- CONFIRMED VULNS (MRE)  : {len(vulns)} (Verified across >=3 trials)",
             f"  [!] Socket / Timeout Errors   : {sock_errs} ({err_pct:.1f}%)",
             "=" * 86,
         ]
