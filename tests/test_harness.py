@@ -150,7 +150,8 @@ def test_anomaly_detector_status_line_and_range_and_baseline():
 
 def test_other_terminator_permutations():
     permutator = VectorPermutator()
-    assert len(permutator.get_terminator_mutators()) == 25
+    assert len(permutator.get_terminator_mutators()) == 32
+    assert len(permutator.get_crlf_desync_mutators()) == 7
 
     base_req = "POST / HTTP/1.1\r\nHost: target.local\r\nX-Custom: val\r\n\r\n$PAYLOAD"
 

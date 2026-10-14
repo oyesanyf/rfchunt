@@ -248,6 +248,9 @@ class DeterministicHarness:
         test_payloads = [
             ("CL.0 / Version Confusion", f"GET / HTTP/777\r\nX-Test: 1\r\n\r\n", b"505"),
             ("TRACE Gadget", f"TRACE / HTTP/1.1\r\nHost: {self.host}\r\nX-Test: 1\r\n\r\n", b"501"),
+            ("CRLF-RHI (417 Expectation Failed)", f"GET / HTTP/1.1\r\nHost: {self.host}\r\nExpect: asdf\r\n\r\n", b"417"),
+            ("CRLF-RHI (501 TE Desync)", f"GET / HTTP/1.1\r\nHost: {self.host}\r\nTransfer-Encoding: asdf\r\n\r\n", b"501"),
+            ("CRLF-Splitting (505 Version Unsupported)", f"GET / HTTP/13.37\r\nHost: {self.host}\r\n\r\n", b"505"),
         ]
 
         for classification_name, payload_snippet, expected_bytes in test_payloads:

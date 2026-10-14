@@ -1,6 +1,6 @@
 {
-  "total_generations": 111,
-  "latest_generation": 9,
+  "total_generations": 112,
+  "latest_generation": 10,
   "policies": [
     {
       "generation": 1,
@@ -2106,9 +2106,28 @@
       },
       "normative_bias": 0.3866,
       "delta_aggressiveness": 0.5424,
-      "fitness_score": 1987.0,
+      "fitness_score": 1997.0,
       "rsi_gain": 0.0,
-      "simulated_yield": 0.6633,
+      "simulated_yield": 0.6667,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 10,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.6390595585380301,
+        "PATH_NUL_EARLY_RESPONSE": 0.03334296411976528,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.03334296411976528,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.05855156479576191,
+        "HEADER_TAB_SPACING": 0.03334296411976528,
+        "CRLF_DELIMITER_SPLIT": 0.10503533784216092,
+        "OBS_FOLD_LINE_JOIN": 0.033762996969783084,
+        "OVERLONG_UTF8_NORMALIZATION": 0.0635616494949682
+      },
+      "normative_bias": 0.3866,
+      "delta_aggressiveness": 0.5424,
+      "fitness_score": 1997.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.6667,
       "false_positive_rate": 0.0
     }
   ]

@@ -359,7 +359,10 @@ TERMINATOR_OPERATIVE_KEYWORDS = [
     "obs-fold", "folding", "line folding", "whitespace", "sp", "htab", "bws", "ows",
     "must reject", "must ignore", "must not", "should reject",
     "multipart/byteranges", "boundary", "tunnel", "upgrade", "websocket",
-    "structured field", "huffman", "pseudo-header"
+    "structured field", "huffman", "pseudo-header",
+    # CRLF-Powered Request Header Injection (RHI) & Desync (Tom Stacey Research)
+    "request header injection", "request splitting", "expect: 100-continue",
+    "connection-locked", "head range", "417 expectation failed"
 ]
 
 
@@ -431,6 +434,9 @@ class TerminatorRFCSelector:
             "pseudo-header": 2.5,
             "must reject": 2.5,
             "must ignore": 2.5,
+            "request header injection": 3.0,
+            "request splitting": 3.0,
+            "expect: 100-continue": 2.5,
         }
 
         for kw in TERMINATOR_OPERATIVE_KEYWORDS:

