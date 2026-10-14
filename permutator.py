@@ -18,10 +18,82 @@ class VectorPermutator:
     to multiply probe novelty. Supports database-backed dynamic permutations and trigger combination.
     """
 
+    CATEGORIES: Dict[str, List[str]] = {
+        "line": [
+            "_mutate_line_terminator_bare_lf",
+            "_mutate_line_terminator_bare_cr",
+            "_mutate_line_terminator_double_cr",
+            "_mutate_line_terminator_lfcr",
+            "_mutate_obs_fold_terminator",
+            "_mutate_control_char_vt_ff_terminator",
+            "_mutate_null_byte_header_terminator",
+            "_mutate_iso8859_nel_separator_terminator",
+        ],
+        "chunk": [
+            "_mutate_chunked_extension_semicolon_terminator",
+            "_mutate_chunked_bare_lf_terminator",
+            "_mutate_chunked_trailer_terminator",
+        ],
+        "framing": [
+            "_mutate_path_nul",
+            "_mutate_path_asterisk_gadget",
+            "_mutate_header_tab_spacing",
+            "_mutate_dual_matching_cl",
+            "_mutate_header_casing_underscore",
+            "_mutate_dangling_byte",
+            "_mutate_multipart_byteranges",
+            "_mutate_http10_te_gzip",
+            "_mutate_intermediary_terminator_headers",
+        ],
+        "cross_protocol": [
+            "_mutate_smtp_dot_bdat_terminator",
+            "_mutate_mime_boundary_closing_terminator",
+            "_mutate_websocket_upgrade_terminator",
+            "_mutate_early_hints_103_expect_terminator",
+            "_mutate_capsule_datagram_terminator",
+        ],
+        "crlf_rhi": [
+            "_mutate_crlf_path_rhi",
+            "_mutate_crlf_cookie_rhi",
+            "_mutate_crlf_routing_headers",
+            "_mutate_crlf_double_url_encoding",
+            "_mutate_crlf_0_cl_connection_lock",
+            "_mutate_crlf_expect_100_tunnel",
+            "_mutate_head_range_gadget",
+        ],
+        "h2_gateway": [
+            "_mutate_h2_cl_gateway_translation",
+            "_mutate_h2_te_chunked_smuggling",
+            "_mutate_unicode_non_breaking_space",
+            "_mutate_utf8_overlong_crlf",
+        ],
+    }
+
     def __init__(self, db: Optional[Database] = None):
         self.db = db
 
-    def permute_probe(self, base_probe: Dict[str, Any], max_variants: int = 5) -> List[Dict[str, Any]]:
+    def get_mutators_by_categories(self, categories: Optional[List[str]] = None) -> List[Any]:
+        """Returns mutator methods matching specified categories or all if 'all' or None is passed."""
+        if not categories or "all" in categories:
+            return self.get_terminator_mutators()
+
+        selected_methods = []
+        for cat in categories:
+            cat_clean = cat.strip().lower()
+            method_names = self.CATEGORIES.get(cat_clean, [])
+            for m_name in method_names:
+                m_func = getattr(self, m_name, None)
+                if m_func and m_func not in selected_methods:
+                    selected_methods.append(m_func)
+
+        return selected_methods or self.get_terminator_mutators()
+
+    def permute_probe(
+        self,
+        base_probe: Dict[str, Any],
+        max_variants: int = 5,
+        categories: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         raw_req = base_probe.get("raw_request", "")
         if not raw_req:
             return []
@@ -39,7 +111,7 @@ class VectorPermutator:
             except Exception:
                 pass
 
-        mutators = self.get_terminator_mutators()
+        mutators = self.get_mutators_by_categories(categories) if categories else self.get_terminator_mutators()
 
         # Pick mutators up to effective_max
         selected_mutators = random.sample(mutators, min(len(mutators), effective_max))

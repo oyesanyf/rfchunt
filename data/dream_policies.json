@@ -1,6 +1,6 @@
 {
-  "total_generations": 127,
-  "latest_generation": 25,
+  "total_generations": 128,
+  "latest_generation": 1,
   "policies": [
     {
       "generation": 1,
@@ -2413,6 +2413,25 @@
       "fitness_score": 2137.0,
       "rsi_gain": 0.0,
       "simulated_yield": 0.7133,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 1,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.20424042848466548,
+        "PATH_NUL_EARLY_RESPONSE": 0.16703378563519045,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.027296219089603193,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.027296219089603193,
+        "HEADER_TAB_SPACING": 0.24192934277990893,
+        "CRLF_DELIMITER_SPLIT": 0.027296219089603193,
+        "OBS_FOLD_LINE_JOIN": 0.062376350635474656,
+        "OVERLONG_UTF8_NORMALIZATION": 0.24253143519595083
+      },
+      "normative_bias": 0.4704,
+      "delta_aggressiveness": 0.5774,
+      "fitness_score": 677.0,
+      "rsi_gain": 1.3589,
+      "simulated_yield": 0.2267,
       "false_positive_rate": 0.0
     }
   ]

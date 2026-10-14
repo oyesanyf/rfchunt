@@ -28,7 +28,7 @@ if sys.platform == "win32":
         pass
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="HTTP Terminator: One-Click Dual Launcher (Test Lab + Flaw Hunter / MCP)",
         epilog="""
@@ -80,7 +80,27 @@ USAGE EXAMPLES:
     parser.add_argument("--no-lab", action="store_true", help="Do not spawn the built-in mock lab server; target an existing server instead")
     parser.add_argument("--comb-only", "--offline", dest="comb_only", action="store_true", help="Comb through RFCs, chunk fragments, and generate probes into database without testing hosts")
     parser.add_argument("--mcp", action="store_true", help="Launch the MCP server instead of the continuous hunter")
-    args = parser.parse_args()
+    parser.add_argument("--targets", default=None, help="Comma-separated target terminators (e.g. '127.0.0.1:8080,127.0.0.1:8081,proxy2.local:443')")
+    parser.add_argument("--terminators", default="all", help="Comma-separated terminator categories: 'line,chunk,framing,cross_protocol,crlf_rhi,h2_gateway' or 'all' (default: all)")
+    parser.add_argument("--mode", default=None, choices=["hunt", "ruler", "lab", "offline", "comb-only", "mcp", "dream", "build"], help="Execution mode (default: hunt, or lab+hunt if local)")
+    return parser
+
+
+def parse_arguments(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if isinstance(args.targets, str):
+        args.targets = [t.strip() for t in args.targets.split(",") if t.strip()]
+    if isinstance(args.terminators, str):
+        if args.terminators.lower() == "all":
+            args.terminators = ["all"]
+        else:
+            args.terminators = [t.strip() for t in args.terminators.split(",") if t.strip()]
+    return args
+
+
+def main():
+    args = parse_arguments()
 
     # Determine TLS requirement (automatic for port 443)
     use_tls = args.tls or (args.port == 443)
@@ -97,16 +117,47 @@ USAGE EXAMPLES:
     print("  Starting Spec: RFC 9112 (HTTP/1.1 Message Syntax & Framing - Primary Terminator Spec)")
     print("=" * 70)
 
-    # 1. Start the Local Protocol Test Lab Server (Only when targeting default local port 8080 and not explicitly disabled)
+    # Parse multiple target terminators if provided
+    target_list = []
+    if args.targets:
+        for t_str in args.targets.split(","):
+            t_str = t_str.strip()
+            if not t_str:
+                continue
+            if "://" in t_str:
+                t_proto, t_rest = t_str.split("://", 1)
+                t_tls = t_proto.lower() == "https"
+            else:
+                t_rest = t_str
+                t_tls = args.tls or (":443" in t_rest)
+            if ":" in t_rest:
+                h, p = t_rest.split(":", 1)
+                target_list.append((h.strip(), int(p.strip()), t_tls))
+            else:
+                target_list.append((t_rest.strip(), 443 if t_tls else 80, t_tls))
+    else:
+        target_list = [(args.host, args.port, use_tls)]
+
+    # Handle mode overrides
+    if args.mode:
+        m = args.mode.lower().strip()
+        if m == "mcp":
+            args.mcp = True
+        elif m in ("offline", "comb-only"):
+            args.comb_only = True
+
+    # 1. Start Local Protocol Test Lab Server (if first target is local 8080 and not disabled)
     lab_server = None
-    should_spawn_lab = is_local_target and (args.port == 8080) and not args.no_lab and not args.comb_only
+    first_host, first_port, first_tls = target_list[0]
+    is_first_local = first_host in ("127.0.0.1", "localhost", "::1", "[::1]")
+    should_spawn_lab = is_first_local and (first_port == 8080) and not args.no_lab and not args.comb_only
 
     if args.comb_only:
         print("\n[+] Step 1: Mode: Offline RFC Ingestion & Discovery")
         print("    (Host evaluation bypassed - generating and banking probes into database only)")
     elif should_spawn_lab:
-        print(f"\n[+] Step 1: Initializing local Protocol Test Lab on http://{args.host}:{args.port}...")
-        lab_server = TestLabServer(host=args.host, port=args.port)
+        print(f"\n[+] Step 1: Initializing local Protocol Test Lab on http://{first_host}:{first_port}...")
+        lab_server = TestLabServer(host=first_host, port=first_port)
         try:
             lab_server.start()
             time.sleep(0.4)
@@ -114,9 +165,10 @@ USAGE EXAMPLES:
             print(f"[!] Failed to bind lab server: {e}")
             sys.exit(1)
     else:
-        proto = "https" if use_tls else "http"
-        print(f"\n[+] Step 1: Target Configured: {proto}://{args.host}:{args.port}")
-        print("    (Local mock lab bypassed - evaluating existing target directly)")
+        print(f"\n[+] Step 1: Configured {len(target_list)} Target Terminator(s):")
+        for idx, (h, p, tls_f) in enumerate(target_list, 1):
+            proto = "https" if tls_f else "http"
+            print(f"    [{idx}] {proto}://{h}:{p}")
 
     # Graceful shutdown handler
     def shutdown(sig=None, frame=None):
@@ -135,38 +187,49 @@ USAGE EXAMPLES:
             print(f"\n[+] Step 2: Launching Model Context Protocol (MCP) Server over stdio...")
             mcp_server = TerminatorMCPServer()
             mcp_server.run_stdio()
+        elif args.mode == "lab":
+            print(f"\n[+] Test Lab Server running on http://{first_host}:{first_port}. Press Ctrl+C to stop.")
+            while True:
+                time.sleep(1)
         else:
-            print(f"\n[+] Step 2: Launching Continuous Flaw Hunter (Starting with RFC 9112 - HTTP/1.1 Message Framing)...")
+            print(f"\n[+] Step 2: Launching Continuous Flaw Hunter across {len(target_list)} terminator(s)...")
             sec_model = "fenkohq/foundation-sec-8b:latest" if args.cisco else None
-            hunter = ContinuousFlawHunter(
-                target_host=args.host,
-                target_port=args.port,
-                use_tls=use_tls,
-                preferred_model=args.model,
-                use_fusion=args.fusion,
-                verbose=args.verbose,
-                sec_model=sec_model,
-            )
             keyword_list = [k.strip() for k in args.keywords.split(",")] if args.keywords else None
-            max_limit = args.max_rfcs  # None means unlimited / all active RFCs
+            max_limit = args.max_rfcs
 
-            flaws = hunter.run_until_flaw(
-                max_rfcs=max_limit,
-                fragments_per_rfc=args.fragments,
-                permutations_per_probe=args.variants,
-                stop_on_first_flaw=not args.keep_going,
-                all_active=args.all_active,
-                unrestricted=args.unrestricted,
-                kettle=args.kettle,
-                keywords=keyword_list,
-                resume=args.resume,
-                target_rfc=args.rfc,
-                comb_only=args.comb_only,
-            )
-            if args.comb_only:
-                print(f"\n[+] RFC Ingestion & Probe Bank Discovery complete. All candidate triggers saved to database.")
-            else:
-                print(f"\n[*] Flaw hunt cycle complete. Total discoveries: {len(flaws)}")
+            for idx, (t_host, t_port, t_tls) in enumerate(target_list, 1):
+                if len(target_list) > 1:
+                    proto = "https" if t_tls else "http"
+                    print(f"\n{'='*70}\n[+] TARGET #{idx}: {proto}://{t_host}:{t_port}\n{'='*70}")
+
+                hunter = ContinuousFlawHunter(
+                    target_host=t_host,
+                    target_port=t_port,
+                    use_tls=t_tls,
+                    preferred_model=args.model,
+                    use_fusion=args.fusion,
+                    verbose=args.verbose,
+                    sec_model=sec_model,
+                )
+
+                flaws = hunter.run_until_flaw(
+                    max_rfcs=max_limit,
+                    fragments_per_rfc=args.fragments,
+                    permutations_per_probe=args.variants,
+                    stop_on_first_flaw=not args.keep_going,
+                    all_active=args.all_active,
+                    unrestricted=args.unrestricted,
+                    kettle=args.kettle,
+                    keywords=keyword_list,
+                    resume=args.resume,
+                    target_rfc=args.rfc,
+                    comb_only=args.comb_only,
+                )
+                if args.comb_only:
+                    print(f"\n[+] RFC Ingestion complete. Candidate triggers saved to database.")
+                    break  # Offline mode doesn't need to re-run per target host
+                else:
+                    print(f"\n[*] Flaw hunt cycle complete for {t_host}:{t_port}. Discoveries: {len(flaws)}")
 
     except KeyboardInterrupt:
         shutdown()

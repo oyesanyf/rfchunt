@@ -281,3 +281,39 @@ def test_dashboard_generator():
     assert "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" in html_out
     assert "CRLF Request Header Injection" in html_out
     assert "12 / 12" in html_out
+
+
+def test_multi_terminators_and_modes():
+    """Verifies category-based terminator selection and multi-target parsing."""
+    from permutator import VectorPermutator
+    import argparse
+    from start import parse_arguments
+
+    # 1. Verify CATEGORIES definitions
+    assert "chunk" in VectorPermutator.CATEGORIES
+    assert "line" in VectorPermutator.CATEGORIES
+    assert "framing" in VectorPermutator.CATEGORIES
+    assert "crlf_rhi" in VectorPermutator.CATEGORIES
+    assert "h2_gateway" in VectorPermutator.CATEGORIES
+    assert "cross_protocol" in VectorPermutator.CATEGORIES
+
+    # 2. Verify filtering by specific multiple terminators
+    vp = VectorPermutator()
+    chunk_and_h2 = vp.get_mutators_by_categories(["chunk", "h2_gateway"])
+    chunk_names = [m.__name__ for m in chunk_and_h2]
+    assert any("chunk" in name.lower() for name in chunk_names)
+    assert any("h2" in name.lower() for name in chunk_names)
+    # Ensure line mutators are not included when only chunk,h2_gateway requested
+    assert "mutate_space_before_colon" not in chunk_names
+
+    # 3. Verify CLI parser accepts --terminators, --targets, and --mode
+    args = parse_arguments([
+        "--host", "127.0.0.1",
+        "--targets", "10.0.0.1:8080,https://internal.proxy:8443",
+        "--terminators", "chunk,h2_gateway,crlf_rhi",
+        "--mode", "offline"
+    ])
+    assert args.targets == ["10.0.0.1:8080", "https://internal.proxy:8443"]
+    assert args.terminators == ["chunk", "h2_gateway", "crlf_rhi"]
+    assert args.mode == "offline"
+
