@@ -1135,7 +1135,10 @@ USAGE EXAMPLES (All run directly via rfc_hunt_swarm.py):
             args.tls = True
         clean_h = re.sub(r"^https?://", "", raw_h, flags=re.IGNORECASE).split("/")[0]
         if ":" in clean_h and not clean_h.startswith("["):
-            clean_h = clean_h.split(":")[0]
+            parts = clean_h.split(":", 1)
+            clean_h = parts[0]
+            if len(parts) > 1 and parts[1].isdigit() and args.port == 5006:
+                args.port = int(parts[1])
         args.host = clean_h
 
     # Authorize and validate target host specified on the CLI

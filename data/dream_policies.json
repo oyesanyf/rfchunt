@@ -1,6 +1,6 @@
 {
-  "total_generations": 64,
-  "latest_generation": 19,
+  "total_generations": 65,
+  "latest_generation": 20,
   "policies": [
     {
       "generation": 1,
@@ -1213,9 +1213,28 @@
       },
       "normative_bias": 0.8616,
       "delta_aggressiveness": 0.5228,
-      "fitness_score": 1557.0,
+      "fitness_score": 1547.0,
       "rsi_gain": 0.0,
-      "simulated_yield": 0.52,
+      "simulated_yield": 0.5167,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 20,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.4816132022838005,
+        "PATH_NUL_EARLY_RESPONSE": 0.07736844339632826,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.030348542963902703,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.030348542963902703,
+        "HEADER_TAB_SPACING": 0.10825222518846425,
+        "CRLF_DELIMITER_SPLIT": 0.030348542963902703,
+        "OBS_FOLD_LINE_JOIN": 0.21137195727579616,
+        "OVERLONG_UTF8_NORMALIZATION": 0.030348542963902703
+      },
+      "normative_bias": 0.8616,
+      "delta_aggressiveness": 0.5228,
+      "fitness_score": 1547.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.5167,
       "false_positive_rate": 0.0
     }
   ]
