@@ -240,13 +240,55 @@ class ProtocolResearchSwarm:
         if latest_pol:
             self.bandit.apply_dream_policy(latest_pol)
 
+        # Run-level Pass/Fail Telemetry
+        self.stats_lock = threading.Lock()
+        self.active_rfc_id = "RFC9112"
+        self.run_stats: Dict[str, Any] = {
+            "start_time": time.time(),
+            "rfcs_scheduled": 0,
+            "rfcs_completed": 0,
+            "rfcs_errored": 0,
+            "fragments_processed": 0,
+            "base_probes_generated": 0,
+            "total_candidates_executed": 0,
+            "probes_passed": 0,
+            "probes_failed_anomaly": 0,
+            "socket_errors": 0,
+            "triage_discarded": 0,
+            "anomalies_recorded": [],
+            "vulnerabilities_confirmed": [],
+            "per_rfc": {},
+        }
+
+    def _ensure_rfc_stat(self, rfc_id: str) -> Dict[str, Any]:
+        if rfc_id not in self.run_stats["per_rfc"]:
+            self.run_stats["per_rfc"][rfc_id] = {
+                "fragments": 0,
+                "base_probes": 0,
+                "executed": 0,
+                "passed": 0,
+                "failed_anomalies": 0,
+                "socket_errors": 0,
+                "triage_discarded": 0,
+                "confirmed_vulns": 0,
+                "status": "RUNNING",
+                "error": None,
+            }
+        return self.run_stats["per_rfc"][rfc_id]
+
     # Agent 1: Fetch and Chunk (Replaces manual string entry)
     def fetch_and_chunk_agent(self, state: ResearchState) -> dict:
         raw_rfc = str(state.get("rfc_num", "9112")).strip().upper().replace("RFC-", "").replace("RFC", "")
         rfc_num = 0 if raw_rfc in ("0", "MCP") or not raw_rfc.isdigit() else int(raw_rfc)
+        rfc_label = f"RFC{rfc_num}"
+        with self.stats_lock:
+            self.active_rfc_id = rfc_label
+            r_stat = self._ensure_rfc_stat(rfc_label)
         # Fetch actual text
         rfc_text = self.fetcher.fetch_rfc_by_number(rfc_num) or ""
         if not rfc_text:
+            with self.stats_lock:
+                r_stat["status"] = "UNAVAILABLE"
             return {
                 "rfc_text": "",
                 "fragments": [],
@@ -296,6 +338,13 @@ class ProtocolResearchSwarm:
         for p in llm_probes:
             perms = self.permutator.permute_probe(p)
             all_candidates.extend(perms)
+
+        with self.stats_lock:
+            self.run_stats["fragments_processed"] += 1
+            self.run_stats["base_probes_generated"] += len(llm_probes)
+            r_stat = self._ensure_rfc_stat(self.active_rfc_id)
+            r_stat["fragments"] += 1
+            r_stat["base_probes"] += len(llm_probes)
             
         print(f"[llm_generator_agent] -> LLM generated {len(llm_probes)} base probes -> {len(all_candidates)} total candidates ready for execution.")
         return {
@@ -478,6 +527,26 @@ class ProtocolResearchSwarm:
             if not first_resp_summary:
                 first_resp_summary = resp_summary
 
+            with self.stats_lock:
+                self.run_stats["total_candidates_executed"] += 1
+                r_stat = self._ensure_rfc_stat(self.active_rfc_id)
+                r_stat["executed"] += 1
+                if anomaly:
+                    self.run_stats["probes_failed_anomaly"] += 1
+                    r_stat["failed_anomalies"] += 1
+                    self.run_stats["anomalies_recorded"].append({
+                        "rfc": self.active_rfc_id,
+                        "anomaly_id": anomaly.anomaly_id,
+                        "category": anomaly.category.value,
+                        "behavior": anomaly.observed_behavior,
+                    })
+                elif not item["resp_bytes"] and any(s.socket_error for s in seq_report.steps):
+                    self.run_stats["socket_errors"] += 1
+                    r_stat["socket_errors"] += 1
+                else:
+                    self.run_stats["probes_passed"] += 1
+                    r_stat["passed"] += 1
+
             if self.debug:
                 print(f"\n{'='*75}")
                 print(f"[*] PROTOCOL EVALUATION TRACE [Kettle Evaluation Oracle] (Threaded Semaphore Pool)")
@@ -566,11 +635,17 @@ class ProtocolResearchSwarm:
         # Never classify leftover baseline-response bytes as a confirmed vulnerability
         is_artifact, artifact_reason = self.classifier.is_framing_artifact(anomaly, baseline_resp=baseline_resp)
         if is_artifact:
+            with self.stats_lock:
+                self.run_stats["triage_discarded"] += 1
+                self._ensure_rfc_stat(self.active_rfc_id)["triage_discarded"] += 1
             return {"current_anomaly": None, "current_vuln": None, "history": [f"triage_debugger: Discarded anomaly: {artifact_reason}"]}
 
         # 2. Environmental Noise Filter
         is_noise = self.classifier.filter_environmental_noise(anomaly, baseline_is_healthy=True, baseline_resp=baseline_resp)
         if is_noise:
+            with self.stats_lock:
+                self.run_stats["triage_discarded"] += 1
+                self._ensure_rfc_stat(self.active_rfc_id)["triage_discarded"] += 1
             return {"current_anomaly": None, "current_vuln": None, "history": ["triage_debugger: Discarded anomaly as environmental noise / framing artifact."]}
             
         # 3. Minimize & Reproduce (Mod 8)
@@ -579,6 +654,9 @@ class ProtocolResearchSwarm:
             # 4. Evidence Validation Gate: Confirm finding cannot be explained by ordinary framing
             is_valid_evidence, evidence_reason = self.classifier.validate_evidence(vuln, anomaly, baseline_resp=baseline_resp)
             if not is_valid_evidence:
+                with self.stats_lock:
+                    self.run_stats["triage_discarded"] += 1
+                    self._ensure_rfc_stat(self.active_rfc_id)["triage_discarded"] += 1
                 return {
                     "current_anomaly": None,
                     "current_vuln": None,
@@ -609,6 +687,18 @@ class ProtocolResearchSwarm:
                     recommended_mitigation=tech.recommended_mitigation
                 )
                 novel_name = tech.title
+
+            with self.stats_lock:
+                r_stat = self._ensure_rfc_stat(self.active_rfc_id)
+                r_stat["confirmed_vulns"] += 1
+                self.run_stats["vulnerabilities_confirmed"].append({
+                    "rfc": self.active_rfc_id,
+                    "vuln_id": vuln.vuln_id,
+                    "anomaly_id": anomaly.anomaly_id,
+                    "impact": vuln.impact.value,
+                    "repro": f"{vuln.reproducibility_rate * 100:.0f}% ({vuln.successful_reproductions}/{vuln.verification_attempts})",
+                    "behavior": anomaly.observed_behavior,
+                })
                 
             return {
                 "current_vuln": vuln, 
@@ -616,6 +706,9 @@ class ProtocolResearchSwarm:
                 "history": [f"triage_debugger: Confirmed Vulnerability {vuln.vuln_id}! Saved to DB."]
             }
         
+        with self.stats_lock:
+            self.run_stats["triage_discarded"] += 1
+            self._ensure_rfc_stat(self.active_rfc_id)["triage_discarded"] += 1
         return {"current_vuln": None, "history": ["triage_debugger: Failed reproducibility verification."]}
 
     def route_after_triage(self, state: ResearchState) -> str:
@@ -747,6 +840,106 @@ class ProtocolResearchSwarm:
         builder.add_conditional_edges("cascade_and_publish_agent", self.route_after_publish)
 
         return builder.compile()
+
+    def print_run_summary(self) -> str:
+        """
+        Formats and prints a comprehensive Pass/Fail statistics summary table at the end of a Swarm run.
+        Includes overall probe pass/fail counts, triage filtering stats, per-RFC verdicts, and detailed findings.
+        """
+        with self.stats_lock:
+            elapsed = max(0.001, time.time() - self.run_stats["start_time"])
+            total_exec = self.run_stats["total_candidates_executed"]
+            passed = self.run_stats["probes_passed"]
+            failed_anom = self.run_stats["probes_failed_anomaly"]
+            sock_errs = self.run_stats["socket_errors"]
+            triage_disc = self.run_stats["triage_discarded"]
+            vulns = list(self.run_stats["vulnerabilities_confirmed"])
+            anoms = list(self.run_stats["anomalies_recorded"])
+            per_rfc = dict(self.run_stats["per_rfc"])
+            rfcs_sched = self.run_stats["rfcs_scheduled"] or len(per_rfc)
+            rfcs_comp = self.run_stats["rfcs_completed"]
+            rfcs_err = self.run_stats["rfcs_errored"]
+            frags_proc = self.run_stats["fragments_processed"]
+            base_gen = self.run_stats["base_probes_generated"]
+
+        pass_pct = (passed / total_exec * 100.0) if total_exec > 0 else 0.0
+        fail_pct = (failed_anom / total_exec * 100.0) if total_exec > 0 else 0.0
+        err_pct = (sock_errs / total_exec * 100.0) if total_exec > 0 else 0.0
+        proto_str = "https" if self.use_tls else "http"
+
+        lines = [
+            "",
+            "=" * 86,
+            "  SWARM RUN TELEMETRY & PASS / FAIL SUMMARY",
+            "=" * 86,
+            f"  Target Endpoint               : {proto_str}://{self.host}:{self.port} (TLS: {self.use_tls})",
+            f"  Total Runtime                 : {elapsed:.1f}s",
+            f"  RFC Specifications            : {rfcs_comp}/{rfcs_sched} completed ({rfcs_err} errored)",
+            f"  RFC Fragments Analyzed        : {frags_proc} fragments -> {base_gen} base probes synthesized",
+            "-" * 86,
+            f"  TOTAL WIRE PROBES EXECUTED    : {total_exec}",
+            f"  [+] PASSED (Target Conformant): {passed} ({pass_pct:.1f}%)",
+            f"  [-] FAILED (Anomaly Triggered): {failed_anom} ({fail_pct:.1f}%)",
+            f"      ├─ Triage Filtered/Benign : {triage_disc} (Compliant rejection / framing noise)",
+            f"      └─ CONFIRMED VULNS (MRE)  : {len(vulns)} (Verified across >=3 trials)",
+            f"  [!] Socket / Timeout Errors   : {sock_errs} ({err_pct:.1f}%)",
+            "=" * 86,
+        ]
+
+        if per_rfc:
+            lines.append("  PER-RFC PASS / FAIL BREAKDOWN:")
+            lines.append(f"  {'RFC':<10} | {'Frags':>5} | {'Executed':>8} | {'Passed':>8} | {'Failed':>8} | {'Vulns':>5} | {'Verdict'}")
+            lines.append("  " + "-" * 82)
+            for rfc_id, st in per_rfc.items():
+                ex = st["executed"]
+                pa = st["passed"]
+                fa = st["failed_anomalies"]
+                vu = st["confirmed_vulns"]
+                fr = st["fragments"]
+                if st.get("status") == "ERROR":
+                    verdict = f"ERROR ({st.get('error', 'fault')[:24]})"
+                elif st.get("status") == "UNAVAILABLE":
+                    verdict = "SKIPPED (RFC unavailable)"
+                elif vu > 0:
+                    verdict = "FAIL (VULNERABILITY CONFIRMED)"
+                elif fa > 0:
+                    verdict = "WARN (ANOMALY - TRIAGED)"
+                elif ex > 0:
+                    verdict = "PASS (100% CONFORMANT)"
+                else:
+                    verdict = st.get("status", "PASS")
+                lines.append(f"  {rfc_id:<10} | {fr:>5} | {ex:>8} | {pa:>8} | {fa:>8} | {vu:>5} | {verdict}")
+            lines.append("=" * 86)
+
+        if vulns:
+            lines.append(f"  [!] CONFIRMED REPRODUCIBLE VULNERABILITIES ({len(vulns)}):")
+            for idx, v in enumerate(vulns, 1):
+                lines.append(f"    {idx}. [{v['rfc']}] {v['vuln_id']} ({v['impact']}) | Repro: {v['repro']}")
+                lines.append(f"       Behavior: {v['behavior']}")
+            lines.append("=" * 86)
+        elif anoms:
+            lines.append(f"  [*] RECORDED PROTOCOL ANOMALIES ({len(anoms)} total, {triage_disc} filtered in triage):")
+            for idx, a in enumerate(anoms[:10], 1):
+                lines.append(f"    {idx}. [{a['rfc']}] {a['anomaly_id']} ({a['category']}): {a['behavior'][:95]}")
+            if len(anoms) > 10:
+                lines.append(f"    ... and {len(anoms) - 10} additional anomalies saved in {self.db_path}")
+            lines.append("=" * 86)
+
+        overall_verdict = (
+            f"FAIL ({len(vulns)} Confirmed Vulnerability/ies)"
+            if vulns
+            else (
+                f"PASS WITH WARNINGS ({failed_anom} Anomalies Triaged, 0 Confirmed Vulns)"
+                if failed_anom > 0
+                else "PASS (Target Conformant Across All Executed Probes)"
+            )
+        )
+        lines.append(f"  OVERALL RUN VERDICT: {overall_verdict}")
+        lines.append("=" * 86 + "\n")
+
+        summary_text = "\n".join(lines)
+        print(summary_text)
+        return summary_text
 
 if __name__ == "__main__":
     ALL_MODES = [
@@ -1119,11 +1312,13 @@ USAGE EXAMPLES (All run directly via rfc_hunt_swarm.py):
         if args.max_rfcs:
             rfcs_to_scan = rfcs_to_scan[:args.max_rfcs]
         
+    swarm.run_stats["rfcs_scheduled"] = len(rfcs_to_scan)
     print(f"\n[*] Queue ready: {len(rfcs_to_scan)} RFC(s) scheduled for Swarm processing.\n" + "="*60)
 
     try:
         for rfc_item in rfcs_to_scan:
             rfc_num_str = str(rfc_item)
+            rfc_label = f"RFC{rfc_num_str.replace('RFC', '')}"
             print(f"\n[*] --- Initiating Swarm Cycle for RFC {rfc_num_str} ---")
             
             initial_state = {
@@ -1154,13 +1349,26 @@ USAGE EXAMPLES (All run directly via rfc_hunt_swarm.py):
                         print(f"[{node_name}] -> {last_hist}")
                         if "current_vuln" in state_update and state_update["current_vuln"]:
                             print(f"    !!! VULNERABILITY CONFIRMED: {state_update['current_vuln'].vuln_id}")
+                with swarm.stats_lock:
+                    swarm.run_stats["rfcs_completed"] += 1
+                    r_st = swarm._ensure_rfc_stat(rfc_label)
+                    if r_st["status"] == "RUNNING":
+                        r_st["status"] = "COMPLETED"
             except Exception as e:
                 print(f"[!] Swarm encountered a critical fault on RFC {rfc_num_str}: {e}")
+                with swarm.stats_lock:
+                    swarm.run_stats["rfcs_errored"] += 1
+                    r_st = swarm._ensure_rfc_stat(rfc_label)
+                    r_st["status"] = "ERROR"
+                    r_st["error"] = str(e)
+    except KeyboardInterrupt:
+        print("\n[*] Swarm interrupted by user (Ctrl+C). Generating Pass/Fail run summary...")
     finally:
         if bg_lab_server:
             bg_lab_server.stop()
+        swarm.print_run_summary()
 
-    print("\n[*] Swarm Execution Completed. All evidence saved to DB and Forensics Log.")
+    print("[*] Swarm Execution Completed. All evidence saved to DB and Forensics Log.")
 
     # Caldera Auto-Sync: Runs by default on every run without requiring any flags
     if not args.no_caldera:

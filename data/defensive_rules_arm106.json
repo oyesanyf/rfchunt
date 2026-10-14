@@ -1,10 +1,226 @@
 [
   {
-    "rule_id": "OCTO-ARM106-0001",
+    "rule_id": "OCTO-ARM106-0095-0711",
     "name": "Hardening Rule for QUEUE_POISONING",
     "type": "WAF_MODSEC",
-    "anchor": "RFC9113",
-    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0001,phase:1,deny,status:400\"",
+    "anchor": "RFC9112",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0095,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0096-3533",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC10042",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0096,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0097-1315",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC10042",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0097,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0098-3236",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC10024",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0098,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0099-8872",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC10024",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0099,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0100-3163",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC10024",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0100,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0101-1544",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9980",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0101,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0102-1144",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9958",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0102,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0103-1746",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9954",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0103,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0104-3666",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9954",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0104,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0105-0583",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9954",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0105,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0106-9281",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9936",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0106,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0107-9051",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9881",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0107,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0108-6440",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9881",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0108,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0109-5980",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9867",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0109,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0110-0493",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9867",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0110,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0111-2820",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9858",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0111,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0112-8120",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9802",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0112,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0113-3023",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9802",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0113,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0114-9925",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9802",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0114,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0115-1024",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9708",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0115,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0116-6380",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9690",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0116,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0117-9312",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9690",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0117,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0118-1468",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9690",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0118,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0119-2658",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9629",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0119,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0120-0637",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9629",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0120,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0121-8021",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9583",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0121,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0122-9964",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9583",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0122,phase:1,deny,status:400\"",
     "severity": "CRITICAL"
   }
 ]

@@ -62,3 +62,37 @@ def test_swarm_agent_routing_logic(tmp_path):
     assert swarm.route_after_execution({"current_anomaly": None, "generated_candidates": [1]}) == "execution_oracle_agent"
     assert swarm.route_after_execution({"current_anomaly": None, "generated_candidates": [], "cycle_count": 5, "max_cycles": 3}) == "__end__"
     assert swarm.route_after_execution({"current_anomaly": None, "generated_candidates": [], "cycle_count": 5, "max_cycles": 3, "enable_dream_rsi": True}) == "dream_rsi_agent"
+
+
+def test_swarm_run_summary_pass_fail_telemetry(tmp_path):
+    test_db = str(tmp_path / "test_summary.db")
+    swarm = ProtocolResearchSwarm(host="nrs.gov.ng", port=443, db_path=test_db, use_tls=True)
+    swarm.run_stats["rfcs_scheduled"] = 2
+    swarm.run_stats["rfcs_completed"] = 2
+    swarm.run_stats["fragments_processed"] = 4
+    swarm.run_stats["base_probes_generated"] = 6
+    swarm.run_stats["total_candidates_executed"] = 20
+    swarm.run_stats["probes_passed"] = 18
+    swarm.run_stats["probes_failed_anomaly"] = 2
+    swarm.run_stats["triage_discarded"] = 1
+    r9112 = swarm._ensure_rfc_stat("RFC9112")
+    r9112.update({"fragments": 2, "executed": 10, "passed": 10, "failed_anomalies": 0, "confirmed_vulns": 0, "status": "COMPLETED"})
+    r9110 = swarm._ensure_rfc_stat("RFC9110")
+    r9110.update({"fragments": 2, "executed": 10, "passed": 8, "failed_anomalies": 2, "confirmed_vulns": 1, "status": "COMPLETED"})
+    swarm.run_stats["vulnerabilities_confirmed"].append({
+        "rfc": "RFC9110",
+        "vuln_id": "VULN-REPRO-1001",
+        "anomaly_id": "ANOM-META-1001",
+        "impact": "PARSER_CONFUSION",
+        "repro": "100% (3/3)",
+        "behavior": "Metamorphic Violation: Base request returned 302, but transformed request returned 501",
+    })
+
+    summary = swarm.print_run_summary()
+    assert "SWARM RUN TELEMETRY & PASS / FAIL SUMMARY" in summary
+    assert "PASSED (Target Conformant): 18 (90.0%)" in summary
+    assert "FAILED (Anomaly Triggered): 2 (10.0%)" in summary
+    assert "RFC9112" in summary and "PASS (100% CONFORMANT)" in summary
+    assert "RFC9110" in summary and "FAIL (VULNERABILITY CONFIRMED)" in summary
+    assert "VULN-REPRO-1001" in summary
+

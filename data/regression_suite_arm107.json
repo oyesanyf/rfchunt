@@ -1,13 +1,310 @@
 [
   {
-    "test_id": "OCTO-ARM107-TEST-0001",
-    "vuln_id": "VULN-REPRO-1791924340681",
+    "test_id": "OCTO-ARM107-TEST-0095-0711",
+    "vuln_id": "VULN-REPRO-1791935640711",
     "protocol": "HTTP/1.1",
     "expected_status": [
       400,
       431
     ],
-    "raw_probe_hex": "474554202f20485454502f312e310d0a486f73743a206e72732e676f762e6e670d0a5472616e736665722d456e636f64696e673a206368756e6b65640d0a0d0a300a0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a206e72732e676f762e6e670d0a582d49676e6f72653a20310d0a0d0a",
-    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791924340681\ndef test_octo_arm107_test_0001():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a206e72732e676f762e6e670d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a206e72732e676f762e6e670d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791935640711\ndef test_octo_arm107_test_0095_0711():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0096-3533",
+    "vuln_id": "VULN-REPRO-1791935843533",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a2d2d6162630d0a436f6e74656e742d547970653a20746578742f706c61696e0d0a436f6e74656e742d5472616e736665722d456e636f64696e673a2062696e6172790d0a436f6e74656e742d446973706f736974696f6e3a206174746163686d656e743b2066696c656e616d653d226b65792e646572220d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a0d0a2d2d6162632d2d0d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791935843533\ndef test_octo_arm107_test_0096_3533():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0097-1315",
+    "vuln_id": "VULN-REPRO-1791935951315",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0a436f6e74656e742d547970653a206d756c7469706172742f6d697865643b20626f756e646172793d6162630d0a0d0a2d2d6162630d0a436f6e74656e742d547970653a20746578742f706c61696e0d0a436f6e74656e742d5472616e736665722d456e636f64696e673a2062696e6172790d0a436f6e74656e742d446973706f736974696f6e3a206174746163686d656e743b2066696c656e616d653d226b65792e646572220d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a0d0a2d2d6162632d2d0d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791935951315\ndef test_octo_arm107_test_0097_1315():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0098-3236",
+    "vuln_id": "VULN-REPRO-1791936323236",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791936323236\ndef test_octo_arm107_test_0098_3236():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0099-8872",
+    "vuln_id": "VULN-REPRO-1791936368872",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791936368872\ndef test_octo_arm107_test_0099_8872():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0100-3163",
+    "vuln_id": "VULN-REPRO-1791936523163",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791936523163\ndef test_octo_arm107_test_0100_3163():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0101-1544",
+    "vuln_id": "VULN-REPRO-1791936811544",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791936811544\ndef test_octo_arm107_test_0101_1544():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0102-1144",
+    "vuln_id": "VULN-REPRO-1791937041144",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a485454502f312e3120323030204f4b0d0a436f6e74656e742d4c656e6774683a203130300d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791937041144\ndef test_octo_arm107_test_0102_1144():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0103-1746",
+    "vuln_id": "VULN-REPRO-1791937311746",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791937311746\ndef test_octo_arm107_test_0103_1746():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0104-3666",
+    "vuln_id": "VULN-REPRO-1791937413666",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791937413666\ndef test_octo_arm107_test_0104_3666():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0105-0583",
+    "vuln_id": "VULN-REPRO-1791937550583",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791937550583\ndef test_octo_arm107_test_0105_0583():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0106-9281",
+    "vuln_id": "VULN-REPRO-1791937939281",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791937939281\ndef test_octo_arm107_test_0106_9281():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0107-9051",
+    "vuln_id": "VULN-REPRO-1791938469051",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791938469051\ndef test_octo_arm107_test_0107_9051():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0108-6440",
+    "vuln_id": "VULN-REPRO-1791938556440",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a424441542030204c4153540d0a2e0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791938556440\ndef test_octo_arm107_test_0108_6440():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0109-5980",
+    "vuln_id": "VULN-REPRO-1791938985980",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791938985980\ndef test_octo_arm107_test_0109_5980():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0110-0493",
+    "vuln_id": "VULN-REPRO-1791939230493",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791939230493\ndef test_octo_arm107_test_0110_0493():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0111-2820",
+    "vuln_id": "VULN-REPRO-1791939462820",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "474554202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791939462820\ndef test_octo_arm107_test_0111_2820():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0112-8120",
+    "vuln_id": "VULN-REPRO-1791939748120",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791939748120\ndef test_octo_arm107_test_0112_8120():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0113-3023",
+    "vuln_id": "VULN-REPRO-1791939833023",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791939833023\ndef test_octo_arm107_test_0113_3023():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0114-9925",
+    "vuln_id": "VULN-REPRO-1791939999925",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791939999925\ndef test_octo_arm107_test_0114_9925():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0115-1024",
+    "vuln_id": "VULN-REPRO-1791940521024",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791940521024\ndef test_octo_arm107_test_0115_1024():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0116-6380",
+    "vuln_id": "VULN-REPRO-1791940836380",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f6e756c20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a436f6e74656e742d4c656e6774683a20350d0a0d0a3132333435360d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791940836380\ndef test_octo_arm107_test_0116_6380():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0117-9312",
+    "vuln_id": "VULN-REPRO-1791941229312",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791941229312\ndef test_octo_arm107_test_0117_9312():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0118-1468",
+    "vuln_id": "VULN-REPRO-1791941341468",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a2d2d424f554e440d0a436f6e74656e742d547970653a20746578742f706c61696e0d0a0d0a706172740d0a2d2d424f554e442d2d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791941341468\ndef test_octo_arm107_test_0118_1468():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0119-2658",
+    "vuln_id": "VULN-REPRO-1791941992658",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791941992658\ndef test_octo_arm107_test_0119_2658():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0120-0637",
+    "vuln_id": "VULN-REPRO-1791942120637",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791942120637\ndef test_octo_arm107_test_0120_0637():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0121-8021",
+    "vuln_id": "VULN-REPRO-1791942438021",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791942438021\ndef test_octo_arm107_test_0121_8021():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
+  },
+  {
+    "test_id": "OCTO-ARM107-TEST-0122-9964",
+    "vuln_id": "VULN-REPRO-1791942679964",
+    "protocol": "HTTP/1.1",
+    "expected_status": [
+      400,
+      431
+    ],
+    "raw_probe_hex": "504f5354202f20485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a0d0a474554202f7465726d696e61746f725f6d61726b65725f3838323120485454502f312e310d0a486f73743a20646c70746573742e636f6d0d0a582d49676e6f72653a20310d0a0d0a",
+    "validation_logic": "# Arm 107 Regression Test for VULN-REPRO-1791942679964\ndef test_octo_arm107_test_0122_9964():\n    res = client.send_raw(raw_probe)\n    assert res.status_code in [400, 431], f'Expected rejection, got {res.status_code}'\n"
   }
 ]
