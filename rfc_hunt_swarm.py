@@ -1338,7 +1338,8 @@ USAGE EXAMPLES (All run directly via rfc_hunt_swarm.py):
     parser.add_argument("--export-rules-dir", type=str, default="defense_rules", help="Output directory for exported Nuclei, ModSecurity, and Suricata rules (default: defense_rules)")
     parser.add_argument("--probe", type=str, default=None, help="Custom raw wire probe string or hex for oracle, h2, and differential modes")
     parser.add_argument("--random-port", "--high-port", action="store_true", help="Use a high random available port for the UI and lab servers")
-    parser.add_argument("--serve", "--ui", dest="serve", action="store_true", help="Serve the dashboard UI on a high random available port after generation")
+    parser.add_argument("--ui", action="store_true", help="Launch the interactive research dashboard web UI on a high random available port")
+    parser.add_argument("--serve", action="store_true", help="Serve the dashboard UI on a high random available port after generation")
     parser.add_argument("--kettle", action="store_true", help="Shortcut to scan James Kettle's curated 138 HTTP & SMTP RFC corpus")
     parser.add_argument("--all-active", action="store_true", help="Shortcut to scan all active IETF protocol specifications")
     parser.add_argument("--cycles", type=int, default=3, help="Max mutation cycles to run per RFC")
@@ -1408,7 +1409,9 @@ def main_swarm(argv=None):
 
     # Resolve positional command / shortcut flags into active_mode
     active_mode = args.command or args.mode
-    if args.build:
+    if args.ui:
+        active_mode = "ui"
+    elif args.build:
         active_mode = "build"
     elif args.mcp:
         active_mode = "mcp"

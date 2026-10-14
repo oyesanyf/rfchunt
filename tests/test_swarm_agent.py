@@ -146,4 +146,8 @@ def test_swarm_all_wired_commands(tmp_path):
     rule_files = os.listdir(str(tmp_path / "rules"))
     assert len(rule_files) >= 3
 
+    # 4. Verify --ui flag parses cleanly
+    ui_args = parse_swarm_arguments(["--ui"])
+    assert ui_args.ui is True
+
 
