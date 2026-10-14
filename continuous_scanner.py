@@ -156,11 +156,21 @@ class ContinuousFlawHunter:
             rfc_queue = unscanned_queue
 
         confirmed_flaws: List[Dict[str, Any]] = []
+        scan_stats: Dict[str, Any] = {
+            "total_evaluated": 0,
+            "passed": 0,
+            "anomalies": 0,
+            "flaws": 0,
+            "per_rfc": {},
+        }
 
         for rfc_num in rfc_queue:
             if self._stop_requested:
                 self.on_progress("[!] Stop requested by user.")
                 break
+
+            if rfc_num not in scan_stats["per_rfc"]:
+                scan_stats["per_rfc"][rfc_num] = {"evaluated": 0, "passed": 0, "anomalies": 0, "flaws": 0}
 
             self.on_progress(f"\n=======================================================")
             self.on_progress(f"[+] STEP 1: Ingesting RFC {rfc_num} from RFC Editor...")
@@ -234,6 +244,20 @@ class ContinuousFlawHunter:
 
                     anomalies = meta.get("anomalies", [])
                     has_anomaly = len(anomalies) > 0
+
+                    scan_stats["total_evaluated"] += 1
+                    rfc_st = scan_stats["per_rfc"].setdefault(rfc_num, {"evaluated": 0, "passed": 0, "anomalies": 0, "flaws": 0})
+                    rfc_st["evaluated"] += 1
+
+                    if is_vuln:
+                        scan_stats["flaws"] += 1
+                        rfc_st["flaws"] += 1
+                    elif has_anomaly:
+                        scan_stats["anomalies"] += 1
+                        rfc_st["anomalies"] += 1
+                    else:
+                        scan_stats["passed"] += 1
+                        rfc_st["passed"] += 1
 
                     if is_vuln or has_anomaly:
                         flaw_record = {
@@ -380,13 +404,73 @@ class ContinuousFlawHunter:
 
                         if stop_on_first_flaw:
                             self.on_progress("\n[+] Target flaw discovered and verified! Halting research cascade.")
+                            self._print_scan_summary(scan_stats, confirmed_flaws)
                             report_file = self.forensics.save_forensic_report()
                             self.on_progress(f"[+] Forensic Evidence Report saved: {report_file}")
                             self.on_progress(f"[+] Full Run Log saved: {self.forensics.log_file}")
                             return confirmed_flaws
 
         self.on_progress(f"\n[*] Continuous RFC scan cycle finished. Total flaws surfaced: {len(confirmed_flaws)}")
+        self._print_scan_summary(scan_stats, confirmed_flaws)
         report_file = self.forensics.save_forensic_report()
         self.on_progress(f"[+] Forensic Evidence Report saved: {report_file}")
         self.on_progress(f"[+] Full Run Log saved: {self.forensics.log_file}")
         return confirmed_flaws
+
+    def _print_scan_summary(self, stats: Dict[str, Any], flaws: List[Dict[str, Any]]):
+        tot = stats.get("total_evaluated", 0)
+        pa = stats.get("passed", 0)
+        an = stats.get("anomalies", 0)
+        fl = stats.get("flaws", 0)
+        pa_pct = (pa / tot * 100.0) if tot > 0 else 0.0
+        an_pct = (an / tot * 100.0) if tot > 0 else 0.0
+        fl_pct = (fl / tot * 100.0) if tot > 0 else 0.0
+
+        lines = [
+            "",
+            "=" * 78,
+            "  CONTINUOUS SCANNER RUN TELEMETRY & PASS / FAIL SUMMARY",
+            "=" * 78,
+            f"  Target Endpoint               : {self.target_host}:{self.target_port} (TLS: {self.use_tls})",
+            f"  TOTAL WIRE PROBES EXECUTED    : {tot}",
+            f"  [+] PASSED (Target Conformant): {pa} ({pa_pct:.1f}%)",
+            f"  [-] FAILED (Anomalies Found)  : {an} ({an_pct:.1f}%)",
+            f"  [!] CONFIRMED VULNERABILITIES : {fl} ({fl_pct:.1f}%)",
+            "=" * 78,
+        ]
+
+        per_rfc = stats.get("per_rfc", {})
+        if per_rfc:
+            lines.append("  PER-RFC BREAKDOWN:")
+            lines.append(f"  {'RFC':<10} | {'Executed':>8} | {'Passed':>8} | {'Anomalies':>9} | {'Flaws':>6} | {'Verdict'}")
+            lines.append("  " + "-" * 74)
+            for rfc_num, st in per_rfc.items():
+                e = st["evaluated"]
+                p = st["passed"]
+                a = st["anomalies"]
+                f_count = st["flaws"]
+                if f_count > 0:
+                    verdict = "FAIL (FLAW CONFIRMED)"
+                elif a > 0:
+                    verdict = "WARN (ANOMALY DETECTED)"
+                elif e > 0:
+                    verdict = "PASS (CONFORMANT)"
+                else:
+                    verdict = "SKIPPED"
+                lines.append(f"  RFC{rfc_num:<7} | {e:>8} | {p:>8} | {a:>9} | {f_count:>6} | {verdict}")
+            lines.append("=" * 78)
+
+        overall_verdict = (
+            f"FAIL ({fl} Confirmed Flaws)"
+            if fl > 0
+            else (
+                f"PASS WITH WARNINGS ({an} Anomalies Detected)"
+                if an > 0
+                else "PASS (Target Conformant Across All Evaluated Probes)"
+            )
+        )
+        lines.append(f"  OVERALL RUN VERDICT: {overall_verdict}")
+        lines.append("=" * 78 + "\n")
+
+        for line in lines:
+            self.on_progress(line)

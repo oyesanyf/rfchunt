@@ -230,5 +230,21 @@
     "anchor": "RFC9583",
     "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0123,phase:1,deny,status:400\"",
     "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0124-8663",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9340",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0124,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
+  },
+  {
+    "rule_id": "OCTO-ARM106-0125-8815",
+    "name": "Hardening Rule for QUEUE_POISONING",
+    "type": "WAF_MODSEC",
+    "anchor": "RFC9340",
+    "body": "SecRule REQUEST_HEADERS_NAMES \"@rx .*\" \"id:0125,phase:1,deny,status:400\"",
+    "severity": "CRITICAL"
   }
 ]
