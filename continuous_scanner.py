@@ -21,6 +21,9 @@ from weaponizer import RQPWeaponizer
 from engine.orchestrator import ProtocolResearchOrchestrator
 from engine.taxonomy import ImplementationAnomaly, AnomalyCategory
 from engine.terminator_rfc_selector import TerminatorRFCSelector
+from engine.merkle_audit import MerkleAuditTrail
+from engine.exploit_exporter import ExploitExporter
+from engine.dashboard_generator import DashboardGenerator
 
 
 class ContinuousFlawHunter:
@@ -76,6 +79,7 @@ class ContinuousFlawHunter:
             use_tls=use_tls,
             db=self.db,
         )
+        self.merkle_audit = MerkleAuditTrail()
 
         self._stop_requested = False
 
@@ -387,6 +391,35 @@ class ContinuousFlawHunter:
                         self.on_progress(f"    [Arm 106 Defense Ingestion]: Published {arm106_rule.rule_id} ({arm106_rule.name})")
                         self.on_progress(f"    [Arm 107 Regression Suite]: Published {arm107_test.test_id} (Expected Status: {arm107_test.expected_status_rejection})")
 
+                        # Independent 4-Parser Differential Matrix (Protocol Research Reproducibility Invariant)
+                        has_diff, _, diff_matrix = self.research_engine.oracle.evaluate_matrix_4parsers(anom_obj.raw_probe)
+                        status_tag = "CONFIRMED_VULNERABILITY" if is_vuln else ("ANOMALY_VERIFIED" if has_anomaly else "NON_REPRODUCIBLE_TRANSIENT")
+
+                        # Append to Cryptographic Merkle Audit Trail
+                        leaf = self.merkle_audit.record_finding(
+                            entry_id=repro_vuln.vuln_id,
+                            target_engine=anom_obj.target_engine,
+                            raw_probe=anom_obj.raw_probe,
+                            raw_response=anom_obj.raw_response,
+                            reproducibility_rate=repro_vuln.reproducibility_rate,
+                            verification_attempts=repro_vuln.verification_attempts,
+                            successful_reproductions=repro_vuln.successful_reproductions,
+                            four_parser_differential=diff_matrix,
+                            status=status_tag,
+                        )
+                        self.on_progress(f"    [Cryptographic Merkle Audit Trail]: Logged Leaf #{leaf.index} (Root: {self.merkle_audit.get_merkle_root()[:16]}...)")
+
+                        # Export Nuclei, ModSecurity, and Suricata artifacts if vulnerable
+                        if is_vuln:
+                            try:
+                                nuclei_tmpl = ExploitExporter.export_nuclei_template(repro_vuln)
+                                nuclei_path = self.forensics.run_dir / f"nuclei_{repro_vuln.vuln_id.lower()}.yaml"
+                                with open(nuclei_path, "w", encoding="utf-8") as nf:
+                                    nf.write(nuclei_tmpl)
+                                self.on_progress(f"    [Nuclei Exploit Template Exported]: {nuclei_path.name}")
+                            except Exception:
+                                pass
+
                         # Record Forensic Evidence Artifact
                         self.forensics.record_finding(
                             rfc_num=rfc_num,
@@ -406,6 +439,7 @@ class ContinuousFlawHunter:
                             self.on_progress("\n[+] Target flaw discovered and verified! Halting research cascade.")
                             self._print_scan_summary(scan_stats, confirmed_flaws)
                             report_file = self.forensics.save_forensic_report()
+                            self._generate_and_save_dashboard(scan_stats, confirmed_flaws)
                             self.on_progress(f"[+] Forensic Evidence Report saved: {report_file}")
                             self.on_progress(f"[+] Full Run Log saved: {self.forensics.log_file}")
                             return confirmed_flaws
@@ -413,9 +447,31 @@ class ContinuousFlawHunter:
         self.on_progress(f"\n[*] Continuous RFC scan cycle finished. Total flaws surfaced: {len(confirmed_flaws)}")
         self._print_scan_summary(scan_stats, confirmed_flaws)
         report_file = self.forensics.save_forensic_report()
+        self._generate_and_save_dashboard(scan_stats, confirmed_flaws)
         self.on_progress(f"[+] Forensic Evidence Report saved: {report_file}")
         self.on_progress(f"[+] Full Run Log saved: {self.forensics.log_file}")
         return confirmed_flaws
+
+    def _generate_and_save_dashboard(self, stats: Dict[str, Any], flaws: List[Dict[str, Any]]):
+        """Generates and writes the standalone interactive HTML research dashboard."""
+        try:
+            arm106_c = self.db.get_arm106_rules_count() if hasattr(self.db, "get_arm106_rules_count") else 0
+            arm107_c = self.db.get_arm107_tests_count() if hasattr(self.db, "get_arm107_tests_count") else 0
+            dash_html = DashboardGenerator.generate_html_dashboard(
+                target_host=self.target_host,
+                target_port=self.target_port,
+                scan_stats=stats,
+                merkle_audit_log=self.merkle_audit.export_audit_log(),
+                flaws=flaws,
+                arm106_count=arm106_c,
+                arm107_count=arm107_c,
+            )
+            dash_path = self.forensics.run_dir / "research_dashboard.html"
+            with open(dash_path, "w", encoding="utf-8") as df:
+                df.write(dash_html)
+            self.on_progress(f"[+] Interactive Research Dashboard saved: {dash_path}")
+        except Exception as e:
+            self.on_progress(f"[!] Warning: Could not render research dashboard: {e}")
 
     def _print_scan_summary(self, stats: Dict[str, Any], flaws: List[Dict[str, Any]]):
         tot = stats.get("total_evaluated", 0)

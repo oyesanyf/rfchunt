@@ -42,24 +42,43 @@ class DeltaDebugger:
         # Step 1: Minimize headers and bytes
         minimized, delta_steps = self._delta_debug_probe(raw_probe, evaluator)
 
-        # Step 2: Verification across N trials to eliminate network noise
+        # Step 2: Verification across N trials (Minimum 3 trials per Protocol Research Reproducibility Invariant)
+        effective_trials = max(3, max_verification_trials)
         successes = 0
-        for _ in range(max_verification_trials):
+        for _ in range(effective_trials):
             if evaluator(minimized):
                 successes += 1
             time.sleep(0.05)
 
-        repro_rate = successes / max_verification_trials if max_verification_trials > 0 else 0.0
+        repro_rate = successes / effective_trials if effective_trials > 0 else 0.0
 
-        # Determine impact classification
-        impact = ImpactClass.PARSER_CONFUSION
-        probe_lower = minimized.lower()
-        if b"transfer-encoding" in probe_lower and b"content-length" in probe_lower:
-            impact = ImpactClass.DESYNCHRONIZATION
-        elif b"canary" in probe_lower or b"terminator_marker" in probe_lower:
-            impact = ImpactClass.QUEUE_POISONING
-        elif b"obs-fold" in probe_lower or b"chunk" in probe_lower:
-            impact = ImpactClass.BOUNDARY_OVERFLOW
+        # Multi-Trial Confirmation Law: Flakes must be automatically downgraded
+        provenance = [
+            f"Triggered from anomaly: {anomaly.anomaly_id}",
+            f"Original probe length: {len(raw_probe)} bytes",
+            f"Minimized probe length: {len(minimized)} bytes",
+            f"Reproducibility: {successes}/{effective_trials} ({repro_rate * 100:.1f}%)",
+        ]
+
+        if successes < 3 or repro_rate < 0.60:
+            impact = ImpactClass.NON_REPRODUCIBLE_TRANSIENT
+            provenance.append("Downgraded to NonReproducibleTransient: Failed minimum 3-trial stability requirement.")
+        else:
+            # Determine impact classification for confirmed reproducible findings
+            impact = ImpactClass.PARSER_CONFUSION
+            probe_lower = minimized.lower()
+            if b"%0d%0a" in probe_lower or b"x-original-url" in probe_lower or b"expect: asdf" in probe_lower:
+                impact = ImpactClass.CRLF_REQUEST_HEADER_INJECTION
+            elif b"x-h2" in probe_lower or b"pri * http/2" in probe_lower:
+                impact = ImpactClass.HTTP2_GATEWAY_DESYNC
+            elif b"head " in probe_lower and b"range: bytes" in probe_lower:
+                impact = ImpactClass.HEAD_RANGE_OVERREAD
+            elif b"transfer-encoding" in probe_lower and b"content-length" in probe_lower:
+                impact = ImpactClass.DESYNCHRONIZATION
+            elif b"canary" in probe_lower or b"terminator_marker" in probe_lower:
+                impact = ImpactClass.QUEUE_POISONING
+            elif b"obs-fold" in probe_lower or b"chunk" in probe_lower:
+                impact = ImpactClass.BOUNDARY_OVERFLOW
 
         return ReproducibleVulnerability(
             vuln_id=f"VULN-REPRO-{int(time.time() * 1000)}",
@@ -67,15 +86,10 @@ class DeltaDebugger:
             impact=impact,
             minimized_probe=minimized,
             reproducibility_rate=repro_rate,
-            verification_attempts=max_verification_trials,
+            verification_attempts=effective_trials,
             successful_reproductions=successes,
             delta_debug_steps=delta_steps,
-            provenance_chain=[
-                f"Triggered from anomaly: {anomaly.anomaly_id}",
-                f"Original probe length: {len(raw_probe)} bytes",
-                f"Minimized probe length: {len(minimized)} bytes",
-                f"Reproducibility: {successes}/{max_verification_trials} ({repro_rate * 100:.1f}%)",
-            ],
+            provenance_chain=provenance,
         )
 
     def _delta_debug_probe(self, probe: bytes, evaluator: Callable[[bytes], bool]) -> Tuple[bytes, int]:

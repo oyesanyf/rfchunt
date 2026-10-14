@@ -19,7 +19,7 @@ def test_crlf_permutator_mutators():
     """Verifies that all 7 CRLF Request Header Injection mutators transform requests accurately."""
     permutator = VectorPermutator()
     assert len(permutator.get_crlf_desync_mutators()) == 7
-    assert len(permutator.get_terminator_mutators()) == 32
+    assert len(permutator.get_terminator_mutators()) == 36
 
     base_req = "GET / HTTP/1.1\r\nHost: target.local\r\nUser-Agent: test\r\n\r\n"
 

