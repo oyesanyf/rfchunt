@@ -969,53 +969,56 @@ Based on the autonomous protocol research methodology by James Kettle
 USAGE EXAMPLES (All run directly via rfc_hunt_swarm.py):
 ===============================================================================
 
-1. Scan RFC 9112 against a local or remote HTTPS target:
-   python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host target.example.com --port 443 --tls --debug
+1. Scan a Single RFC against a local or remote target:
+   python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host remote-target.com --port 443 --tls --debug
+   python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host 127.0.0.1 --port 3030 --cycles 2 --debug
 
-2. Scan the full 25-RFC Terminator & Gateway Suite (HTTP/1.1, H2, H3, WebSockets,
-   Caching, Forwarded, Early-Data, Capsule, Structured Fields, HPACK/QPACK):
-   python -u rfc_hunt_swarm.py --mode terminator --host target.example.com --port 443 --tls
+2. Scan the full 25-RFC Terminator & Gateway Suite against a Remote Host:
+   python -u rfc_hunt_swarm.py --mode terminator --host remote-target.com --port 443 --tls --concurrency 8 --debug
+   (Covers RFC 9112, 9110, 9111, 7230, 2616, 9113, 7540, 9297, 9651, 8297, 8446, etc.)
 
-3. Test specific Terminator RFCs (Caching, Forwarded, WebSockets, Capsule, Structured Fields):
-   python -u rfc_hunt_swarm.py --mode single --rfc 9111 --host target.example.com --port 443 --tls
-   python -u rfc_hunt_swarm.py --mode single --rfc 7239 --host target.example.com --port 443 --tls
-   python -u rfc_hunt_swarm.py --mode single --rfc 6455 --host target.example.com --port 443 --tls
-   python -u rfc_hunt_swarm.py --mode single --rfc 9297 --host target.example.com --port 443 --tls
-   python -u rfc_hunt_swarm.py --mode single --rfc 9651 --host target.example.com --port 443 --tls
+3. Scan James Kettle's Full 138-RFC Research Corpus against a Remote Host:
+   python -u rfc_hunt_swarm.py --mode corpus --host remote-target.com --port 443 --tls --concurrency 8 --debug
+   (Covers all 138 curated HTTP, caching, transport, and SMTP/MIME cross-protocol specifications)
 
-4. High-speed multithreaded evaluation with 8 concurrent socket threads (Semaphore-bounded):
-   python -u rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 8080 --concurrency 8
+4. Discover & Scan ALL Active IETF Protocol Specifications from the RFC Editor index:
+   python -u rfc_hunt_swarm.py --mode all --host remote-target.com --port 443 --tls --concurrency 8 --debug
 
-5. One-Click Local Test Lab + Swarm (auto-starts local TestLabServer if port is free):
-   python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host 127.0.0.1 --port 8080
+5. Filter Active IETF Specifications by Protocol Keywords:
+   python -u rfc_hunt_swarm.py --mode all --keywords "chunked,trailer,websocket,proxy" --host remote-target.com --port 443 --tls --debug
 
-6. Offline RFC ingestion & probe generation into terminator.db (no packets sent to any host):
-   python -u rfc_hunt_swarm.py --mode terminator --comb-only --max-rfcs 25
+6. Post-Quantum Cryptography (PQC) & Hybrid TLS Testing:
+   python -u rfc_hunt_swarm.py --mode pqc --host remote-target.com --port 443 --tls --debug
+   python -u rfc_hunt_swarm.py --mode single --rfc 9180 --host remote-target.com --port 443 --tls --debug
+   python -u rfc_hunt_swarm.py --mode single --rfc 9370 --host remote-target.com --port 443 --tls --debug
 
-7. Filter active RFCs by keyword (e.g. chunked, trailer, websocket):
-   python -u rfc_hunt_swarm.py --mode all --keywords "chunked,trailer,websocket" --max-rfcs 10
+7. Local Plaintext HTTP Testing (No --tls, custom port or full URL):
+   python -u rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 3030 --debug
+   python -u rfc_hunt_swarm.py --mode terminator --host http://127.0.0.1:3030/ --debug
 
-8. Scan James Kettle's 138-RFC Corpus or Post-Quantum Cryptography (PQC) RFCs:
-   python -u rfc_hunt_swarm.py --mode corpus --timeout 0
-   python -u rfc_hunt_swarm.py --mode pqc
+8. High-Speed Multithreaded Evaluation (Semaphore-bounded socket thread pool):
+   python -u rfc_hunt_swarm.py --mode terminator --host remote-target.com --port 443 --tls --concurrency 16
 
 9. Protocol Ruler mode (measure front-end byte transformations using backend length limits):
-   python -u rfc_hunt_swarm.py --mode ruler --host target.example.com --port 443 --tls --debug
-   python -u rfc_hunt_swarm.py --mode ruler --host 127.0.0.1 --port 8080 --sequence "\\xc0\\x8a" --name "Overlong-LF"
+   python -u rfc_hunt_swarm.py --mode ruler --host remote-target.com --port 443 --tls --debug
+   python -u rfc_hunt_swarm.py --mode ruler --host 127.0.0.1 --port 3030 --sequence "\\xc0\\x8a" --name "Overlong-LF"
 
-10. Unified 'Build All' pipeline (syntax check, DB schema, 25 RFC cache, Caldera, Dream-RSI, pytest):
+10. Offline RFC ingestion & probe generation into terminator.db (zero network packets sent):
+    python -u rfc_hunt_swarm.py --mode terminator --comb-only --max-rfcs 25
+
+11. Unified 'Build All' pipeline (syntax check, DB schema, 25 RFC cache, Caldera, Dream-RSI, pytest):
     python -u rfc_hunt_swarm.py --mode build
     python -u rfc_hunt_swarm.py build --skip-tests
 
-11. Modular pipeline stages & standalone services (formerly in main.py / start.py):
+12. Modular pipeline stages & standalone services:
     python -u rfc_hunt_swarm.py --mode lab --host 127.0.0.1 --port 8080
     python -u rfc_hunt_swarm.py --mode mcp
-    python -u rfc_hunt_swarm.py --mode hunt --host 127.0.0.1 --port 8080 --max-rfcs 15
-    python -u rfc_hunt_swarm.py --mode auto --host 127.0.0.1 --port 8080 --concurrency 4
+    python -u rfc_hunt_swarm.py --mode hunt --host 127.0.0.1 --port 3030 --max-rfcs 15
+    python -u rfc_hunt_swarm.py --mode auto --host 127.0.0.1 --port 3030 --concurrency 8
     python -u rfc_hunt_swarm.py --mode dream --dream-rollouts 300
     python -u rfc_hunt_swarm.py --mode caldera --export-caldera ./caldera_export
 
-12. List all 25 Terminator RFC Specifications and 25 Wire/Chunk Terminator Mutators:
+13. List all 25 Terminator RFC Specifications and 25 Wire/Chunk Terminator Mutators:
     python -u rfc_hunt_swarm.py --list-terminators
 ===============================================================================
 """,
