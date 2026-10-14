@@ -82,7 +82,9 @@ USAGE EXAMPLES:
     parser.add_argument("--mcp", action="store_true", help="Launch the MCP server instead of the continuous hunter")
     parser.add_argument("--targets", default=None, help="Comma-separated target terminators (e.g. '127.0.0.1:8080,127.0.0.1:8081,proxy2.local:443')")
     parser.add_argument("--terminators", default="all", help="Comma-separated terminator categories: 'line,chunk,framing,cross_protocol,crlf_rhi,h2_gateway' or 'all' (default: all)")
-    parser.add_argument("--mode", default=None, choices=["hunt", "ruler", "lab", "offline", "comb-only", "mcp", "dream", "build"], help="Execution mode (default: hunt, or lab+hunt if local)")
+    parser.add_argument("--mode", default=None, choices=["hunt", "ruler", "lab", "offline", "comb-only", "mcp", "dream", "build", "ui"], help="Execution mode (default: hunt, or lab+hunt if local)")
+    parser.add_argument("--random-port", "--high-port", action="store_true", help="Use a high random available port for the test lab server / UI")
+    parser.add_argument("--ui", action="store_true", help="Launch the interactive research dashboard web UI on a high random available port")
     return parser
 
 
@@ -146,21 +148,24 @@ def main():
         elif m in ("offline", "comb-only"):
             args.comb_only = True
 
-    # 1. Start Local Protocol Test Lab Server (if first target is local 8080 and not disabled)
+    # 1. Start Local Protocol Test Lab Server (if first target is local 8080 and not disabled, or if --random-port is given)
     lab_server = None
     first_host, first_port, first_tls = target_list[0]
     is_first_local = first_host in ("127.0.0.1", "localhost", "::1", "[::1]")
-    should_spawn_lab = is_first_local and (first_port == 8080) and not args.no_lab and not args.comb_only
+    should_spawn_lab = is_first_local and (first_port == 8080 or args.random_port) and not args.no_lab and not args.comb_only and not (args.ui or args.mode == "ui")
 
     if args.comb_only:
         print("\n[+] Step 1: Mode: Offline RFC Ingestion & Discovery")
         print("    (Host evaluation bypassed - generating and banking probes into database only)")
     elif should_spawn_lab:
-        print(f"\n[+] Step 1: Initializing local Protocol Test Lab on http://{first_host}:{first_port}...")
-        lab_server = TestLabServer(host=first_host, port=first_port)
+        bind_port = 0 if args.random_port else first_port
+        lab_server = TestLabServer(host=first_host, port=bind_port)
         try:
             lab_server.start()
+            first_port = lab_server.port
+            target_list[0] = (first_host, first_port, first_tls)
             time.sleep(0.4)
+            print(f"\n[+] Step 1: Initializing local Protocol Test Lab on http://{first_host}:{first_port}...")
         except Exception as e:
             print(f"[!] Failed to bind lab server: {e}")
             sys.exit(1)
@@ -187,6 +192,20 @@ def main():
             print(f"\n[+] Step 2: Launching Model Context Protocol (MCP) Server over stdio...")
             mcp_server = TerminatorMCPServer()
             mcp_server.run_stdio()
+        elif args.ui or args.mode == "ui":
+            ui_port = 0 if (args.random_port or args.ui) else args.port
+            lab_server = TestLabServer(host=first_host if is_first_local else "127.0.0.1", port=ui_port)
+            lab_server.start()
+            print(f"\n{'='*70}")
+            print(f"  HTTP TERMINATOR: RESEARCH DASHBOARD UI")
+            print(f"{'='*70}")
+            print(f"  [+] UI Server Active on High Random Port : {lab_server.port}")
+            print(f"  [+] Local Web UI URL                    : http://127.0.0.1:{lab_server.port}/")
+            print(f"  [+] Interactive Dashboard Viewport      : http://127.0.0.1:{lab_server.port}/dashboard")
+            print(f"{'='*70}")
+            print("  Press Ctrl+C to halt the UI server.\n")
+            while True:
+                time.sleep(1)
         elif args.mode == "lab":
             print(f"\n[+] Test Lab Server running on http://{first_host}:{first_port}. Press Ctrl+C to stop.")
             while True:

@@ -42,6 +42,7 @@ class ContinuousFlawHunter:
         on_progress: Optional[Callable[[str], None]] = None,
         verbose: bool = True,
         sec_model: Optional[str] = None,
+        terminator_categories: Optional[List[str]] = None,
     ):
         self.target_host = target_host
         self.target_port = target_port
@@ -50,6 +51,7 @@ class ContinuousFlawHunter:
         self.use_fusion = use_fusion
         self.sec_model = sec_model
         self.verbose = verbose
+        self.terminator_categories = terminator_categories
         self.db = Database(db_path)
 
         # Initialize Forensic Logging Engine
@@ -221,7 +223,11 @@ class ContinuousFlawHunter:
 
                 # 4. Apply Systematic Vector Permutations
                 for base_p in probes:
-                    variants = self.permutator.permute_probe(base_p, max_variants=permutations_per_probe)
+                    variants = self.permutator.permute_probe(
+                        base_p,
+                        max_variants=permutations_per_probe,
+                        categories=self.terminator_categories,
+                    )
                     all_candidates.extend(variants)
 
                 self.on_progress(f"    -> Total candidate triggers (with permutations): {len(all_candidates)}")

@@ -96,3 +96,54 @@ def test_swarm_run_summary_pass_fail_telemetry(tmp_path):
     assert "RFC9110" in summary and "FAIL (VULNERABILITY CONFIRMED)" in summary
     assert "VULN-REPRO-1001" in summary
 
+
+def test_swarm_all_wired_commands(tmp_path):
+    """Verifies that all commands, arguments, targets, and modes are cleanly wired into rfc_hunt_swarm.py."""
+    import os
+    from rfc_hunt_swarm import (
+        ALL_MODES,
+        build_swarm_parser,
+        parse_swarm_arguments,
+        cmd_oracle,
+        cmd_h2,
+        cmd_audit,
+        cmd_dashboard,
+        cmd_export,
+    )
+
+    # 1. Verify ALL_MODES coverage
+    for mode in [
+        "single", "terminator", "corpus", "all", "pqc", "ruler",
+        "build", "lab", "mcp", "hunt", "auto", "start",
+        "fetch", "chunk", "generate", "permute", "evaluate",
+        "weaponize", "cascade", "dream", "caldera",
+        "dashboard", "export", "oracle", "differential", "h2", "http2", "audit", "merkle",
+    ]:
+        assert mode in ALL_MODES
+
+    # 2. Test CLI argument parser with newly wired options
+    args = parse_swarm_arguments([
+        "oracle",
+        "--targets", "127.0.0.1:8080,https://internal.proxy:8443",
+        "--terminators", "chunk,h2_gateway",
+        "--dashboard-out", str(tmp_path / "dash.html"),
+        "--export-rules-dir", str(tmp_path / "rules"),
+        "--probe", "POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+    ])
+    assert args.command == "oracle"
+    assert args.targets == ["127.0.0.1:8080", "https://internal.proxy:8443"]
+    assert args.terminators == ["chunk", "h2_gateway"]
+
+    # 3. Test execution of newly wired standalone commands
+    cmd_oracle(args)
+    cmd_h2(args)
+    cmd_audit(args)
+    cmd_dashboard(args)
+    assert os.path.exists(str(tmp_path / "dash.html"))
+
+    cmd_export(args)
+    assert os.path.exists(str(tmp_path / "rules"))
+    rule_files = os.listdir(str(tmp_path / "rules"))
+    assert len(rule_files) >= 3
+
+
