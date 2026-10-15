@@ -132,8 +132,7 @@ class DeltaDebugger:
 
     def _default_oracle(self, anomaly: ImplementationAnomaly) -> Callable[[bytes], bool]:
         """Creates a socket test oracle that tests if the target reproduces the anomaly behavior."""
-        if anomaly.category in (AnomalyCategory.PIPELINE_LEAK, AnomalyCategory.PARSER_DIVERGENCE):
-            # Pipelined sequence verification: verify if candidate probe causes pipeline leak, desync, or status match
+        if anomaly.category in (AnomalyCategory.PIPELINE_LEAK, AnomalyCategory.SOCKET_HANG) or "pipeline leak" in anomaly.observed_behavior.lower():
             from engine.sequence_engine import StatefulProtocolSequenceEngine
             seq_engine = StatefulProtocolSequenceEngine(default_timeout=self.timeout)
 
@@ -146,31 +145,7 @@ class DeltaDebugger:
                         return True
                 except Exception:
                     pass
-                # Fallback: check direct socket response match (e.g. 500 error or identical anomalous response prefix)
-                sock = None
-                try:
-                    sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
-                    if self.use_tls:
-                        context = ssl.create_default_context()
-                        context.check_hostname = False
-                        context.verify_mode = ssl.CERT_NONE
-                        sock = context.wrap_socket(sock, server_hostname=self.host)
-                    sock.sendall(test_bytes)
-                    framed = HTTPFramingReader.read_response(sock, timeout=self.timeout)
-                    resp = framed.raw_response
-                    if framed.status_code == 500 or b"500 Internal" in resp:
-                        return True
-                    if anomaly.raw_response and resp and resp.split(b"\r\n")[0] == anomaly.raw_response.split(b"\r\n")[0] and framed.status_code >= 400:
-                        return True
-                    return False
-                except Exception:
-                    return False
-                finally:
-                    if sock:
-                        try:
-                            sock.close()
-                        except Exception:
-                            pass
+                return False
 
             return pipeline_oracle
 
@@ -201,12 +176,24 @@ class DeltaDebugger:
                 sock.sendall(test_bytes)
                 framed = HTTPFramingReader.read_response(sock, timeout=self.timeout)
                 resp = framed.raw_response
-                # Check if behavior matches anomalous pattern (e.g. server crash or 500 error)
+                # 1. Server crash or internal fault
                 if framed.status_code == 500 or b"500 Internal" in resp:
                     return True
+                # 2. Structural anomaly cascade reproduction
+                from anomaly_detector import AnomalyDetector
+                anoms = AnomalyDetector.analyze_response(resp)
+                if any(a["type"] in anomaly.observed_behavior for a in anoms):
+                    return True
+                # 3. Status and header divergence reproduction
+                if anomaly.raw_response and resp:
+                    orig_line = anomaly.raw_response.split(b"\r\n")[0].strip()
+                    curr_line = resp.split(b"\r\n")[0].strip()
+                    if orig_line and orig_line == curr_line and (framed.status_code >= 400 or b"HTTP/0.9" in anomaly.observed_behavior.encode()):
+                        return True
                 return False
             except (socket.timeout, ConnectionResetError):
-                return False
+                # Socket hang or connection reset indicates crash or timeout desync
+                return "hang" in anomaly.observed_behavior.lower() or "timeout" in anomaly.observed_behavior.lower()
             except Exception:
                 return False
             finally:

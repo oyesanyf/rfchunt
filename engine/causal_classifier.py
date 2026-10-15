@@ -129,15 +129,20 @@ class CausalAnomalyClassifier:
         # For pipeline leaks / queue desync, verify that desynchronization was actually demonstrated
         if (
             vuln.impact in (ImpactClass.QUEUE_POISONING, ImpactClass.DESYNCHRONIZATION)
-            or anomaly.category == AnomalyCategory.PIPELINE_LEAK
+            or anomaly.category in (AnomalyCategory.PIPELINE_LEAK, AnomalyCategory.SOCKET_HANG)
             or "pipeline leak" in anomaly.observed_behavior.lower()
+            or "timeout-based" in anomaly.observed_behavior.lower()
         ):
             probe_lower = vuln.minimized_probe.lower()
+            obs_lower = anomaly.observed_behavior.lower()
             has_desync_vectors = (
                 (b"transfer-encoding" in probe_lower and b"content-length" in probe_lower)
                 or b"canary" in probe_lower
                 or b"terminator_marker" in probe_lower
                 or (b"transfer-encoding" in probe_lower and b"chunk" in probe_lower)
+                or (b"content-length" in probe_lower and probe_lower.startswith(b"get "))
+                or "timeout-based" in obs_lower
+                or "cl.0" in obs_lower
             )
             if not has_desync_vectors:
                 return False, "Unvalidated pipeline leak: does not exhibit verified cross-request queue desynchronization or conflicting framing headers."

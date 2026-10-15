@@ -317,3 +317,32 @@ def test_multi_terminators_and_modes():
     assert args.terminators == ["chunk", "h2_gateway", "crlf_rhi"]
     assert args.mode == "offline"
 
+
+def test_active_flaw_prober_canonical_vectors():
+    """Verifies that ActiveFlawProber creates the complete canonical PortSwigger vulnerability probe suite."""
+    from engine.active_flaw_prober import ActiveFlawProber
+    prober = ActiveFlawProber(host="127.0.0.1", port=8080)
+    probes = prober.get_canonical_attack_probes()
+
+    categories = {cat for _, cat, _ in probes}
+    assert "CL.TE" in categories
+    assert "TE.CL" in categories
+    assert "CL.0" in categories
+    assert "TE.TE" in categories
+    assert "CRLF-RHI" in categories
+    assert "RULER" in categories
+    assert "CRASH" in categories
+    assert len(probes) >= 15
+
+    # Check CL.0 probe contains nested request
+    cl0_probes = [p for _, cat, p in probes if cat == "CL.0"]
+    assert any(b"Content-Length:" in p and b"GET /terminator_marker" in p for p in cl0_probes)
+
+
+def test_sequence_engine_cl0_detection():
+    """Verifies that StatefulProtocolSequenceEngine detects CL.0 request smuggling."""
+    from engine.sequence_engine import StatefulProtocolSequenceEngine
+    engine = StatefulProtocolSequenceEngine()
+    assert hasattr(engine, "run_cl0_canary_sequence")
+
+

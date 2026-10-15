@@ -170,6 +170,34 @@ class ContinuousFlawHunter:
             "per_rfc": {},
         }
 
+        # Step 0: Active Canonical PortSwigger Flaw Suite
+        if not comb_only:
+            from engine.active_flaw_prober import ActiveFlawProber
+            prober = ActiveFlawProber(
+                host=self.target_host,
+                port=self.target_port,
+                use_tls=self.use_tls,
+                db=self.db,
+                on_trace=self.on_progress,
+            )
+            canonical_vulns = prober.run_active_audit()
+            for v in canonical_vulns:
+                confirmed_flaws.append({
+                    "rfc_num": "CANONICAL",
+                    "rationale": f"PortSwigger Canonical Vector ({v.impact.value})",
+                    "raw_request": v.minimized_probe.decode("latin-1", errors="replace"),
+                    "is_vulnerable": True,
+                    "desync_class": v.impact.value,
+                    "details": f"Reproducibility {v.reproducibility_rate*100:.0f}%: {v.vuln_id}",
+                    "anomalies": [],
+                    "timestamp": time.time(),
+                })
+                scan_stats["flaws"] += 1
+                scan_stats["total_evaluated"] += 1
+            if confirmed_flaws and stop_on_first_flaw:
+                self.on_progress(f"\n[+] Canonical vulnerability verified on {self.target_host}:{self.target_port}! Halting as requested.")
+                return confirmed_flaws
+
         for rfc_num in rfc_queue:
             if self._stop_requested:
                 self.on_progress("[!] Stop requested by user.")

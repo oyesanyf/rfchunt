@@ -1701,6 +1701,29 @@ def main_swarm(argv=None):
         swarm.run_stats["rfcs_scheduled"] = len(rfcs_to_scan)
         print(f"\n[*] Queue ready: {len(rfcs_to_scan)} RFC(s) scheduled for Swarm processing.\n" + "="*60)
 
+        # Step 0: Active Canonical Flaw Verification Suite
+        if not args.comb_only:
+            from engine.active_flaw_prober import ActiveFlawProber
+            active_prober = ActiveFlawProber(
+                host=t_host,
+                port=t_port,
+                use_tls=t_tls,
+                timeout=args.timeout if (0 < args.timeout <= 10.0) else 3.5,
+                db=swarm.db,
+                on_trace=print,
+            )
+            canonical_vulns = active_prober.run_active_audit()
+            for v in canonical_vulns:
+                with swarm.stats_lock:
+                    swarm.run_stats["vulnerabilities_confirmed"].append({
+                        "rfc": "CANONICAL",
+                        "vuln_id": v.vuln_id,
+                        "anomaly_id": v.anomaly_id,
+                        "impact": v.impact.value,
+                        "repro": f"{v.reproducibility_rate * 100:.0f}% ({v.successful_reproductions}/{v.verification_attempts})",
+                        "behavior": "Canonical PortSwigger attack vector verified",
+                    })
+
         try:
             for rfc_item in rfcs_to_scan:
                 rfc_num_str = str(rfc_item)

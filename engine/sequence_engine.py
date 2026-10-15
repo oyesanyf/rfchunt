@@ -136,13 +136,28 @@ class StatefulProtocolSequenceEngine:
                 report.details = "Scanner Artifact: Residual baseline response bytes detected on socket; not a pipeline leak."
                 return report
 
-            # Check if server closed connection following candidate probe (RFC 9112 Section 9.3 client error closure)
-            server_closed_after_probe = framed2.is_connection_closed or status2 in (400, 431, 500, 501, 505)
+            # PortSwigger Timeout-Based Desynchronization Detection (CL.TE / TE.CL)
+            probe_lower = candidate_probe.lower()
+            has_cl = b"content-length:" in probe_lower or b"content-length :" in probe_lower
+            has_te = b"transfer-encoding:" in probe_lower or b"transfer-encoding :" in probe_lower
+            is_timeout = (framed2.error and "timeout" in framed2.error.lower()) or (latency2 >= self.default_timeout * 0.85)
+
+            if is_timeout and latency1 < 1.2 and (has_cl or has_te):
+                report.has_desynchronization = True
+                report.has_pipeline_leak = False
+                if has_cl and has_te:
+                    report.details = f"Timeout-Based Desynchronization (CL.TE/TE.CL): Target hung ({latency2:.2f}s vs {latency1:.2f}s baseline); parser divergence in Content-Length/Transfer-Encoding precedence."
+                elif has_te:
+                    report.details = f"Timeout-Based Desynchronization (Chunk Boundary): Target hung ({latency2:.2f}s) awaiting chunk completion."
+                else:
+                    report.details = f"Timeout-Based Desynchronization (CL.0): Target hung ({latency2:.2f}s) awaiting declared body length."
+                return report
+
+            # Check if server explicitly closed connection (Connection: close or socket EOF)
+            server_closed_after_probe = framed2.is_connection_closed
 
             # Step 3: Canary Request
             if server_closed_after_probe:
-                # Connection was cleanly closed by the server due to malformed probe rejection.
-                # Do not treat standard error connection teardown as a pipeline leak!
                 report.steps.append(
                     SequenceStepResult(
                         step_name="Step 3: Canary Check",
@@ -155,17 +170,23 @@ class StatefulProtocolSequenceEngine:
                 )
                 report.has_desynchronization = False
                 report.has_pipeline_leak = False
-                report.details = f"Connection closed by server after candidate probe ({status2} rejection); expected HTTP error behavior, not a pipeline leak."
+                report.details = f"Connection closed by server after candidate probe ({status2}); expected HTTP error behavior, not a pipeline leak."
                 return report
 
             start_t = time.time()
-            sock.sendall(canary_request)
-            framed3 = HTTPFramingReader.read_response(
-                sock, timeout=self.default_timeout, initial_bytes=framed2.unconsumed_bytes
-            )
-            resp3 = framed3.raw_response
-            status3 = framed3.status_code
-            latency3 = time.time() - start_t
+            try:
+                sock.sendall(canary_request)
+                framed3 = HTTPFramingReader.read_response(
+                    sock, timeout=self.default_timeout, initial_bytes=framed2.unconsumed_bytes
+                )
+                resp3 = framed3.raw_response
+                status3 = framed3.status_code
+                latency3 = time.time() - start_t
+            except Exception as e:
+                resp3 = b""
+                status3 = 0
+                latency3 = time.time() - start_t
+                framed3 = None
 
             report.steps.append(
                 SequenceStepResult(
@@ -240,6 +261,76 @@ class StatefulProtocolSequenceEngine:
                 except Exception:
                     pass
 
+        return report
+    def run_cl0_canary_sequence(
+        self,
+        host: str,
+        port: int,
+        path: str = "/",
+        probe_body: bytes = b"GET /terminator_marker_8821 HTTP/1.1\r\nX-Ignore: 1\r\n\r\n",
+        use_tls: bool = False,
+    ) -> SequenceExecutionReport:
+        """
+        Executes dedicated CL.0 (Content-Length on GET / static route) desynchronization sequence:
+        1. Probe: GET {path} with declared Content-Length and smuggled request prefix.
+        2. Immediate follow-up Canary: GET / HTTP/1.1 on the SAME connection.
+        If Canary receives 404, reflects smuggled path, or alters status instead of root response,
+        the backend ignored Content-Length on GET and prepended the unread body into the canary!
+        """
+        report = SequenceExecutionReport(
+            sequence_type="CL0_CANARY",
+            target=f"{host}:{port}",
+        )
+        sock = None
+        try:
+            sock = socket.create_connection((host, port), timeout=self.default_timeout)
+            if use_tls:
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                sock = context.wrap_socket(sock, server_hostname=host)
+
+            # Step 1: Baseline Request
+            sock.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n".encode())
+            framed1 = HTTPFramingReader.read_response(sock, timeout=self.default_timeout)
+            if not framed1.is_complete or framed1.is_connection_closed:
+                report.details = "Target does not support persistent keep-alive on baseline GET."
+                return report
+
+            # Step 2: CL.0 Probe (GET with Content-Length and nested request prefix)
+            cl0_probe = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"Content-Length: {len(probe_body)}\r\n"
+                f"Connection: keep-alive\r\n\r\n"
+            ).encode() + probe_body
+            sock.sendall(cl0_probe)
+            framed2 = HTTPFramingReader.read_response(sock, timeout=self.default_timeout, initial_bytes=framed1.unconsumed_bytes)
+
+            if framed2.is_connection_closed:
+                report.details = "Target server closed connection on GET with Content-Length (safe RFC-compliant behavior)."
+                return report
+
+            # Step 3: Canary Request
+            canary_req = f"GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode()
+            sock.sendall(canary_req)
+            framed3 = HTTPFramingReader.read_response(sock, timeout=self.default_timeout, initial_bytes=framed2.unconsumed_bytes)
+
+            resp3_lower = framed3.raw_response.lower()
+            if b"404" in resp3_lower or b"terminator_marker" in resp3_lower or framed3.status_code == 404:
+                report.has_desynchronization = True
+                report.has_pipeline_leak = True
+                report.details = "CL.0 Request Desynchronization Confirmed: Backend ignored Content-Length on GET and prepended unread body bytes into subsequent request!"
+            else:
+                report.details = "Normal: Backend properly consumed or rejected GET request body."
+        except Exception as e:
+            report.details = f"CL.0 evaluation error: {e}"
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
         return report
 
     def _read_socket_available(self, sock: socket.socket, timeout: float = 2.0) -> bytes:
