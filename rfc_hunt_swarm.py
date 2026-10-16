@@ -1226,13 +1226,64 @@ def cmd_start(args):
         sys.argv = old_argv
 
 
+def cmd_vulns(args):
+    """Prints all confirmed vulnerabilities along with the host name and reproduction metrics."""
+    import sqlite3
+    import os
+    import re
+    db_path = getattr(args, "db", "terminator.db")
+    if not os.path.exists(db_path):
+        print(f"[-] Database {db_path} does not exist.")
+        return
+
+    con = sqlite3.connect(db_path)
+    cur = con.cursor()
+
+    host_filter = getattr(args, "host", None)
+    if host_filter in ("127.0.0.1", "0.0.0.0", "::") and not any("--host" in a for a in sys.argv):
+        host_filter = None
+
+    query = """
+        SELECT r.vuln_id, a.target_engine, r.impact, r.reproducibility_rate, 
+               r.successful_reproductions, r.verification_attempts, r.minimized_probe, r.created_at
+        FROM reproducible_vulnerabilities r
+        LEFT JOIN implementation_anomalies a ON r.anomaly_id = a.anomaly_id
+        ORDER BY r.created_at DESC
+    """
+    rows = cur.execute(query).fetchall()
+    
+    results = []
+    for r in rows:
+        vuln_id, target_engine, impact, rate, succ, att, probe, created_at = r
+        if not target_engine:
+            host_m = re.search(r"Host:\s*([^\r\n]+)", probe or "", re.IGNORECASE)
+            target_engine = host_m.group(1).strip() if host_m else "Unknown Host"
+        
+        if host_filter and host_filter.lower() not in target_engine.lower():
+            continue
+        results.append((vuln_id, target_engine, impact, rate, succ, att, created_at))
+
+    print(f"\n{'='*105}")
+    print(f"[*] CONFIRMED VULNERABILITIES & HOST MAPPING (Database: {db_path})")
+    if host_filter:
+        print(f"    Filtered by Host: {host_filter}")
+    print(f"{'='*105}")
+    print(f"{'VULN ID':<28} {'HOST / TARGET':<22} {'IMPACT CLASS':<28} {'REPRO RATE':<12} {'TIMESTAMP'}")
+    print(f"{'-'*28} {'-'*22} {'-'*28} {'-'*12} {'-'*19}")
+    for vuln_id, target_engine, impact, rate, succ, att, created_at in results:
+        rate_str = f"{rate*100:>5.1f}% ({succ}/{att})"
+        print(f"{vuln_id:<28} {target_engine:<22} {impact:<28} {rate_str:<12} {str(created_at)[:19]}")
+    print(f"{'='*105}")
+    print(f"Total Confirmed Vulnerabilities: {len(results)}\n")
+
+
 ALL_MODES = [
     "single", "terminator", "corpus", "all", "pqc", "ruler",
     "build", "lab", "mcp", "hunt", "auto", "start",
     "fetch", "chunk", "generate", "permute", "evaluate",
     "weaponize", "cascade", "dream", "caldera",
     "dashboard", "export", "oracle", "differential", "h2", "http2", "audit", "merkle",
-    "ui",
+    "ui", "vulns", "findings", "list",
 ]
 
 
@@ -1491,6 +1542,10 @@ def main_swarm(argv=None):
 
     if active_mode == "ui":
         cmd_ui(args)
+        return
+
+    if active_mode in ("vulns", "findings", "list"):
+        cmd_vulns(args)
         return
 
     # Normalize default args.host (strip http://, https://, trailing slashes/paths, and inline :port)

@@ -1,6 +1,6 @@
 {
-  "total_generations": 157,
-  "latest_generation": 29,
+  "total_generations": 193,
+  "latest_generation": 25,
   "policies": [
     {
       "generation": 1,
@@ -2983,6 +2983,690 @@
       "fitness_score": 1907.0,
       "rsi_gain": 0.0,
       "simulated_yield": 0.6367,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 1,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.2996112335019183,
+        "PATH_NUL_EARLY_RESPONSE": 0.2538060206634111,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.24356611460249336,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.04060332624643545,
+        "HEADER_TAB_SPACING": 0.04060332624643545,
+        "CRLF_DELIMITER_SPLIT": 0.04060332624643545,
+        "OBS_FOLD_LINE_JOIN": 0.04060332624643545,
+        "OVERLONG_UTF8_NORMALIZATION": 0.04060332624643545
+      },
+      "normative_bias": 0.5378,
+      "delta_aggressiveness": 0.4717,
+      "fitness_score": 837.0,
+      "rsi_gain": 1.5406,
+      "simulated_yield": 0.28,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 2,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.4575604559645943,
+        "PATH_NUL_EARLY_RESPONSE": 0.24708320242896362,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.045177651395668185,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.045177651395668185,
+        "HEADER_TAB_SPACING": 0.045177651395668185,
+        "CRLF_DELIMITER_SPLIT": 0.045177651395668185,
+        "OBS_FOLD_LINE_JOIN": 0.045177651395668185,
+        "OVERLONG_UTF8_NORMALIZATION": 0.06946808462810104
+      },
+      "normative_bias": 0.4786,
+      "delta_aggressiveness": 0.401,
+      "fitness_score": 1347.0,
+      "rsi_gain": 0.5496,
+      "simulated_yield": 0.45,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 3,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.44118220933322755,
+        "PATH_NUL_EARLY_RESPONSE": 0.07436369865421834,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.03528355417960621,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.08966125585481931,
+        "HEADER_TAB_SPACING": 0.03528355417960621,
+        "CRLF_DELIMITER_SPLIT": 0.03528355417960621,
+        "OBS_FOLD_LINE_JOIN": 0.03528355417960621,
+        "OVERLONG_UTF8_NORMALIZATION": 0.25365861943931
+      },
+      "normative_bias": 0.4828,
+      "delta_aggressiveness": 0.355,
+      "fitness_score": 1427.0,
+      "rsi_gain": 0.0148,
+      "simulated_yield": 0.4767,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 4,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.44118220933322755,
+        "PATH_NUL_EARLY_RESPONSE": 0.07436369865421834,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.03528355417960621,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.08966125585481931,
+        "HEADER_TAB_SPACING": 0.03528355417960621,
+        "CRLF_DELIMITER_SPLIT": 0.03528355417960621,
+        "OBS_FOLD_LINE_JOIN": 0.03528355417960621,
+        "OVERLONG_UTF8_NORMALIZATION": 0.25365861943931
+      },
+      "normative_bias": 0.4828,
+      "delta_aggressiveness": 0.355,
+      "fitness_score": 1297.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.4333,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 5,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.44118220933322755,
+        "PATH_NUL_EARLY_RESPONSE": 0.07436369865421834,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.03528355417960621,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.08966125585481931,
+        "HEADER_TAB_SPACING": 0.03528355417960621,
+        "CRLF_DELIMITER_SPLIT": 0.03528355417960621,
+        "OBS_FOLD_LINE_JOIN": 0.03528355417960621,
+        "OVERLONG_UTF8_NORMALIZATION": 0.25365861943931
+      },
+      "normative_bias": 0.4828,
+      "delta_aggressiveness": 0.355,
+      "fitness_score": 1167.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.39,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 6,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.43333272517460675,
+        "PATH_NUL_EARLY_RESPONSE": 0.04576648889033046,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.04576648889033046,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.04576648889033046,
+        "HEADER_TAB_SPACING": 0.12811379967902606,
+        "CRLF_DELIMITER_SPLIT": 0.0906835008942867,
+        "OBS_FOLD_LINE_JOIN": 0.04576648889033046,
+        "OVERLONG_UTF8_NORMALIZATION": 0.1648040186907587
+      },
+      "normative_bias": 0.2162,
+      "delta_aggressiveness": 0.4644,
+      "fitness_score": 1457.0,
+      "rsi_gain": 0.1457,
+      "simulated_yield": 0.4867,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 7,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.43333272517460675,
+        "PATH_NUL_EARLY_RESPONSE": 0.04576648889033046,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.04576648889033046,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.04576648889033046,
+        "HEADER_TAB_SPACING": 0.12811379967902606,
+        "CRLF_DELIMITER_SPLIT": 0.0906835008942867,
+        "OBS_FOLD_LINE_JOIN": 0.04576648889033046,
+        "OVERLONG_UTF8_NORMALIZATION": 0.1648040186907587
+      },
+      "normative_bias": 0.2162,
+      "delta_aggressiveness": 0.4644,
+      "fitness_score": 1407.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.47,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 8,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.47967238442813676,
+        "PATH_NUL_EARLY_RESPONSE": 0.04330902082860126,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.04569213590795558,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.09390369240274334,
+        "HEADER_TAB_SPACING": 0.04330902082860126,
+        "CRLF_DELIMITER_SPLIT": 0.2074957039467594,
+        "OBS_FOLD_LINE_JOIN": 0.04330902082860126,
+        "OVERLONG_UTF8_NORMALIZATION": 0.04330902082860126
+      },
+      "normative_bias": 0.2297,
+      "delta_aggressiveness": 0.3804,
+      "fitness_score": 1217.0,
+      "rsi_gain": 0.0498,
+      "simulated_yield": 0.4067,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 9,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.4153951280276938,
+        "PATH_NUL_EARLY_RESPONSE": 0.048428092238122514,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.03797833349888108,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.19509658127580382,
+        "HEADER_TAB_SPACING": 0.03797833349888108,
+        "CRLF_DELIMITER_SPLIT": 0.03797833349888108,
+        "OBS_FOLD_LINE_JOIN": 0.18916686446285552,
+        "OVERLONG_UTF8_NORMALIZATION": 0.03797833349888108
+      },
+      "normative_bias": 0.1,
+      "delta_aggressiveness": 0.468,
+      "fitness_score": 1207.0,
+      "rsi_gain": 0.0164,
+      "simulated_yield": 0.4033,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 10,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.49702937666300756,
+        "PATH_NUL_EARLY_RESPONSE": 0.050353403840386106,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.08766237577348822,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.050353403840386106,
+        "HEADER_TAB_SPACING": 0.050353403840386106,
+        "CRLF_DELIMITER_SPLIT": 0.050353403840386106,
+        "OBS_FOLD_LINE_JOIN": 0.07075150468362126,
+        "OVERLONG_UTF8_NORMALIZATION": 0.14314312751833852
+      },
+      "normative_bias": 0.1,
+      "delta_aggressiveness": 0.5442,
+      "fitness_score": 1557.0,
+      "rsi_gain": 0.2071,
+      "simulated_yield": 0.52,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 11,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.49702937666300756,
+        "PATH_NUL_EARLY_RESPONSE": 0.050353403840386106,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.08766237577348822,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.050353403840386106,
+        "HEADER_TAB_SPACING": 0.050353403840386106,
+        "CRLF_DELIMITER_SPLIT": 0.050353403840386106,
+        "OBS_FOLD_LINE_JOIN": 0.07075150468362126,
+        "OVERLONG_UTF8_NORMALIZATION": 0.14314312751833852
+      },
+      "normative_bias": 0.1,
+      "delta_aggressiveness": 0.5442,
+      "fitness_score": 1557.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.52,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 1,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.181673322743106,
+        "PATH_NUL_EARLY_RESPONSE": 0.11877406718399103,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.030871961175488037,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.1266151232661151,
+        "HEADER_TAB_SPACING": 0.17636234672698725,
+        "CRLF_DELIMITER_SPLIT": 0.10839739884349062,
+        "OBS_FOLD_LINE_JOIN": 0.1663212801525722,
+        "OVERLONG_UTF8_NORMALIZATION": 0.09098449990824976
+      },
+      "normative_bias": 0.4681,
+      "delta_aggressiveness": 0.4038,
+      "fitness_score": 437.0,
+      "rsi_gain": 0.6631,
+      "simulated_yield": 0.1467,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 2,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.24505870082162406,
+        "PATH_NUL_EARLY_RESPONSE": 0.14189199530935545,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.10545147981783982,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.18830473211522353,
+        "HEADER_TAB_SPACING": 0.17079235753786284,
+        "CRLF_DELIMITER_SPLIT": 0.06327179668375225,
+        "OBS_FOLD_LINE_JOIN": 0.061631694267714476,
+        "OVERLONG_UTF8_NORMALIZATION": 0.023597243446627558
+      },
+      "normative_bias": 0.49,
+      "delta_aggressiveness": 0.5608,
+      "fitness_score": 587.0,
+      "rsi_gain": 0.5721,
+      "simulated_yield": 0.1967,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 3,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.4908461968658557,
+        "PATH_NUL_EARLY_RESPONSE": 0.16288861322673412,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.1398462607966833,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.03830464639502715,
+        "HEADER_TAB_SPACING": 0.03830464639502715,
+        "CRLF_DELIMITER_SPLIT": 0.03830464639502715,
+        "OBS_FOLD_LINE_JOIN": 0.05320034353061837,
+        "OVERLONG_UTF8_NORMALIZATION": 0.03830464639502715
+      },
+      "normative_bias": 0.4948,
+      "delta_aggressiveness": 0.6239,
+      "fitness_score": 1397.0,
+      "rsi_gain": 1.5843,
+      "simulated_yield": 0.4667,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 4,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.4908461968658557,
+        "PATH_NUL_EARLY_RESPONSE": 0.16288861322673412,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.1398462607966833,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.03830464639502715,
+        "HEADER_TAB_SPACING": 0.03830464639502715,
+        "CRLF_DELIMITER_SPLIT": 0.03830464639502715,
+        "OBS_FOLD_LINE_JOIN": 0.05320034353061837,
+        "OVERLONG_UTF8_NORMALIZATION": 0.03830464639502715
+      },
+      "normative_bias": 0.4948,
+      "delta_aggressiveness": 0.6239,
+      "fitness_score": 1467.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.49,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 5,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.4908461968658557,
+        "PATH_NUL_EARLY_RESPONSE": 0.16288861322673412,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.1398462607966833,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.03830464639502715,
+        "HEADER_TAB_SPACING": 0.03830464639502715,
+        "CRLF_DELIMITER_SPLIT": 0.03830464639502715,
+        "OBS_FOLD_LINE_JOIN": 0.05320034353061837,
+        "OVERLONG_UTF8_NORMALIZATION": 0.03830464639502715
+      },
+      "normative_bias": 0.4948,
+      "delta_aggressiveness": 0.6239,
+      "fitness_score": 1297.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.4333,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 6,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.5097768240639994,
+        "PATH_NUL_EARLY_RESPONSE": 0.03462674514336428,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.03462674514336428,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.088506785892385,
+        "HEADER_TAB_SPACING": 0.22858266432679425,
+        "CRLF_DELIMITER_SPLIT": 0.03462674514336428,
+        "OBS_FOLD_LINE_JOIN": 0.03462674514336428,
+        "OVERLONG_UTF8_NORMALIZATION": 0.03462674514336428
+      },
+      "normative_bias": 0.5553,
+      "delta_aggressiveness": 0.6454,
+      "fitness_score": 1597.0,
+      "rsi_gain": 0.2313,
+      "simulated_yield": 0.5333,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 7,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.5097768240639994,
+        "PATH_NUL_EARLY_RESPONSE": 0.03462674514336428,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.03462674514336428,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.088506785892385,
+        "HEADER_TAB_SPACING": 0.22858266432679425,
+        "CRLF_DELIMITER_SPLIT": 0.03462674514336428,
+        "OBS_FOLD_LINE_JOIN": 0.03462674514336428,
+        "OVERLONG_UTF8_NORMALIZATION": 0.03462674514336428
+      },
+      "normative_bias": 0.5553,
+      "delta_aggressiveness": 0.6454,
+      "fitness_score": 1487.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.4967,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 8,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.5097768240639994,
+        "PATH_NUL_EARLY_RESPONSE": 0.03462674514336428,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.03462674514336428,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.088506785892385,
+        "HEADER_TAB_SPACING": 0.22858266432679425,
+        "CRLF_DELIMITER_SPLIT": 0.03462674514336428,
+        "OBS_FOLD_LINE_JOIN": 0.03462674514336428,
+        "OVERLONG_UTF8_NORMALIZATION": 0.03462674514336428
+      },
+      "normative_bias": 0.5553,
+      "delta_aggressiveness": 0.6454,
+      "fitness_score": 1507.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.5033,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 9,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.46891970725306487,
+        "PATH_NUL_EARLY_RESPONSE": 0.061178107100917686,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.09074327536150786,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.13730339566184874,
+        "HEADER_TAB_SPACING": 0.10799813573486021,
+        "CRLF_DELIMITER_SPLIT": 0.03852619822363961,
+        "OBS_FOLD_LINE_JOIN": 0.03852619822363961,
+        "OVERLONG_UTF8_NORMALIZATION": 0.05680498244052136
+      },
+      "normative_bias": 0.361,
+      "delta_aggressiveness": 0.6377,
+      "fitness_score": 1377.0,
+      "rsi_gain": 0.0133,
+      "simulated_yield": 0.46,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 10,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.49995645601736377,
+        "PATH_NUL_EARLY_RESPONSE": 0.0411556464949096,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.1686293902566523,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.0411556464949096,
+        "HEADER_TAB_SPACING": 0.0411556464949096,
+        "CRLF_DELIMITER_SPLIT": 0.0411556464949096,
+        "OBS_FOLD_LINE_JOIN": 0.0411556464949096,
+        "OVERLONG_UTF8_NORMALIZATION": 0.1256359212514359
+      },
+      "normative_bias": 0.4783,
+      "delta_aggressiveness": 0.636,
+      "fitness_score": 1497.0,
+      "rsi_gain": 0.0726,
+      "simulated_yield": 0.5,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 11,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.49995645601736377,
+        "PATH_NUL_EARLY_RESPONSE": 0.0411556464949096,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.1686293902566523,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.0411556464949096,
+        "HEADER_TAB_SPACING": 0.0411556464949096,
+        "CRLF_DELIMITER_SPLIT": 0.0411556464949096,
+        "OBS_FOLD_LINE_JOIN": 0.0411556464949096,
+        "OVERLONG_UTF8_NORMALIZATION": 0.1256359212514359
+      },
+      "normative_bias": 0.4783,
+      "delta_aggressiveness": 0.636,
+      "fitness_score": 1437.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.48,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 12,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.49995645601736377,
+        "PATH_NUL_EARLY_RESPONSE": 0.0411556464949096,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.1686293902566523,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.0411556464949096,
+        "HEADER_TAB_SPACING": 0.0411556464949096,
+        "CRLF_DELIMITER_SPLIT": 0.0411556464949096,
+        "OBS_FOLD_LINE_JOIN": 0.0411556464949096,
+        "OVERLONG_UTF8_NORMALIZATION": 0.1256359212514359
+      },
+      "normative_bias": 0.4783,
+      "delta_aggressiveness": 0.636,
+      "fitness_score": 1657.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.5533,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 13,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.5864615533190712,
+        "PATH_NUL_EARLY_RESPONSE": 0.0386565179094359,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.18159933922431323,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.0386565179094359,
+        "HEADER_TAB_SPACING": 0.0386565179094359,
+        "CRLF_DELIMITER_SPLIT": 0.0386565179094359,
+        "OBS_FOLD_LINE_JOIN": 0.0386565179094359,
+        "OVERLONG_UTF8_NORMALIZATION": 0.0386565179094359
+      },
+      "normative_bias": 0.2729,
+      "delta_aggressiveness": 0.6589,
+      "fitness_score": 1677.0,
+      "rsi_gain": 0.1207,
+      "simulated_yield": 0.56,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 14,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.5864615533190712,
+        "PATH_NUL_EARLY_RESPONSE": 0.0386565179094359,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.18159933922431323,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.0386565179094359,
+        "HEADER_TAB_SPACING": 0.0386565179094359,
+        "CRLF_DELIMITER_SPLIT": 0.0386565179094359,
+        "OBS_FOLD_LINE_JOIN": 0.0386565179094359,
+        "OVERLONG_UTF8_NORMALIZATION": 0.0386565179094359
+      },
+      "normative_bias": 0.2729,
+      "delta_aggressiveness": 0.6589,
+      "fitness_score": 1697.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.5667,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 15,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.5864615533190712,
+        "PATH_NUL_EARLY_RESPONSE": 0.0386565179094359,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.18159933922431323,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.0386565179094359,
+        "HEADER_TAB_SPACING": 0.0386565179094359,
+        "CRLF_DELIMITER_SPLIT": 0.0386565179094359,
+        "OBS_FOLD_LINE_JOIN": 0.0386565179094359,
+        "OVERLONG_UTF8_NORMALIZATION": 0.0386565179094359
+      },
+      "normative_bias": 0.2729,
+      "delta_aggressiveness": 0.6589,
+      "fitness_score": 1767.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.59,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 16,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.5864615533190712,
+        "PATH_NUL_EARLY_RESPONSE": 0.0386565179094359,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.18159933922431323,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.0386565179094359,
+        "HEADER_TAB_SPACING": 0.0386565179094359,
+        "CRLF_DELIMITER_SPLIT": 0.0386565179094359,
+        "OBS_FOLD_LINE_JOIN": 0.0386565179094359,
+        "OVERLONG_UTF8_NORMALIZATION": 0.0386565179094359
+      },
+      "normative_bias": 0.2729,
+      "delta_aggressiveness": 0.6589,
+      "fitness_score": 1767.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.59,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 17,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.5864615533190712,
+        "PATH_NUL_EARLY_RESPONSE": 0.0386565179094359,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.18159933922431323,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.0386565179094359,
+        "HEADER_TAB_SPACING": 0.0386565179094359,
+        "CRLF_DELIMITER_SPLIT": 0.0386565179094359,
+        "OBS_FOLD_LINE_JOIN": 0.0386565179094359,
+        "OVERLONG_UTF8_NORMALIZATION": 0.0386565179094359
+      },
+      "normative_bias": 0.2729,
+      "delta_aggressiveness": 0.6589,
+      "fitness_score": 1767.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.59,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 18,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.5864615533190712,
+        "PATH_NUL_EARLY_RESPONSE": 0.0386565179094359,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.18159933922431323,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.0386565179094359,
+        "HEADER_TAB_SPACING": 0.0386565179094359,
+        "CRLF_DELIMITER_SPLIT": 0.0386565179094359,
+        "OBS_FOLD_LINE_JOIN": 0.0386565179094359,
+        "OVERLONG_UTF8_NORMALIZATION": 0.0386565179094359
+      },
+      "normative_bias": 0.2729,
+      "delta_aggressiveness": 0.6589,
+      "fitness_score": 1867.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.6233,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 19,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.5864615533190712,
+        "PATH_NUL_EARLY_RESPONSE": 0.0386565179094359,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.18159933922431323,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.0386565179094359,
+        "HEADER_TAB_SPACING": 0.0386565179094359,
+        "CRLF_DELIMITER_SPLIT": 0.0386565179094359,
+        "OBS_FOLD_LINE_JOIN": 0.0386565179094359,
+        "OVERLONG_UTF8_NORMALIZATION": 0.0386565179094359
+      },
+      "normative_bias": 0.2729,
+      "delta_aggressiveness": 0.6589,
+      "fitness_score": 1887.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.63,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 20,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.5864615533190712,
+        "PATH_NUL_EARLY_RESPONSE": 0.0386565179094359,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.18159933922431323,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.0386565179094359,
+        "HEADER_TAB_SPACING": 0.0386565179094359,
+        "CRLF_DELIMITER_SPLIT": 0.0386565179094359,
+        "OBS_FOLD_LINE_JOIN": 0.0386565179094359,
+        "OVERLONG_UTF8_NORMALIZATION": 0.0386565179094359
+      },
+      "normative_bias": 0.2729,
+      "delta_aggressiveness": 0.6589,
+      "fitness_score": 1787.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.5967,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 21,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.6359440302693428,
+        "PATH_NUL_EARLY_RESPONSE": 0.04556076511630399,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.09274419997240589,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.04515020092838944,
+        "HEADER_TAB_SPACING": 0.04515020092838944,
+        "CRLF_DELIMITER_SPLIT": 0.04515020092838944,
+        "OBS_FOLD_LINE_JOIN": 0.04515020092838944,
+        "OVERLONG_UTF8_NORMALIZATION": 0.04515020092838944
+      },
+      "normative_bias": 0.2987,
+      "delta_aggressiveness": 0.7484,
+      "fitness_score": 1817.0,
+      "rsi_gain": 0.0839,
+      "simulated_yield": 0.6067,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 22,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.6359440302693428,
+        "PATH_NUL_EARLY_RESPONSE": 0.04556076511630399,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.09274419997240589,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.04515020092838944,
+        "HEADER_TAB_SPACING": 0.04515020092838944,
+        "CRLF_DELIMITER_SPLIT": 0.04515020092838944,
+        "OBS_FOLD_LINE_JOIN": 0.04515020092838944,
+        "OVERLONG_UTF8_NORMALIZATION": 0.04515020092838944
+      },
+      "normative_bias": 0.2987,
+      "delta_aggressiveness": 0.7484,
+      "fitness_score": 1757.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.5867,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 23,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.6359440302693428,
+        "PATH_NUL_EARLY_RESPONSE": 0.04556076511630399,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.09274419997240589,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.04515020092838944,
+        "HEADER_TAB_SPACING": 0.04515020092838944,
+        "CRLF_DELIMITER_SPLIT": 0.04515020092838944,
+        "OBS_FOLD_LINE_JOIN": 0.04515020092838944,
+        "OVERLONG_UTF8_NORMALIZATION": 0.04515020092838944
+      },
+      "normative_bias": 0.2987,
+      "delta_aggressiveness": 0.7484,
+      "fitness_score": 1987.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.6633,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 24,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.6359440302693428,
+        "PATH_NUL_EARLY_RESPONSE": 0.04556076511630399,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.09274419997240589,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.04515020092838944,
+        "HEADER_TAB_SPACING": 0.04515020092838944,
+        "CRLF_DELIMITER_SPLIT": 0.04515020092838944,
+        "OBS_FOLD_LINE_JOIN": 0.04515020092838944,
+        "OVERLONG_UTF8_NORMALIZATION": 0.04515020092838944
+      },
+      "normative_bias": 0.2987,
+      "delta_aggressiveness": 0.7484,
+      "fitness_score": 2007.0,
+      "rsi_gain": 0.0,
+      "simulated_yield": 0.67,
+      "false_positive_rate": 0.0
+    },
+    {
+      "generation": 25,
+      "mutator_weights": {
+        "TE_CL_DUAL_HEADER": 0.6999991883573914,
+        "PATH_NUL_EARLY_RESPONSE": 0.04914699719986325,
+        "DANGLING_BYTE_STACKED_RESPONSE": 0.09871111328823229,
+        "MULTIPART_BYTERANGES_SHARED_PARSER": 0.03042854023090262,
+        "HEADER_TAB_SPACING": 0.03042854023090262,
+        "CRLF_DELIMITER_SPLIT": 0.03042854023090262,
+        "OBS_FOLD_LINE_JOIN": 0.03042854023090262,
+        "OVERLONG_UTF8_NORMALIZATION": 0.03042854023090262
+      },
+      "normative_bias": 0.3043,
+      "delta_aggressiveness": 0.536,
+      "fitness_score": 2227.0,
+      "rsi_gain": 0.1096,
+      "simulated_yield": 0.7433,
       "false_positive_rate": 0.0
     }
   ]

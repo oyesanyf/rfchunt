@@ -236,6 +236,15 @@ class ActiveFlawProber:
                     self.on_trace(f"      [+] VULNERABILITY CONFIRMED: {vuln.vuln_id} ({vuln.impact.value}) - Repro Rate: {vuln.reproducibility_rate*100:.0f}%")
                     confirmed_vulns.append(vuln)
                     if self.db:
+                        self.db.save_implementation_anomaly(
+                            anomaly_id=detected_anomaly.anomaly_id,
+                            target_engine=detected_anomaly.target_engine,
+                            category=detected_anomaly.category.value,
+                            observed_behavior=detected_anomaly.observed_behavior,
+                            expected_behavior=detected_anomaly.expected_behavior,
+                            raw_probe=detected_anomaly.raw_probe.decode("latin-1", errors="replace"),
+                            raw_response=detected_anomaly.raw_response.decode("latin-1", errors="replace"),
+                        )
                         self.db.save_reproducible_vulnerability(
                             vuln_id=vuln.vuln_id,
                             anomaly_id=detected_anomaly.anomaly_id,
