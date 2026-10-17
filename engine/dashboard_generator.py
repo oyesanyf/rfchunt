@@ -145,7 +145,28 @@ class DashboardGenerator:
         <div class="meta">
             Target Endpoint: <strong>{target_host}:{target_port}</strong> |
             Generated: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())} |
-            Engine: James Kettle & Tom Stacey Multi-Ring Framing Matrix
+            Engines: PortSwigger HTTP Terminator (James Kettle) &amp; RAPTOR Framework (Gadi Evron, Daniel Cuthbert, Halvar Flake)
+        </div>
+    </div>
+
+    <div class="card" style="margin-bottom:20px; border-left: 4px solid #58a6ff;">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+            <div>
+                <div class="card-title" style="color:#58a6ff;">RAPTOR Autonomous Security Framework Integration</div>
+                <div style="font-size:14px; margin-top:4px; color:#f0f6fc;">
+                    <strong>Core Authors:</strong> Gadi Evron &bull; Daniel Cuthbert (ORCID: 0009-0000-6443-0251) &bull; Thomas Dullien (&ldquo;Halvar Flake&rdquo;)
+                </div>
+            </div>
+            <div>
+                <span class="badge" style="background:rgba(88, 166, 255, 0.15); color:#58a6ff; border:1px solid #1f6feb;">danielcuthbert/raptor:latest</span>
+                <span class="badge" style="background:rgba(35, 134, 54, 0.2); color:#3fb950; border:1px solid #238636;">Local AI Triage (Foundation-Sec)</span>
+            </div>
+        </div>
+        <div style="font-size:13px; margin-top:10px; color:#8b949e; line-height:1.5;">
+            Seamlessly unites wire-layer protocol desynchronization research with source-code static analysis (Semgrep, Coccinelle, CodeQL) and dynamic web application scanning (<code>raptor.py web</code>). Findings are normalized into <code>terminator.db</code> and protected by the Merkle audit trail.
+            <div style="margin-top:6px;">
+                <a href="https://github.com/gadievron/raptor" target="_blank" style="color:#58a6ff; text-decoration:none; font-weight:600;">&rarr; https://github.com/gadievron/raptor</a>
+            </div>
         </div>
     </div>
 
