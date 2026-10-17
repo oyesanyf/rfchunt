@@ -1574,8 +1574,127 @@ USAGE EXAMPLES (All run directly via rfc_hunt_swarm.py):
     return parser
 
 
+def print_raptor_help():
+    """Prints the comprehensive, detailed help manual for RAPTOR integration with full attribution."""
+    help_text = """
+===============================================================================
+RAPTOR: Autonomous Offensive/Defensive Research Framework
+Integrated Security Engine & Unified CLI Reference
+===============================================================================
+
+CREDIT & CITATION:
+------------------
+RAPTOR is an autonomous offensive/defensive research framework created by:
+  - Gadi Evron
+  - Daniel Cuthbert (https://orcid.org/0009-0000-6443-0251)
+  - Thomas Dullien ("Halvar Flake")
+
+Official Project Repository : https://github.com/gadievron/raptor
+Docker Registry Engine      : danielcuthbert/raptor:latest
+License                     : MIT
+
+ACADEMIC CITATION:
+  Evron, G., Cuthbert, D., & Dullien, T. (2026).
+  RAPTOR: Autonomous Offensive/Defensive Research Framework (Version 3.1.0).
+  https://github.com/gadievron/raptor
+
+===============================================================================
+OVERVIEW & CAPABILITIES:
+===============================================================================
+RAPTOR provides end-to-end autonomous security testing across both live remote
+hosts (web DAST) and local source-code repositories (SAST, agentic LLM triage,
+and post-quantum cryptographic auditing):
+
+1. LIVE HOST WEB APPLICATION TESTING ('web' mode):
+   - Phased dynamic scanner executing against live URLs (https://<host>:<port>).
+   - Phase 0: Preflight reachability and TLS negotiation.
+   - Phase 2: Robots, sitemap, API specs, and service fingerprinting.
+   - Phase 4: ASVS-mapped passive security header checks.
+   - Phase 6: Autonomous parameter fuzzing, CRLF, and injection verification.
+   - Correlates wire-level RFC desynchronization with application-level flaws.
+
+2. AUTONOMOUS AGENTIC SOURCE-CODE PENTESTING ('agentic' mode):
+   - Static analysis across Semgrep and Coccinelle with optional CodeQL.
+   - Automated LLM exploitability triage powered by local Ollama models:
+     Default Model: 'fenkohq/foundation-sec-8b:latest' (Cisco Foundation-Sec-8B).
+   - 100% private, on-device execution (zero cloud API fees, zero token limits).
+
+3. POST-QUANTUM CRYPTOGRAPHY AUDITING ('crypto' mode):
+   - Audits codebases for quantum-resistant cryptographic readiness (ML-KEM,
+     HPKE, hybrid key exchange, post-quantum signatures).
+
+4. SOFTWARE COMPOSITION ANALYSIS ('sca' mode):
+   - Audits dependencies, lockfiles, and third-party CVE advisories.
+
+5. UNIFIED REPOSITORY INGESTION & DEFENSE EXPORT:
+   - Ingests SARIF reports into terminator.db.
+   - Exports defensive rules (ModSecurity WAF, Nuclei, Suricata IDS).
+
+===============================================================================
+COMMAND-LINE USAGE & EXAMPLES:
+===============================================================================
+
+1. Diagnostics & Readiness Status:
+   python -u rfc_hunt_swarm.py raptor --status
+   (Checks Docker daemon, danielcuthbert/raptor:latest image, and Ollama models)
+
+2. Scan a Live Remote Host (Web Application Dynamic Audit):
+   python -u rfc_hunt_swarm.py raptor --host vanguardngr.com --port 443 --tls
+   python -u rfc_hunt_swarm.py raptor --host dlptest.com --port 443 --tls
+   python -u rfc_hunt_swarm.py --mode raptor --host 127.0.0.1 --port 3030
+
+3. Scan a Local Source-Code Repository (Fast Static Scan):
+   python -u rfc_hunt_swarm.py raptor --repo D:\\harfile\\my_project --raptor-mode scan
+
+4. Full Autonomous Agentic Pentest (Static Scan + Ollama LLM Triage):
+   python -u rfc_hunt_swarm.py raptor --repo D:\\harfile\\my_project --raptor-mode agentic
+   python -u rfc_hunt_swarm.py raptor --repo D:\\harfile\\my_project --raptor-mode agentic --raptor-model fenkohq/foundation-sec-8b:latest
+
+5. Post-Quantum Cryptography & Algorithm Audit:
+   python -u rfc_hunt_swarm.py raptor --repo D:\\harfile\\my_project --raptor-mode crypto
+
+6. Software Composition Analysis (SCA Dependencies & Advisories):
+   python -u rfc_hunt_swarm.py raptor --repo D:\\harfile\\my_project --raptor-mode sca
+
+7. Profile Target Codebase Surface & Language Breakdown:
+   python -u rfc_hunt_swarm.py raptor --describe D:\\harfile\\my_project
+
+8. Review Historical SARIF Vulnerability Findings:
+   python -u rfc_hunt_swarm.py raptor --findings
+   python -u rfc_hunt_swarm.py raptor --findings --limit 25
+
+===============================================================================
+CLI FLAGS FOR RAPTOR:
+===============================================================================
+  --host HOST           Target domain or IP for live web application testing
+  --port PORT           Target port (default: 443 with TLS, 80 with HTTP)
+  --tls                 Enable TLS/HTTPS encryption (auto-enabled if port is 443)
+  --repo, --raptor-target PATH
+                        Path to local repository or source folder to audit
+  --raptor-mode {web,scan,agentic,crypto,sca,describe}
+                        Execution mode (default: 'web' for hosts, 'scan' for repos)
+  --raptor-model MODEL  Ollama LLM for agentic triage (default: fenkohq/foundation-sec-8b:latest)
+  --raptor-status, --status
+                        Verify Docker container and Ollama model status
+  --raptor-findings, --findings
+                        List and summarize recent SARIF vulnerability findings
+  --policy-groups GROUPS
+                        Filter Semgrep policies (e.g. 'secrets,owasp,crypto')
+  --include-codeql      Enable CodeQL compilation during agentic scan
+  --db DB_PATH          SQLite database for unified finding storage (default: terminator.db)
+===============================================================================
+"""
+    print(help_text)
+
+
 def parse_swarm_arguments(argv=None):
     """Parses arguments using build_swarm_parser."""
+    raw_args = sys.argv[1:] if argv is None else list(argv)
+    if any(h in raw_args for h in ("--help", "-h", "help")):
+        if "raptor" in raw_args or "--raptor" in raw_args:
+            print_raptor_help()
+            sys.exit(0)
+
     parser = build_swarm_parser()
     args = parser.parse_args(argv)
     if isinstance(args.targets, str):

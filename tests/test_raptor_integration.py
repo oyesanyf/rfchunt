@@ -160,3 +160,16 @@ def test_rfc_hunt_swarm_raptor_cli_modes(tmp_path):
     assert args3.command == "raptor"
     assert args3.raptor_target == str(tmp_path)
     assert args3.raptor_mode == "agentic"
+
+
+def test_raptor_help_manual(capsys):
+    """Verifies that raptor --help prints dedicated help with full attribution."""
+    from rfc_hunt_swarm import print_raptor_help
+    print_raptor_help()
+    captured = capsys.readouterr()
+    assert "RAPTOR: Autonomous Offensive/Defensive Research Framework" in captured.out
+    assert "Gadi Evron" in captured.out
+    assert "Daniel Cuthbert" in captured.out
+    assert "Halvar Flake" in captured.out
+    assert "https://github.com/gadievron/raptor" in captured.out
+    assert "--host HOST" in captured.out
