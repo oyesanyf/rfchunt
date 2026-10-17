@@ -27,7 +27,7 @@ import re
 import sys
 import threading
 import time
-from typing import Annotated, Any, Dict, List, Optional, TypedDict
+from typing import Annotated, Any, Dict, List, Optional, Tuple, TypedDict
 
 from langgraph.graph import END, StateGraph
 
@@ -1277,13 +1277,115 @@ def cmd_vulns(args):
     print(f"Total Confirmed Vulnerabilities: {len(results)}\n")
 
 
+def cmd_raptor(args):
+    """
+    Executes the RAPTOR Security Framework against a live host or local repository.
+    Gives explicit attribution to Gadi Evron, Daniel Cuthbert, and Thomas Dullien (Halvar Flake).
+    """
+    from engine.raptor_integrator import (
+        RaptorIntegrator,
+        RAPTOR_PROJECT_TITLE,
+        RAPTOR_AUTHORS,
+        RAPTOR_REPO_URL,
+        RAPTOR_DOCKER_IMAGE,
+    )
+    from database import Database
+
+    db = Database(getattr(args, "db", "terminator.db"))
+    raptor = RaptorIntegrator(db=db)
+
+    print(f"\n{'='*75}")
+    print(RaptorIntegrator.get_attribution_banner())
+    print(f"{'='*75}\n")
+
+    # 1. Status Check
+    if getattr(args, "raptor_status", False) or (hasattr(args, "status") and args.status):
+        st = raptor.check_status()
+        print(f"[*] RAPTOR SYSTEM STATUS:")
+        img_id = str(st.get("image_id") or "")[:12]
+        print(f"    Docker Image Ready     : {'YES (' + img_id + ')' if st['docker_ready'] else 'NO'}")
+        print(f"    Framework Installed    : {'YES (' + st['raptor_root'] + ')' if st['raptor_available'] else 'NO'}")
+        print(f"    Ollama Daemon Ready    : {'YES' if st['ollama_ready'] else 'NO'}")
+        print(f"    Preferred Model Ready  : {'YES (fenkohq/foundation-sec-8b:latest)' if st['preferred_model_installed'] else 'NO'}")
+        print(f"    Installed Models       : {', '.join(st['ollama_models'][:6]) or 'None detected'}")
+        print(f"{'='*75}\n")
+        return
+
+    # 2. Findings Summary
+    if getattr(args, "raptor_findings", False):
+        findings = raptor.list_all_findings(max_items=getattr(args, "limit", 50))
+        print(f"[*] RECENT RAPTOR VULNERABILITY FINDINGS (Total: {len(findings)}):")
+        if not findings:
+            print("    No previous findings discovered in out/ directory.")
+        else:
+            print(f"{'SEVERITY':<10} {'RULE ID':<30} {'LOCATION':<32} {'MESSAGE'}")
+            print(f"{'-'*10} {'-'*30} {'-'*32} {'-'*30}")
+            for f in findings:
+                loc = f"{f['file']}:{f['line']}"
+                print(f"{f['severity']:<10} {f['rule_id']:<30} {loc[:32]:<32} {f['message'][:50]}")
+        print(f"{'='*75}\n")
+        return
+
+    # 3. Determine Scan Target: Live Host vs Local Project
+    target_repo = getattr(args, "raptor_target", None)
+    host = getattr(args, "host", None)
+    raptor_mode = getattr(args, "raptor_mode", None)
+
+    # Check if target_repo points to an existing directory
+    if target_repo and os.path.exists(str(target_repo)):
+        mode = raptor_mode or "scan"
+        model = getattr(args, "raptor_model", "fenkohq/foundation-sec-8b:latest")
+        pg = getattr(args, "policy_groups", "") or ""
+        codeql = bool(getattr(args, "include_codeql", False))
+        res = raptor.run_scan(
+            target_path=target_repo,
+            mode=mode,
+            model=model,
+            policy_groups=pg,
+            include_codeql=codeql,
+        )
+    else:
+        # Live Host Web Scan!
+        # Fall back to host argument or target URL
+        if not host or host in ("127.0.0.1", "localhost") and getattr(args, "target", None):
+            host = getattr(args, "target", host)
+
+        port = getattr(args, "port", 443)
+        use_tls = bool(getattr(args, "tls", False) or port == 443)
+
+        res = raptor.run_host_scan(
+            host=host,
+            port=port,
+            use_tls=use_tls,
+        )
+
+    # 4. Display Results Summary
+    if "error" in res:
+        print(f"[-] RAPTOR Execution Notice: {res['error']}")
+    else:
+        print(f"[+] RAPTOR Execution Completed Successfully!")
+        print(f"    Target             : {res.get('target_url') or res.get('target')}")
+        print(f"    Mode               : {res.get('mode')}")
+        print(f"    Duration           : {res.get('duration_sec')}s")
+        print(f"    Total Findings     : {res.get('total_findings')}")
+        print(f"    Ingested to DB     : {res.get('ingested_to_db')}")
+        if res.get("findings"):
+            print(f"\n[*] TOP DISCOVERED FINDINGS:")
+            print(f"{'SEVERITY':<10} {'RULE ID':<30} {'LOCATION':<32} {'MESSAGE'}")
+            print(f"{'-'*10} {'-'*30} {'-'*32} {'-'*30}")
+            for f in res["findings"][:15]:
+                loc = f"{f['file']}:{f['line']}"
+                print(f"{f['severity']:<10} {f['rule_id']:<30} {loc[:32]:<32} {f['message'][:50]}")
+    print(f"{'='*75}\n")
+
+
 ALL_MODES = [
     "single", "terminator", "corpus", "all", "pqc", "ruler",
     "build", "lab", "mcp", "hunt", "auto", "start",
     "fetch", "chunk", "generate", "permute", "evaluate",
     "weaponize", "cascade", "dream", "caldera",
     "dashboard", "export", "oracle", "differential", "h2", "http2", "audit", "merkle",
-    "ui", "vulns", "findings", "list",
+    "ui", "vulns", "findings", "list", "raptor",
 ]
 
 
@@ -1435,8 +1537,19 @@ USAGE EXAMPLES (All run directly via rfc_hunt_swarm.py):
     parser.add_argument("--export-caldera", type=str, default="caldera_export", help="Directory to export Caldera plugin structure (default: caldera_export, runs automatically)")
     parser.add_argument("--no-caldera", action="store_true", help="Disable default Caldera export")
     parser.add_argument("--caldera-url", "--push", dest="caldera_url", type=str, default=None, help="Optional Caldera server URL to push confirmed findings live")
-    parser.add_argument("--caldera-key", "--api-key", dest="caldera_key", type=str, default=None, help="Optional Caldera API key for REST authentication")
     parser.add_argument("--concurrency", "--threads", type=int, default=8, help="Maximum concurrent probe execution threads (bounded by semaphore, default: 8)")
+
+    # RAPTOR Autonomous Offensive/Defensive Research Framework Integration
+    # Credit: Gadi Evron, Daniel Cuthbert, Thomas Dullien (Halvar Flake)
+    # https://github.com/gadievron/raptor
+    parser.add_argument("--raptor", "--enable-raptor", dest="enable_raptor", action="store_true", help="Enable RAPTOR Autonomous Framework (Web application & source code pentesting; credit: Gadi Evron, Daniel Cuthbert, Halvar Flake)")
+    parser.add_argument("--raptor-mode", type=str, choices=["web", "scan", "agentic", "crypto", "sca", "describe"], default=None, help="RAPTOR analysis mode: 'web' (live host DAST), 'scan' (fast static), 'agentic' (LLM triage), 'crypto' (PQC), 'sca' (dependencies)")
+    parser.add_argument("--raptor-target", "--repo", dest="raptor_target", type=str, default=None, help="Local repository path or directory to audit with RAPTOR")
+    parser.add_argument("--raptor-model", type=str, default="fenkohq/foundation-sec-8b:latest", help="Ollama LLM for RAPTOR agentic triage (default: fenkohq/foundation-sec-8b:latest)")
+    parser.add_argument("--raptor-status", "--status", dest="raptor_status", action="store_true", help="Check RAPTOR Docker container (danielcuthbert/raptor:latest) and Ollama security model readiness")
+    parser.add_argument("--raptor-findings", "--findings", dest="raptor_findings", action="store_true", help="List and summarize recent SARIF vulnerability findings from RAPTOR scans")
+    parser.add_argument("--policy-groups", type=str, default="", help="Optional policy groups for RAPTOR scan (e.g. 'secrets,owasp,crypto')")
+    parser.add_argument("--include-codeql", action="store_true", help="Include deep CodeQL compilation during RAPTOR agentic scan")
     return parser
 
 
@@ -1546,6 +1659,10 @@ def main_swarm(argv=None):
 
     if active_mode in ("vulns", "findings", "list"):
         cmd_vulns(args)
+        return
+
+    if active_mode == "raptor" or getattr(args, "raptor_status", False) or getattr(args, "raptor_findings", False):
+        cmd_raptor(args)
         return
 
     # Normalize default args.host (strip http://, https://, trailing slashes/paths, and inline :port)

@@ -137,6 +137,13 @@ from probe_generator import ProbeGenerator
 from rfc_chunker import RFCChunker
 from rfc_fetcher import RFCFetcher
 from weaponizer import RQPWeaponizer
+from engine.raptor_integrator import (
+    RaptorIntegrator,
+    RAPTOR_PROJECT_TITLE,
+    RAPTOR_AUTHORS,
+    RAPTOR_REPO_URL,
+    RAPTOR_DOCKER_IMAGE,
+)
 
 
 class TerminatorMCPServer:
@@ -145,6 +152,7 @@ class TerminatorMCPServer:
         self.db = Database(db_path)
         self.fetcher = RFCFetcher(db=self.db)
         self.permutator = VectorPermutator(db=self.db)
+        self.raptor = RaptorIntegrator(db=self.db)
 
     def handle_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         method = request.get("method")
@@ -340,6 +348,47 @@ class TerminatorMCPServer:
                 "description": "Retrieves real-time counts of ingested RFCs, micro-fragments, generated probes, confirmed vulnerabilities, and anomaly detections.",
                 "inputSchema": {"type": "object"},
             },
+            {
+                "name": "raptor_status",
+                "description": "[RAPTOR Framework Integration by Gadi Evron, Daniel Cuthbert & Halvar Flake] Verifies Docker container readiness (danielcuthbert/raptor:latest), RAPTOR status, and local Ollama security models.",
+                "inputSchema": {"type": "object"},
+            },
+            {
+                "name": "raptor_describe_target",
+                "description": "[RAPTOR Framework Integration by Gadi Evron, Daniel Cuthbert & Halvar Flake] Profiles a local codebase repository: language distribution, lines of code, build systems, and attack surface.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "target_path": {"type": "string", "description": "Absolute path to repository on host"},
+                    },
+                    "required": ["target_path"],
+                },
+            },
+            {
+                "name": "raptor_scan_project",
+                "description": "[RAPTOR Framework Integration by Gadi Evron, Daniel Cuthbert & Halvar Flake] Executes autonomous source code security analysis (Semgrep, Coccinelle, CodeQL, LLM exploitability triage, crypto/PQC readiness, and SCA). Automatically ingests SARIF findings into terminator.db.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "target_path": {"type": "string", "description": "Absolute path to repository on host"},
+                        "mode": {"type": "string", "enum": ["scan", "agentic", "crypto", "sca"], "default": "scan"},
+                        "model": {"type": "string", "default": "fenkohq/foundation-sec-8b:latest"},
+                        "policy_groups": {"type": "string", "default": ""},
+                        "include_codeql": {"type": "boolean", "default": False},
+                    },
+                    "required": ["target_path"],
+                },
+            },
+            {
+                "name": "raptor_list_findings",
+                "description": "[RAPTOR Framework Integration by Gadi Evron, Daniel Cuthbert & Halvar Flake] Lists and summarizes SARIF vulnerability findings from previous RAPTOR scans in out/.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "max_items": {"type": "integer", "default": 50},
+                    },
+                },
+            },
         ]
 
     def _execute_tool(self, name: str, args: Dict[str, Any]) -> Any:
@@ -460,6 +509,47 @@ class TerminatorMCPServer:
                 "probes_generated": probes_count,
                 "confirmed_vulnerabilities": vulns_count,
                 "anomalies_detected": anomalies_count,
+            }
+
+        elif name == "raptor_status":
+            return self.raptor.check_status()
+
+        elif name == "raptor_describe_target":
+            t_path = args.get("target_path", ".")
+            return self.raptor.describe_target(t_path)
+
+        elif name == "raptor_scan_project":
+            t_path = args.get("target_path", ".")
+            mode = args.get("mode", "scan")
+            model = args.get("model", "fenkohq/foundation-sec-8b:latest")
+            pg = args.get("policy_groups", "")
+            codeql = args.get("include_codeql", False)
+            if mode == "web" or t_path.startswith("http://") or t_path.startswith("https://"):
+                from urllib.parse import urlparse
+                u = urlparse(t_path if t_path.startswith("http") else f"https://{t_path}")
+                host = u.hostname or "127.0.0.1"
+                port = u.port or (443 if u.scheme == "https" else 80)
+                tls = u.scheme == "https"
+                return self.raptor.run_host_scan(host=host, port=port, use_tls=tls)
+            return self.raptor.run_scan(
+                target_path=t_path,
+                mode=mode,
+                model=model,
+                policy_groups=pg,
+                include_codeql=codeql,
+            )
+
+        elif name == "raptor_list_findings":
+            max_i = args.get("max_items", 50)
+            findings = self.raptor.list_all_findings(max_items=max_i)
+            return {
+                "total_findings": len(findings),
+                "findings": findings,
+                "credit": {
+                    "framework": RAPTOR_PROJECT_TITLE,
+                    "authors": RAPTOR_AUTHORS,
+                    "url": RAPTOR_REPO_URL,
+                },
             }
 
         raise ValueError(f"Unknown tool: {name}")

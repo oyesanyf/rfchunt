@@ -388,8 +388,56 @@ This project was inspired by James Kettle's research ([Can AI Do Novel Security 
 ### Key Methodologies Implemented:
 1. **Micro-Inspiration Prompts**: Preventing context-contamination by feeding isolated 1–3 sentence RFC fragments.
 2. **Persistent Socket Canaries**: Proving real state contamination through 3-step connection sequences.
-3. **The Protocol Ruler**: Calibrating backend buffer limits down to the byte to detect front-end transformations without reflection.
-4. **The Discovery Cascade**: Recursively mutating discovered anomalies into adjacent vulnerability classes.
+---
+
+## RAPTOR Framework Integration & Attribution
+
+The RFC Hunt Swarm seamlessly integrates the **RAPTOR Autonomous Offensive/Defensive Research Framework** to bridge wire-level protocol desynchronization research with source-code static analysis and dynamic web application security testing.
+
+### Credit & Attribution:
+- **Project**: [RAPTOR: Autonomous Offensive/Defensive Research Framework](https://github.com/gadievron/raptor)
+- **Core Authors**:
+  - **Gadi Evron**
+  - **Daniel Cuthbert** ([ORCID: 0009-0000-6443-0251](https://orcid.org/0009-0000-6443-0251))
+  - **Thomas Dullien ("Halvar Flake")**
+- **Docker Engine**: `danielcuthbert/raptor:latest`
+- **Citation**:
+  ```bibtex
+  @software{Evron_RAPTOR_2026,
+    author = {Evron, Gadi and Cuthbert, Daniel and Dullien, Thomas},
+    title = {{RAPTOR: Autonomous Offensive/Defensive Research Framework}},
+    url = {https://github.com/gadievron/raptor},
+    version = {3.1.0},
+    year = {2026}
+  }
+  ```
+
+### Key Integration Capabilities:
+1. **Live Host Dynamic Web Application Security Testing (`raptor.py web`)**:
+   - Executes phased DAST discovery, ASVS checks, parameter fuzzing, and injection checks against live remote target hosts (`--host target.example.com --port 443 --tls`).
+2. **Autonomous Source Code Security Audits (`scan`, `agentic`, `crypto`, `sca`)**:
+   - Runs Semgrep, Coccinelle, and CodeQL against web server repositories and backend implementations.
+   - Evaluates exploitability via local Ollama models (`fenkohq/foundation-sec-8b:latest`).
+3. **Unified Vulnerability Ledger (`terminator.db`)**:
+   - Automatically ingests SARIF findings and correlates wire-level RFC desync anomalies with underlying source code defects.
+
+### CLI Usage:
+```bash
+# 1. Check RAPTOR Docker container and Ollama security model status
+python -u rfc_hunt_swarm.py raptor --status
+
+# 2. Run RAPTOR Web Application scan against a live remote host
+python -u rfc_hunt_swarm.py raptor --host vanguardngr.com --port 443 --tls
+
+# 3. Run full agentic source code audit on a local target repository
+python -u rfc_hunt_swarm.py raptor --repo D:\path\to\target --raptor-mode agentic
+
+# 4. Run post-quantum cryptography (PQC) readiness audit
+python -u rfc_hunt_swarm.py raptor --repo D:\path\to\target --raptor-mode crypto
+
+# 5. Review all discovered SARIF vulnerability findings
+python -u rfc_hunt_swarm.py raptor --findings
+```
 
 ---
 
