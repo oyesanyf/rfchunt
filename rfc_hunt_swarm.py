@@ -1401,11 +1401,20 @@ The unified primary CLI entrypoint combining:
   - One-Click Local Test Lab Auto-Launcher & Continuous Flaw Hunter (start.py)
   - Modular Pipeline, Build-All Verification, Dream-RSI & Caldera CLI (main.py)
   - 4-Parser Differential Matrix, Exploit Exporter & Dashboard Generator
+  - RAPTOR Autonomous Offensive/Defensive Research Framework Integration
 
-Based on the autonomous protocol research methodology by James Kettle
-(Director of Research, PortSwigger):
-  "Can AI Do Novel Security Research? Meet the HTTP Terminator"
-  https://portswigger.net/research/can-ai-do-novel-security-research
+METHODOLOGY ATTRIBUTIONS:
+-------------------------
+1. HTTP Terminator & Protocol Desynchronization Research:
+   - Inspired by James Kettle (Director of Research, PortSwigger)
+   - "Can AI Do Novel Security Research? Meet the HTTP Terminator"
+   - https://portswigger.net/research/can-ai-do-novel-security-research
+
+2. RAPTOR Autonomous Security & Pentesting Framework:
+   - Authored by Gadi Evron, Daniel Cuthbert, and Thomas Dullien (Halvar Flake)
+   - Project: https://github.com/gadievron/raptor
+   - Engine: danielcuthbert/raptor:latest (Docker Container)
+   - Integrates Semgrep, CodeQL, web DAST, and local LLM exploitability triage.
 """,
         epilog="""
 ===============================================================================
@@ -1426,42 +1435,54 @@ USAGE EXAMPLES (All run directly via rfc_hunt_swarm.py):
 4. Discover & Scan ALL Active IETF Protocol Specifications:
    python -u rfc_hunt_swarm.py --mode all --host remote-target.com --port 443 --tls --concurrency 8 --debug
 
-5. Target Multiple Reverse Proxies / Intermediate Terminators Simultaneously:
+5. RAPTOR Framework Integration (Credit: Gadi Evron, Daniel Cuthbert, Halvar Flake):
+   # A. Verify RAPTOR Docker container and Ollama security models:
+   python -u rfc_hunt_swarm.py raptor --status
+
+   # B. Run RAPTOR Dynamic Web Application Scan against a live remote host:
+   python -u rfc_hunt_swarm.py raptor --host vanguardngr.com --port 443 --tls
+   python -u rfc_hunt_swarm.py --mode raptor --host dlptest.com --port 443 --tls
+
+   # C. Run Autonomous Agentic Source Code Pentest with Foundation-Sec-8B:
+   python -u rfc_hunt_swarm.py raptor --repo D:\\harfile\\my_project --raptor-mode agentic
+
+   # D. Run Post-Quantum Cryptography (PQC) & Cryptographic Readiness Audit:
+   python -u rfc_hunt_swarm.py raptor --repo D:\\harfile\\my_project --raptor-mode crypto
+
+   # E. List and inspect recent RAPTOR SARIF vulnerability findings:
+   python -u rfc_hunt_swarm.py raptor --findings
+
+6. Query Confirmed Vulnerabilities Mapped by Host Name:
+   python -u rfc_hunt_swarm.py vulns
+   python -u rfc_hunt_swarm.py vulns --host dlptest.com
+
+7. Target Multiple Reverse Proxies / Intermediate Terminators Simultaneously:
    python -u rfc_hunt_swarm.py --targets "127.0.0.1:8080,https://target.local:8443" --terminators chunk,h2_gateway
 
-6. Filter Protocol Terminators by Category:
+8. Filter Protocol Terminators by Category:
    python -u rfc_hunt_swarm.py --terminators line,chunk,framing,cross_protocol,crlf_rhi,h2_gateway
 
-7. Generate Interactive HTML Research Dashboard:
-   python -u rfc_hunt_swarm.py dashboard --dashboard-out my_report.html
+9. Generate Interactive HTML Research Dashboard & Launch Web UI:
+   python -u rfc_hunt_swarm.py ui
+   python -u rfc_hunt_swarm.py dashboard --serve
 
-8. Export Confirmed Vulnerabilities to Nuclei, ModSecurity & Suricata Rules:
-   python -u rfc_hunt_swarm.py export --export-rules-dir ./defense_rules
+10. Export Confirmed Vulnerabilities to Nuclei, ModSecurity & Suricata Rules:
+    python -u rfc_hunt_swarm.py export --export-rules-dir ./defense_rules
 
-9. Evaluate Wire Probe Against 4-Parser Differential Matrix:
-   python -u rfc_hunt_swarm.py oracle
+11. Evaluate Wire Probe Against 4-Parser Differential Matrix:
+    python -u rfc_hunt_swarm.py oracle
 
-10. Synthesize Binary HTTP/2 Gateway Framing Desynchronization Streams:
+12. Synthesize Binary HTTP/2 Gateway Framing Desynchronization Streams:
     python -u rfc_hunt_swarm.py h2 --host 127.0.0.1 --port 8080
 
-11. Verify Cryptographic Merkle Audit Trail (RFC 6962 Tree Root & Proofs):
+13. Verify Cryptographic Merkle Audit Trail (RFC 6962 Tree Root & Proofs):
     python -u rfc_hunt_swarm.py audit
 
-12. One-Click Dual Launcher (Local Test Lab Server + Flaw Hunter):
-    python -u rfc_hunt_swarm.py start --terminators chunk,h2_gateway
-
-13. Protocol Ruler mode (measure front-end byte transformations):
+14. Protocol Ruler mode (measure front-end byte transformations):
     python -u rfc_hunt_swarm.py ruler --host 127.0.0.1 --port 3030 --sequence "\\xc0\\x8a" --name "Overlong-LF"
 
-14. Unified 'Build All' pipeline (syntax check, DB schema, 25 RFC cache, Caldera, Dream-RSI, pytest):
+15. Unified 'Build All' pipeline (syntax check, DB schema, 25 RFC cache, Caldera, Dream-RSI, pytest):
     python -u rfc_hunt_swarm.py build --skip-tests
-
-15. List all 25 Terminator RFC Specifications and 36 Terminator Mutators:
-    python -u rfc_hunt_swarm.py --list-terminators
-
-16. Launch Interactive Dashboard Web UI on High Random Port:
-    python -u rfc_hunt_swarm.py ui
-    python -u rfc_hunt_swarm.py dashboard --serve
 ===============================================================================
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
