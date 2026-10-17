@@ -153,7 +153,15 @@ def build_step_run_tests() -> Tuple[bool, str]:
     """Executes the complete automated test suite via pytest."""
     try:
         cmd = [sys.executable, "-m", "pytest", "tests/", "test_protocol_ruler.py", "-q"]
-        res = subprocess.run(cmd, cwd=str(ROOT_DIR), capture_output=True, text=True, timeout=300)
+        res = subprocess.run(
+            cmd,
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+        )
         if res.returncode == 0:
             lines = [l for l in res.stdout.strip().splitlines() if "passed" in l or "warning" in l]
             summary = lines[-1] if lines else "All tests passed."

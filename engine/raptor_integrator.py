@@ -109,6 +109,8 @@ class RaptorIntegrator:
                 ["docker", "image", "inspect", RAPTOR_DOCKER_IMAGE, "--format", "{{.Id}}"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=6,
                 check=False,
             )
@@ -161,7 +163,15 @@ class RaptorIntegrator:
         ]
 
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                check=False,
+            )
             return {
                 "target": str(target),
                 "returncode": proc.returncode,
@@ -222,7 +232,15 @@ class RaptorIntegrator:
 
         t_start = time.time()
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec, check=False)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_sec,
+                check=False,
+            )
             duration = time.time() - t_start
         except subprocess.TimeoutExpired:
             return {"error": f"RAPTOR scan timed out after {timeout_sec}s.", "duration_sec": timeout_sec}
@@ -302,7 +320,15 @@ class RaptorIntegrator:
 
         t_start = time.time()
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec, check=False)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_sec,
+                check=False,
+            )
             duration = time.time() - t_start
         except subprocess.TimeoutExpired:
             return {"error": f"RAPTOR host scan timed out after {timeout_sec}s.", "duration_sec": timeout_sec}
