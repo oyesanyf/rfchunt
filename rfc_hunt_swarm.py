@@ -2036,6 +2036,38 @@ def main_swarm(argv=None):
                         "behavior": "Canonical PortSwigger attack vector verified",
                     })
 
+            # Step 0b: RAPTOR Autonomous Security Analysis (if --raptor / --enable-raptor enabled)
+            if getattr(args, "enable_raptor", False):
+                from engine.raptor_integrator import RaptorIntegrator
+                print(f"\n{'='*75}")
+                print(RaptorIntegrator.get_attribution_banner())
+                print(f"{'='*75}\n")
+                raptor_eng = RaptorIntegrator(db=swarm.db, on_trace=print)
+                target_repo = getattr(args, "raptor_target", None)
+                if target_repo and os.path.exists(str(target_repo)):
+                    raptor_res = raptor_eng.run_scan(
+                        target_path=target_repo,
+                        mode=getattr(args, "raptor_mode", "scan") or "scan",
+                        model=getattr(args, "raptor_model", "fenkohq/foundation-sec-8b:latest"),
+                    )
+                else:
+                    raptor_res = raptor_eng.run_host_scan(
+                        host=t_host,
+                        port=t_port,
+                        use_tls=t_tls,
+                    )
+                if raptor_res.get("findings"):
+                    for rf in raptor_res["findings"]:
+                        with swarm.stats_lock:
+                            swarm.run_stats["vulnerabilities_confirmed"].append({
+                                "rfc": "RAPTOR",
+                                "vuln_id": f"RAPTOR-{rf['rule_id'][:15]}",
+                                "anomaly_id": f"RAPTOR-{rf['severity']}",
+                                "impact": f"RAPTOR_{rf['severity']}",
+                                "repro": "100%",
+                                "behavior": f"[{rf['severity']}] {rf['rule_id']}: {rf['message'][:60]}",
+                            })
+
         try:
             for rfc_item in rfcs_to_scan:
                 rfc_num_str = str(rfc_item)
