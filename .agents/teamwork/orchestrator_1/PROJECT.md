@@ -40,8 +40,8 @@ The HTTP Terminator / RFC Hunt Swarm is an autonomous network protocol security 
 | M1 | Host Containment & Subprocess Silencing | `engine/host_containment.py`, Windows WFP `fwpuclnt.dll` DYNAMIC session, Linux Netlink, `CREATE_NO_WINDOW` & `DEVNULL` silencing, integration hooks | none | DONE |
 | M2 | Protocol Framing & 4-Parser Differential Matrix | Dead stub removal, ABNF multi-line rules, 3-step canary pipeline, 3-trial reproducibility invariant, 4-parser differential matrix | none | DONE |
 | M3 | Module 16 Google Research Harness² & Protocol Ruler | `c1..c8` surface verification, Propose-Probe-Compose, $R=4k$ / $P=3k$ ledger identity, per-domain library persistence, Protocol Ruler verification | M2 | DONE |
-| M4 | Security Boundaries & Concurrency Locks | Target authorization fix, mathematical `ipaddress` SSRF validation, hardened `normalize_rel`, SQLite WAL & locks | M1, M2 | IN_PROGRESS |
-| M5 | Full Verification, E2E Testing & Build Pipeline | `tests/test_host_containment.py`, all unit/integration tests (`pytest tests/ test_protocol_ruler.py -v`), `main.py build` exit 0 | M1, M2, M3, M4 | PLANNED |
+| M4 | Security Boundaries & Concurrency Locks | Target authorization fix, mathematical `ipaddress` SSRF validation, hardened `normalize_rel`, SQLite WAL & locks | M1, M2 | DONE |
+| M5 | Full Verification, E2E Testing & Build Pipeline | `tests/test_host_containment.py`, all unit/integration tests (`pytest tests/ test_protocol_ruler.py -v`), `main.py build` exit 0 | M1, M2, M3, M4 | IN_PROGRESS |
 
 ## Interface Contracts
 ### HostContainmentManager ↔ DefensivePublisher & Swarm

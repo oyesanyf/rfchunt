@@ -24,10 +24,10 @@ Orchestrate an exhaustive IETF RFC-compliance, security boundary, and host netwo
   2. M1: Native Host-Restoring Containment & Subprocess Silencing [done]
   3. M2: IETF RFC Compliance & 4-Parser Differential Matrix (Modules 1-15) [done]
   4. M3: Module 16 Google Research Harness² & Protocol Ruler [done]
-  5. M4: Security Boundaries (SSRF, Path Traversal, Concurrency Locks) [in-progress]
-  6. M5: Full Verification & E2E Test Suite [pending]
-- **Current phase**: 2 (Milestone Execution - M4)
-- **Current focus**: Milestone 4: Security Boundaries (SSRF IP Guards, Path Traversal, SQLite Concurrency Locks)
+  5. M4: Security Boundaries (SSRF, Path Traversal, Concurrency Locks) [done]
+  6. M5: Full Verification & E2E Test Suite [in-progress]
+- **Current phase**: 2 (Milestone Execution - M5)
+- **Current focus**: Milestone 5: Full Regression Testing, Build Verification & Packaging Readiness
 
 ## 🔒 Key Constraints
 - NEVER write, modify, or create source code files directly.
@@ -69,12 +69,19 @@ Orchestrate an exhaustive IETF RFC-compliance, security boundary, and host netwo
 | challenger_m4_2 | teamwork_preview_challenger | M4 Path Traversal & Concurrency Stress Challenge | completed | 659cfaf7-4e0d-447a-801f-8980182adff6 |
 | auditor_m4_1 | teamwork_preview_auditor | M4 Forensic Integrity Audit | completed | 4310d442-2260-42c4-b6ad-0e6615ebc4bb |
 | explorer_m4_rem_1 | teamwork_preview_explorer | M4 Remediation Survey (SSRF Socket Gating) | completed | a43e1350-a949-47bb-8618-a32f589aa307 |
-| worker_m4_rem_1 | teamwork_preview_worker | M4 Remediation Implementation (SSRF Socket Gating) | in-progress | 38babee7-a9c9-4cc3-9eea-c883aa4fc6a2 |
+| worker_m4_rem_1 | teamwork_preview_worker | M4 Remediation Implementation (SSRF Socket Gating) | completed | 38babee7-a9c9-4cc3-9eea-c883aa4fc6a2 |
+| reviewer_m4_rem_1 | teamwork_preview_reviewer | M4 Remediation Review (Prober & Sub-Engine Gating) | completed | d6c86e19-f309-4d7a-bcff-6274971871a3 |
+| reviewer_m4_rem_2 | teamwork_preview_reviewer | M4 Remediation Review (Full Suite & Build) | completed | 2e477e2c-6964-439d-b031-2658f164c565 |
+| challenger_m4_rem_1 | teamwork_preview_challenger | M4 Remediation Adversarial Challenge (Socket Spy) | completed | 679b68dc-0779-41d7-b325-b55d3a951361 |
+| challenger_m4_rem_2 | teamwork_preview_challenger | M4 Remediation Adversarial Challenge (Regression & Concurrency) | completed | 6c29e1dc-5fac-417e-bb84-e432a04c3528 |
+| auditor_m4_rem_1 | teamwork_preview_auditor | M4 Remediation Forensic Integrity Audit | completed | 6ca35ca5-c7e9-498e-8e36-dc070ff6382f |
+| explorer_m5_1 | teamwork_preview_explorer | M5 Verification & Packaging Survey | completed | dc15940f-e9b0-45fd-a301-9445cbb573a3 |
+| worker_m5 | teamwork_preview_worker | M5 Full Verification & Auto-Commit Execution | in-progress | 79ff7a17-49a5-4340-b995-c74d296b4e0c |
 
 ## Succession Status
 - Succession required: no
-- Spawn count: 48 / 128
-- Pending subagents: 38babee7-a9c9-4cc3-9eea-c883aa4fc6a2
+- Spawn count: 59 / 128
+- Pending subagents: 79ff7a17-49a5-4340-b995-c74d296b4e0c
 - Predecessor: none
 - Successor: none
 
