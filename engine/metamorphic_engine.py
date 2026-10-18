@@ -160,6 +160,17 @@ class MetamorphicTestingEngine:
         return results
 
     def _execute_raw(self, host: str, port: int, payload: bytes, timeout: float, use_tls: bool = False) -> Tuple[int, bytes]:
+        is_local = host in ("127.0.0.1", "localhost", "::1", "[::1]") or host.startswith("127.")
+        from engine.safe_network_validator import validate_target_host
+        is_safe, reason = validate_target_host(host, allow_private=is_local)
+        if not is_safe:
+            return 0, b""
+        from mcp_server import TargetAuthorizationGate
+        try:
+            TargetAuthorizationGate.check_target(host)
+        except PermissionError:
+            return 0, b""
+
         sock = None
         try:
             sock = socket.create_connection((host, port), timeout=timeout)

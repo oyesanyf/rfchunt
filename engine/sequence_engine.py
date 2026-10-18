@@ -58,6 +58,23 @@ class StatefulProtocolSequenceEngine:
             sequence_type="PIPELINED_CANARY",
             target=f"{host}:{port}",
         )
+        # Defense-in-depth SSRF and Target Authorization Gate
+        is_local = host in ("127.0.0.1", "localhost", "::1", "[::1]") or host.startswith("127.")
+        from engine.safe_network_validator import validate_target_host
+        is_safe, reason = validate_target_host(host, allow_private=is_local)
+        if not is_safe:
+            report.has_desynchronization = False
+            report.has_pipeline_leak = False
+            report.details = f"Target '{host}' rejected by SSRF safety boundary: {reason}"
+            return report
+        from mcp_server import TargetAuthorizationGate
+        try:
+            TargetAuthorizationGate.check_target(host)
+        except PermissionError as e:
+            report.has_desynchronization = False
+            report.has_pipeline_leak = False
+            report.details = f"Target '{host}' rejected by target authorization gate: {e}"
+            return report
         canary_token = f"CANARY_{random.randint(10000, 99999)}"
         canary_request = (
             f"GET /check_{canary_token} HTTP/1.1\r\n"
@@ -287,6 +304,23 @@ class StatefulProtocolSequenceEngine:
             sequence_type="CL0_CANARY",
             target=f"{host}:{port}",
         )
+        # Defense-in-depth SSRF and Target Authorization Gate
+        is_local = host in ("127.0.0.1", "localhost", "::1", "[::1]") or host.startswith("127.")
+        from engine.safe_network_validator import validate_target_host
+        is_safe, reason = validate_target_host(host, allow_private=is_local)
+        if not is_safe:
+            report.has_desynchronization = False
+            report.has_pipeline_leak = False
+            report.details = f"Target '{host}' rejected by SSRF safety boundary: {reason}"
+            return report
+        from mcp_server import TargetAuthorizationGate
+        try:
+            TargetAuthorizationGate.check_target(host)
+        except PermissionError as e:
+            report.has_desynchronization = False
+            report.has_pipeline_leak = False
+            report.details = f"Target '{host}' rejected by target authorization gate: {e}"
+            return report
         sock = None
         try:
             sock = socket.create_connection((host, port), timeout=self.default_timeout)

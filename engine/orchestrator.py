@@ -55,6 +55,16 @@ class ProtocolResearchOrchestrator:
         use_tls: bool = False,
         db: Optional[Any] = None,
     ):
+        if primary_host in ("0.0.0.0", "::"):
+            raise ValueError(f"Target host cannot be {primary_host} (INADDR_ANY listening address). Use 127.0.0.1 or localhost.")
+        is_local = primary_host in ("127.0.0.1", "localhost", "::1", "[::1]") or primary_host.startswith("127.")
+        from engine.safe_network_validator import validate_target_host
+        is_safe, reason = validate_target_host(primary_host, allow_private=is_local)
+        if not is_safe:
+            raise PermissionError(f"Target '{primary_host}' rejected by SSRF safety boundary: {reason}")
+        from mcp_server import TargetAuthorizationGate
+        TargetAuthorizationGate.check_target(primary_host)
+
         self.host = primary_host
         self.port = primary_port
         self.use_tls = use_tls

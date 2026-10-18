@@ -25,6 +25,17 @@ class DeltaDebugger:
         self.port = target_port
         self.timeout = default_timeout
         self.use_tls = use_tls
+        is_local = target_host in ("127.0.0.1", "localhost", "::1", "[::1]") or target_host.startswith("127.")
+        from engine.safe_network_validator import validate_target_host
+        self._is_safe, self._safety_reason = validate_target_host(target_host, allow_private=is_local)
+        from mcp_server import TargetAuthorizationGate
+        try:
+            TargetAuthorizationGate.check_target(target_host)
+            self._is_authorized = True
+            self._auth_reason = ""
+        except PermissionError as e:
+            self._is_authorized = False
+            self._auth_reason = str(e)
 
     def minimize_and_reproduce(
         self,
@@ -132,6 +143,9 @@ class DeltaDebugger:
 
     def _default_oracle(self, anomaly: ImplementationAnomaly) -> Callable[[bytes], bool]:
         """Creates a socket test oracle that tests if the target reproduces the anomaly behavior."""
+        if not self._is_safe or not self._is_authorized:
+            return lambda test_bytes: False
+
         if anomaly.category in (AnomalyCategory.PIPELINE_LEAK, AnomalyCategory.SOCKET_HANG) or "pipeline leak" in anomaly.observed_behavior.lower():
             from engine.sequence_engine import StatefulProtocolSequenceEngine
             seq_engine = StatefulProtocolSequenceEngine(default_timeout=self.timeout)
@@ -167,6 +181,8 @@ class DeltaDebugger:
         def oracle(test_bytes: bytes) -> bool:
             sock = None
             try:
+                if not self._is_safe or not self._is_authorized:
+                    return False
                 sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
                 if self.use_tls:
                     context = ssl.create_default_context()

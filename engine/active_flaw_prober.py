@@ -42,25 +42,41 @@ class ActiveFlawProber:
         db: Optional[Database] = None,
         on_trace: Optional[Callable[[str], None]] = None,
     ):
+        if host in ("0.0.0.0", "::"):
+            raise ValueError(f"Target host cannot be {host} (INADDR_ANY listening address). Use 127.0.0.1 or localhost.")
         self.host = host
         self.port = port
         self.use_tls = use_tls
         self.timeout = timeout
         self.db = db
         self.on_trace = on_trace or print
+
+        is_local = host in ("127.0.0.1", "localhost", "::1", "[::1]") or host.startswith("127.")
+        from engine.safe_network_validator import validate_target_host
+        self._is_safe, self._safety_reason = validate_target_host(host, allow_private=is_local)
+        from mcp_server import TargetAuthorizationGate
+        try:
+            TargetAuthorizationGate.check_target(host)
+            self._is_authorized = True
+            self._auth_reason = ""
+        except PermissionError as e:
+            self._is_authorized = False
+            self._auth_reason = str(e)
+
         self.seq_engine = StatefulProtocolSequenceEngine(default_timeout=timeout)
         self.debugger = DeltaDebugger(target_host=host, target_port=port, default_timeout=timeout, use_tls=use_tls)
         self.classifier = CausalAnomalyClassifier()
         self.permutator = VectorPermutator(db=db)
 
+    def _check_safety(self) -> None:
+        """Enforces fail-closed target validation and SSRF authorization."""
+        if not self._is_safe:
+            raise PermissionError(f"Target '{self.host}' rejected by SSRF safety boundary: {self._safety_reason}")
+        if not self._is_authorized:
+            raise PermissionError(self._auth_reason)
+
     def _open_connection(self) -> socket.socket:
-        is_local = self.host in ("127.0.0.1", "localhost", "::1", "[::1]") or self.host.startswith("127.")
-        from engine.safe_network_validator import validate_target_host
-        is_safe, reason = validate_target_host(self.host, allow_private=is_local)
-        if not is_safe:
-            raise PermissionError(f"Target '{self.host}' rejected by SSRF safety boundary: {reason}")
-        from mcp_server import TargetAuthorizationGate
-        TargetAuthorizationGate.check_target(self.host)
+        self._check_safety()
         raw_sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
         if self.use_tls:
             context = ssl.create_default_context()
@@ -164,6 +180,12 @@ class ActiveFlawProber:
         Runs the canonical vulnerability suite against the target host.
         Returns a list of verified, confirmed ReproducibleVulnerability objects.
         """
+        try:
+            self._check_safety()
+        except PermissionError as e:
+            self.on_trace(f"[*] SSRF containment active: ActiveFlawProber audit halted for target '{self.host}': {e}")
+            return []
+
         self.on_trace(f"\n{'='*75}")
         self.on_trace(f"[*] LAUNCHING CANONICAL ACTIVE FLAW VERIFICATION SUITE")
         self.on_trace(f"[*] Target: {'https' if self.use_tls else 'http'}://{self.host}:{self.port}")

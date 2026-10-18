@@ -62,12 +62,19 @@ Orchestrate an exhaustive IETF RFC-compliance, security boundary, and host netwo
 | explorer_m4_1 | teamwork_preview_explorer | M4 Target Auth & SSRF Survey | completed | 0aed4df1-b362-40e2-a642-c6ec1d6542b8 |
 | explorer_m4_2 | teamwork_preview_explorer | M4 Path Traversal & normalize_rel Survey | completed | 2568c6c7-f278-4f40-a351-a0218db140d5 |
 | explorer_m4_3 | teamwork_preview_explorer | M4 SQLite WAL & Concurrency Locks Survey | completed | 15ad6ba3-0b9f-4314-8f05-097c1c03c237 |
-| worker_m4 | teamwork_preview_worker | M4 Security Boundaries & Locks Implementation | in-progress | be39ee83-0403-4688-8bc7-6f350ebe89bb |
+| worker_m4 | teamwork_preview_worker | M4 Security Boundaries & Locks Implementation | completed | be39ee83-0403-4688-8bc7-6f350ebe89bb |
+| reviewer_m4_1 | teamwork_preview_reviewer | M4 SSRF & Target Auth Review | completed | 371008d8-6cf3-4e9e-a19c-02e20fe0192d |
+| reviewer_m4_2 | teamwork_preview_reviewer | M4 Path Traversal & SQLite Concurrency Review | completed | 3289d1e2-4843-40a5-981e-d4fd4c759ffe |
+| challenger_m4_1 | teamwork_preview_challenger | M4 SSRF Adversarial Challenge | completed | dcafc03d-aea7-4715-ae57-bcb7743bdb9c |
+| challenger_m4_2 | teamwork_preview_challenger | M4 Path Traversal & Concurrency Stress Challenge | completed | 659cfaf7-4e0d-447a-801f-8980182adff6 |
+| auditor_m4_1 | teamwork_preview_auditor | M4 Forensic Integrity Audit | completed | 4310d442-2260-42c4-b6ad-0e6615ebc4bb |
+| explorer_m4_rem_1 | teamwork_preview_explorer | M4 Remediation Survey (SSRF Socket Gating) | completed | a43e1350-a949-47bb-8618-a32f589aa307 |
+| worker_m4_rem_1 | teamwork_preview_worker | M4 Remediation Implementation (SSRF Socket Gating) | in-progress | 38babee7-a9c9-4cc3-9eea-c883aa4fc6a2 |
 
 ## Succession Status
 - Succession required: no
-- Spawn count: 41 / 128
-- Pending subagents: be39ee83-0403-4688-8bc7-6f350ebe89bb
+- Spawn count: 48 / 128
+- Pending subagents: 38babee7-a9c9-4cc3-9eea-c883aa4fc6a2
 - Predecessor: none
 - Successor: none
 
