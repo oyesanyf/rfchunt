@@ -10,6 +10,10 @@
 > 2. **RAPTOR Autonomous Offensive/Defensive Framework**:
 >    - Authored by **Gadi Evron**, **Daniel Cuthbert** ([ORCID: 0009-0000-6443-0251](https://orcid.org/0009-0000-6443-0251)), and **Thomas Dullien ("Halvar Flake")**
 >    - Docker Engine: `danielcuthbert/raptor:latest` | Repo: <https://github.com/gadievron/raptor>
+>
+> 3. **Google Research Harness² Recursive Agent Harnessing Engine**:
+>    - Authored by **Ruiyao Xu, Yanfei Chen, Zhongying CuiZhu, Bhavana Dalvi Mishra, Yifei Ming, Han Yu, Rujun Han, Chen-Yu Lee, and Tomas Pfister** (Google Research, 2026)
+>    - Paper: *"Harness²: Recursive Agent Harnessing for an Open World"* (`arXiv:2610.14224`) | Repo: <https://github.com/google-research/harness2>
 
 ---
 

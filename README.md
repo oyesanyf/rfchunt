@@ -16,11 +16,12 @@
 [![LangGraph](https://img.shields.io/badge/Swarm-LangGraph-orange.svg?style=for-the-badge)](https://github.com/langchain-ai/langgraph)
 [![Ollama Zero-Cost](https://img.shields.io/badge/Local%20AI-Ollama-black.svg?style=for-the-badge)](https://ollama.ai/)
 [![James Kettle Research](https://img.shields.io/badge/Research-James%20Kettle%20DEF%20CON%2034-red.svg?style=for-the-badge)](https://portswigger.net/research/can-ai-do-novel-security-research)
+[![Google Research Harness2](https://img.shields.io/badge/Harness%C2%B2-Google%20Research-4285F4.svg?style=for-the-badge)](https://github.com/google-research/harness2)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-green.svg?style=for-the-badge)](LICENSE)
 
 > [!IMPORTANT]
-> **Inspired by James Kettle's Seminal Research ([Can AI Do Novel Security Research?](https://portswigger.net/research/can-ai-do-novel-security-research))**:
-> An autonomous, 12-agent research swarm orchestrated via LangGraph that extracts normative grammar rules and micro-inspiration from Post-Quantum Cryptography (PQC) and IETF RFC specifications, synthesizes novel boundary and desynchronization probes via ModelFusion, executes stateful pipelined canary sequences against live HTTP/TLS endpoints, and delta-debugs reproducible anomalies.
+> **Inspired by James Kettle's Seminal Research ([Can AI Do Novel Security Research?](https://portswigger.net/research/can-ai-do-novel-security-research)) & Google Research's [Harness²](https://github.com/google-research/harness2)**:
+> An autonomous, 16-module research swarm orchestrated via LangGraph that extracts normative grammar rules and micro-inspiration from Post-Quantum Cryptography (PQC) and IETF RFC specifications, recursively refines its 8-component agent harness (`c1..c8`) via Harness², synthesizes novel boundary and desynchronization probes via ModelFusion, executes stateful pipelined canary sequences against live HTTP/TLS endpoints, and delta-debugs reproducible anomalies.
 
 </div>
 
@@ -36,8 +37,10 @@
    - [rfc_hunt_swarm.py (Swarm CLI)](#1-rfc_hunt_swarmpy-swarm-orchestrator)
    - [protocol_ruler.py (Standalone Ruler)](#2-protocol_rulerpy-standalone-ruler)
    - [main.py (Modular Subcommand Toolkit)](#3-mainpy-modular-toolkit-subcommands)
-7. [The 12 Protocol Research Modules](#the-12-protocol-research-modules)
+7. [The 16 Protocol Research Modules](#the-16-protocol-research-modules)
 8. [Research Attribution & Citations](#research-attribution--citations)
+9. [RAPTOR Framework Integration & Attribution](#raptor-framework-integration--attribution)
+10. [Google Research Harness² Integration & Attribution](#google-research-harness-integration--attribution)
 
 ---
 
@@ -283,20 +286,29 @@ python -u rfc_hunt_swarm.py --mode corpus --sec-model qwen2.5:7b --timeout 300
 ## Exhaustive CLI Flag & Parameter Reference
 
 > [!TIP]
-> **Complete 63-Flag Manual With Copy-Paste Examples**:
-> For the comprehensive flag-by-flag manual detailing all 63 flags across Swarm Orchestrator, Server/Lab, UI, RAPTOR, and Database Compaction with concrete CLI examples for every flag, see **[CLI Reference Manual](docs/CLI_REFERENCE.md)** or run `python -u rfc_hunt_swarm.py --help`.
+> **Complete 70-Flag Manual With Copy-Paste Examples**:
+> For the comprehensive flag-by-flag manual detailing all 70 flags across Swarm Orchestrator, Server/Lab, UI, RAPTOR, Google Research Harness², and Database Compaction with concrete CLI examples for every flag, see **[CLI Reference Manual](docs/CLI_REFERENCE.md)**, **[Harness² Integration Guide](docs/HARNESS2_INTEGRATION.md)**, and **[RAPTOR Integration Guide](docs/RAPTOR_INTEGRATION.md)**, or run `python -u rfc_hunt_swarm.py --help`.
 
 ### 1. `rfc_hunt_swarm.py` (Swarm Orchestrator)
 
-The main entrypoint executing the 12-agent LangGraph autonomous research swarm.
+The main entrypoint executing the 16-module LangGraph autonomous research swarm.
 
 | Flag / Argument | Type | Default | Description & Engineering Details |
 | :--- | :--- | :--- | :--- |
-| `--mode` | `choice` | `single` | Scan mode: `single` (one RFC), `terminator` (curated HTTP Terminator suite), `corpus` (Kettle 138 corpus), `all` (IETF registry), `pqc` (Post-Quantum & TLS 1.3), or `ruler` (Protocol Ruler). |
-| `--rfc` | `string` | `9112` | Target RFC number when `--mode single` is selected. Automatically normalizes inputs (e.g. `RFC9112` $\rightarrow$ `9112`). |
+| `--mode` | `choice` | `single` | Scan mode: `single`, `terminator`, `corpus`, `all`, `pqc`, `ruler`, `dream`, `caldera`, `raptor`, `harness2`, `build`, or `mcp`. |
+| `--rfc` | `string` | `9112` | Target RFC number(s) (e.g. `9112` or `9112,9110,9113`). |
 | `--host` | `string` | `127.0.0.1` | Target IP address or hostname. Dynamically normalizes `Host: target.local` probes to the real target to prevent gateway rejection. |
 | `--port` | `integer` | `5006` | Target TCP port. If port `443` is specified, TLS is automatically enabled. |
 | `--tls` | `flag` | `False` | Wraps socket in TLS/HTTPS context with SNI and self-signed certificate tolerance. |
+| `--clean-db` | `flag` | `False` | Truncates high-volume exploration tables (`probes`, `fragments`, `harness2_runs`, etc.) and executes SQLite `VACUUM` to reclaim disk space. |
+| `--keep-rfcs` | `flag` | `False` | Retains downloaded RFC specifications when running `--clean-db`. |
+| `--keep-findings` | `flag` | `False` | Retains confirmed vulnerabilities and defensive rules when running `--clean-db`. |
+| `--harness2` / `--no-harness2` | `flag` | `True` | Enables or disables Google Research Harness² recursive agent harnessing (`c1..c8`). |
+| `--harness2-k`, `--k` | `integer` | `1` | Task-level recursion parameter $k$ ($R = 4k$ rollouts, $P = 3k$ stages). |
+| `--harness2-mode` | `choice` | `parallel` | Recursion topology: `parallel` (`agg` width), `sequential` (`seq` depth), or `both`. |
+| `--harness2-domain` | `string` | `auto` | Protocol domain for Harness² experience library (`http11_framing`, `h2_translation`, etc.). |
+| `--harness2-report` | `flag` | `False` | Prints persisted Harness² runs, $R=4k/P=3k$ ledger proofs, and learned domain lessons. |
+| `--raptor` | `flag` | `False` | Enables RAPTOR Autonomous Framework (`web`, `scan`, `agentic`, `crypto`, `sca`). |
 | `--cycles` | `integer` | `3` | Maximum mutation and permutation cycles executed per RFC. |
 | `--timeout` | `float` | `900.0` | Process-scoped Ollama inference timeout in seconds (900s = 15m). Set to `0` for unlimited timeout on heavy models. |
 | `--sec-model` | `string` | `None` | Secondary security model for ModelFusion (e.g. `qwen2.5:7b`, `fenkohq/foundation-sec-8b:latest`, `deepseek-r1:1.5b`). |
@@ -361,22 +373,26 @@ Modular toolkit providing discrete CLI commands for each phase of the research f
 
 ---
 
-## The 12 Protocol Research Modules
+## The 16 Protocol Research Modules
 
 | # | Module | Source File | Core Responsibility |
 | :-: | :--- | :--- | :--- |
 | **1** | **ABNF Grammar Extractor** | `engine/abnf_engine.py` | Compiles formal RFC 5234 ABNF grammar rules to find boundary edge-cases. |
 | **2** | **Context-Free Generator** | `probe_generator.py` | Synthesizes unanchored HTTP request templates from isolated micro-fragments. |
 | **3** | **Semantic Constraint Compiler** | `engine/semantic_compiler.py` | Extracts normative RFC keywords (`MUST`, `SHOULD NOT`) into validation rules. |
-| **4** | **Differential Oracle** | `engine/differential_oracle.py`| Dispatches probes across multi-engine targets to detect metamorphic divergences. |
+| **4** | **Differential Oracle** | `engine/differential_oracle.py`| Dispatches probes across a 4-parser matrix to detect metamorphic divergences. |
 | **5** | **Stateful Sequence Engine** | `engine/sequence_engine.py` | Manages persistent TCP channels to test 3-step canary contamination. |
 | **6** | **RFC Evolution Tracker** | `engine/errata_tracker.py` | Tracks official IETF technical errata and historical specification updates. |
 | **7** | **Metamorphic Invariance Oracle** | `engine/metamorphic_engine.py`| Tests semantic equivalence across case, whitespace, and encoding mutations. |
 | **8** | **Delta-Debugging Engine** | `engine/delta_debugger.py` | Recursively slices payloads to isolate the absolute minimal root-cause byte sequence. |
-| **9** | **Causal Anomaly Classifier** | `engine/causal_classifier.py` | Classifies anomalies into discrete taxonomy (CL.0, TE.CL, Response Forking, Leaks). |
+| **9** | **Causal Anomaly Classifier** | `engine/causal_classifier.py` | Classifies anomalies into discrete taxonomy (`CL.0`, `TE.CL`, Response Forking, Leaks). |
 | **10**| **Cross-Protocol Analyzer** | `engine/boundary_analyzer.py`| Translates SMTP/MIME delimiters and BDAT frames into HTTP parser confusion probes. |
 | **11**| **Research Knowledge Graph** | `engine/knowledge_graph.py` | Maintains an interconnected SQLite knowledge graph of RFCs, rules, and findings. |
-| **12**| **Defensive Publisher** | `engine/defensive_publisher.py`| Exports Snort/Suricata rules (Arm 106) and pytest regression suites (Arm 107). |
+| **12**| **Defensive Publisher** | `engine/defensive_publisher.py`| Exports Snort/Suricata rules (Arm 106), Nuclei templates, and pytest suites (Arm 107). |
+| **13**| **Open-Dream-RSI World Model** | `engine/dream_world_model.py` | Offline protocol world model and policy self-improvement via evolutionary dream rollouts. |
+| **14**| **MITRE Caldera Adversary Export** | `engine/caldera_integration.py`| Translates confirmed protocol flaws into MITRE Caldera adversary abilities and profiles. |
+| **15**| **RAPTOR Autonomous Framework** | `engine/raptor_engine.py` | Integrates Semgrep, CodeQL, PQC crypto audits, and live web DAST into `terminator.db`. |
+| **16**| **Google Research Harness² Engine** | `engine/harness2_engine.py` | Two-level recursive agent harnessing (`Propose–Probe–Compose` across `c1..c8` + per-domain `Library`). |
 
 ---
 
