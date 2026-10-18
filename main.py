@@ -450,6 +450,32 @@ def cmd_build(args):
         sys.exit(1)
 
 
+def cmd_harness2(args):
+    """Executes Google Research Harness² recursive agent harnessing (Propose-Probe-Compose across c1..c8)."""
+    from engine.harness2_engine import Harness2ProtocolEngine
+
+    db = Database(args.db)
+    engine = Harness2ProtocolEngine(
+        runs_root=args.runs_dir,
+        target_host=args.target,
+        target_port=args.port,
+        db_path=args.db,
+    )
+    if args.report:
+        print(engine.format_cli_report(db_instance=db))
+        return
+
+    rfcs = [r.strip() for r in str(args.rfc).split(",") if r.strip()]
+    summary = engine.run_suite(
+        rfc_list=rfcs,
+        k=args.k,
+        mode=args.mode,
+        domain=args.domain,
+        db_instance=db,
+    )
+    print(engine.format_cli_report(summary=summary, db_instance=db))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="""
@@ -493,6 +519,9 @@ USAGE EXAMPLES:
 
 8. Export confirmed findings to a MITRE Caldera adversary emulation plugin:
    python main.py caldera --export ./caldera_export
+
+9. Run Google Research Harness² recursive agent harnessing (Propose-Probe-Compose across c1..c8):
+   python main.py harness2 --rfc 9112 --k 2 --mode both
 ===============================================================================
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -607,6 +636,17 @@ USAGE EXAMPLES:
     p_caldera.add_argument("--push", type=str, default=None, help="Caldera server URL to push abilities live")
     p_caldera.add_argument("--api-key", type=str, default=None, help="Caldera API key for REST authentication")
 
+    # Harness2 (Google Research Recursive Agent Harnessing)
+    p_harness2 = subparsers.add_parser("harness2", help="Run Google Research Harness2 recursive agent harnessing (c1..c8)")
+    p_harness2.add_argument("--rfc", default="9112", help="Target RFC number(s) (e.g. 9112 or 9112,9110,9113)")
+    p_harness2.add_argument("--k", "--harness2-k", dest="k", type=int, default=1, help="Recursion parameter k (R=4k rollouts, P=3k stages)")
+    p_harness2.add_argument("--mode", "--harness2-mode", dest="mode", choices=["parallel", "sequential", "agg", "seq", "both"], default="parallel", help="Recursion topology: parallel (agg width), sequential (seq depth), or both")
+    p_harness2.add_argument("--domain", "--harness2-domain", dest="domain", default="auto", help="Protocol domain for experience library")
+    p_harness2.add_argument("--runs-dir", "--harness2-runs-dir", dest="runs_dir", default="runs/harness2", help="Directory for persisted Harness2 runs and experience library")
+    p_harness2.add_argument("--target", default="127.0.0.1", help="Target host")
+    p_harness2.add_argument("--port", type=int, default=8080, help="Target port")
+    p_harness2.add_argument("--report", "--harness2-report", dest="report", action="store_true", help="Print historical Harness2 runs and experience libraries")
+
     # Build All Pipeline
     p_build = subparsers.add_parser("build", help="Build all components, verify database, pre-cache RFCs, and run verification suite")
     p_build.add_argument("--skip-tests", action="store_true", help="Skip running the pytest verification suite")
@@ -644,6 +684,7 @@ USAGE EXAMPLES:
         "auto": cmd_auto,
         "dream": cmd_dream,
         "caldera": cmd_caldera,
+        "harness2": cmd_harness2,
     }
 
     dispatch[args.command](args)

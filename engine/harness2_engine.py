@@ -455,8 +455,24 @@ class Ledger:
         return sum(1 for e in self.entries if e.kind == "rollout")
 
     @property
+    def rollouts(self) -> int:
+        return self.rollouts_count
+
+    @property
     def sessions_count(self) -> int:
         return sum(1 for e in self.entries if e.kind == "session")
+
+    @property
+    def sessions(self) -> int:
+        return self.sessions_count
+
+    @property
+    def expected_rollouts(self) -> int:
+        return expected_rollouts(self.k)
+
+    @property
+    def expected_sessions(self) -> int:
+        return expected_sessions(self.k)
 
     def assert_identity(self) -> None:
         exp_r = expected_rollouts(self.k)
@@ -467,6 +483,10 @@ class Ledger:
                 f"expected R={exp_r} rollouts & P={exp_p} sessions, "
                 f"got R={self.rollouts_count} & P={self.sessions_count}"
             )
+
+    def verify_budget(self) -> bool:
+        self.assert_identity()
+        return True
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1418,3 +1438,57 @@ class Harness2ProtocolEngine:
             work_dir=work_dir,
             library=lib,
         )
+
+    def run_suite(
+        self,
+        rfc_list: Sequence[str],
+        k: int = 1,
+        mode: str = "parallel",
+        domain: str = "auto",
+        db_instance: Any = None,
+    ) -> List[ModeResult]:
+        """Executes Harness² across one or more RFCs in parallel, sequential, or both modes."""
+        modes_to_run = ["parallel", "sequential"] if mode.lower() == "both" else [mode]
+        results: List[ModeResult] = []
+        for raw_rfc in rfc_list:
+            rfc_clean = str(raw_rfc).strip().replace("RFC-", "").replace("RFC", "")
+            task_id = f"RFC{rfc_clean}"
+            for m in modes_to_run:
+                res = self.run_mode(mode=m, task_id=task_id, k=k, domain=domain)
+                if db_instance is not None and hasattr(db_instance, "save_harness2_run"):
+                    db_instance.save_harness2_run(res.to_dict())
+                results.append(res)
+        return results
+
+    def format_cli_report(
+        self,
+        summary: Optional[Sequence[ModeResult]] = None,
+        db_instance: Any = None,
+    ) -> str:
+        """Formats a CLI report for a suite of ModeResults or historical database runs."""
+        lines = [
+            "=" * 78,
+            "  GOOGLE RESEARCH HARNESS²: RECURSIVE AGENT HARNESSING FOR AN OPEN WORLD",
+            "  Citation : Xu et al., Google Research (arXiv:2610.14224, 2026)",
+            "  Repo     : https://github.com/google-research/harness2",
+            "=" * 78,
+        ]
+        if summary:
+            for res in summary:
+                l_dict = res.ledger.to_dict() if res.ledger else {}
+                lines.append(
+                    f"  [+] Task: {res.task_id} | Mode: {res.mode} | Domain: {res.domain} | "
+                    f"Adopted: `{res.adopted_label}` | R={l_dict.get('actual_rollouts')}/{l_dict.get('expected_rollouts')} "
+                    f"P={l_dict.get('actual_sessions')}/{l_dict.get('expected_sessions')}"
+                )
+                lines.append(f"      Lesson: {res.experience.get('lesson', '')}")
+        elif db_instance is not None and hasattr(db_instance, "get_harness2_runs"):
+            runs = db_instance.get_harness2_runs(limit=25)
+            lines.append(f"  [*] Historical Harness² Runs ({len(runs)} recorded):")
+            for r in runs:
+                lines.append(
+                    f"  - [{r['run_id']}] {r['task_id']} ({r['domain']}) mode={r['mode']} k={r['k_budget']} "
+                    f"R/P={r['rollouts_count']}/{r['sessions_count']} adopted={r['adopted_label']} score={r['contrast_score']:.1f}"
+                )
+        lines.append("=" * 78)
+        return "\n".join(lines)

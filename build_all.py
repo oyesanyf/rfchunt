@@ -78,7 +78,7 @@ def build_step_database(db_path: str = "terminator.db") -> Tuple[bool, str]:
         required_tables = [
             "rfcs", "fragments", "probes", "evaluations", "anomalies",
             "cascade_hypotheses", "rfc_requirements", "implementation_anomalies",
-            "reproducible_vulnerabilities", "novel_techniques"
+            "reproducible_vulnerabilities", "novel_techniques", "harness2_runs"
         ]
         missing = [t for t in required_tables if t not in tables]
         if missing:
@@ -149,6 +149,29 @@ def build_step_dream_rsi() -> Tuple[bool, str]:
         return False, f"Dream-RSI policy verification failure: {e}"
 
 
+def build_step_harness2() -> Tuple[bool, str]:
+    """Verifies Google Research Harness² c1..c8 surface, Propose-Probe-Compose loop, and R=4k/P=3k ledger."""
+    try:
+        from engine.harness2_engine import Harness2ProtocolEngine, RFCHUNT_SURFACE, validate_tree
+
+        engine = Harness2ProtocolEngine(
+            runs_root=ROOT_DIR / "runs" / "harness2",
+            target_host="127.0.0.1",
+            target_port=8080,
+            db_path=str(ROOT_DIR / "terminator.db"),
+        )
+        base_tree = engine.build_base_harness(domain="http11_framing")
+        validate_tree(RFCHUNT_SURFACE, base_tree)
+        res = engine.run_parallel("RFC-9112", k=1, domain="http11_framing", base_tree=base_tree)
+        res.ledger.verify_budget()
+        return True, (
+            f"Harness² Engine verified (8 c1..c8 components valid, adopted={res.adopted_label}, "
+            f"R={res.ledger.rollouts}/{res.ledger.expected_rollouts}, P={res.ledger.sessions}/{res.ledger.expected_sessions})."
+        )
+    except Exception as e:
+        return False, f"Harness² verification failure: {e}"
+
+
 def build_step_run_tests() -> Tuple[bool, str]:
     """Executes the complete automated test suite via pytest."""
     try:
@@ -187,6 +210,7 @@ def run_full_build(skip_tests: bool = False) -> bool:
         ("Terminator RFC Pre-Caching & Offline Readiness", build_step_precache_rfcs),
         ("Caldera Adversary Emulation Plugin Generation", build_step_caldera_export),
         ("Dream-RSI Off-Policy Model Verification", build_step_dream_rsi),
+        ("Google Research Harness² Recursive Engine Verification", build_step_harness2),
     ]
 
     if not skip_tests:

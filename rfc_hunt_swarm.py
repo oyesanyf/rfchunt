@@ -1494,47 +1494,54 @@ def cmd_harness2(args):
             print(f"{'='*78}\n")
             return
 
-    rfc_clean = str(args.rfc or "9112").replace("RFC-", "").replace("RFC", "")
-    task_id = f"RFC{rfc_clean}"
+    rfc_items = [
+        r.strip().replace("RFC-", "").replace("RFC", "")
+        for r in str(args.rfc or "9112").split(",")
+        if r.strip()
+    ]
     k = max(1, int(getattr(args, "harness2_k", 1) or 1))
-    mode = getattr(args, "harness2_mode", "parallel") or "parallel"
+    req_mode = getattr(args, "harness2_mode", "parallel") or "parallel"
+    modes_to_run = ["parallel", "sequential"] if req_mode == "both" else [req_mode]
     domain = getattr(args, "harness2_domain", "auto") or "auto"
 
-    print(f"  [+] Task ID                  : {task_id}")
-    print(f"  [+] Recursion Mode           : {mode} ({'WIDTH: 2k INV+DOM -> k AGG' if mode in ('parallel', 'agg') else 'DEPTH: k sequential Propose-Probe-Compose rounds'})")
-    print(f"  [+] Task Recursion Budget (k): {k} (Expected Rollouts R={4*k}, Improvement Stages P={3*k})")
-    print(f"  [+] Editable Surface (c1..c8): {', '.join(RFCHUNT_SURFACE.always_on)} + skills/ + sub_agents/ + scripts/ + plugin/")
-    print(f"  [+] Runs & Experience Dir    : {h2_engine.runs_root}")
-    print(f"{'-'*78}")
+    for rfc_clean in rfc_items:
+        task_id = f"RFC{rfc_clean}"
+        for mode in modes_to_run:
+            print(f"  [+] Task ID                  : {task_id}")
+            print(f"  [+] Recursion Mode           : {mode} ({'WIDTH: 2k INV+DOM -> k AGG' if mode in ('parallel', 'agg') else 'DEPTH: k sequential Propose-Probe-Compose rounds'})")
+            print(f"  [+] Task Recursion Budget (k): {k} (Expected Rollouts R={4*k}, Improvement Stages P={3*k})")
+            print(f"  [+] Editable Surface (c1..c8): {', '.join(RFCHUNT_SURFACE.always_on)} + skills/ + sub_agents/ + scripts/ + plugin/")
+            print(f"  [+] Runs & Experience Dir    : {h2_engine.runs_root}")
+            print(f"{'-'*78}")
 
-    res = h2_engine.run_mode(mode=mode, task_id=task_id, k=k, domain=domain)
-    res_dict = res.to_dict()
-    db.save_harness2_run(res_dict)
+            res = h2_engine.run_mode(mode=mode, task_id=task_id, k=k, domain=domain)
+            res_dict = res.to_dict()
+            db.save_harness2_run(res_dict)
 
-    print("\n  [*] TASK-LEVEL PROPOSE-PROBE-COMPOSE STAGES:")
-    for st in res.stages:
-        view = res.rollouts.get(st.label)
-        score_str = f"{view.behavioral_score:.1f}" if view else "N/A"
-        div_str = f"{view.parser_divergences}" if view else "0"
-        print(f"      - [{st.dim:<7}] Stage `{st.label:<6}` | Score: {score_str:<6} | Divergences: {div_str} | {st.notes}")
+            print("\n  [*] TASK-LEVEL PROPOSE-PROBE-COMPOSE STAGES:")
+            for st in res.stages:
+                view = res.rollouts.get(st.label)
+                score_str = f"{view.behavioral_score:.1f}" if view else "N/A"
+                div_str = f"{view.parser_divergences}" if view else "0"
+                print(f"      - [{st.dim:<7}] Stage `{st.label:<10}` | Score: {score_str:<6} | Divergences: {div_str} | {st.notes}")
 
-    print("\n  [*] BUDGET IDENTITY VERIFICATION (Ledger):")
-    if res.ledger:
-        l_dict = res.ledger.to_dict()
-        print(
-            f"      - Rollouts (R = 4k) : {l_dict['actual_rollouts']}/{l_dict['expected_rollouts']} "
-            f"| Stages (P = 3k) : {l_dict['actual_sessions']}/{l_dict['expected_sessions']} "
-            f"| Verified: {l_dict['budget_verified']}"
-        )
+            print("\n  [*] BUDGET IDENTITY VERIFICATION (Ledger):")
+            if res.ledger:
+                l_dict = res.ledger.to_dict()
+                print(
+                    f"      - Rollouts (R = 4k) : {l_dict['actual_rollouts']}/{l_dict['expected_rollouts']} "
+                    f"| Stages (P = 3k) : {l_dict['actual_sessions']}/{l_dict['expected_sessions']} "
+                    f"| Verified: {l_dict['budget_verified']}"
+                )
 
-    print("\n  [*] HARNESSING-LEVEL RECURSION (Adopted Harness & Experience Library):")
-    print(f"      - Adopted Candidate : `{res.adopted_label}` (Domain: `{res.domain}`)")
-    if res.similarity:
-        print(f"      - Candidate Diversity: Mean Jaccard={res.similarity['mean_jaccard_similarity']} (Diversity Index={res.similarity.get('diversity_index', 0.0)})")
-    print(f"      - Cue               : {res.experience.get('cue')}")
-    print(f"      - Lesson            : {res.experience.get('lesson')}")
-    print(f"      - Evidence          : {res.experience.get('evidence')}")
-    print(f"{'='*78}\n")
+            print("\n  [*] HARNESSING-LEVEL RECURSION (Adopted Harness & Experience Library):")
+            print(f"      - Adopted Candidate : `{res.adopted_label}` (Domain: `{res.domain}`)")
+            if res.similarity:
+                print(f"      - Candidate Diversity: Mean Jaccard={res.similarity['mean_jaccard_similarity']} (Diversity Index={res.similarity.get('diversity_index', 0.0)})")
+            print(f"      - Cue               : {res.experience.get('cue')}")
+            print(f"      - Lesson            : {res.experience.get('lesson')}")
+            print(f"      - Evidence          : {res.experience.get('evidence')}")
+            print(f"{'='*78}\n")
 
 
 def print_harness2_help():
@@ -1935,7 +1942,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--harness2", dest="enable_harness2", action="store_true", default=True, help="Enable Google Research Harness² recursive agent harnessing (c1..c8 Propose-Probe-Compose; enabled by default)")
     parser.add_argument("--no-harness2", dest="enable_harness2", action="store_false", help="Disable Google Research Harness² recursive agent harnessing")
     parser.add_argument("--harness2-k", "--k", dest="harness2_k", type=int, default=1, help="Harness² task-level recursion budget k (R=4k rollouts, P=3k improvement stages; default: 1)")
-    parser.add_argument("--harness2-mode", type=str, choices=["parallel", "sequential", "agg", "seq"], default="parallel", help="Harness² recursion mode: 'parallel' ('agg' width exploration) or 'sequential' ('seq' depth refinement)")
+    parser.add_argument("--harness2-mode", type=str, choices=["parallel", "sequential", "agg", "seq", "both"], default="parallel", help="Harness² recursion mode: 'parallel' ('agg' width exploration), 'sequential' ('seq' depth refinement), or 'both'")
     parser.add_argument("--harness2-domain", type=str, default="auto", help="Protocol domain for Harness² experience library (e.g. http11_framing, h2_translation, tls13_pqc, auto)")
     parser.add_argument("--harness2-runs-dir", type=str, default="runs/harness2", help="Output directory for persisted Harness² domain libraries, INDEX.md, and EXPERIENCE.md (default: runs/harness2)")
     parser.add_argument("--harness2-report", action="store_true", help="Display historical Harness² recursion runs, R=4k/P=3k ledger verification, and learned domain lessons")
