@@ -56,5 +56,11 @@ Current iteration: Milestone 5 Iteration 1
         - [x] Forensic Auditor M4 Remediation (conv: 6ca35ca5-c7e9-498e-8e36-dc070ff6382f) - CLEAN
   - [/] M5: Full Regression Testing & Build Verification
     - [x] Explorer M5-1: Full Verification & Packaging Survey - DONE
-    - [/] Worker M5: Full Verification & Auto-Commit Execution
+    - [x] Worker M5: Full Verification & Auto-Commit Execution - DONE (Commit 2b4751d pushed)
+    - [/] Verification Gate (Reviewers, Challengers, Auditor)
+      - [/] Reviewer M5-1: Full Verification & E2E Acceptance
+      - [/] Reviewer M5-2: Packaging & Regression Verification
+      - [/] Challenger M5-1: E2E Pipeline Empirical Challenge
+      - [/] Challenger M5-2: Git Working Tree & Concurrency Challenge
+      - [/] Forensic Auditor M5-1: Final Forensic Integrity Audit
 - [ ] Phase 3: Final Forensic Audit & Git Auto-Commit/Push
