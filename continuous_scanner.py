@@ -24,6 +24,7 @@ from engine.terminator_rfc_selector import TerminatorRFCSelector
 from engine.merkle_audit import MerkleAuditTrail
 from engine.exploit_exporter import ExploitExporter
 from engine.dashboard_generator import DashboardGenerator
+from engine.host_containment import HostContainmentManager
 
 
 class ContinuousFlawHunter:
@@ -82,13 +83,66 @@ class ContinuousFlawHunter:
             db=self.db,
         )
         self.merkle_audit = MerkleAuditTrail()
+        self.containment = HostContainmentManager()
+        if hasattr(self.research_engine, "publisher") and hasattr(self.research_engine.publisher, "containment_manager"):
+            self.research_engine.publisher.containment_manager = self.containment
 
         self._stop_requested = False
 
     def stop(self) -> None:
         self._stop_requested = True
+        try:
+            self.containment.stop()
+        except Exception:
+            pass
 
     def run_until_flaw(
+        self,
+        max_rfcs: Optional[int] = 15,
+        fragments_per_rfc: int = 3,
+        permutations_per_probe: int = 2,
+        stop_on_first_flaw: bool = True,
+        all_active: bool = False,
+        unrestricted: bool = False,
+        kettle: bool = True,
+        keywords: Optional[List[str]] = None,
+        resume: bool = True,
+        target_rfc: Optional[str] = None,
+        comb_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Continuously loops through RFCs until flaws are found.
+        When comb_only=True, generates and stores candidate probes into database without testing hosts.
+        Guarantees host network containment during active execution.
+        """
+        if not comb_only:
+            try:
+                self.containment.start()
+            except Exception as e:
+                self.on_progress(f"[-] Containment startup notice: {e}")
+
+        try:
+            return self._run_until_flaw_impl(
+                max_rfcs=max_rfcs,
+                fragments_per_rfc=fragments_per_rfc,
+                permutations_per_probe=permutations_per_probe,
+                stop_on_first_flaw=stop_on_first_flaw,
+                all_active=all_active,
+                unrestricted=unrestricted,
+                kettle=kettle,
+                keywords=keywords,
+                resume=resume,
+                target_rfc=target_rfc,
+                comb_only=comb_only,
+            )
+        finally:
+            if not comb_only:
+                try:
+                    self.containment.stop()
+                except Exception as e:
+                    self.on_progress(f"[-] Containment teardown notice: {e}")
+
+    def _run_until_flaw_impl(
         self,
         max_rfcs: Optional[int] = 15,
         fragments_per_rfc: int = 3,

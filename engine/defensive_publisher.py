@@ -23,10 +23,16 @@ class DefensiveIntelligencePublisher:
     and regression verification tests for Arm 107.
     """
 
-    def __init__(self, output_dir: Optional[str] = None, db: Optional[Any] = None):
+    def __init__(
+        self,
+        output_dir: Optional[str] = None,
+        db: Optional[Any] = None,
+        containment_manager: Optional[Any] = None,
+    ):
         self.output_dir = Path(output_dir or "data")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.db = db
+        self.containment_manager = containment_manager
         self.arm106_rules: List[Arm106DefensiveRule] = []
         self.arm107_tests: List[Arm107RegressionTest] = []
 
@@ -49,6 +55,13 @@ class DefensiveIntelligencePublisher:
         # 1. Synthesize Arm 106 Defensive Hardening Rule
         arm106_rule = self._synthesize_arm106_rule(vuln, rfc_anchor)
         self.arm106_rules.append(arm106_rule)
+
+        # 1b. Apply host containment rule if containment manager is configured
+        if self.containment_manager is not None and hasattr(self.containment_manager, "apply_defensive_rule"):
+            try:
+                self.containment_manager.apply_defensive_rule(arm106_rule)
+            except Exception as e:
+                print(f"[!] Warning: Failed to apply containment rule: {e}")
 
         # 2. Synthesize Arm 107 Regression Test
         arm107_test = self._synthesize_arm107_test(vuln)

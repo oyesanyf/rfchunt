@@ -116,6 +116,7 @@ class OllamaLifecycleManager:
             if winget_bin:
                 try:
                     print("[*] [Ollama Auto-Setup] Installing Ollama via winget...")
+                    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
                     subprocess.run(
                         [
                             winget_bin,
@@ -127,6 +128,10 @@ class OllamaLifecycleManager:
                             "--accept-package-agreements",
                             "--accept-source-agreements",
                         ],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=creation_flags,
                         timeout=180,
                         check=False,
                     )
@@ -149,7 +154,16 @@ class OllamaLifecycleManager:
                                     f.write(chunk)
                 if installer_path.is_file():
                     print("[*] [Ollama Auto-Setup] Running silent installer OllamaSetup.exe /SILENT...")
-                    subprocess.run([str(installer_path), "/SILENT"], timeout=180, check=False)
+                    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                    subprocess.run(
+                        [str(installer_path), "/SILENT"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=creation_flags,
+                        timeout=180,
+                        check=False,
+                    )
                     installed = cls.find_ollama_binary()
                     if installed:
                         print(f"[+] [Ollama Auto-Setup] Ollama installed at {installed}")
@@ -159,7 +173,15 @@ class OllamaLifecycleManager:
         else:
             try:
                 print("[*] [Ollama Auto-Setup] Installing Ollama via official install.sh...")
-                subprocess.run("curl -fsSL https://ollama.com/install.sh | sh", shell=True, timeout=180, check=False)
+                subprocess.run(
+                    "curl -fsSL https://ollama.com/install.sh | sh",
+                    shell=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=180,
+                    check=False,
+                )
                 installed = cls.find_ollama_binary()
                 if installed:
                     return installed
@@ -209,6 +231,7 @@ class OllamaLifecycleManager:
                 subprocess.Popen(
                     [ollama_bin, "serve"],
                     env=proc_env,
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     creationflags=creation_flags,
@@ -253,6 +276,7 @@ class OllamaLifecycleManager:
                 try:
                     res = subprocess.run(
                         [ollama_bin, "pull", model_name],
+                        stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         timeout=600,

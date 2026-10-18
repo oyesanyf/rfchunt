@@ -43,6 +43,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+CREATE_NO_WINDOW: int = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
 # Credit / Attribution metadata constants
 RAPTOR_PROJECT_TITLE = "RAPTOR: Autonomous Offensive/Defensive Research Framework"
 RAPTOR_AUTHORS = "Gadi Evron, Daniel Cuthbert, Thomas Dullien (Halvar Flake)"
@@ -107,12 +109,14 @@ class RaptorIntegrator:
         try:
             res = subprocess.run(
                 ["docker", "image", "inspect", RAPTOR_DOCKER_IMAGE, "--format", "{{.Id}}"],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 timeout=6,
                 check=False,
+                creationflags=CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0,
             )
             if res.returncode == 0 and res.stdout.strip():
                 status["docker_ready"] = True
@@ -165,12 +169,14 @@ class RaptorIntegrator:
         try:
             proc = subprocess.run(
                 cmd,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 timeout=120,
                 check=False,
+                creationflags=CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0,
             )
             return {
                 "target": str(target),
@@ -234,12 +240,14 @@ class RaptorIntegrator:
         try:
             proc = subprocess.run(
                 cmd,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout_sec,
                 check=False,
+                creationflags=CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0,
             )
             duration = time.time() - t_start
         except subprocess.TimeoutExpired:
@@ -322,12 +330,14 @@ class RaptorIntegrator:
         try:
             proc = subprocess.run(
                 cmd,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout_sec,
                 check=False,
+                creationflags=CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0,
             )
             duration = time.time() - t_start
         except subprocess.TimeoutExpired:

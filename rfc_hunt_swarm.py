@@ -71,6 +71,7 @@ from engine.dream_world_model import ProtocolWorldModel
 from engine.dream_rsi_optimizer import DreamRSIOptimizer, DreamPolicy
 from engine.dream_policy_store import DreamPolicyStore
 from engine.harness2_engine import Harness2ProtocolEngine, RFCHUNT_SURFACE
+from engine.host_containment import HostContainmentManager
 
 # 1. State Definition (Encompassing all original functionality + Dream-RSI + Google Research Harness²)
 class ResearchState(TypedDict, total=False):
@@ -245,7 +246,8 @@ class ProtocolResearchSwarm:
         self.classifier = CausalAnomalyClassifier()
         self.boundary = CrossProtocolBoundaryAnalyzer()
         self.knowledge_graph = ResearchKnowledgeGraph()
-        self.publisher = DefensiveIntelligencePublisher(db=self.db)
+        self.containment = HostContainmentManager()
+        self.publisher = DefensiveIntelligencePublisher(db=self.db, containment_manager=self.containment)
         self.publisher.sync_db_findings()
 
         # Open Dream-RSI Engine (Modules 13-15)
@@ -2518,6 +2520,11 @@ def main_swarm(argv=None):
                             })
 
         try:
+            swarm.containment.start()
+        except Exception as e:
+            print(f"[-] Warning: Failed to start host containment: {e}")
+
+        try:
             for rfc_item in rfcs_to_scan:
                 rfc_num_str = str(rfc_item)
                 rfc_label = f"RFC{rfc_num_str.replace('RFC', '')}"
@@ -2572,6 +2579,10 @@ def main_swarm(argv=None):
         except KeyboardInterrupt:
             print("\n[*] Swarm interrupted by user (Ctrl+C). Generating Pass/Fail run summary...")
         finally:
+            try:
+                swarm.containment.stop()
+            except Exception:
+                pass
             if bg_lab_server:
                 bg_lab_server.stop()
             swarm.print_run_summary()

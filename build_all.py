@@ -176,14 +176,17 @@ def build_step_run_tests() -> Tuple[bool, str]:
     """Executes the complete automated test suite via pytest."""
     try:
         cmd = [sys.executable, "-m", "pytest", "tests/", "test_protocol_ruler.py", "-q"]
+        creationflags = 0x08000000 if (sys.platform == "win32" or os.name == "nt") else 0
         res = subprocess.run(
             cmd,
             cwd=str(ROOT_DIR),
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=300,
+            creationflags=creationflags,
         )
         if res.returncode == 0:
             lines = [l for l in res.stdout.strip().splitlines() if "passed" in l or "warning" in l]

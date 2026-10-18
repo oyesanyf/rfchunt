@@ -28,6 +28,7 @@ from rfc_chunker import RFCChunker
 from rfc_fetcher import RFCFetcher
 from test_lab_server import TestLabServer
 from weaponizer import RQPWeaponizer
+from engine.host_containment import HostContainmentManager
 
 
 def cmd_fetch(args):
@@ -127,6 +128,12 @@ def cmd_permute(args):
 
 
 def cmd_evaluate(args):
+    """Evaluates pending probes with active host network containment."""
+    with HostContainmentManager():
+        return _cmd_evaluate_impl(args)
+
+
+def _cmd_evaluate_impl(args):
     db = Database(args.db)
     pending = db.get_pending_probes(target_host=args.target, limit=args.limit)
 
@@ -273,37 +280,38 @@ def cmd_auto(args):
         lab_server.start()
         time.sleep(0.5)
 
-    try:
-        # 6. Evaluate
-        cmd_evaluate(args)
-
-        # 7. Weaponize
-        cmd_weaponize(args)
-
-        # 8. Cascade
-        cmd_cascade(args)
-
-        # 9. Caldera Auto-Sync (Default)
+    with HostContainmentManager():
         try:
-            from engine.caldera_bridge import CalderaBridge
-            bridge = CalderaBridge(db_path=args.db)
-            c_res = bridge.export_plugin(output_dir="caldera_export")
-            bridge.export_plugin(output_dir=".")
-            print(f"\n[+] Caldera Auto-Sync [Default]: {c_res['abilities_count']} abilities and {c_res['adversaries_count']} adversaries updated.")
-        except Exception as e:
-            print(f"[-] Caldera Auto-Sync notice: {e}")
+            # 6. Evaluate
+            cmd_evaluate(args)
 
-        # 10. Dream-RSI Auto-Optimization (Default)
-        if not getattr(args, "no_dream_rsi", False):
+            # 7. Weaponize
+            cmd_weaponize(args)
+
+            # 8. Cascade
+            cmd_cascade(args)
+
+            # 9. Caldera Auto-Sync (Default)
             try:
-                print(f"\n[*] Dream-RSI Auto-Optimization [Default]: Evolving off-policy exploration trajectories...")
-                cmd_dream(args)
+                from engine.caldera_bridge import CalderaBridge
+                bridge = CalderaBridge(db_path=args.db)
+                c_res = bridge.export_plugin(output_dir="caldera_export")
+                bridge.export_plugin(output_dir=".")
+                print(f"\n[+] Caldera Auto-Sync [Default]: {c_res['abilities_count']} abilities and {c_res['adversaries_count']} adversaries updated.")
             except Exception as e:
-                print(f"[-] Dream-RSI Auto-Optimization notice: {e}")
+                print(f"[-] Caldera Auto-Sync notice: {e}")
 
-    finally:
-        if lab_server:
-            lab_server.stop()
+            # 10. Dream-RSI Auto-Optimization (Default)
+            if not getattr(args, "no_dream_rsi", False):
+                try:
+                    print(f"\n[*] Dream-RSI Auto-Optimization [Default]: Evolving off-policy exploration trajectories...")
+                    cmd_dream(args)
+                except Exception as e:
+                    print(f"[-] Dream-RSI Auto-Optimization notice: {e}")
+
+        finally:
+            if lab_server:
+                lab_server.stop()
 
 
 def cmd_hunt(args):
@@ -466,13 +474,14 @@ def cmd_harness2(args):
         return
 
     rfcs = [r.strip() for r in str(args.rfc).split(",") if r.strip()]
-    summary = engine.run_suite(
-        rfc_list=rfcs,
-        k=args.k,
-        mode=args.mode,
-        domain=args.domain,
-        db_instance=db,
-    )
+    with HostContainmentManager():
+        summary = engine.run_suite(
+            rfc_list=rfcs,
+            k=args.k,
+            mode=args.mode,
+            domain=args.domain,
+            db_instance=db,
+        )
     print(engine.format_cli_report(summary=summary, db_instance=db))
 
 
