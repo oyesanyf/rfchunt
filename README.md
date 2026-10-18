@@ -282,6 +282,10 @@ python -u rfc_hunt_swarm.py --mode corpus --sec-model qwen2.5:7b --timeout 300
 
 ## Exhaustive CLI Flag & Parameter Reference
 
+> [!TIP]
+> **Complete 63-Flag Manual With Copy-Paste Examples**:
+> For the comprehensive flag-by-flag manual detailing all 63 flags across Swarm Orchestrator, Server/Lab, UI, RAPTOR, and Database Compaction with concrete CLI examples for every flag, see **[CLI Reference Manual](docs/CLI_REFERENCE.md)** or run `python -u rfc_hunt_swarm.py --help`.
+
 ### 1. `rfc_hunt_swarm.py` (Swarm Orchestrator)
 
 The main entrypoint executing the 12-agent LangGraph autonomous research swarm.

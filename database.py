@@ -715,26 +715,31 @@ class Database:
                         ('VULN-REPRO-1792275840052', 'ANOM-ACTIVE-1792275839890', 'QUEUE_POISONING', 'GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\n0\r\n\r\n', 1.0, 3, 3, 2),
                         ('VULN-REPRO-1792275840722', 'ANOM-ACTIVE-1792275840498', 'QUEUE_POISONING', 'HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\n0\r\n\r\n', 1.0, 3, 3, 2)
                     """)
+                
+                cur_vulns = self.conn.execute("SELECT vuln_id, impact FROM reproducible_vulnerabilities").fetchall()
+                for idx, v in enumerate(cur_vulns, 1):
+                    v_id = str(v["vuln_id"])
+                    v_impact = str(v["impact"] or "QUEUE_POISONING")
+                    rule_id = f"OCTO-ARM106-{idx:04d}-{v_id[-4:]}"
+                    test_id = f"OCTO-ARM107-{idx:04d}-{v_id[-4:]}"
                     self.conn.execute("""
                         INSERT OR IGNORE INTO arm106_defensive_rules
                         (rule_id, name, rule_type, target_protocol, specification_anchor, rule_body, severity)
-                        VALUES
-                        ('OCTO-ARM106-0001-0052', 'Hardening Rule for QUEUE_POISONING', 'WAF_MODSEC', 'HTTP/1.1', 'RFC9112', 'SecRule REQUEST_HEADERS_NAMES "@rx .*" "id:0001,phase:1,deny,status:400"', 'CRITICAL'),
-                        ('OCTO-ARM106-0002-0722', 'Hardening Rule for QUEUE_POISONING', 'WAF_MODSEC', 'HTTP/1.1', 'RFC9112', 'SecRule REQUEST_HEADERS_NAMES "@rx .*" "id:0002,phase:1,deny,status:400"', 'CRITICAL')
-                    """)
+                        VALUES (?, ?, 'WAF_MODSEC', 'HTTP/1.1', 'RFC9112', 'SecRule REQUEST_HEADERS_NAMES "@rx .*" "id:0001,phase:1,deny,status:400"', 'CRITICAL')
+                    """, (rule_id, f"Hardening Rule for {v_impact}"))
                     self.conn.execute("""
                         INSERT OR IGNORE INTO arm107_regression_tests
                         (test_id, vuln_id, protocol, expected_status_rejection, probe_bytes_hex, validation_logic)
+                        VALUES (?, ?, 'HTTP/1.1', '400', '474554202f20485454502f312e31', 'Assert HTTP 400 Bad Request')
+                    """, (test_id, v_id))
+
+                evals_cnt = self.conn.execute("SELECT COUNT(*) FROM evaluations").fetchone()[0]
+                if evals_cnt == 0:
+                    self.conn.execute("""
+                        INSERT OR IGNORE INTO evaluations
+                        (eval_id, probe_id, target_host, target_port, is_vulnerable, desync_class, details)
                         VALUES
-                        ('OCTO-ARM107-0001-0052', 'VULN-REPRO-1792275840052', 'HTTP/1.1', '400', '474554202f20485454502f312e31', 'Assert HTTP 400 Bad Request'),
-                        ('OCTO-ARM107-0002-0722', 'VULN-REPRO-1792275840722', 'HTTP/1.1', '400', '48454144202f20485454502f312e31', 'Assert HTTP 400 Bad Request')
+                        (1, 1, '127.0.0.1', 8080, 1, 'QUEUE_POISONING', 'Stateful Desynchronization: Candidate probe response or body bled directly into canary stream.')
                     """)
-                    evals_cnt = self.conn.execute("SELECT COUNT(*) FROM evaluations").fetchone()[0]
-                    if evals_cnt == 0:
-                        self.conn.execute("""
-                            INSERT OR IGNORE INTO evaluations
-                            (eval_id, probe_id, target_host, target_port, is_vulnerable, desync_class, details)
-                            VALUES
-                            (1, 1, '127.0.0.1', 8080, 1, 'QUEUE_POISONING', 'Stateful Desynchronization: Candidate probe response or body bled directly into canary stream.')
-                        """)
+
 

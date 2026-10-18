@@ -20,11 +20,18 @@ Core Mechanisms:
   - Autonomous discovery cascade & Post-Quantum Cryptography (PQC) standards
 """
 
+import sys
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import argparse
 import concurrent.futures
 import operator
 import re
-import sys
 import threading
 import time
 from typing import Annotated, Any, Dict, List, Optional, Tuple, TypedDict
@@ -1415,7 +1422,7 @@ ALL_MODES = [
 def build_swarm_parser() -> argparse.ArgumentParser:
     """Builds the comprehensive argument parser for rfc_hunt_swarm.py."""
     parser = argparse.ArgumentParser(
-        description="""
+        description=r"""
 ===============================================================================
 RFC HUNT SWARM: Unified Autonomous Protocol Research & Compliance Engine
 ===============================================================================
@@ -1439,18 +1446,17 @@ METHODOLOGY ATTRIBUTIONS:
    - Engine: danielcuthbert/raptor:latest (Docker Container)
    - Integrates Semgrep, CodeQL, web DAST, and local LLM exploitability triage.
 """,
-        epilog="""
+        epilog=r"""
 ===============================================================================
-USAGE EXAMPLES (All run directly via rfc_hunt_swarm.py):
+PRIMARY WORKFLOW EXAMPLES (All run directly via rfc_hunt_swarm.py):
 ===============================================================================
 
-1. Scan a Single RFC against a local or remote target:
-   python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host remote-target.com --port 443 --tls --debug
-   python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host 127.0.0.1 --port 3030 --cycles 2 --debug
+1. Scan the 25-RFC Terminator Suite against a Live Host with Debug Telemetry & RAPTOR:
+   python -u rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 3030 --debug --ui --raptor
 
-2. Scan the full 25-RFC Terminator & Gateway Suite against a Remote Host:
-   python -u rfc_hunt_swarm.py --mode terminator --host remote-target.com --port 443 --tls --concurrency 8 --debug
-   (Covers RFC 9112, 9110, 9111, 7230, 2616, 9113, 7540, 9297, 9651, 8297, 8446, etc.)
+2. Clean and Compact the Database to Reclaim Disk Space:
+   python -u rfc_hunt_swarm.py --clean-db
+   python -u rfc_hunt_swarm.py --clean-db --mode terminator --host 127.0.0.1 --port 3030
 
 3. Scan James Kettle's Full 138-RFC Research Corpus against a Remote Host:
    python -u rfc_hunt_swarm.py --mode corpus --host remote-target.com --port 443 --tls --concurrency 8 --debug
@@ -1458,54 +1464,175 @@ USAGE EXAMPLES (All run directly via rfc_hunt_swarm.py):
 4. Discover & Scan ALL Active IETF Protocol Specifications:
    python -u rfc_hunt_swarm.py --mode all --host remote-target.com --port 443 --tls --concurrency 8 --debug
 
-5. RAPTOR Framework Integration (Credit: Gadi Evron, Daniel Cuthbert, Halvar Flake):
-   # A. Verify RAPTOR Docker container and Ollama security models:
+5. RAPTOR Autonomous Pentesting & Web DAST (Evron, Cuthbert, Dullien / Halvar Flake):
    python -u rfc_hunt_swarm.py raptor --status
-
-   # B. Run RAPTOR Dynamic Web Application Scan against a live remote host:
    python -u rfc_hunt_swarm.py raptor --host vanguardngr.com --port 443 --tls
-   python -u rfc_hunt_swarm.py --mode raptor --host dlptest.com --port 443 --tls
-
-   # C. Run Autonomous Agentic Source Code Pentest with Foundation-Sec-8B:
    python -u rfc_hunt_swarm.py raptor --repo D:\\harfile\\my_project --raptor-mode agentic
-
-   # D. Run Post-Quantum Cryptography (PQC) & Cryptographic Readiness Audit:
-   python -u rfc_hunt_swarm.py raptor --repo D:\\harfile\\my_project --raptor-mode crypto
-
-   # E. List and inspect recent RAPTOR SARIF vulnerability findings:
    python -u rfc_hunt_swarm.py raptor --findings
 
-6. Query Confirmed Vulnerabilities Mapped by Host Name:
-   python -u rfc_hunt_swarm.py vulns
-   python -u rfc_hunt_swarm.py vulns --host dlptest.com
+6. Launch Interactive Mission Control Dashboard Web UI:
+   python -u rfc_hunt_swarm.py ui --ui-port 8088
 
-7. Target Multiple Reverse Proxies / Intermediate Terminators Simultaneously:
-   python -u rfc_hunt_swarm.py --targets "127.0.0.1:8080,https://target.local:8443" --terminators chunk,h2_gateway
+7. Protocol Ruler Byte-Transformation Measurement (James Kettle Technique):
+   python -u rfc_hunt_swarm.py ruler --host 127.0.0.1 --port 3030 --sequence "\\xc0\\x8a" --name "Overlong-LF"
 
-8. Filter Protocol Terminators by Category:
-   python -u rfc_hunt_swarm.py --terminators line,chunk,framing,cross_protocol,crlf_rhi,h2_gateway
+8. Export Confirmed Vulnerabilities to Nuclei, ModSecurity & Suricata Rules:
+   python -u rfc_hunt_swarm.py export --export-rules-dir ./defense_rules
 
-9. Generate Interactive HTML Research Dashboard & Launch Web UI:
-   python -u rfc_hunt_swarm.py ui
-   python -u rfc_hunt_swarm.py dashboard --serve
+9. Run Unified 'Build All' Pipeline:
+   python -u rfc_hunt_swarm.py build --skip-tests
 
-10. Export Confirmed Vulnerabilities to Nuclei, ModSecurity & Suricata Rules:
-    python -u rfc_hunt_swarm.py export --export-rules-dir ./defense_rules
+===============================================================================
+EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
+===============================================================================
 
-11. Evaluate Wire Probe Against 4-Parser Differential Matrix:
-    python -u rfc_hunt_swarm.py oracle
+1. EXECUTION MODE & SCOPE FLAGS:
+   --mode MODE              Execution mode: single, terminator, corpus, all, ruler, build, lab, mcp, hunt, auto, ui
+                            Example: python -u rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 3030
+   --rfc RFC_ID             Specific RFC ID to analyze (default: 9112)
+                            Example: python -u rfc_hunt_swarm.py --mode single --rfc 7230 --host 127.0.0.1 --port 3030
+   --kettle                 Shortcut flag to scan James Kettle's curated 138 HTTP & SMTP corpus
+                            Example: python -u rfc_hunt_swarm.py --kettle --host 127.0.0.1 --port 3030
+   --all-active             Shortcut flag to cycle through all active IETF protocol specifications
+                            Example: python -u rfc_hunt_swarm.py --all-active --host 127.0.0.1 --port 3030
+   --max-rfcs, --count N    Cap the maximum number of RFCs evaluated in this run
+                            Example: python -u rfc_hunt_swarm.py --mode terminator --max-rfcs 5
+   --keywords KW            Comma-separated keywords to filter active RFC specifications
+                            Example: python -u rfc_hunt_swarm.py --mode all --keywords "chunked,trailer,websocket"
+   --discover-recent N      Discover newly published RFCs from the live IETF index
+                            Example: python -u rfc_hunt_swarm.py --mode fetch --discover-recent 5
+   --list-terminators       Print catalog of 25 Terminator RFCs and 36 mutators and exit
+                            Example: python -u rfc_hunt_swarm.py --list-terminators
 
-12. Synthesize Binary HTTP/2 Gateway Framing Desynchronization Streams:
-    python -u rfc_hunt_swarm.py h2 --host 127.0.0.1 --port 8080
+2. TARGET SPECIFICATION & MULTIPLEXING FLAGS:
+   --host, --target HOST    Target domain or IP address (default: 127.0.0.1)
+                            Example: python -u rfc_hunt_swarm.py --host dlptest.com --port 443 --tls
+   --port PORT              Target TCP port (default: 5006)
+                            Example: python -u rfc_hunt_swarm.py --host 127.0.0.1 --port 3030
+   --tls                    Enable TLS/HTTPS encryption (auto-enabled if port is 443)
+                            Example: python -u rfc_hunt_swarm.py --host dlptest.com --port 443 --tls
+   --authorized             Explicitly authorize testing against remote or public targets
+                            Example: python -u rfc_hunt_swarm.py --host dlptest.com --port 443 --tls --authorized
+   --targets TARGETS        Comma-separated list of multiple target terminators
+                            Example: python -u rfc_hunt_swarm.py --targets "127.0.0.1:8080,https://target.local:8443"
+   --terminators CATS       Filter mutator categories: line,chunk,framing,cross_protocol,crlf_rhi,h2_gateway
+                            Example: python -u rfc_hunt_swarm.py --terminators line,chunk,framing,cross_protocol
+   --no-lab                 Do not auto-spawn local mock TestLabServer when targeting localhost
+                            Example: python -u rfc_hunt_swarm.py --host 127.0.0.1 --port 3030 --no-lab
 
-13. Verify Cryptographic Merkle Audit Trail (RFC 6962 Tree Root & Proofs):
-    python -u rfc_hunt_swarm.py audit
+3. DATABASE MAINTENANCE & STORAGE RECLAIM FLAGS:
+   --clean-db               Truncate transient evaluation, probe, and anomaly tables and run SQLite VACUUM
+                            Example: python -u rfc_hunt_swarm.py --clean-db
+                            Example: python -u rfc_hunt_swarm.py --clean-db --mode terminator --host 127.0.0.1 --port 3030
+   --keep-rfcs              When cleaning the database, retain cached RFC specifications and index
+                            Example: python -u rfc_hunt_swarm.py --clean-db --keep-rfcs
+   --keep-findings          When cleaning the database, retain confirmed vulnerabilities and defensive rules
+                            Example: python -u rfc_hunt_swarm.py --clean-db --keep-findings
+   --db DB_PATH             Specify custom SQLite database path (default: terminator.db)
+                            Example: python -u rfc_hunt_swarm.py --db /data/terminator_prod.db
+   --cache-dir DIR          Local directory to cache RFC texts (default: rfcs)
+                            Example: python -u rfc_hunt_swarm.py --cache-dir /cache/rfcs
 
-14. Protocol Ruler mode (measure front-end byte transformations):
-    python -u rfc_hunt_swarm.py ruler --host 127.0.0.1 --port 3030 --sequence "\\xc0\\x8a" --name "Overlong-LF"
+4. DASHBOARD, UI & RULE EXPORT FLAGS:
+   --ui                     Launch the interactive research dashboard web UI on an available port
+                            Example: python -u rfc_hunt_swarm.py ui
+                            Example: python -u rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 3030 --ui
+   --ui-port PORT           Explicit port to bind the interactive UI dashboard server
+                            Example: python -u rfc_hunt_swarm.py ui --ui-port 8088
+   --serve                  Serve the dashboard UI after report generation completes
+                            Example: python -u rfc_hunt_swarm.py dashboard --serve
+   --random-port            Force servers to bind to high random unprivileged ports (10000-65000)
+                            Example: python -u rfc_hunt_swarm.py ui --random-port
+   --dashboard-out PATH     Custom output path for generated HTML report (default: terminator_dashboard.html)
+                            Example: python -u rfc_hunt_swarm.py dashboard --dashboard-out reports/audit.html
+   --export-rules-dir DIR   Output directory for exported Nuclei, ModSecurity, and Suricata rules
+                            Example: python -u rfc_hunt_swarm.py export --export-rules-dir ./defense_rules
 
-15. Unified 'Build All' pipeline (syntax check, DB schema, 25 RFC cache, Caldera, Dream-RSI, pytest):
-    python -u rfc_hunt_swarm.py build --skip-tests
+5. RAPTOR AUTONOMOUS SECURITY FRAMEWORK FLAGS:
+   --raptor                 Enable RAPTOR autonomous framework during active testing
+                            Example: python -u rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 3030 --raptor
+   --raptor-status          Verify RAPTOR Docker container and Ollama security models
+                            Example: python -u rfc_hunt_swarm.py raptor --status
+   --raptor-mode MODE       RAPTOR mode: web, scan, agentic, crypto, sca, describe
+                            Example: python -u rfc_hunt_swarm.py raptor --repo D:\harfile\my_project --raptor-mode agentic
+   --repo, --raptor-target  Path to local codebase or project to audit with RAPTOR
+                            Example: python -u rfc_hunt_swarm.py raptor --repo D:\harfile\my_project
+   --raptor-model MODEL     Ollama model for agentic triage (default: fenkohq/foundation-sec-8b:latest)
+                            Example: python -u rfc_hunt_swarm.py raptor --repo D:\harfile\app --raptor-model fenkohq/foundation-sec-8b:latest
+   --raptor-findings        List and summarize recent SARIF vulnerability findings from RAPTOR
+                            Example: python -u rfc_hunt_swarm.py raptor --findings
+   --policy-groups GROUPS   Filter Semgrep policy groups (e.g. 'secrets,owasp,crypto')
+                            Example: python -u rfc_hunt_swarm.py raptor --repo D:\harfile\app --policy-groups secrets,owasp
+   --include-codeql         Enable deep CodeQL compilation during RAPTOR agentic scan
+                            Example: python -u rfc_hunt_swarm.py raptor --repo D:\harfile\app --raptor-mode agentic --include-codeql
+
+6. PROTOCOL RULER & DIFFERENTIAL MATRIX FLAGS:
+   --sequence BYTES         Custom byte sequence to measure in Protocol Ruler mode (e.g. '\xc0\x8a')
+                            Example: python -u rfc_hunt_swarm.py ruler --host 127.0.0.1 --port 3030 --sequence "\\xc0\\x8a"
+   --name NAME              Name for custom sequence in Protocol Ruler mode
+                            Example: python -u rfc_hunt_swarm.py ruler --sequence "\\xc0\\x8a" --name "Overlong-LF"
+   --max-size BYTES         Max header buffer length to test in Protocol Ruler mode (default: 131072)
+                            Example: python -u rfc_hunt_swarm.py ruler --max-size 65536
+   --probe PROBE_STR        Custom raw wire probe string or hex for oracle, h2, and differential modes
+                            Example: python -u rfc_hunt_swarm.py oracle --probe "GET / HTTP/1.1\\r\\n\\r\\n"
+
+7. AI MODELFUSION & EXPLORATION TUNING FLAGS:
+   --model MODEL            Preferred primary base model (default: gemma2:2b)
+                            Example: python -u rfc_hunt_swarm.py --model gemma2:2b
+   --sec-model MODEL        Secondary security model for ModelFusion panel
+                            Example: python -u rfc_hunt_swarm.py --sec-model fenkohq/foundation-sec-8b:latest
+   --no-fusion              Disable multi-model panel fusion (query primary model only)
+                            Example: python -u rfc_hunt_swarm.py --no-fusion
+   --timeout SECONDS        Ollama inference timeout in seconds (default: 900.0; 0 for unlimited)
+                            Example: python -u rfc_hunt_swarm.py --timeout 300.0
+   --cycles N               Maximum mutation cycles to run per RFC (default: 3)
+                            Example: python -u rfc_hunt_swarm.py --cycles 4
+   --limit, --fragments N   Maximum fragments/probes to process per RFC (default: 5)
+                            Example: python -u rfc_hunt_swarm.py --limit 8
+   --variants N             Permutation variants per probe (default: 3)
+                            Example: python -u rfc_hunt_swarm.py --variants 4
+   --sentences N            Sentences per chunk in chunking mode (default: 2)
+                            Example: python -u rfc_hunt_swarm.py --mode chunk --sentences 3
+   --concurrency N          Maximum concurrent probe execution threads (default: 8)
+                            Example: python -u rfc_hunt_swarm.py --concurrency 16
+   --comb-only, --offline   Offline RFC ingestion & probe synthesis without sending network packets
+                            Example: python -u rfc_hunt_swarm.py --comb-only --max-rfcs 10
+
+8. DREAM-RSI & CALDERA ADVERSARY EMULATION FLAGS:
+   --dream-rsi              Enable Open Dream-RSI: recursive off-policy self-improvement (default: True)
+                            Example: python -u rfc_hunt_swarm.py --dream-rsi
+   --no-dream-rsi           Disable default Open Dream-RSI evolution cycle
+                            Example: python -u rfc_hunt_swarm.py --no-dream-rsi
+   --dream-rollouts N       Number of simulated rollouts per dream generation (default: 300)
+                            Example: python -u rfc_hunt_swarm.py --dream-rollouts 500
+   --generations N          Evolutionary dream generations (default: 3)
+                            Example: python -u rfc_hunt_swarm.py --generations 5
+   --dream-export PATH      Path to export evolved Dream-RSI policies (default: data/dream_policies.json)
+                            Example: python -u rfc_hunt_swarm.py --dream-export data/dream_policies.json
+   --export-caldera DIR     Directory to export Caldera plugin structure (default: caldera_export)
+                            Example: python -u rfc_hunt_swarm.py --export-caldera ./my_caldera
+   --no-caldera             Disable default Caldera export
+                            Example: python -u rfc_hunt_swarm.py --no-caldera
+   --caldera-url URL        Caldera server URL to push confirmed findings live
+                            Example: python -u rfc_hunt_swarm.py --caldera-url http://127.0.0.1:8888
+   --caldera-key KEY        Caldera API authentication key (default: ADMIN123)
+                            Example: python -u rfc_hunt_swarm.py --caldera-url http://127.0.0.1:8888 --caldera-key ADMIN123
+
+9. TELEMETRY, LOGGING & PIPELINE SHORTCUT FLAGS:
+   --debug                  Enable comprehensive debugging mode (prints raw host responses and telemetry)
+                            Example: python -u rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 3030 --debug
+   --show-response          Print full raw HTTP/TLS responses received from target host
+                            Example: python -u rfc_hunt_swarm.py --mode single --rfc 9112 --show-response
+   -v, --verbose            Enable verbose execution telemetry and payload/response tracing
+                            Example: python -u rfc_hunt_swarm.py -v
+   --keep-going             Continue hunting after finding first flaw in hunt mode
+                            Example: python -u rfc_hunt_swarm.py --mode hunt --keep-going
+   --build                  Shortcut to run the unified 'Build All' verification pipeline
+                            Example: python -u rfc_hunt_swarm.py --build
+   --skip-tests             Skip running pytest when executing --mode build / --build
+                            Example: python -u rfc_hunt_swarm.py --build --skip-tests
+   --mcp                    Shortcut to launch the Model Context Protocol (MCP) JSON-RPC server over stdio
+                            Example: python -u rfc_hunt_swarm.py --mcp
 ===============================================================================
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
