@@ -175,6 +175,23 @@ class Database:
                     is_clean BOOLEAN DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS harness2_runs (
+                    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    domain TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    k_budget INTEGER NOT NULL,
+                    adopted_label TEXT,
+                    rollouts_count INTEGER,
+                    sessions_count INTEGER,
+                    contrast_score REAL,
+                    cue TEXT,
+                    lesson TEXT,
+                    evidence TEXT,
+                    result_json TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             """)
 
     def save_rfc(self, rfc_id: str, title: str, source_url: str, doc_path: str) -> None:
@@ -612,6 +629,7 @@ class Database:
             "probes",
             "fragments",
             "dynamic_permutations",
+            "harness2_runs",
         ]
         if not keep_findings:
             tables_to_clear.extend([
@@ -683,7 +701,7 @@ class Database:
             "cascade_hypotheses", "rfc_requirements", "implementation_anomalies",
             "reproducible_vulnerabilities", "novel_techniques",
             "arm106_defensive_rules", "arm107_regression_tests",
-            "anomaly_fingerprints", "dynamic_permutations",
+            "anomaly_fingerprints", "dynamic_permutations", "harness2_runs",
         ]
         counts = {}
         with self._lock:
@@ -701,6 +719,50 @@ class Database:
             "table_counts": counts,
             "total_rows": sum(counts.values()),
         }
+
+    def save_harness2_run(self, result_dict: Dict[str, Any]) -> int:
+        """Persists a completed Google Research Harness² recursion run into SQLite."""
+        exp = result_dict.get("experience") or {}
+        ledger = result_dict.get("ledger") or {}
+        adopted_lbl = result_dict.get("adopted_label", "")
+        rollouts = result_dict.get("rollouts") or {}
+        best_view = rollouts.get(adopted_lbl) or {}
+        score = float(best_view.get("behavioral_score", 0.0))
+
+        with self._lock:
+            with self.conn:
+                cur = self.conn.execute(
+                    """
+                    INSERT INTO harness2_runs
+                    (task_id, domain, mode, k_budget, adopted_label, rollouts_count, sessions_count,
+                     contrast_score, cue, lesson, evidence, result_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(result_dict.get("task_id", "")),
+                        str(result_dict.get("domain", "")),
+                        str(result_dict.get("mode", "agg")),
+                        int(result_dict.get("k", 1)),
+                        adopted_lbl,
+                        int(ledger.get("actual_rollouts", 0)),
+                        int(ledger.get("actual_sessions", 0)),
+                        score,
+                        str(exp.get("cue", "")),
+                        str(exp.get("lesson", "")),
+                        str(exp.get("evidence", "")),
+                        json.dumps(result_dict),
+                    ),
+                )
+                return int(cur.lastrowid or 0)
+
+    def get_harness2_runs(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Retrieves persisted Harness² recursive harnessing runs."""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT * FROM harness2_runs ORDER BY run_id DESC LIMIT ?", (limit,)
+            )
+            return [dict(r) for r in cur.fetchall()]
 
     def _seed_baseline_defensive_intelligence(self) -> None:
         """Populates verified baseline defensive intelligence records if empty."""

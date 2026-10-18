@@ -82,6 +82,13 @@
 | `--raptor-findings`, `--findings`| flag | `False` | List recent SARIF vulnerability findings from RAPTOR | `--raptor-findings` |
 | `--policy-groups` | string | `""` | Filter Semgrep policy groups (e.g. `secrets,owasp`) | `--policy-groups "secrets,crypto"` |
 | `--include-codeql` | flag | `False` | Enable CodeQL compilation in RAPTOR agentic mode | `--include-codeql` |
+| `--harness2` | flag | `True` | Enable Google Research Harness² recursive agent harnessing | `--harness2` |
+| `--no-harness2` | flag | `False` | Disable Google Research Harness² recursive agent harnessing | `--no-harness2` |
+| `--harness2-k`, `--k` | int | `1` | Task-level recursion budget $k$ ($R=4k$ rollouts, $P=3k$ stages) | `--harness2-k 2` |
+| `--harness2-mode` | string | `parallel` | Recursion topology: `parallel` (`agg` width) or `sequential` (`seq` depth) | `--harness2-mode sequential` |
+| `--harness2-domain` | string | `auto` | Protocol domain for Harness² experience library (`http11_framing`, `h2_translation`, etc.) | `--harness2-domain h2_translation` |
+| `--harness2-runs-dir` | string | `runs/harness2` | Directory for persisted Harness² `c1..c8` trees, `INDEX.md`, and `EXPERIENCE.md` | `--harness2-runs-dir runs/h2` |
+| `--harness2-report` | flag | `False` | Display historical Harness² runs, $R=4k/P=3k$ ledger proofs, and learned lessons | `--harness2-report` |
 
 ---
 
@@ -279,8 +286,24 @@ py -3.12 -u rfc_hunt_swarm.py --concurrency 16
 py -3.12 -u rfc_hunt_swarm.py --comb-only --max-rfcs 10
 ```
 
-### 8. Open Dream-RSI & Caldera Adversary Integration
+### 8. Open Dream-RSI, Google Research Harness² & Caldera Adversary Integration
 ```powershell
+# Google Research Harness²: Parallel (Width) Propose-Probe-Compose recursion (k=2 -> R=8 rollouts, P=6 stages)
+py -3.12 -u rfc_hunt_swarm.py harness2 --rfc 9112 --harness2-k 2 --harness2-mode parallel
+
+# Google Research Harness²: Sequential (Depth) Propose-Probe-Compose recursion (k=2 iterative rounds)
+py -3.12 -u rfc_hunt_swarm.py harness2 --rfc 9113 --harness2-k 2 --harness2-mode sequential --harness2-domain h2_translation
+
+# Google Research Harness²: View historical recursion runs, R=4k/P=3k ledger verification, and domain lessons
+py -3.12 -u rfc_hunt_swarm.py harness2 --harness2-report
+
+# --harness2 / --no-harness2 (Enable or disable Harness² during active Swarm scans)
+py -3.12 -u rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 3030 --harness2 --harness2-k 1
+py -3.12 -u rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 3030 --no-harness2
+
+# --harness2-runs-dir (Custom output directory for persisted c1..c8 trees, INDEX.md & EXPERIENCE.md)
+py -3.12 -u rfc_hunt_swarm.py harness2 --rfc 9112 --harness2-runs-dir ./runs/custom_harness2
+
 # --dream-rsi / --no-dream-rsi (Control recursive self-improvement)
 py -3.12 -u rfc_hunt_swarm.py --dream-rsi
 py -3.12 -u rfc_hunt_swarm.py --no-dream-rsi

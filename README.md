@@ -445,6 +445,52 @@ python -u rfc_hunt_swarm.py raptor --findings
 
 ---
 
+## Google Research Harness² Integration & Attribution
+
+`rfchunt` integrates **Google Research's Harness²** (*Recursive Agent Harnessing for an Open World*) as **Module 16** (`engine/harness2_engine.py`) to recursively optimize the agent harness around the local ModelFusion panel while keeping model weights fixed.
+
+### Two-Level Recursive Agent Harnessing (`c1..c8` Surface):
+1. **Eight Editable Harness Components (`RFCHUNT_SURFACE`)**:
+   - `c1` (`systemprompt.md`): Core micro-inspiration & protocol boundary synthesis directive.
+   - `c2` (`guardrails.md`): Anti-anchoring constraints, multi-trial verification rules, and auto-triggered skill lines.
+   - `c3` (`LongTermMEMORY.md`): Cross-RFC empirical protocol memory (header ceilings, chunked parser quirks, H2 translation tolerances).
+   - `c4` (`tool_descriptions/tool_guidance.md`): Tool orchestration guidance for 3-Step Canary Pipeline, Protocol Ruler, and 4-Parser Differential Matrix.
+   - `c5` (`sub_agents/<name>/AGENT.md`): Delegated protocol specialist subagents.
+   - `c6` (`skills/<name>/SKILL.md`): Reusable on-demand protocol audit workflows.
+   - `c7` (`scripts/<name>.py`): Deterministic Python wire-framing and boundary helper scripts.
+   - `c8` (`plugin/<name>.ts`): In-loop guard plugins enforcing protocol invariants inside the execution loop.
+2. **Level 1 — Task-Level Contrastive Recursion (`Propose–Probe–Compose`)**:
+   - Refines `c1..c8` for the current RFC task by proposing `INV` (general invariant) and `DOM` (domain-specific) candidate edits, probing their behavioral contrast against the 4-Parser Differential Matrix and Protocol World Model without ground-truth labels, and composing refined harnesses under strict budget accounting ($R = 4k$ rollouts, $P = 3k$ stages).
+   - Supports both **`parallel` (`agg` — width exploration)** and **`sequential` (`seq` — depth refinement)** modes.
+3. **Level 2 — Harnessing-Level Recursion (`Library`, `INDEX.md`, `EXPERIENCE.md`)**:
+   - Persists adopted `c1..c8` trees and evidence-backed lessons (`cue`, `lesson`, `evidence`) into per-domain experience libraries (`runs/harness2/<run_tag>/<mode>/<domain>/`) to guide future unseen RFCs.
+
+### Citation:
+```bibtex
+@article{xu2026harness2,
+  title   = {Harness$^2$: Recursive Agent Harnessing for an Open World},
+  author  = {Xu, Ruiyao and Chen, Yanfei and CuiZhu, Zhongying and Dalvi Mishra, Bhavana and Ming, Yifei and Yu, Han and Han, Rujun and Lee, Chen-Yu and Pfister, Tomas},
+  journal = {arXiv preprint arXiv:2610.14224},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2610.14224}
+}
+```
+
+### CLI Usage:
+```bash
+# 1. Run Parallel (Width) Harness² recursion (k=2 -> R=8 rollouts, P=6 stages) on RFC 9112
+python -u rfc_hunt_swarm.py harness2 --rfc 9112 --harness2-k 2 --harness2-mode parallel
+
+# 2. Run Sequential (Depth) Harness² recursion (k=2 iterative rounds) on RFC 9113
+python -u rfc_hunt_swarm.py harness2 --rfc 9113 --harness2-k 2 --harness2-mode sequential
+
+# 3. View historical Harness² runs, R=4k/P=3k ledger verification, and learned domain lessons
+python -u rfc_hunt_swarm.py harness2 --harness2-report
+```
+
+---
+
 ## License
 
 Apache 2.0 / MIT.
+

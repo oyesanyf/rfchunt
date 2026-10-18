@@ -70,9 +70,10 @@ from engine.taxonomy import (
 from engine.dream_world_model import ProtocolWorldModel
 from engine.dream_rsi_optimizer import DreamRSIOptimizer, DreamPolicy
 from engine.dream_policy_store import DreamPolicyStore
+from engine.harness2_engine import Harness2ProtocolEngine, RFCHUNT_SURFACE
 
-# 1. State Definition (Encompassing all original functionality + Dream-RSI)
-class ResearchState(TypedDict):
+# 1. State Definition (Encompassing all original functionality + Dream-RSI + Google Research Harness²)
+class ResearchState(TypedDict, total=False):
     rfc_num: str
     rfc_text: str
     fragments: List[str]
@@ -90,7 +91,14 @@ class ResearchState(TypedDict):
     enable_dream_rsi: bool
     dream_rollouts: int
     current_dream_policy: Optional[Dict[str, Any]]
+    enable_harness2: bool
+    harness2_k: int
+    harness2_mode: str
+    harness2_runs_dir: str
+    harness2_domain: str
+    current_harness2_result: Optional[Dict[str, Any]]
     history: Annotated[List[str], operator.add]
+
 
 
 def format_kettle_http_bytes(raw_bytes: bytes, max_len: int = 4000, is_debug: bool = True) -> str:
@@ -248,6 +256,11 @@ class ProtocolResearchSwarm:
         latest_pol = self.dream_store.get_latest_policy()
         if latest_pol:
             self.bandit.apply_dream_policy(latest_pol)
+
+        # Google Research Harness² Engine (Module 16 - arXiv:2610.14224)
+        self.harness2_engine = Harness2ProtocolEngine(
+            target_host=host, target_port=port, db_path=db_path
+        )
 
         # Run-level Pass/Fail Telemetry
         self.stats_lock = threading.Lock()
@@ -802,7 +815,7 @@ class ProtocolResearchSwarm:
             "history": [f"cascade_publish: Ran Cascade, Published rules ({arm_id}), and saved Forensic trace!"]
         }
 
-    # Agent 13: Dream-RSI (Recursive Self-Improvement through Evolving Worlds)
+    # Agent 13: Dream-RSI & Google Research Harness² (Recursive Self-Improvement & Agent Harnessing)
     def dream_rsi_agent(self, state: ResearchState) -> dict:
         rollouts = state.get("dream_rollouts", 300)
         print(f"\n[*] [DREAM-RSI] Initiating Off-Policy Dreaming Cycle ({rollouts} rollouts)...")
@@ -812,10 +825,42 @@ class ProtocolResearchSwarm:
 
         gain_str = f"+{evolved_policy.rsi_gain * 100:.1f}%" if evolved_policy.rsi_gain > 0 else "0.0%"
         print(f"[+] [DREAM-RSI] Policy Evolved: Gen {evolved_policy.generation} | RSI Gain: {gain_str} | Hot-reloaded into Swarm Scheduler.")
+        hist_notes = [f"dream_rsi: Evolved Gen {evolved_policy.generation} policy (gain: {gain_str})."]
+
+        h2_dict = None
+        if state.get("enable_harness2", True):
+            rfc_num = str(state.get("rfc_num", "9112")).replace("RFC-", "").replace("RFC", "")
+            task_id = f"RFC{rfc_num}"
+            h2_mode = state.get("harness2_mode", "parallel") or "parallel"
+            h2_k = int(state.get("harness2_k", 1) or 1)
+            h2_domain = state.get("harness2_domain", "auto") or "auto"
+            runs_dir = state.get("harness2_runs_dir", "runs/harness2") or "runs/harness2"
+            self.harness2_engine.runs_root = Path(runs_dir)
+
+            print(
+                f"[*] [HARNESS²] Initiating Google Research Recursive Agent Harnessing "
+                f"(Task={task_id}, Mode={h2_mode}, k={h2_k}, R={4*h2_k} rollouts, P={3*h2_k} stages)..."
+            )
+            h2_res = self.harness2_engine.run_mode(
+                mode=h2_mode, task_id=task_id, k=h2_k, domain=h2_domain
+            )
+            h2_dict = h2_res.to_dict()
+            self.db.save_harness2_run(h2_dict)
+            best_score = h2_res.rollouts[h2_res.adopted_label].behavioral_score
+            print(
+                f"[+] [HARNESS²] Adopted `{h2_res.adopted_label}` (Domain: `{h2_res.domain}`, "
+                f"Score: {best_score:.1f}) | Persisted c1..c8 tree & EXPERIENCE.md to {runs_dir}."
+            )
+            hist_notes.append(
+                f"harness2: Adopted {h2_res.adopted_label} on {task_id} (mode={h2_res.mode}, k={h2_k}, score={best_score:.1f})."
+            )
+
         return {
             "current_dream_policy": evolved_policy.to_dict(),
-            "history": [f"dream_rsi: Evolved Gen {evolved_policy.generation} policy (gain: {gain_str})."]
+            "current_harness2_result": h2_dict,
+            "history": hist_notes,
         }
+
 
     def route_after_publish(self, state: ResearchState) -> str:
         if state.get("generated_candidates"):
@@ -1409,11 +1454,154 @@ def cmd_raptor(args):
     print(f"{'='*75}\n")
 
 
+def cmd_harness2(args):
+    """
+    Executes Google Research Harness² Recursive Agent Harnessing (arXiv:2610.14224)
+    in standalone or report mode.
+    """
+    from database import Database
+    from engine.harness2_engine import Harness2ProtocolEngine, RFCHUNT_SURFACE
+
+    db = Database(args.db)
+    h2_engine = Harness2ProtocolEngine(
+        runs_root=getattr(args, "harness2_runs_dir", "runs/harness2") or "runs/harness2",
+        target_host=args.host,
+        target_port=args.port,
+        db_path=args.db,
+    )
+
+    print(f"\n{'='*78}")
+    print("  GOOGLE RESEARCH HARNESS²: RECURSIVE AGENT HARNESSING FOR AN OPEN WORLD")
+    print("  Citation : Xu et al., Google Research (arXiv:2610.14224, 2026)")
+    print("  Repo     : https://github.com/google-research/harness2")
+    print(f"{'='*78}")
+
+    if getattr(args, "harness2_report", False):
+        runs = db.get_harness2_runs(limit=args.limit or 25)
+        print(f"\n[*] HISTORICAL HARNESS² RECURSION RUNS ({len(runs)} recorded in {args.db}):")
+        if not runs:
+            print("    [~] No Harness² runs recorded yet. Executing a live k=1 run first...")
+        else:
+            print(f"  {'ID':<4} {'TASK':<10} {'DOMAIN':<28} {'MODE':<6} {'K':<3} {'R/P':<7} {'ADOPTED':<8} {'SCORE':<7}")
+            print(f"  {'-'*4} {'-'*10} {'-'*28} {'-'*6} {'-'*3} {'-'*7} {'-'*8} {'-'*7}")
+            for r in runs:
+                rp = f"{r['rollouts_count']}/{r['sessions_count']}"
+                print(
+                    f"  {r['run_id']:<4} {r['task_id']:<10} {r['domain'][:28]:<28} "
+                    f"{r['mode']:<6} {r['k_budget']:<3} {rp:<7} {r['adopted_label']:<8} {r['contrast_score']:<7.1f}"
+                )
+                print(f"       Lesson: {r['lesson']}")
+            print(f"{'='*78}\n")
+            return
+
+    rfc_clean = str(args.rfc or "9112").replace("RFC-", "").replace("RFC", "")
+    task_id = f"RFC{rfc_clean}"
+    k = max(1, int(getattr(args, "harness2_k", 1) or 1))
+    mode = getattr(args, "harness2_mode", "parallel") or "parallel"
+    domain = getattr(args, "harness2_domain", "auto") or "auto"
+
+    print(f"  [+] Task ID                  : {task_id}")
+    print(f"  [+] Recursion Mode           : {mode} ({'WIDTH: 2k INV+DOM -> k AGG' if mode in ('parallel', 'agg') else 'DEPTH: k sequential Propose-Probe-Compose rounds'})")
+    print(f"  [+] Task Recursion Budget (k): {k} (Expected Rollouts R={4*k}, Improvement Stages P={3*k})")
+    print(f"  [+] Editable Surface (c1..c8): {', '.join(RFCHUNT_SURFACE.always_on)} + skills/ + sub_agents/ + scripts/ + plugin/")
+    print(f"  [+] Runs & Experience Dir    : {h2_engine.runs_root}")
+    print(f"{'-'*78}")
+
+    res = h2_engine.run_mode(mode=mode, task_id=task_id, k=k, domain=domain)
+    res_dict = res.to_dict()
+    db.save_harness2_run(res_dict)
+
+    print("\n  [*] TASK-LEVEL PROPOSE-PROBE-COMPOSE STAGES:")
+    for st in res.stages:
+        view = res.rollouts.get(st.label)
+        score_str = f"{view.behavioral_score:.1f}" if view else "N/A"
+        div_str = f"{view.parser_divergences}" if view else "0"
+        print(f"      - [{st.dim:<7}] Stage `{st.label:<6}` | Score: {score_str:<6} | Divergences: {div_str} | {st.notes}")
+
+    print("\n  [*] BUDGET IDENTITY VERIFICATION (Ledger):")
+    if res.ledger:
+        l_dict = res.ledger.to_dict()
+        print(
+            f"      - Rollouts (R = 4k) : {l_dict['actual_rollouts']}/{l_dict['expected_rollouts']} "
+            f"| Stages (P = 3k) : {l_dict['actual_sessions']}/{l_dict['expected_sessions']} "
+            f"| Verified: {l_dict['budget_verified']}"
+        )
+
+    print("\n  [*] HARNESSING-LEVEL RECURSION (Adopted Harness & Experience Library):")
+    print(f"      - Adopted Candidate : `{res.adopted_label}` (Domain: `{res.domain}`)")
+    if res.similarity:
+        print(f"      - Candidate Diversity: Mean Jaccard={res.similarity['mean_jaccard_similarity']} (Diversity Index={res.similarity.get('diversity_index', 0.0)})")
+    print(f"      - Cue               : {res.experience.get('cue')}")
+    print(f"      - Lesson            : {res.experience.get('lesson')}")
+    print(f"      - Evidence          : {res.experience.get('evidence')}")
+    print(f"{'='*78}\n")
+
+
+def print_harness2_help():
+    """Prints the comprehensive manual for Google Research Harness² integration."""
+    help_text = r"""
+===============================================================================
+HARNESS²: Recursive Agent Harnessing for an Open World (Google Research)
+Integrated Two-Level Recursive Agent Optimization Engine
+===============================================================================
+
+CREDIT & CITATION:
+------------------
+  @article{xu2026harness2,
+    title   = {Harness$^2$: Recursive Agent Harnessing for an Open World},
+    author  = {Xu, Ruiyao and Chen, Yanfei and CuiZhu, Zhongying and Dalvi Mishra, Bhavana
+               and Ming, Yifei and Yu, Han and Han, Rujun and Lee, Chen-Yu and Pfister, Tomas},
+    journal = {arXiv preprint arXiv:2610.14224},
+    year    = {2026},
+    url     = {https://arxiv.org/abs/2610.14224}
+  }
+  Official Repository: https://github.com/google-research/harness2
+  License            : Apache-2.0
+
+ARCHITECTURE IN RFCHUNT:
+------------------------
+  1. Eight Editable Harness Components (c1..c8 SurfaceSpec):
+     - c1: systemprompt.md                   (Core micro-inspiration directive)
+     - c2: guardrails.md                     (Anti-anchoring rules & auto-triggered skills)
+     - c3: LongTermMEMORY.md                 (Cross-RFC empirical protocol memory)
+     - c4: tool_descriptions/tool_guidance.md(3-Step Canary, Ruler & Oracle guidance)
+     - c5: sub_agents/<name>/AGENT.md        (Delegated specialist subagents)
+     - c6: skills/<name>/SKILL.md            (Reusable protocol audit workflows)
+     - c7: scripts/<name>.py                 (Deterministic wire-framing Python helpers)
+     - c8: plugin/<name>.ts                  (In-loop protocol framing enforcement)
+
+  2. Task-Level Recursion (Propose -> Probe -> Compose):
+     - Refines c1..c8 through contrastive behavioral probing without ground-truth labels.
+     - Enforces strict budget accounting: R = 4k rollouts and P = 3k stages.
+     - Supports 'parallel' ('agg' width exploration) and 'sequential' ('seq' depth refinement).
+
+  3. Harnessing-Level Recursion (Per-Domain Experience Library):
+     - Persists adopted c1..c8 trees, INDEX.md, and EXPERIENCE.md (cue, lesson, evidence)
+       under runs/harness2/<run_tag>/<mode>/<domain>/ to guide future unseen RFCs.
+
+EXAMPLES:
+---------
+  1. Run Parallel Harness² Recursion (k=2 -> R=8 rollouts, P=6 stages) on RFC 9112:
+     python -u rfc_hunt_swarm.py harness2 --rfc 9112 --harness2-k 2 --harness2-mode parallel
+
+  2. Run Sequential Harness² Recursion (k=2 depth rounds) on RFC 9113 (H2 Translation):
+     python -u rfc_hunt_swarm.py harness2 --rfc 9113 --harness2-k 2 --harness2-mode sequential
+
+  3. View Historical Harness² Runs, Ledger Verification & Learned Domain Lessons:
+     python -u rfc_hunt_swarm.py harness2 --harness2-report
+
+  4. Run Full Terminator Swarm with Harness² Active:
+     python -u rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 3030 --harness2 --harness2-k 1
+===============================================================================
+"""
+    print(help_text)
+
+
 ALL_MODES = [
     "single", "terminator", "corpus", "all", "pqc", "ruler",
     "build", "lab", "mcp", "hunt", "auto", "start",
     "fetch", "chunk", "generate", "permute", "evaluate",
-    "weaponize", "cascade", "dream", "caldera",
+    "weaponize", "cascade", "dream", "caldera", "harness2",
     "dashboard", "export", "oracle", "differential", "h2", "http2", "audit", "merkle",
     "ui", "vulns", "findings", "list", "raptor", "clean", "clean-db",
 ]
@@ -1432,6 +1620,7 @@ The unified primary CLI entrypoint combining:
   - Modular Pipeline, Build-All Verification, Dream-RSI & Caldera CLI (main.py)
   - 4-Parser Differential Matrix, Exploit Exporter & Dashboard Generator
   - RAPTOR Autonomous Offensive/Defensive Research Framework Integration
+  - Google Research Harness² Recursive Agent Harnessing (c1..c8 Propose-Probe-Compose)
 
 METHODOLOGY ATTRIBUTIONS:
 -------------------------
@@ -1445,6 +1634,12 @@ METHODOLOGY ATTRIBUTIONS:
    - Project: https://github.com/gadievron/raptor
    - Engine: danielcuthbert/raptor:latest (Docker Container)
    - Integrates Semgrep, CodeQL, web DAST, and local LLM exploitability triage.
+
+3. Google Research Harness² (Recursive Agent Harnessing for an Open World):
+   - Authored by Ruiyao Xu, Yanfei Chen, Zhongying CuiZhu, Bhavana Dalvi Mishra,
+     Yifei Ming, Han Yu, Rujun Han, Chen-Yu Lee, and Tomas Pfister (Google Research, 2026)
+   - Paper: arXiv:2610.14224 | Repo: https://github.com/google-research/harness2
+   - Two-level recursive agent harnessing across 8 editable components (c1..c8).
 """,
         epilog=r"""
 ===============================================================================
@@ -1458,28 +1653,33 @@ PRIMARY WORKFLOW EXAMPLES (All run directly via rfc_hunt_swarm.py):
    python -u rfc_hunt_swarm.py --clean-db
    python -u rfc_hunt_swarm.py --clean-db --mode terminator --host 127.0.0.1 --port 3030
 
-3. Scan James Kettle's Full 138-RFC Research Corpus against a Remote Host:
+3. Google Research Harness² Recursive Agent Harnessing (Parallel & Sequential):
+   python -u rfc_hunt_swarm.py harness2 --rfc 9112 --harness2-k 2 --harness2-mode parallel
+   python -u rfc_hunt_swarm.py harness2 --rfc 9113 --harness2-k 2 --harness2-mode sequential
+   python -u rfc_hunt_swarm.py harness2 --harness2-report
+
+4. Scan James Kettle's Full 138-RFC Research Corpus against a Remote Host:
    python -u rfc_hunt_swarm.py --mode corpus --host remote-target.com --port 443 --tls --concurrency 8 --debug
 
-4. Discover & Scan ALL Active IETF Protocol Specifications:
+5. Discover & Scan ALL Active IETF Protocol Specifications:
    python -u rfc_hunt_swarm.py --mode all --host remote-target.com --port 443 --tls --concurrency 8 --debug
 
-5. RAPTOR Autonomous Pentesting & Web DAST (Evron, Cuthbert, Dullien / Halvar Flake):
+6. RAPTOR Autonomous Pentesting & Web DAST (Evron, Cuthbert, Dullien / Halvar Flake):
    python -u rfc_hunt_swarm.py raptor --status
    python -u rfc_hunt_swarm.py raptor --host vanguardngr.com --port 443 --tls
    python -u rfc_hunt_swarm.py raptor --repo D:\\harfile\\my_project --raptor-mode agentic
    python -u rfc_hunt_swarm.py raptor --findings
 
-6. Launch Interactive Mission Control Dashboard Web UI:
+7. Launch Interactive Mission Control Dashboard Web UI:
    python -u rfc_hunt_swarm.py ui --ui-port 8088
 
-7. Protocol Ruler Byte-Transformation Measurement (James Kettle Technique):
+8. Protocol Ruler Byte-Transformation Measurement (James Kettle Technique):
    python -u rfc_hunt_swarm.py ruler --host 127.0.0.1 --port 3030 --sequence "\\xc0\\x8a" --name "Overlong-LF"
 
-8. Export Confirmed Vulnerabilities to Nuclei, ModSecurity & Suricata Rules:
+9. Export Confirmed Vulnerabilities to Nuclei, ModSecurity & Suricata Rules:
    python -u rfc_hunt_swarm.py export --export-rules-dir ./defense_rules
 
-9. Run Unified 'Build All' Pipeline:
+10. Run Unified 'Build All' Pipeline:
    python -u rfc_hunt_swarm.py build --skip-tests
 
 ===============================================================================
@@ -1487,7 +1687,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
 ===============================================================================
 
 1. EXECUTION MODE & SCOPE FLAGS:
-   --mode MODE              Execution mode: single, terminator, corpus, all, ruler, build, lab, mcp, hunt, auto, ui
+   --mode MODE              Execution mode: single, terminator, corpus, all, ruler, harness2, build, lab, mcp, hunt, auto, ui
                             Example: python -u rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 3030
    --rfc RFC_ID             Specific RFC ID to analyze (default: 9112)
                             Example: python -u rfc_hunt_swarm.py --mode single --rfc 7230 --host 127.0.0.1 --port 3030
@@ -1598,7 +1798,21 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
    --comb-only, --offline   Offline RFC ingestion & probe synthesis without sending network packets
                             Example: python -u rfc_hunt_swarm.py --comb-only --max-rfcs 10
 
-8. DREAM-RSI & CALDERA ADVERSARY EMULATION FLAGS:
+8. DREAM-RSI, HARNESS² & CALDERA ADVERSARY EMULATION FLAGS:
+   --harness2               Enable Google Research Harness² recursive agent harnessing (default: True)
+                            Example: python -u rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 3030 --harness2
+   --no-harness2            Disable Google Research Harness² recursive agent harnessing
+                            Example: python -u rfc_hunt_swarm.py --mode terminator --no-harness2
+   --harness2-k K           Task-level recursion budget k (R=4k rollouts, P=3k stages; default: 1)
+                            Example: python -u rfc_hunt_swarm.py harness2 --rfc 9112 --harness2-k 2
+   --harness2-mode MODE     Harness² recursion mode: 'parallel' ('agg' width) or 'sequential' ('seq' depth)
+                            Example: python -u rfc_hunt_swarm.py harness2 --rfc 9112 --harness2-mode sequential --harness2-k 2
+   --harness2-domain DOM    Protocol domain for Harness² experience library (default: auto)
+                            Example: python -u rfc_hunt_swarm.py harness2 --rfc 9113 --harness2-domain h2_translation
+   --harness2-runs-dir DIR  Output directory for Harness² c1..c8 trees, INDEX.md & EXPERIENCE.md (default: runs/harness2)
+                            Example: python -u rfc_hunt_swarm.py harness2 --harness2-runs-dir ./runs/custom_h2
+   --harness2-report        Display historical Harness² runs, ledger proofs, and learned domain lessons
+                            Example: python -u rfc_hunt_swarm.py harness2 --harness2-report
    --dream-rsi              Enable Open Dream-RSI: recursive off-policy self-improvement (default: True)
                             Example: python -u rfc_hunt_swarm.py --dream-rsi
    --no-dream-rsi           Disable default Open Dream-RSI evolution cycle
@@ -1642,7 +1856,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
         nargs="?",
         choices=ALL_MODES,
         default=None,
-        help="Optional positional mode/subcommand (e.g. build, ruler, lab, mcp, hunt, auto, terminator, start, dashboard, export, oracle, h2, audit, ui)",
+        help="Optional positional mode/subcommand (e.g. build, ruler, lab, mcp, hunt, auto, terminator, start, dashboard, export, oracle, h2, audit, ui, harness2)",
     )
     parser.add_argument("--rfc", type=str, default="9112", help="Specific RFC ID to analyze (e.g. 9112 or MCP)")
     parser.add_argument(
@@ -1712,7 +1926,19 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--export-caldera", type=str, default="caldera_export", help="Directory to export Caldera plugin structure (default: caldera_export, runs automatically)")
     parser.add_argument("--no-caldera", action="store_true", help="Disable default Caldera export")
     parser.add_argument("--caldera-url", "--push", dest="caldera_url", type=str, default=None, help="Optional Caldera server URL to push confirmed findings live")
+    parser.add_argument("--caldera-key", "--api-key", dest="caldera_key", type=str, default="ADMIN123", help="Caldera API authentication key (default: ADMIN123)")
     parser.add_argument("--concurrency", "--threads", type=int, default=8, help="Maximum concurrent probe execution threads (bounded by semaphore, default: 8)")
+
+    # Google Research Harness² Recursive Agent Harnessing Integration
+    # Credit: Xu et al., Google Research (arXiv:2610.14224, 2026)
+    # https://github.com/google-research/harness2
+    parser.add_argument("--harness2", dest="enable_harness2", action="store_true", default=True, help="Enable Google Research Harness² recursive agent harnessing (c1..c8 Propose-Probe-Compose; enabled by default)")
+    parser.add_argument("--no-harness2", dest="enable_harness2", action="store_false", help="Disable Google Research Harness² recursive agent harnessing")
+    parser.add_argument("--harness2-k", "--k", dest="harness2_k", type=int, default=1, help="Harness² task-level recursion budget k (R=4k rollouts, P=3k improvement stages; default: 1)")
+    parser.add_argument("--harness2-mode", type=str, choices=["parallel", "sequential", "agg", "seq"], default="parallel", help="Harness² recursion mode: 'parallel' ('agg' width exploration) or 'sequential' ('seq' depth refinement)")
+    parser.add_argument("--harness2-domain", type=str, default="auto", help="Protocol domain for Harness² experience library (e.g. http11_framing, h2_translation, tls13_pqc, auto)")
+    parser.add_argument("--harness2-runs-dir", type=str, default="runs/harness2", help="Output directory for persisted Harness² domain libraries, INDEX.md, and EXPERIENCE.md (default: runs/harness2)")
+    parser.add_argument("--harness2-report", action="store_true", help="Display historical Harness² recursion runs, R=4k/P=3k ledger verification, and learned domain lessons")
 
     # RAPTOR Autonomous Offensive/Defensive Research Framework Integration
     # Credit: Gadi Evron, Daniel Cuthbert, Thomas Dullien (Halvar Flake)
@@ -1848,6 +2074,9 @@ def parse_swarm_arguments(argv=None):
         if "raptor" in raw_args or "--raptor" in raw_args:
             print_raptor_help()
             sys.exit(0)
+        if "harness2" in raw_args or "--harness2" in raw_args:
+            print_harness2_help()
+            sys.exit(0)
 
     parser = build_swarm_parser()
     args = parser.parse_args(argv)
@@ -1859,6 +2088,7 @@ def parse_swarm_arguments(argv=None):
         else:
             args.terminators = [t.strip() for t in args.terminators.split(",") if t.strip()]
     return args
+
 
 
 def main_swarm(argv=None):
@@ -2001,6 +2231,11 @@ def main_swarm(argv=None):
     if active_mode == "raptor" or getattr(args, "raptor_status", False) or getattr(args, "raptor_findings", False):
         cmd_raptor(args)
         return
+
+    if active_mode == "harness2" or getattr(args, "harness2_report", False):
+        cmd_harness2(args)
+        return
+
 
     # Normalize default args.host (strip http://, https://, trailing slashes/paths, and inline :port)
     if args.host:
@@ -2299,6 +2534,12 @@ def main_swarm(argv=None):
                     "enable_dream_rsi": bool(args.dream_rsi),
                     "dream_rollouts": args.dream_rollouts,
                     "current_dream_policy": None,
+                    "enable_harness2": bool(getattr(args, "enable_harness2", True)),
+                    "harness2_k": int(getattr(args, "harness2_k", 1)),
+                    "harness2_mode": getattr(args, "harness2_mode", "parallel"),
+                    "harness2_runs_dir": getattr(args, "harness2_runs_dir", "runs/harness2"),
+                    "harness2_domain": getattr(args, "harness2_domain", "auto"),
+                    "current_harness2_result": None,
                     "history": []
                 }
 
