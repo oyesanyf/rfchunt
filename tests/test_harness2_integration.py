@@ -215,3 +215,138 @@ def test_cli_harness2_execution(tmp_path: Path, capsys):
     report_out = capsys.readouterr().out
     assert "HISTORICAL HARNESS² RECURSION RUNS" in report_out
     assert "RFC9112" in report_out
+
+
+def test_ledger_budget_error_boundaries():
+    """Verifies that exceeding rollouts or deficit/excess stages strictly raises BudgetError."""
+    k = 2  # Expected: R = 8, P = 6
+    ledger = Ledger(mode="agg", task_id="RFC9112", k=k)
+    for i in range(8):
+        ledger.rollout(f"r{i}")
+    for i in range(6):
+        ledger.session(f"s{i}")
+    assert ledger.verify_budget() is True
+
+    # 1. Excess rollouts (9 instead of 8)
+    excess_rollouts_ledger = Ledger(mode="agg", task_id="RFC9112", k=k)
+    for i in range(9):
+        excess_rollouts_ledger.rollout(f"r{i}")
+    for i in range(6):
+        excess_rollouts_ledger.session(f"s{i}")
+    with pytest.raises(BudgetError, match=r"budget violation"):
+        excess_rollouts_ledger.assert_identity()
+
+    # 2. Deficit sessions (5 instead of 6)
+    deficit_sessions_ledger = Ledger(mode="agg", task_id="RFC9112", k=k)
+    for i in range(8):
+        deficit_sessions_ledger.rollout(f"r{i}")
+    for i in range(5):
+        deficit_sessions_ledger.session(f"s{i}")
+    with pytest.raises(BudgetError, match=r"budget violation"):
+        deficit_sessions_ledger.assert_identity()
+
+    # 3. Excess sessions (7 instead of 6)
+    excess_sessions_ledger = Ledger(mode="agg", task_id="RFC9112", k=k)
+    for i in range(8):
+        excess_sessions_ledger.rollout(f"r{i}")
+    for i in range(7):
+        excess_sessions_ledger.session(f"s{i}")
+    with pytest.raises(BudgetError, match=r"budget violation"):
+        excess_sessions_ledger.assert_identity()
+
+
+
+
+def test_plugin_c8_and_quoted_frontmatter_validation(tmp_path: Path):
+    """Verifies c8 plugin non-empty validation, quoted frontmatter parsing, and empty always-on checks."""
+    engine = Harness2ProtocolEngine(runs_root=tmp_path / "runs")
+    base = engine.build_base_harness()
+
+    # Empty c8 plugin must fail
+    bad_c8 = dict(base)
+    bad_c8["plugin/guard.ts"] = "   \n"
+    with pytest.raises(ValueError, match="plugin.*cannot be empty"):
+        validate_tree(RFCHUNT_SURFACE, bad_c8)
+
+    # Valid c8 plugin must pass
+    good_c8 = dict(base)
+    good_c8["plugin/guard.ts"] = "export function enforce(): boolean { return true; }"
+    validate_tree(RFCHUNT_SURFACE, good_c8)
+
+    # Quoted frontmatter must be stripped and match
+    quoted_skill = dict(base)
+    quoted_skill["skills/quoted_skill/SKILL.md"] = (
+        "---\n"
+        "name: \"quoted_skill\"\n"
+        "description: 'specialist for handling quoted frontmatter'\n"
+        "---\n"
+        "# Quoted Skill\n"
+    )
+    validate_tree(RFCHUNT_SURFACE, quoted_skill)
+
+    # Empty always-on component must fail
+    empty_always_on = dict(base)
+    empty_always_on["guardrails.md"] = "   "
+    with pytest.raises(ValueError, match="always-on harness components.*cannot be empty"):
+        validate_tree(RFCHUNT_SURFACE, empty_always_on)
+
+
+def test_library_task_update_and_chronological_entries(tmp_path: Path):
+    """Verifies that re-recording a task updates INDEX.md without duplicate rows and entries() sorts by mtime."""
+    lib = Library(root=tmp_path / "runs" / "lib_test", domain="http11_framing")
+    engine = Harness2ProtocolEngine(runs_root=tmp_path / "runs")
+    base = engine.build_base_harness()
+
+    # Initial record
+    lib.record(
+        "RFC9112",
+        base,
+        {"cue": "initial cue", "lesson": "initial lesson", "evidence": "ev1"},
+        picked_label="agg1",
+        contrast_score=10.0,
+    )
+    assert lib.index.is_file()
+    initial_text = lib.index.read_text(encoding="utf-8")
+    assert "| `RFC9112` | `agg1` | `10.00` | initial cue | initial lesson |" in initial_text
+
+    # Re-record task with updated results
+    lib.record(
+        "RFC9112",
+        base,
+        {"cue": "updated cue", "lesson": "updated lesson", "evidence": "ev2"},
+        picked_label="agg2",
+        contrast_score=25.5,
+    )
+    updated_text = lib.index.read_text(encoding="utf-8")
+    assert updated_text.count("| `RFC9112` |") == 1
+    assert "| `RFC9112` | `agg2` | `25.50` | updated cue | updated lesson |" in updated_text
+    assert "initial lesson" not in updated_text
+
+    # Record second task after brief pause to ensure distinct mtime
+    import time
+    time.sleep(0.05)
+    lib.record(
+        "RFC7230",
+        base,
+        {"cue": "cue7230", "lesson": "lesson7230", "evidence": "ev3"},
+        picked_label="agg1",
+        contrast_score=18.0,
+    )
+    entries = lib.entries()
+    assert entries == ["RFC9112", "RFC7230"]
+
+
+def test_normalize_rel_windows_device_names_and_base_dir(tmp_path: Path):
+    """Verifies normalize_rel rejects Windows device names, double percent-encoding, and supports base_dir."""
+    for dev in ("scripts/con.py", "scripts/nul.py", "skills/aux/SKILL.md", "scripts/com1.py", "scripts/lpt9.py"):
+        with pytest.raises(ValueError, match="Windows reserved device name"):
+            normalize_rel(dev)
+
+    for enc in ("scripts/%252ebar.py", "scripts/%255cfoo.py", "scripts/%252fbar.py"):
+        with pytest.raises(ValueError, match="path escapes the harness"):
+            normalize_rel(enc)
+
+    resolved = normalize_rel("scripts/helper.py", base_dir=tmp_path)
+    assert isinstance(resolved, Path)
+    assert resolved == (tmp_path / "scripts" / "helper.py").resolve()
+

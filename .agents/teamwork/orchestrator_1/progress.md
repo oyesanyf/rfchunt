@@ -1,23 +1,36 @@
 # Progress Log — orchestrator_1
 
 ## Current Status
-Last visited: 2026-10-18T18:20:15Z
+Last visited: 2026-10-18T20:20:15Z
 
 ## Iteration Status
-Current iteration: 1 / 32
+Current iteration: Milestone 3 Iteration 1
 
 ## Checklist
 - [x] Received dispatch and initialized BRIEFING.md and DISPATCH.md
-- [x] Started recurring heartbeat cron (task-12)
+- [x] Started recurring heartbeat cron (task-218)
 - [x] Phase 0: Codebase Survey completed (3 parallel Explorers delivered reports)
-  - [x] Explorer 1: Protocol & Framing across Modules 1-16 (conv: 206669d2-6ff3-4d69-8c48-c685baeed36c)
-  - [x] Explorer 2: Host Containment & Subprocesses (conv: f0d8ea9d-dec1-4e3c-b9a6-0e9545f49631)
-  - [x] Explorer 3: Security Boundaries & Tests (conv: fd483d01-73c6-41ba-9da9-0aaf8b3d5f4c)
 - [x] Phase 1: Decompose into Milestones (created PROJECT.md)
 - [/] Phase 2: Milestone Execution & Verification Loop
-  - [/] M1: Host-Restoring Containment (WFP DYNAMIC, Netfilter) & Subprocess Silencing (worker_m1 conv: dd681700-12a0-447a-8a14-8aefa6746d2a - actively implementing subprocess silencing across modules)
-  - [ ] M2: Protocol Framing, Canary Pipeline & 4-Parser Differential Matrix (Modules 1-15)
-  - [ ] M3: Module 16 Research Harness² (c1..c8, R=4k/P=3k ledger, Library) & Protocol Ruler
+  - [x] M1: Host-Restoring Containment (WFP DYNAMIC, Netfilter) & Subprocess Silencing - VERIFIED PASS
+  - [x] M2: Protocol Framing, Canary Pipeline & 4-Parser Differential Matrix (Modules 1-15) - VERIFIED PASS
+    - [x] Iteration 1 Gate: FAIL (Challenger M2-1 REQUEST_CHANGES)
+    - [x] Iteration 2: Remediation Loop
+      - [x] Worker M2 Remediation (conv: 39101a8e-6511-4386-97a2-dac50af46e89) - DONE
+      - [x] Verification Gate (Reviewers, Challengers, Auditor) - ALL PASS / CLEAN
+        - [x] Reviewer M2 Remediation 1 (conv: bab8d222-dd36-41b0-916e-38bf427075af) - APPROVE
+        - [x] Reviewer M2 Remediation 2 (conv: 349f58fb-4c83-43a7-b2d9-eff975406fd8) - APPROVE
+        - [x] Challenger M2 Remediation 1 (conv: 7d163640-288e-44cb-9807-81c9b71b33dc) - APPROVE
+        - [x] Challenger M2 Remediation 2 (conv: 19bc0eda-7516-4682-b36e-c392d6572d15) - APPROVE
+        - [x] Forensic Auditor M2 Remediation (conv: 03134505-5634-4123-ac81-5a091adc4e9b) - CLEAN
+  - [/] M3: Module 16 Research Harness² (c1..c8, R=4k/P=3k ledger, Library) & Protocol Ruler
+    - [/] Survey & Code Audit (3 parallel Explorers)
+      - [x] Explorer M3-1 (conv: 8188be8d-d135-42f5-80af-c9e66441e5f2) - DONE
+      - [x] Explorer M3-2 (conv: 9a872d74-12ae-4cba-9558-3114ce53a7cf) - DONE
+      - [x] Explorer M3-3 (conv: 4943e6b9-5679-4a73-ade3-12e25e75d25c) - DONE
+    - [/] Implementation / Hardening (Worker M3)
+      - [/] Worker M3 (conv: 96f3f1b7-430a-436a-aa36-750fe9e7f8f2)
+    - [ ] Verification Gate (Reviewers, Challengers, Auditor)
   - [ ] M4: Security Boundaries (SSRF IP guards, path traversal normalize_rel, SQLite locks)
   - [ ] M5: Full Regression Testing & Build Verification
 - [ ] Phase 3: Final Forensic Audit & Git Auto-Commit/Push

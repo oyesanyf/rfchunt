@@ -37,8 +37,8 @@ The HTTP Terminator / RFC Hunt Swarm is an autonomous network protocol security 
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
 |---|------|-------|-------------|--------|
-| M1 | Host Containment & Subprocess Silencing | `engine/host_containment.py`, Windows WFP `fwpuclnt.dll` DYNAMIC session, Linux Netlink, `CREATE_NO_WINDOW` & `DEVNULL` silencing, integration hooks | none | IN_PROGRESS |
-| M2 | Protocol Framing & 4-Parser Differential Matrix | Dead stub removal, ABNF multi-line rules, 3-step canary pipeline, 3-trial reproducibility invariant, 4-parser differential matrix | none | PLANNED |
+| M1 | Host Containment & Subprocess Silencing | `engine/host_containment.py`, Windows WFP `fwpuclnt.dll` DYNAMIC session, Linux Netlink, `CREATE_NO_WINDOW` & `DEVNULL` silencing, integration hooks | none | DONE |
+| M2 | Protocol Framing & 4-Parser Differential Matrix | Dead stub removal, ABNF multi-line rules, 3-step canary pipeline, 3-trial reproducibility invariant, 4-parser differential matrix | none | DONE |
 | M3 | Module 16 Google Research Harness² & Protocol Ruler | `c1..c8` surface verification, Propose-Probe-Compose, $R=4k$ / $P=3k$ ledger identity, per-domain library persistence, Protocol Ruler verification | M2 | PLANNED |
 | M4 | Security Boundaries & Concurrency Locks | Target authorization fix, mathematical `ipaddress` SSRF validation, hardened `normalize_rel`, SQLite WAL & locks | M1, M2 | PLANNED |
 | M5 | Full Verification, E2E Testing & Build Pipeline | `tests/test_host_containment.py`, all unit/integration tests (`pytest tests/ test_protocol_ruler.py -v`), `main.py build` exit 0 | M1, M2, M3, M4 | PLANNED |
@@ -69,12 +69,12 @@ def normalize_rel(path_str: str, base_dir: Optional[Path] = None) -> Path: ...
 ```
 
 ## Code Layout
-- `engine/host_containment.py`: Production-grade WFP dynamic session and Netlink containment manager
-- `engine/defensive_publisher.py`: Arm 106/107 publisher wired to `HostContainmentManager`
+- `engine/host_containment.py`: Production-grade WFP dynamic session and Netlink containment manager (VERIFIED DONE)
+- `engine/defensive_publisher.py`: Arm 106/107 publisher wired to `HostContainmentManager` (VERIFIED DONE)
 - `engine/differential_oracle.py`: 4-parser differential matrix with dead stub removed
 - `engine/abnf_engine.py`: Multi-line indented ABNF grammar parser
 - `engine/sequence_engine.py`: 3-step pipelined canary sequence evaluator
 - `engine/harness2_engine.py`: Module 16 Google Research Harness²
 - `engine/safe_network_validator.py`: Mathematical SSRF validator using `ipaddress`
 - `database.py`: SQLite connection factory with WAL mode and concurrency locks
-- `tests/test_host_containment.py`: Comprehensive containment lifecycle and subprocess silencing test suite
+- `tests/test_host_containment.py`: Comprehensive containment lifecycle and subprocess silencing test suite (VERIFIED DONE)

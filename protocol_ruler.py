@@ -108,10 +108,17 @@ class ProtocolRuler:
     def _open_socket(self) -> socket.socket:
         raw_sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
         if self.use_tls:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            return context.wrap_socket(raw_sock, server_hostname=self.host)
+            try:
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                return context.wrap_socket(raw_sock, server_hostname=self.host)
+            except Exception:
+                try:
+                    raw_sock.close()
+                except Exception:
+                    pass
+                raise
         return raw_sock
 
     def send_probe(self, request_bytes: bytes) -> Tuple[int, bytes, float]:
@@ -122,11 +129,11 @@ class ProtocolRuler:
         t0 = time.time()
         status_code = 0
         response_bytes = b""
+        sock = None
         try:
             sock = self._open_socket()
             sock.sendall(request_bytes)
             framed = HTTPFramingReader.read_response(sock, timeout=self.timeout)
-            sock.close()
             status_code = framed.status_code
             response_bytes = framed.raw_response
             latency = (time.time() - t0) * 1000
@@ -134,14 +141,21 @@ class ProtocolRuler:
         except Exception:
             latency = (time.time() - t0) * 1000
             return 0, b"", latency
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
     def is_error_boundary(self, status_code: int) -> bool:
         """
         Returns True if the status code represents hitting the server's header buffer limit.
         Typically 400 Bad Request, 431 Request Header Fields Too Large, 414 URI Too Long,
+        413 Content Too Large, 500 Internal Server Error (buffer fault),
         502 Bad Gateway (upstream proxy error), or 0 (connection reset/dropped by firewall).
         """
-        return status_code in (400, 431, 414, 502, 504, 0)
+        return status_code in (400, 413, 414, 431, 500, 502, 503, 504, 0)
 
     def calibrate_baseline_limit(
         self,
@@ -169,8 +183,11 @@ class ProtocolRuler:
         # Step 1: Coarse exponential / stepped bracket search
         brackets = [1024, 2048, 4096, 8192, 16384, 32768, 64000, 64040, 65536, 98304, 131072]
         brackets = [b for b in brackets if min_size <= b <= max_size]
+        if min_size not in brackets:
+            brackets.append(min_size)
         if max_size not in brackets:
             brackets.append(max_size)
+        brackets.sort()
 
         low = None
         high = None
@@ -200,8 +217,8 @@ class ProtocolRuler:
         self._log(f"[*] Executing binary search to pinpoint exact single-byte cliff...")
 
         # Step 2: Binary Search down to exact single byte
-        left = low
-        right = high
+        left = low + 1
+        right = high - 1
         last_ok = low
 
         while left <= right:
@@ -222,6 +239,11 @@ class ProtocolRuler:
         code_ok, _, lat_ok = self.send_probe(req_ok)
         req_err = _build_request(limit + 1)
         code_err, _, lat_err = self.send_probe(req_err)
+
+        if self.is_error_boundary(code_ok) or not self.is_error_boundary(code_err):
+            self._log(f"[-] Limit cliff verification failed: limit ({limit:,}) gave {code_ok}, limit+1 ({limit + 1:,}) gave {code_err}")
+            return None
+
 
         self._log(f"\n{'='*70}")
         self._log(f"[+] PROTOCOL RULER CALIBRATED: Header Length Limit = {limit:,} bytes")
@@ -258,14 +280,33 @@ class ProtocolRuler:
                 f"{header_name}: "
             ).encode("latin-1") + payload + b"\r\nConnection: close\r\n\r\n"
 
-        low_bound = max(10, baseline_limit - search_radius)
+        low_bound = max(seq_len, baseline_limit - search_radius)
         high_bound = baseline_limit + search_radius
 
         if self.debug:
             self._log(f"[*] Testing sequence: '{name}' ({seq_len} bytes: {sequence_bytes!r}) around limit {baseline_limit:,}...")
 
+        # Guard: Ensure sequence is not rejected outright at low_bound
+        req_low = _build_mutated_request(low_bound)
+        code_low, _, _ = self.send_probe(req_low)
+        if self.is_error_boundary(code_low):
+            self._log(f"[-] Sequence '{name}' rejected at lower search bound ({low_bound:,} bytes). Outright rejected or expansion > {search_radius}.")
+            return {
+                "name": name,
+                "sequence_hex": sequence_bytes.hex(),
+                "sequence_repr": repr(sequence_bytes),
+                "sequence_length": seq_len,
+                "baseline_limit": baseline_limit,
+                "mutated_limit": None,
+                "delta_bytes": None,
+                "classification": "REJECTED_OR_OVERSIZED",
+                "verdict": f"Rejected by target at low bound ({low_bound} bytes); sequence rejected or expansion exceeds search radius {search_radius}.",
+                "code_ok": code_low,
+                "code_err": None,
+            }
+
         # Binary search for the mutated cliff
-        left = low_bound
+        left = low_bound + 1
         right = high_bound
         last_ok = low_bound
 
@@ -289,18 +330,32 @@ class ProtocolRuler:
         req_err = _build_mutated_request(mutated_limit + 1)
         code_err, _, _ = self.send_probe(req_err)
 
-        fmt_seq = sequence_bytes.decode("latin-1", errors="replace").encode("unicode_escape").decode("ascii")
-
-        # Interpret the delta
-        if delta > 0:
-            verdict = f"EXPANDED by {delta} bytes on front-end!"
-            classification = "EXPANSION"
-        elif delta < 0:
-            verdict = f"CONTRACTED / STRIPPED by {abs(delta)} bytes on front-end!"
-            classification = "CONTRACTION"
+        # Multi-Trial Confirmation Law (protocol_research_reproducibility.md)
+        confirmed = True
+        if delta != 0:
+            for _ in range(2):
+                c_ok, _, _ = self.send_probe(req_ok)
+                c_err, _, _ = self.send_probe(req_err)
+                if self.is_error_boundary(c_ok) or not self.is_error_boundary(c_err):
+                    confirmed = False
+                    break
+        if not confirmed:
+            classification = "UNCONFIRMED_TRANSIENT"
+            verdict = f"Boundary variation failed 3-trial stability confirmation: classified as NonReproducibleTransient."
         else:
-            verdict = "Transmitted verbatim (0 byte difference)."
-            classification = "VERBATIM"
+            # Interpret the delta
+            if delta > 0:
+                verdict = f"EXPANDED by {delta} bytes on front-end!"
+                classification = "EXPANSION"
+            elif delta < 0:
+                verdict = f"CONTRACTED / STRIPPED by {abs(delta)} bytes on front-end!"
+                classification = "CONTRACTION"
+            else:
+                verdict = "Transmitted verbatim (0 byte difference)."
+                classification = "VERBATIM"
+
+
+        fmt_seq = sequence_bytes.decode("latin-1", errors="replace").encode("unicode_escape").decode("ascii")
 
         self._log(f"--- [RULER MEASUREMENT] {name} ---")
         self._log(f"  Sequence         : {sequence_bytes!r} ({seq_len} bytes)")
@@ -444,12 +499,12 @@ USAGE EXAMPLES:
     custom = []
     if args.sequence:
         seq_str = args.sequence
-        if seq_str.startswith("\\x"):
-            # Decode escaped hex
-            seq_bytes = bytes.fromhex(seq_str.replace("\\x", ""))
-        else:
+        import codecs
+        try:
+            seq_bytes = codecs.decode(seq_str.encode("utf-8"), "unicode_escape").encode("latin-1")
+        except Exception:
             try:
-                seq_bytes = bytes.fromhex(seq_str)
+                seq_bytes = bytes.fromhex(seq_str.replace(" ", "").replace("\\x", ""))
             except ValueError:
                 seq_bytes = seq_str.encode("latin-1")
         custom.append((args.name, seq_bytes, f"User-supplied test sequence: {seq_str}"))

@@ -150,7 +150,7 @@ def build_step_dream_rsi() -> Tuple[bool, str]:
 
 
 def build_step_harness2() -> Tuple[bool, str]:
-    """Verifies Google Research Harness² c1..c8 surface, Propose-Probe-Compose loop, and R=4k/P=3k ledger."""
+    """Verifies Google Research Harness² c1..c8 surface, Propose-Probe-Compose loop, R=4k/P=3k ledger, and Domain Library."""
     try:
         from engine.harness2_engine import Harness2ProtocolEngine, RFCHUNT_SURFACE, validate_tree
 
@@ -162,14 +162,19 @@ def build_step_harness2() -> Tuple[bool, str]:
         )
         base_tree = engine.build_base_harness(domain="http11_framing")
         validate_tree(RFCHUNT_SURFACE, base_tree)
-        res = engine.run_parallel("RFC-9112", k=1, domain="http11_framing", base_tree=base_tree)
+        res = engine.run_mode("parallel", "RFC-9112", k=1, domain="http11_framing", run_tag="build")
         res.ledger.verify_budget()
+        lib_idx = engine.runs_root / "build" / "agg" / "http11_framing" / "INDEX.md"
+        if not lib_idx.is_file():
+            return False, f"Domain library INDEX.md was not persisted at {lib_idx}"
         return True, (
             f"Harness² Engine verified (8 c1..c8 components valid, adopted={res.adopted_label}, "
-            f"R={res.ledger.rollouts}/{res.ledger.expected_rollouts}, P={res.ledger.sessions}/{res.ledger.expected_sessions})."
+            f"R={res.ledger.rollouts}/{res.ledger.expected_rollouts}, P={res.ledger.sessions}/{res.ledger.expected_sessions}, "
+            f"Library INDEX.md verified)."
         )
     except Exception as e:
         return False, f"Harness² verification failure: {e}"
+
 
 
 def build_step_run_tests() -> Tuple[bool, str]:

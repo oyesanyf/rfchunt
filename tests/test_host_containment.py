@@ -34,10 +34,14 @@ import pytest
 
 from engine.host_containment import (
     CREATE_NO_WINDOW,
+    ERROR_ACCESS_DENIED,
     ERROR_SUCCESS,
     FWPM_SESSION_FLAG_DYNAMIC,
     FWPM_SESSION0,
+    FWP_E_ACCESS_DENIED,
     GUID,
+    RPC_C_AUTHN_DEFAULT,
+    RPC_C_AUTHN_WINNT,
     BaseContainmentBackend,
     HostContainmentManager,
     LinuxNetlinkContainmentBackend,
@@ -118,8 +122,13 @@ def test_explicit_start_stop_close_idempotency():
 # =============================================================================
 
 def test_wfp_dynamic_session_flag_and_structures():
-    """Verifies FWPM_SESSION_FLAG_DYNAMIC is exactly 0x00000001 and structure layouts."""
+    """Verifies FWPM_SESSION_FLAG_DYNAMIC is exactly 0x00000001, RPC constants, and structure layouts."""
     assert FWPM_SESSION_FLAG_DYNAMIC == 0x00000001
+    assert RPC_C_AUTHN_DEFAULT == 0xFFFFFFFF
+    assert RPC_C_AUTHN_WINNT == 10
+    assert ERROR_SUCCESS == 0
+    assert ERROR_ACCESS_DENIED == 5
+    assert FWP_E_ACCESS_DENIED == 0x80320005
 
     session = FWPM_SESSION0()
     session.flags = FWPM_SESSION_FLAG_DYNAMIC
@@ -182,7 +191,8 @@ def test_wfp_simulated_lifecycle_and_transactions():
 
     # Simulate FwpmEngineOpen0 setting handle value
     def fake_open(server_name, authn, auth_id, session_ptr, handle_ptr):
-        # Verify session has FWPM_SESSION_FLAG_DYNAMIC
+        # Verify session has FWPM_SESSION_FLAG_DYNAMIC and RPC_C_AUTHN_DEFAULT
+        assert authn == RPC_C_AUTHN_DEFAULT
         sess = ctypes.cast(session_ptr, ctypes.POINTER(FWPM_SESSION0)).contents
         assert sess.flags == FWPM_SESSION_FLAG_DYNAMIC
         ctypes.cast(handle_ptr, ctypes.POINTER(wintypes.HANDLE)).contents.value = 0xCAFE1234
@@ -238,6 +248,99 @@ def test_wfp_unprivileged_fallback_to_mock():
 
         cm.stop()
         assert not cm.is_active
+
+
+def test_wfp_live_dll_session_lifecycle():
+    """
+    Verifies that live fwpuclnt.dll opens dynamic session with RPC_C_AUTHN_DEFAULT (0xFFFFFFFF),
+    allocates a genuine non-zero engine handle from the Windows kernel, and deterministically
+    closes the handle via FwpmEngineClose0 without mocks.
+    """
+    if sys.platform != "win32":
+        pytest.skip("Windows WFP only available on Windows")
+
+    backend = WindowsWFPContainmentBackend()
+    assert not backend.is_active
+    assert backend._engine_handle is None
+
+    # Open dynamic session on live Windows kernel
+    assert backend.start() is True
+    assert backend.is_active
+    assert backend._engine_handle is not None
+    assert backend._engine_handle.value is not None
+    assert backend._engine_handle.value != 0
+
+    # Deterministically stop session
+    assert backend.stop() is True
+    assert not backend.is_active
+    assert backend._engine_handle is None
+
+    # Idempotent stop
+    assert backend.stop() is True
+
+
+def test_wfp_live_dll_context_manager():
+    """
+    Verifies that WindowsWFPContainmentBackend works as a context manager against
+    live fwpuclnt.dll, opening on enter and deterministically closing on exit.
+    """
+    if sys.platform != "win32":
+        pytest.skip("Windows WFP only available on Windows")
+
+    backend = WindowsWFPContainmentBackend()
+    with backend as b:
+        assert b is backend
+        assert b.is_active
+        assert b._engine_handle is not None
+        assert b._engine_handle.value != 0
+
+    assert not backend.is_active
+    assert backend._engine_handle is None
+
+
+def test_host_containment_manager_live_windows_session():
+    """
+    Verifies that HostContainmentManager on Windows opens a live WFP dynamic session
+    without falling back to MockContainmentBackend when fallback_to_mock=False.
+    """
+    if sys.platform != "win32":
+        pytest.skip("Windows WFP only available on Windows")
+
+    cm = HostContainmentManager(fallback_to_mock=False)
+    assert isinstance(cm.backend, WindowsWFPContainmentBackend)
+    assert not cm.is_active
+
+    assert cm.start() is True
+    assert cm.is_active
+    # Must NOT fall back to mock
+    assert isinstance(cm.backend, WindowsWFPContainmentBackend)
+    assert cm.backend._engine_handle is not None
+    assert cm.backend._engine_handle.value != 0
+
+    # Clean deterministic stop
+    assert cm.stop() is True
+    assert not cm.is_active
+    assert cm.backend._engine_handle is None
+
+
+def test_host_containment_manager_unprivileged_rule_addition_fallback():
+    """
+    Verifies that if add_rule encounters PermissionError on unprivileged accounts,
+    HostContainmentManager gracefully falls back to MockContainmentBackend and preserves rules.
+    """
+    if sys.platform != "win32":
+        pytest.skip("Windows WFP only available on Windows")
+
+    cm = HostContainmentManager(fallback_to_mock=True)
+    assert cm.start() is True
+    assert isinstance(cm.backend, WindowsWFPContainmentBackend)
+    assert cm.is_active
+
+    res = cm.add_containment_rule("192.0.2.1", 80, "BLOCK")
+    assert res is True
+    assert len(cm.get_active_rules()) == 1
+    assert cm.get_active_rules()[0]["remote_ip"] == "192.0.2.1"
+    assert cm.stop() is True
 
 
 # =============================================================================

@@ -1,4 +1,4 @@
-# BRIEFING — 2026-10-18T18:12:00Z
+# BRIEFING — 2026-10-18T19:47:00Z
 
 ## Mission
 Orchestrate an exhaustive IETF RFC-compliance, security boundary, and host network containment review and remediation for the HTTP Terminator / RFC Hunt Swarm at D:\harfile\rfchunt.
@@ -21,13 +21,13 @@ Orchestrate an exhaustive IETF RFC-compliance, security boundary, and host netwo
 4. **Succession**: At 16 spawns, write handoff.md, spawn successor.
 - **Work items**:
   1. Survey and Map Full Codebase [done]
-  2. M1: Native Host-Restoring Containment & Subprocess Silencing [in-progress]
-  3. M2: IETF RFC Compliance & 4-Parser Differential Matrix (Modules 1-15) [pending]
-  4. M3: Module 16 Google Research Harness² & Protocol Ruler [pending]
+  2. M1: Native Host-Restoring Containment & Subprocess Silencing [done]
+  3. M2: IETF RFC Compliance & 4-Parser Differential Matrix (Modules 1-15) [done]
+  4. M3: Module 16 Google Research Harness² & Protocol Ruler [in-progress]
   5. M4: Security Boundaries (SSRF, Path Traversal, Concurrency Locks) [pending]
   6. M5: Full Verification & E2E Test Suite [pending]
-- **Current phase**: 2 (Milestone Execution)
-- **Current focus**: Milestone 1 (Host Containment & Subprocess Silencing)
+- **Current phase**: 2 (Milestone Execution - M3)
+- **Current focus**: Milestone 3: Module 16 Google Research Harness² & Protocol Ruler
 
 ## 🔒 Key Constraints
 - NEVER write, modify, or create source code files directly.
@@ -45,26 +45,33 @@ Orchestrate an exhaustive IETF RFC-compliance, security boundary, and host netwo
 - Updated: 2026-10-18T17:52:00Z
 
 ## Key Decisions Made
-- Decomposed codebase into 5 focused milestones in PROJECT.md.
-- Dispatched Worker M1 to implement `engine/host_containment.py`, wire host containment into `engine/defensive_publisher.py` and swarm entrypoints, silence subprocesses, and author `tests/test_host_containment.py`.
+- Milestone 1 fully completed and verified (PASS across Reviewers, Challengers, Forensic Auditor).
+- Milestone 2 fully completed and verified (PASS across Reviewers, Challengers, Forensic Auditor).
+- Ready to dispatch Milestone 3: Module 16 Google Research Harness² (c1..c8 surface, R=4k/P=3k ledger identity, per-domain library) and Protocol Ruler calibration.
 
 ## Team Roster
 | Agent | Type | Work Item | Status | Conv ID |
 |-------|------|-----------|--------|---------|
-| explorer_survey_1 | teamwork_preview_explorer | Survey R1: Protocol & Framing (Modules 1-16) | completed | 206669d2-6ff3-4d69-8c48-c685baeed36c |
-| explorer_survey_2 | teamwork_preview_explorer | Survey R2: Host Containment & Subprocesses | completed | f0d8ea9d-dec1-4e3c-b9a6-0e9545f49631 |
-| explorer_survey_3 | teamwork_preview_explorer | Survey R3: Security Boundaries & Tests | completed | fd483d01-73c6-41ba-9da9-0aaf8b3d5f4c |
-| worker_m1 | teamwork_preview_worker | M1 Implementation: Host Containment & Subprocesses | in-progress | dd681700-12a0-447a-8a14-8aefa6746d2a |
+| worker_m2_rem_1 | teamwork_preview_worker | M2 Remediation Implementation | completed | 39101a8e-6511-4386-97a2-dac50af46e89 |
+| reviewer_m2_rem_1 | teamwork_preview_reviewer | M2 Remediation Review 1 | completed | bab8d222-dd36-41b0-916e-38bf427075af |
+| reviewer_m2_rem_2 | teamwork_preview_reviewer | M2 Remediation Review 2 | completed | 349f58fb-4c83-43a7-b2d9-eff975406fd8 |
+| challenger_m2_rem_1 | teamwork_preview_challenger | M2 Remediation Challenge 1 | completed | 7d163640-288e-44cb-9807-81c9b71b33dc |
+| challenger_m2_rem_2 | teamwork_preview_challenger | M2 Remediation Challenge 2 | completed | 19bc0eda-7516-4682-b36e-c392d6572d15 |
+| auditor_m2_rem_1 | teamwork_preview_auditor | M2 Remediation Forensic Re-Audit | completed | 03134505-5634-4123-ac81-5a091adc4e9b |
+| explorer_m3_1 | teamwork_preview_explorer | M3 Harness² Architecture Survey | completed | 8188be8d-d135-42f5-80af-c9e66441e5f2 |
+| explorer_m3_2 | teamwork_preview_explorer | M3 Protocol Ruler Survey | completed | 9a872d74-12ae-4cba-9558-3114ce53a7cf |
+| explorer_m3_3 | teamwork_preview_explorer | M3 Harness² Integration Tests Survey | completed | 4943e6b9-5679-4a73-ade3-12e25e75d25c |
+| worker_m3 | teamwork_preview_worker | M3 Harness² & Protocol Ruler Implementation | in-progress | 96f3f1b7-430a-436a-aa36-750fe9e7f8f2 |
 
 ## Succession Status
 - Succession required: no
-- Spawn count: 4 / 16
-- Pending subagents: dd681700-12a0-447a-8a14-8aefa6746d2a
+- Spawn count: 32 / 128
+- Pending subagents: 96f3f1b7-430a-436a-aa36-750fe9e7f8f2
 - Predecessor: none
-- Successor: not yet spawned
+- Successor: none
 
 ## Active Timers
-- Heartbeat cron: task-12 (*/10 * * * *)
+- Heartbeat cron: task-218 (*/10 * * * *)
 - Safety timer: none
 - On succession: kill all timers before spawning successor
 - On context truncation: run manage_task(Action="list") — re-create if missing
@@ -75,7 +82,5 @@ Orchestrate an exhaustive IETF RFC-compliance, security boundary, and host netwo
 - D:\harfile\rfchunt\.agents\teamwork\orchestrator_1\BRIEFING.md — Persistent working memory
 - D:\harfile\rfchunt\.agents\teamwork\orchestrator_1\progress.md — Liveness & status tracking
 - D:\harfile\rfchunt\.agents\teamwork\orchestrator_1\PROJECT.md — Global project architecture & milestones
-- D:\harfile\rfchunt\.agents\teamwork\explorer_survey_1\report.md — Protocol & Framing Survey Report
-- D:\harfile\rfchunt\.agents\teamwork\explorer_survey_2\report.md — Host Containment Survey Report
-- D:\harfile\rfchunt\.agents\teamwork\explorer_survey_3\report.md — Security & Tests Survey Report
-- D:\harfile\rfchunt\.agents\teamwork\worker_m1\DISPATCH.md — Worker M1 task assignment
+- D:\harfile\rfchunt\.agents\teamwork\orchestrator_1\GATE_STATUS.md — Gate verdicts log
+- D:\harfile\rfchunt\.agents\teamwork\worker_m2_rem_1\handoff.md — Worker M2 remediation handoff report

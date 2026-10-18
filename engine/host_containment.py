@@ -99,6 +99,13 @@ class BaseContainmentBackend(ABC):
         """Alias for stop()."""
         self.stop()
 
+    def __enter__(self) -> "BaseContainmentBackend":
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.stop()
+
     @abstractmethod
     def add_rule(self, remote_ip: str, port: int, action: str = "BLOCK") -> bool:
         """Adds a containment filter rule."""
@@ -120,9 +127,10 @@ class BaseContainmentBackend(ABC):
 
 # WFP Constants
 FWPM_SESSION_FLAG_DYNAMIC: int = 0x00000001
-RPC_C_AUTHN_DEFAULT: int = 0
+RPC_C_AUTHN_DEFAULT: int = 0xFFFFFFFF
 RPC_C_AUTHN_WINNT: int = 10
 ERROR_SUCCESS: int = 0
+ERROR_ACCESS_DENIED: int = 5
 FWP_E_ACCESS_DENIED: int = 0x80320005
 
 
@@ -240,7 +248,7 @@ class WindowsWFPContainmentBackend(BaseContainmentBackend):
             if status != ERROR_SUCCESS:
                 unsigned_status = status & 0xFFFFFFFF
                 err_msg = f"FwpmEngineOpen0 failed with status code 0x{unsigned_status:08X}"
-                if unsigned_status == FWP_E_ACCESS_DENIED:
+                if unsigned_status in (ERROR_ACCESS_DENIED, FWP_E_ACCESS_DENIED):
                     err_msg += " (Access Denied: Requires Administrator privileges for WFP)"
                 logger.error(err_msg)
                 raise PermissionError(err_msg)
@@ -260,7 +268,12 @@ class WindowsWFPContainmentBackend(BaseContainmentBackend):
             dll = self._get_dll()
             status = dll.FwpmTransactionBegin0(self._engine_handle, 0)
             if status != ERROR_SUCCESS:
-                raise RuntimeError(f"FwpmTransactionBegin0 failed with code 0x{status & 0xFFFFFFFF:08X}")
+                unsigned_status = status & 0xFFFFFFFF
+                err_msg = f"FwpmTransactionBegin0 failed with code 0x{unsigned_status:08X}"
+                if unsigned_status in (ERROR_ACCESS_DENIED, FWP_E_ACCESS_DENIED):
+                    err_msg += " (Access Denied: Requires Administrator privileges for WFP transaction)"
+                    raise PermissionError(err_msg)
+                raise RuntimeError(err_msg)
             self._in_transaction = True
             return True
 
@@ -703,7 +716,22 @@ class HostContainmentManager:
         with self._lock:
             if not self.is_active:
                 self.start()
-            return self._backend.add_rule(remote_ip=remote_ip, port=port, action=action)
+            try:
+                return self._backend.add_rule(remote_ip=remote_ip, port=port, action=action)
+            except PermissionError as exc:
+                if self.fallback_to_mock and not isinstance(self._backend, MockContainmentBackend):
+                    logger.warning(
+                        "Unprivileged environment: WFP filter creation requires Administrator (%s). Falling back to MockContainmentBackend.",
+                        exc,
+                    )
+                    rules = self._backend.get_rules()
+                    self._backend.stop()
+                    self._backend = MockContainmentBackend()
+                    self._backend.start()
+                    for r in rules:
+                        self._backend.add_rule(r["remote_ip"], r["port"], r["action"])
+                    return self._backend.add_rule(remote_ip=remote_ip, port=port, action=action)
+                raise
 
     def remove_containment_rule(self, rule_id: str) -> bool:
         """Removes a previously applied containment rule."""

@@ -113,30 +113,6 @@ class MultiImplementationDifferentialOracle:
                 except Exception:
                     pass
 
-    def evaluate_divergence(
-        self, raw_probe: bytes, rule_id: Optional[str] = None
-    ) -> Tuple[bool, Optional[ImplementationAnomaly], Dict[str, Any]]:
-        """
-        Sends the probe to all targets and determines if any two parsers diverge.
-        Returns: (has_divergence, optional_anomaly_object, telemetry_matrix)
-        """
-        responses: Dict[str, TargetResponse] = {}
-        for target in self.targets:
-            responses[target.name] = self.dispatch_single_target(target, raw_probe)
-
-        # Filter out targets that were unreachable/refused
-        active_responses = {k: v for k, v in responses.items() if v.socket_state != "CONNECTION_REFUSED"}
-
-        matrix = {
-            name: {
-                "status": resp.status_code,
-                "socket_state": resp.socket_state,
-                "latency": round(resp.latency, 4),
-                "bytes_len": len(resp.raw_response),
-            }
-            for name, resp in responses.items()
-        }
-
     def evaluate_matrix_4parsers(
         self, raw_probe: bytes, rule_id: Optional[str] = None
     ) -> Tuple[bool, Optional[ImplementationAnomaly], Dict[str, Any]]:
@@ -157,7 +133,10 @@ class MultiImplementationDifferentialOracle:
 
         responses: Dict[str, TargetResponse] = {}
         for p in parsers:
-            responses[p.name] = p.parse(raw_probe)
+            try:
+                responses[p.name] = p.parse(raw_probe)
+            except Exception as e:
+                responses[p.name] = TargetResponse(p.name, 500, {}, str(e).encode(), 0.0, "ERROR")
 
         matrix = {
             name: {
@@ -288,9 +267,10 @@ class StrictRFC7230Parser:
             return TargetResponse(self.name, 400, {}, b"HTTP/1.1 400 Bad Request\r\n\r\nIncomplete request headers", time.time() - t0, "OK")
 
         head, body = raw_probe.split(b"\r\n\r\n", 1)
-        # Check for bare LF or bare CR inside head
-        if b"\r\r" in head or b"\n\r" in head:
-            return TargetResponse(self.name, 400, {}, b"HTTP/1.1 400 Bad Request\r\n\r\nInvalid line terminator", time.time() - t0, "OK")
+        # Check for bare LF or bare CR inside head (RFC 7230 §3.2.4 / RFC 9112 §2.2)
+        head_no_crlf = head.replace(b"\r\n", b"")
+        if b"\r" in head_no_crlf or b"\n" in head_no_crlf:
+            return TargetResponse(self.name, 400, {}, b"HTTP/1.1 400 Bad Request\r\n\r\nBare delimiter error", time.time() - t0, "OK")
 
         lines = head.split(b"\r\n")
         req_line = lines[0]
@@ -418,9 +398,12 @@ class AsyncMicroserviceParser:
 
         # Dangling byte detection: If Content-Length declared is larger than received body, async parser pauses/hangs
         import re
-        cl_match = re.search(rb"content-length:\s*(\d+)", lower_head)
+        cl_match = re.search(rb"(?:^|\r\n)content-length:\s*(\d+)", lower_head)
         if cl_match:
-            declared_len = int(cl_match.group(1))
+            try:
+                declared_len = int(cl_match.group(1))
+            except (ValueError, OverflowError):
+                return TargetResponse(self.name, 400, {}, b"HTTP/1.1 400 Bad Request\r\n\r\nInvalid Content-Length", time.time() - t0, "OK")
             if declared_len > len(body):
                 # Dangling byte: Pauses waiting for remaining body bytes
                 return TargetResponse(self.name, 408, {}, b"", time.time() - t0 + 0.1, "TIMEOUT")

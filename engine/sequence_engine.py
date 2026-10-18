@@ -130,11 +130,17 @@ class StatefulProtocolSequenceEngine:
             )
 
             # Check if Step 2 received leftover baseline HTML bytes (scanner artifact guard)
-            if framed1.body and resp2 and (resp2 in framed1.body or framed1.body.startswith(resp2[:100])):
-                report.has_desynchronization = False
-                report.has_pipeline_leak = False
-                report.details = "Scanner Artifact: Residual baseline response bytes detected on socket; not a pipeline leak."
-                return report
+            is_http_response = resp2.startswith((b"HTTP/1.", b"HTTP/2", b"HTTP/0.9"))
+            if framed1.body and resp2 and not is_http_response:
+                if (
+                    resp2 in framed1.body
+                    or framed1.body.startswith(resp2[:100])
+                    or any(marker in resp2.lower() for marker in (b"<!doctype html", b"<html", b"<body", b"<head"))
+                ):
+                    report.has_desynchronization = False
+                    report.has_pipeline_leak = False
+                    report.details = "Scanner Artifact: Residual baseline response bytes detected on socket; not a pipeline leak."
+                    return report
 
             # PortSwigger Timeout-Based Desynchronization Detection (CL.TE / TE.CL)
             probe_lower = candidate_probe.lower()
@@ -195,7 +201,7 @@ class StatefulProtocolSequenceEngine:
                     received_bytes=resp3,
                     status_code=status3,
                     latency=latency3,
-                    socket_error=framed3.error,
+                    socket_error=framed3.error if framed3 else str(e),
                 )
             )
 

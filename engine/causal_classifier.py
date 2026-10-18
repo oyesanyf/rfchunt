@@ -110,8 +110,12 @@ class CausalAnomalyClassifier:
         if is_artifact:
             return False, f"Anomalous bytes explained by ordinary response framing: {reason}"
 
-        if vuln.reproducibility_rate < 0.66:
-            return False, f"Low reproducibility rate ({vuln.reproducibility_rate:.1%}); network flake or non-deterministic behavior."
+        # Multi-Trial Confirmation Law (Protocol Research Reproducibility Invariant)
+        if vuln.impact == ImpactClass.NON_REPRODUCIBLE_TRANSIENT:
+            return False, "Finding was classified as NonReproducibleTransient; failed minimum 3-trial stability requirement."
+
+        if vuln.verification_attempts < 3 or vuln.reproducibility_rate < 0.60:
+            return False, f"Low reproducibility rate ({vuln.successful_reproductions}/{vuln.verification_attempts}, {vuln.reproducibility_rate:.1%}); failed minimum 3-trial stability requirement."
 
         # Stage 3: Metamorphic validity gate
         if anomaly.category == AnomalyCategory.METAMORPHIC_VIOLATION:

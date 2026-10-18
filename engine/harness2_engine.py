@@ -45,7 +45,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from engine.differential_oracle import MultiImplementationDifferentialOracle
 from engine.dream_world_model import ProtocolWorldModel
@@ -53,9 +53,15 @@ from engine.dream_world_model import ProtocolWorldModel
 Tree = Dict[str, str]
 
 RESERVED_SCRIPTS = frozenset({"read_doc.py", "pack.py", "unpack.py"})
+WIN_DEVICE_NAMES = frozenset({
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+})
 STAGE_ATTEMPTS = 2
 PHASE_WIDTH = 4
 _NAME_PATTERN = r"[a-z0-9][a-z0-9_\-]*"
+
 
 
 # =====================================================================
@@ -156,18 +162,28 @@ def _rx(surface: SurfaceSpec) -> Dict[str, re.Pattern]:
     return _compiled_surface_regexes(surface.name, surface.skill_dir, surface.plugin_dir)
 
 
-def normalize_rel(rel: str) -> str:
-    """Normalise a relative path, rejecting escapes, drive letters, and percent-encoded traversal."""
+def normalize_rel(rel: str, base_dir: Optional[Path] = None) -> Any:
+    """Normalise a relative path, rejecting escapes, drive letters, and percent-encoded traversal.
+
+    If base_dir is supplied, validates that the path resolves strictly inside base_dir and returns
+    the canonical Path object per PROJECT.md:68. Otherwise returns the cleaned normalized relative string.
+    """
     r = str(rel).strip().replace("\\", "/")
     r_lower = r.lower()
     if (
         r.startswith("/")
         or ":" in r
+        or "%3a" in r_lower
+        or "%253a" in r_lower
         or ".." in r.split("/")
         or "%2e" in r_lower
+        or "%252e" in r_lower
         or "%2f" in r_lower
+        or "%252f" in r_lower
         or "%5c" in r_lower
+        or "%255c" in r_lower
         or "%00" in r_lower
+        or "%2500" in r_lower
         or "\x00" in r
     ):
         raise ValueError(f"path escapes the harness: {rel!r}")
@@ -176,6 +192,21 @@ def normalize_rel(rel: str) -> str:
     cleaned = r.strip("/")
     if not cleaned:
         raise ValueError(f"empty relative path on harness surface: {rel!r}")
+
+    for part in cleaned.split("/"):
+        stem = part.split(".")[0].lower()
+        if stem in WIN_DEVICE_NAMES or part.lower() in WIN_DEVICE_NAMES:
+            raise ValueError(f"path contains Windows reserved device name: {rel!r}")
+
+    if base_dir is not None:
+        base_path = Path(base_dir).resolve()
+        resolved = (base_path / cleaned).resolve()
+        try:
+            resolved.relative_to(base_path)
+        except ValueError:
+            raise ValueError(f"path escapes base directory: {rel!r}")
+        return resolved
+
     return cleaned
 
 
@@ -212,7 +243,7 @@ def subagent_names(surface: SurfaceSpec, tree: Tree) -> List[str]:
 
 def _frontmatter_field(body: str, key: str) -> str:
     m = re.search(rf"^{re.escape(key)}:\s*(.+)$", body[:800], re.M)
-    return m.group(1).strip() if m else ""
+    return m.group(1).strip().strip("'\"") if m else ""
 
 
 def autotrigger(surface: SurfaceSpec, tree: Tree) -> List[str]:
@@ -225,7 +256,7 @@ def autotrigger(surface: SurfaceSpec, tree: Tree) -> List[str]:
         if not m:
             continue
         name = m.group(1)
-        if name not in always_text:
+        if not re.search(rf"\b{re.escape(name)}\b", always_text):
             desc = _frontmatter_field(body, "description") or f"analyzing {name} protocol anomalies"
             line = surface.trigger_line.format(name=name, desc=desc)
             current_guard = tree.get(surface.autotrigger_file, "")
@@ -235,6 +266,7 @@ def autotrigger(surface: SurfaceSpec, tree: Tree) -> List[str]:
             always_text += "\n" + line
             triggered.append(name)
     return triggered
+
 
 
 def validate_tree(
@@ -251,8 +283,10 @@ def validate_tree(
             raise ValueError(f"off-surface path rejected: {rel!r}")
 
     if surface.reject_empty_always_on:
-        if not any(tree.get(a, "").strip() for a in surface.always_on):
-            raise ValueError("always-on harness components (c1..c4) cannot all be empty")
+        if not any(a in tree for a in surface.always_on) or not all(
+            tree.get(a, "").strip() for a in surface.always_on if a in tree
+        ):
+            raise ValueError("always-on harness components (c1..c4) cannot be empty")
 
     always_chars = sum(len(tree.get(a, "")) for a in surface.always_on)
     if always_chars > surface.always_on_max:
@@ -284,6 +318,10 @@ def validate_tree(
                 raise ValueError(f"subagent {norm!r} requires frontmatter `mode: subagent`")
             if not fm_desc:
                 raise ValueError(f"subagent {norm!r} requires frontmatter `description:`")
+
+        elif "plugin" in r and r["plugin"].fullmatch(norm):
+            if not body.strip():
+                raise ValueError(f"plugin {norm!r} (c8) cannot be empty")
 
         elif r["script"].fullmatch(norm) or (
             surface.compile_skill_scripts and r["skill_script"].fullmatch(norm) and norm.endswith(".py")
@@ -561,7 +599,11 @@ class Library:
 
     def entries(self) -> List[str]:
         d = self.dir / "harnesses"
-        return sorted(p.name for p in d.iterdir() if p.is_dir()) if d.is_dir() else []
+        if not d.is_dir():
+            return []
+        dirs = [p for p in d.iterdir() if p.is_dir()]
+        dirs.sort(key=lambda p: p.stat().st_mtime)
+        return [p.name for p in dirs]
 
     def tree_of(self, task_id: str) -> Tree:
         return read_tree(self.surface, self.entry_dir(task_id) / "harness")
@@ -605,7 +647,14 @@ class Library:
             f"| `{task_id}` | `{picked_label}` | `{contrast_score:.2f}` | "
             f"{experience['cue'].strip()} | {experience['lesson'].strip()} |\n"
         )
-        if f"| `{task_id}` |" not in current_idx:
+        pattern = rf"^\|\s*`{re.escape(task_id)}`\s*\|.*$"
+        if re.search(pattern, current_idx, flags=re.M):
+            current_idx = re.sub(pattern, row.strip(), current_idx, flags=re.M)
+            if not current_idx.endswith("\n"):
+                current_idx += "\n"
+        else:
+            if not current_idx.endswith("\n"):
+                current_idx += "\n"
             current_idx += row
         self.index.write_text(current_idx, encoding="utf-8")
         return edir
@@ -616,7 +665,9 @@ class Library:
         d = self.dir / "harnesses"
         if not d.is_dir():
             return lessons
-        for p in sorted(d.iterdir()):
+        dir_entries = [p for p in d.iterdir() if p.is_dir()]
+        dir_entries.sort(key=lambda p: p.stat().st_mtime)
+        for p in dir_entries:
             exp_file = p / "EXPERIENCE.md"
             if not exp_file.is_file():
                 continue
