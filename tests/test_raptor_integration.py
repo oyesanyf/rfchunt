@@ -102,41 +102,44 @@ def test_sarif_parsing_and_db_ingestion(tmp_path):
     # 3. Ingest into test DB
     test_db_path = str(tmp_path / "test_terminator.db")
     db = Database(test_db_path)
-    integrator = RaptorIntegrator(db=db)
+    try:
+        integrator = RaptorIntegrator(db=db)
 
-    count = integrator.ingest_findings_to_db(findings, target_engine="target.example.com:443")
-    assert count == 1
+        count = integrator.ingest_findings_to_db(findings, target_engine="target.example.com:443")
+        assert count == 1
 
-    # Verify presence in database
-    cur = db.conn.cursor()
-    cur.execute("SELECT anomaly_id, target_engine, observed_behavior FROM implementation_anomalies WHERE target_engine = 'target.example.com:443'")
-    rows = cur.fetchall()
-    assert len(rows) == 1
-    assert "crlf-header-injection" in rows[0]["observed_behavior"]
+        # Verify presence in database
+        cur = db.conn.cursor()
+        cur.execute("SELECT anomaly_id, target_engine, observed_behavior FROM implementation_anomalies WHERE target_engine = 'target.example.com:443'")
+        rows = cur.fetchall()
+        assert len(rows) == 1
+        assert "crlf-header-injection" in rows[0]["observed_behavior"]
+    finally:
+        db.close()
 
 
 def test_mcp_server_raptor_tool_exposure(tmp_path):
     """Verifies that TerminatorMCPServer exposes RAPTOR security tools over JSON-RPC."""
     test_db = str(tmp_path / "mcp_test.db")
-    server = TerminatorMCPServer(db_path=test_db)
-    tool_defs = server._get_tool_definitions()
-    tool_names = [t["name"] for t in tool_defs]
+    with TerminatorMCPServer(db_path=test_db) as server:
+        tool_defs = server._get_tool_definitions()
+        tool_names = [t["name"] for t in tool_defs]
 
-    assert "raptor_status" in tool_names
-    assert "raptor_describe_target" in tool_names
-    assert "raptor_scan_project" in tool_names
-    assert "raptor_list_findings" in tool_names
+        assert "raptor_status" in tool_names
+        assert "raptor_describe_target" in tool_names
+        assert "raptor_scan_project" in tool_names
+        assert "raptor_list_findings" in tool_names
 
-    # Check that tool descriptions explicitly give credit to RAPTOR authors
-    raptor_desc = next(t["description"] for t in tool_defs if t["name"] == "raptor_status")
-    assert "Gadi Evron" in raptor_desc
-    assert "Daniel Cuthbert" in raptor_desc
-    assert "Halvar Flake" in raptor_desc
+        # Check that tool descriptions explicitly give credit to RAPTOR authors
+        raptor_desc = next(t["description"] for t in tool_defs if t["name"] == "raptor_status")
+        assert "Gadi Evron" in raptor_desc
+        assert "Daniel Cuthbert" in raptor_desc
+        assert "Halvar Flake" in raptor_desc
 
-    # Test raptor_status tool call
-    res = server._execute_tool("raptor_status", {})
-    assert "attribution" in res
-    assert "docker_ready" in res
+        # Test raptor_status tool call
+        res = server._execute_tool("raptor_status", {})
+        assert "attribution" in res
+        assert "docker_ready" in res
 
 
 def test_rfc_hunt_swarm_raptor_cli_modes(tmp_path):

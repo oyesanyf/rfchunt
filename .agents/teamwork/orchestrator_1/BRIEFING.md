@@ -23,11 +23,11 @@ Orchestrate an exhaustive IETF RFC-compliance, security boundary, and host netwo
   1. Survey and Map Full Codebase [done]
   2. M1: Native Host-Restoring Containment & Subprocess Silencing [done]
   3. M2: IETF RFC Compliance & 4-Parser Differential Matrix (Modules 1-15) [done]
-  4. M3: Module 16 Google Research Harness² & Protocol Ruler [in-progress]
-  5. M4: Security Boundaries (SSRF, Path Traversal, Concurrency Locks) [pending]
+  4. M3: Module 16 Google Research Harness² & Protocol Ruler [done]
+  5. M4: Security Boundaries (SSRF, Path Traversal, Concurrency Locks) [in-progress]
   6. M5: Full Verification & E2E Test Suite [pending]
-- **Current phase**: 2 (Milestone Execution - M3)
-- **Current focus**: Milestone 3: Module 16 Google Research Harness² & Protocol Ruler
+- **Current phase**: 2 (Milestone Execution - M4)
+- **Current focus**: Milestone 4: Security Boundaries (SSRF IP Guards, Path Traversal, SQLite Concurrency Locks)
 
 ## 🔒 Key Constraints
 - NEVER write, modify, or create source code files directly.
@@ -47,26 +47,27 @@ Orchestrate an exhaustive IETF RFC-compliance, security boundary, and host netwo
 ## Key Decisions Made
 - Milestone 1 fully completed and verified (PASS across Reviewers, Challengers, Forensic Auditor).
 - Milestone 2 fully completed and verified (PASS across Reviewers, Challengers, Forensic Auditor).
-- Ready to dispatch Milestone 3: Module 16 Google Research Harness² (c1..c8 surface, R=4k/P=3k ledger identity, per-domain library) and Protocol Ruler calibration.
+- Milestone 3 fully completed and verified (PASS across Reviewers, Challengers, Forensic Auditor).
+- Ready to dispatch Milestone 4: Security Boundaries (Target Authorization Gate, Mathematical SSRF IP Guards, Path Traversal normalize_rel, SQLite WAL Mode & Concurrency Locks).
 
 ## Team Roster
 | Agent | Type | Work Item | Status | Conv ID |
 |-------|------|-----------|--------|---------|
-| worker_m2_rem_1 | teamwork_preview_worker | M2 Remediation Implementation | completed | 39101a8e-6511-4386-97a2-dac50af46e89 |
-| reviewer_m2_rem_1 | teamwork_preview_reviewer | M2 Remediation Review 1 | completed | bab8d222-dd36-41b0-916e-38bf427075af |
-| reviewer_m2_rem_2 | teamwork_preview_reviewer | M2 Remediation Review 2 | completed | 349f58fb-4c83-43a7-b2d9-eff975406fd8 |
-| challenger_m2_rem_1 | teamwork_preview_challenger | M2 Remediation Challenge 1 | completed | 7d163640-288e-44cb-9807-81c9b71b33dc |
-| challenger_m2_rem_2 | teamwork_preview_challenger | M2 Remediation Challenge 2 | completed | 19bc0eda-7516-4682-b36e-c392d6572d15 |
-| auditor_m2_rem_1 | teamwork_preview_auditor | M2 Remediation Forensic Re-Audit | completed | 03134505-5634-4123-ac81-5a091adc4e9b |
-| explorer_m3_1 | teamwork_preview_explorer | M3 Harness² Architecture Survey | completed | 8188be8d-d135-42f5-80af-c9e66441e5f2 |
-| explorer_m3_2 | teamwork_preview_explorer | M3 Protocol Ruler Survey | completed | 9a872d74-12ae-4cba-9558-3114ce53a7cf |
-| explorer_m3_3 | teamwork_preview_explorer | M3 Harness² Integration Tests Survey | completed | 4943e6b9-5679-4a73-ade3-12e25e75d25c |
-| worker_m3 | teamwork_preview_worker | M3 Harness² & Protocol Ruler Implementation | in-progress | 96f3f1b7-430a-436a-aa36-750fe9e7f8f2 |
+| worker_m3 | teamwork_preview_worker | M3 Harness² & Protocol Ruler Implementation | completed | 96f3f1b7-430a-436a-aa36-750fe9e7f8f2 |
+| reviewer_m3_1 | teamwork_preview_reviewer | M3 Harness² Review | completed | 6c674057-bbd1-47c0-be58-a1e5bb4549f7 |
+| reviewer_m3_2 | teamwork_preview_reviewer | M3 Protocol Ruler Review | completed | 83aaa4ad-b222-4601-8c1d-694a4536d655 |
+| challenger_m3_1 | teamwork_preview_challenger | M3 Harness² Adversarial Challenge | completed | 66ddd91e-7b12-4ce0-84f2-637bf6da140d |
+| challenger_m3_2 | teamwork_preview_challenger | M3 Protocol Ruler Stress Challenge | completed | 99959cfc-5c5a-484f-a42c-07a4ad985d17 |
+| auditor_m3_1 | teamwork_preview_auditor | M3 Forensic Integrity Audit | completed | 2d12f576-1a80-4574-aa73-49cfe9b95ea3 |
+| explorer_m4_1 | teamwork_preview_explorer | M4 Target Auth & SSRF Survey | completed | 0aed4df1-b362-40e2-a642-c6ec1d6542b8 |
+| explorer_m4_2 | teamwork_preview_explorer | M4 Path Traversal & normalize_rel Survey | completed | 2568c6c7-f278-4f40-a351-a0218db140d5 |
+| explorer_m4_3 | teamwork_preview_explorer | M4 SQLite WAL & Concurrency Locks Survey | completed | 15ad6ba3-0b9f-4314-8f05-097c1c03c237 |
+| worker_m4 | teamwork_preview_worker | M4 Security Boundaries & Locks Implementation | in-progress | be39ee83-0403-4688-8bc7-6f350ebe89bb |
 
 ## Succession Status
 - Succession required: no
-- Spawn count: 32 / 128
-- Pending subagents: 96f3f1b7-430a-436a-aa36-750fe9e7f8f2
+- Spawn count: 41 / 128
+- Pending subagents: be39ee83-0403-4688-8bc7-6f350ebe89bb
 - Predecessor: none
 - Successor: none
 

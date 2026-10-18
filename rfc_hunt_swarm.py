@@ -284,6 +284,28 @@ class ProtocolResearchSwarm:
             "per_rfc": {},
         }
 
+    def close(self) -> None:
+        """Releases database connections and forensic file handles."""
+        if hasattr(self, "db") and self.db is not None:
+            self.db.close()
+        if hasattr(self, "containment") and self.containment is not None:
+            try:
+                self.containment.close()
+            except Exception:
+                pass
+
+    def __enter__(self) -> "ProtocolResearchSwarm":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def _ensure_rfc_stat(self, rfc_id: str) -> Dict[str, Any]:
         if rfc_id not in self.run_stats["per_rfc"]:
             self.run_stats["per_rfc"][rfc_id] = {
@@ -1314,44 +1336,47 @@ def cmd_vulns(args):
         return
 
     con = sqlite3.connect(db_path)
-    cur = con.cursor()
+    try:
+        cur = con.cursor()
 
-    host_filter = getattr(args, "host", None)
-    if host_filter in ("127.0.0.1", "0.0.0.0", "::") and not any("--host" in a for a in sys.argv):
-        host_filter = None
+        host_filter = getattr(args, "host", None)
+        if host_filter in ("127.0.0.1", "0.0.0.0", "::") and not any("--host" in a for a in sys.argv):
+            host_filter = None
 
-    query = """
-        SELECT r.vuln_id, a.target_engine, r.impact, r.reproducibility_rate, 
-               r.successful_reproductions, r.verification_attempts, r.minimized_probe, r.created_at
-        FROM reproducible_vulnerabilities r
-        LEFT JOIN implementation_anomalies a ON r.anomaly_id = a.anomaly_id
-        ORDER BY r.created_at DESC
-    """
-    rows = cur.execute(query).fetchall()
-    
-    results = []
-    for r in rows:
-        vuln_id, target_engine, impact, rate, succ, att, probe, created_at = r
-        if not target_engine:
-            host_m = re.search(r"Host:\s*([^\r\n]+)", probe or "", re.IGNORECASE)
-            target_engine = host_m.group(1).strip() if host_m else "Unknown Host"
+        query = """
+            SELECT r.vuln_id, a.target_engine, r.impact, r.reproducibility_rate, 
+                   r.successful_reproductions, r.verification_attempts, r.minimized_probe, r.created_at
+            FROM reproducible_vulnerabilities r
+            LEFT JOIN implementation_anomalies a ON r.anomaly_id = a.anomaly_id
+            ORDER BY r.created_at DESC
+        """
+        rows = cur.execute(query).fetchall()
         
-        if host_filter and host_filter.lower() not in target_engine.lower():
-            continue
-        results.append((vuln_id, target_engine, impact, rate, succ, att, created_at))
+        results = []
+        for r in rows:
+            vuln_id, target_engine, impact, rate, succ, att, probe, created_at = r
+            if not target_engine:
+                host_m = re.search(r"Host:\s*([^\r\n]+)", probe or "", re.IGNORECASE)
+                target_engine = host_m.group(1).strip() if host_m else "Unknown Host"
+            
+            if host_filter and host_filter.lower() not in target_engine.lower():
+                continue
+            results.append((vuln_id, target_engine, impact, rate, succ, att, created_at))
 
-    print(f"\n{'='*105}")
-    print(f"[*] CONFIRMED VULNERABILITIES & HOST MAPPING (Database: {db_path})")
-    if host_filter:
-        print(f"    Filtered by Host: {host_filter}")
-    print(f"{'='*105}")
-    print(f"{'VULN ID':<28} {'HOST / TARGET':<22} {'IMPACT CLASS':<28} {'REPRO RATE':<12} {'TIMESTAMP'}")
-    print(f"{'-'*28} {'-'*22} {'-'*28} {'-'*12} {'-'*19}")
-    for vuln_id, target_engine, impact, rate, succ, att, created_at in results:
-        rate_str = f"{rate*100:>5.1f}% ({succ}/{att})"
-        print(f"{vuln_id:<28} {target_engine:<22} {impact:<28} {rate_str:<12} {str(created_at)[:19]}")
-    print(f"{'='*105}")
-    print(f"Total Confirmed Vulnerabilities: {len(results)}\n")
+        print(f"\n{'='*105}")
+        print(f"[*] CONFIRMED VULNERABILITIES & HOST MAPPING (Database: {db_path})")
+        if host_filter:
+            print(f"    Filtered by Host: {host_filter}")
+        print(f"{'='*105}")
+        print(f"{'VULN ID':<28} {'HOST / TARGET':<22} {'IMPACT CLASS':<28} {'REPRO RATE':<12} {'TIMESTAMP'}")
+        print(f"{'-'*28} {'-'*22} {'-'*28} {'-'*12} {'-'*19}")
+        for vuln_id, target_engine, impact, rate, succ, att, created_at in results:
+            rate_str = f"{rate*100:>5.1f}% ({succ}/{att})"
+            print(f"{vuln_id:<28} {target_engine:<22} {impact:<28} {rate_str:<12} {str(created_at)[:19]}")
+        print(f"{'='*105}")
+        print(f"Total Confirmed Vulnerabilities: {len(results)}\n")
+    finally:
+        con.close()
 
 
 def cmd_raptor(args):
@@ -1386,6 +1411,7 @@ def cmd_raptor(args):
         print(f"    Preferred Model Ready  : {'YES (fenkohq/foundation-sec-8b:latest)' if st['preferred_model_installed'] else 'NO'}")
         print(f"    Installed Models       : {', '.join(st['ollama_models'][:6]) or 'None detected'}")
         print(f"{'='*75}\n")
+        db.close()
         return
 
     # 2. Findings Summary
@@ -1401,6 +1427,7 @@ def cmd_raptor(args):
                 loc = f"{f['file']}:{f['line']}"
                 print(f"{f['severity']:<10} {f['rule_id']:<30} {loc[:32]:<32} {f['message'][:50]}")
         print(f"{'='*75}\n")
+        db.close()
         return
 
     # 3. Determine Scan Target: Live Host vs Local Project
@@ -1454,6 +1481,7 @@ def cmd_raptor(args):
                 loc = f"{f['file']}:{f['line']}"
                 print(f"{f['severity']:<10} {f['rule_id']:<30} {loc[:32]:<32} {f['message'][:50]}")
     print(f"{'='*75}\n")
+    db.close()
 
 
 def cmd_harness2(args):
@@ -1494,6 +1522,7 @@ def cmd_harness2(args):
                 )
                 print(f"       Lesson: {r['lesson']}")
             print(f"{'='*78}\n")
+            db.close()
             return
 
     rfc_items = [
@@ -1544,6 +1573,7 @@ def cmd_harness2(args):
             print(f"      - Lesson            : {res.experience.get('lesson')}")
             print(f"      - Evidence          : {res.experience.get('evidence')}")
             print(f"{'='*78}\n")
+    db.close()
 
 
 def print_harness2_help():
@@ -2267,11 +2297,17 @@ def main_swarm(argv=None):
 
     # Authorize and validate each target host specified on the CLI
     from mcp_server import TargetAuthorizationGate
+    from engine.safe_network_validator import validate_target_host
     for t_host, t_port, t_tls in target_list:
-        TargetAuthorizationGate.authorize_target(t_host)
+        is_local = t_host in ("127.0.0.1", "localhost", "::1", "[::1]") or t_host.startswith("127.")
+        is_safe_net, net_reason = validate_target_host(t_host, allow_private=is_local)
+        if not is_safe_net:
+            print(f"[!] Target SSRF validation error for {t_host}: {net_reason}")
+            sys.exit(1)
+
         is_valid_target, target_reason = TargetAuthorizationGate.validate_target(t_host)
         if not is_valid_target:
-            print(f"[!] Target validation error for {t_host}: {target_reason}")
+            print(f"[!] Target authorization error for {t_host}: {target_reason}")
             sys.exit(1)
 
     import os
@@ -2586,6 +2622,10 @@ def main_swarm(argv=None):
             if bg_lab_server:
                 bg_lab_server.stop()
             swarm.print_run_summary()
+            try:
+                swarm.close()
+            except Exception:
+                pass
 
     print("[*] Swarm Execution Completed. All evidence saved to DB and Forensics Log.")
 
@@ -2613,30 +2653,33 @@ def main_swarm(argv=None):
         from engine.dashboard_generator import DashboardGenerator
         from database import Database
         dash_db = Database(args.db)
-        findings = [dict(f) for f in dash_db.get_confirmed_findings()]
-        stats = {
-            "total_evaluated": max(len(findings), 15),
-            "passed": 13,
-            "anomalies": 2,
-            "flaws": len(findings),
-        }
-        merkle_log = {
-            "merkle_root": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            "total_leaves": len(findings),
-        }
-        out_file = getattr(args, "dashboard_out", None) or "terminator_dashboard.html"
-        html = DashboardGenerator.generate_html_dashboard(
-            target_host=args.host,
-            target_port=args.port,
-            scan_stats=stats,
-            merkle_audit_log=merkle_log,
-            flaws=findings,
-            arm106_count=12,
-            arm107_count=12,
-        )
-        with open(out_file, "w", encoding="utf-8") as f:
-            f.write(html)
-        print(f"\n[+] Interactive Research Dashboard generated: {out_file}")
+        try:
+            findings = [dict(f) for f in dash_db.get_confirmed_findings()]
+            stats = {
+                "total_evaluated": max(len(findings), 15),
+                "passed": 13,
+                "anomalies": 2,
+                "flaws": len(findings),
+            }
+            merkle_log = {
+                "merkle_root": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "total_leaves": len(findings),
+            }
+            out_file = getattr(args, "dashboard_out", None) or "terminator_dashboard.html"
+            html = DashboardGenerator.generate_html_dashboard(
+                target_host=args.host,
+                target_port=args.port,
+                scan_stats=stats,
+                merkle_audit_log=merkle_log,
+                flaws=findings,
+                arm106_count=12,
+                arm107_count=12,
+            )
+            with open(out_file, "w", encoding="utf-8") as f:
+                f.write(html)
+            print(f"\n[+] Interactive Research Dashboard generated: {out_file}")
+        finally:
+            dash_db.close()
     except Exception as e:
         print(f"[!] Warning: Dashboard generation encountered error: {e}")
 

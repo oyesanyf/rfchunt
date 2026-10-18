@@ -70,24 +70,27 @@ def build_step_database(db_path: str = "terminator.db") -> Tuple[bool, str]:
     try:
         from database import Database
         db = Database(str(ROOT_DIR / db_path))
-        cursor = db.conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = [row[0] for row in cursor.fetchall()]
-        cursor.close()
+        try:
+            cursor = db.conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            tables = [row[0] for row in cursor.fetchall()]
+            cursor.close()
 
-        required_tables = [
-            "rfcs", "fragments", "probes", "evaluations", "anomalies",
-            "cascade_hypotheses", "rfc_requirements", "implementation_anomalies",
-            "reproducible_vulnerabilities", "novel_techniques", "harness2_runs"
-        ]
-        missing = [t for t in required_tables if t not in tables]
-        if missing:
-            return False, f"Database is missing tables: {', '.join(missing)}"
+            required_tables = [
+                "rfcs", "fragments", "probes", "evaluations", "anomalies",
+                "cascade_hypotheses", "rfc_requirements", "implementation_anomalies",
+                "reproducible_vulnerabilities", "novel_techniques", "harness2_runs"
+            ]
+            missing = [t for t in required_tables if t not in tables]
+            if missing:
+                return False, f"Database is missing tables: {', '.join(missing)}"
 
-        from engine.defensive_publisher import DefensiveIntelligencePublisher
-        DefensiveIntelligencePublisher(db=db).sync_db_findings()
+            from engine.defensive_publisher import DefensiveIntelligencePublisher
+            DefensiveIntelligencePublisher(db=db).sync_db_findings()
 
-        return True, f"Database verified ({len(tables)} tables active, thread-safe locks initialized)."
+            return True, f"Database verified ({len(tables)} tables active, thread-safe locks initialized)."
+        finally:
+            db.close()
     except Exception as e:
         return False, f"Database verification failure: {e}"
 

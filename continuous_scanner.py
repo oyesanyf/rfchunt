@@ -96,6 +96,29 @@ class ContinuousFlawHunter:
         except Exception:
             pass
 
+    def close(self) -> None:
+        """Releases database connections and forensic file handles."""
+        self.stop()
+        if hasattr(self, "db") and self.db is not None:
+            self.db.close()
+        if hasattr(self, "containment") and self.containment is not None:
+            try:
+                self.containment.close()
+            except Exception:
+                pass
+
+    def __enter__(self) -> "ContinuousScanner":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def run_until_flaw(
         self,
         max_rfcs: Optional[int] = 15,

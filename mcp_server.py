@@ -37,7 +37,13 @@ class TargetAuthorizationGate:
                 t_clean = t.strip().lower()
                 # Disallow wildcards from bypassing target controls
                 if t_clean and t_clean not in ("*", "all"):
-                    targets.add(t_clean)
+                    try:
+                        from engine.safe_network_validator import validate_target_host
+                        is_safe, _ = validate_target_host(t_clean, allow_private=True)
+                        if is_safe:
+                            targets.add(t_clean)
+                    except ImportError:
+                        targets.add(t_clean)
         return targets
 
     @classmethod
@@ -47,6 +53,18 @@ class TargetAuthorizationGate:
             raise ValueError("Cannot authorize 0.0.0.0 or :: (INADDR_ANY listening address). Specify a valid host or loopback.")
         if cleaned in ("*", "all"):
             raise ValueError("Wildcard authorization is disallowed. Specify explicit target hostnames or IPs.")
+        try:
+            from engine.safe_network_validator import is_cloud_metadata
+            import ipaddress
+            try:
+                ip = ipaddress.ip_address(cleaned)
+                if is_cloud_metadata(ip) or ip.is_unspecified:
+                    raise ValueError(f"Cannot authorize target '{host}': destination is cloud metadata or unspecified.")
+            except ValueError as e:
+                if "Cannot authorize" in str(e):
+                    raise
+        except ImportError:
+            pass
         cls.ALLOWED_TARGETS.add(cleaned)
 
     @classmethod
@@ -61,6 +79,17 @@ class TargetAuthorizationGate:
                 f"Active protocol research against external services requires explicit authorization "
                 f"(set RFCHUNT_AUTHORIZED_TARGETS={host})."
             )
+        try:
+            from engine.safe_network_validator import validate_target_host
+            is_local = cleaned in ("127.0.0.1", "localhost", "::1", "[::1]") or cleaned.startswith("127.")
+            is_safe, reason = validate_target_host(cleaned, allow_private=is_local)
+            if not is_safe:
+                if "DNS resolution failed for target hostname" in reason:
+                    pass
+                else:
+                    raise PermissionError(f"Target '{host}' failed security boundary validation: {reason}")
+        except ImportError:
+            pass
 
     @classmethod
     def validate_target(cls, host: str) -> Tuple[bool, str]:
@@ -153,6 +182,23 @@ class TerminatorMCPServer:
         self.fetcher = RFCFetcher(db=self.db)
         self.permutator = VectorPermutator(db=self.db)
         self.raptor = RaptorIntegrator(db=self.db)
+
+    def close(self) -> None:
+        """Closes internal database handle cleanly."""
+        if hasattr(self, "db") and self.db is not None:
+            self.db.close()
+
+    def __enter__(self) -> "TerminatorMCPServer":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def handle_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         method = request.get("method")
@@ -580,5 +626,5 @@ class TerminatorMCPServer:
 
 
 if __name__ == "__main__":
-    server = TerminatorMCPServer()
-    server.run_stdio()
+    with TerminatorMCPServer() as server:
+        server.run_stdio()

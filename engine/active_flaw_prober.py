@@ -54,6 +54,13 @@ class ActiveFlawProber:
         self.permutator = VectorPermutator(db=db)
 
     def _open_connection(self) -> socket.socket:
+        is_local = self.host in ("127.0.0.1", "localhost", "::1", "[::1]") or self.host.startswith("127.")
+        from engine.safe_network_validator import validate_target_host
+        is_safe, reason = validate_target_host(self.host, allow_private=is_local)
+        if not is_safe:
+            raise PermissionError(f"Target '{self.host}' rejected by SSRF safety boundary: {reason}")
+        from mcp_server import TargetAuthorizationGate
+        TargetAuthorizationGate.check_target(self.host)
         raw_sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
         if self.use_tls:
             context = ssl.create_default_context()

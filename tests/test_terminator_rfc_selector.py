@@ -82,17 +82,17 @@ def test_database_save_fragments_3_tuple_and_probe_dedup(tmp_path):
     """Verifies Database.save_fragments accepts 3-tuples from chunk_document_for_terminator and save_probe deduplicates."""
     from database import Database
     db_file = str(tmp_path / "test_term.db")
-    db = Database(db_file)
-    chunks = [
-        ("A recipient MUST recognize a single LF as a line terminator.", "must, line terminator", 42.5),
-        ("Transfer-Encoding overrides Content-Length.", "transfer-encoding, content-length", 30.0),
-    ]
-    saved = db.save_fragments("RFC9112", chunks)
-    assert saved == 2
+    with Database(db_file) as db:
+        chunks = [
+            ("A recipient MUST recognize a single LF as a line terminator.", "must, line terminator", 42.5),
+            ("Transfer-Encoding overrides Content-Length.", "transfer-encoding, content-length", 30.0),
+        ]
+        saved = db.save_fragments("RFC9112", chunks)
+        assert saved == 2
 
-    p1 = db.save_probe(1, "First rationale", "GET / HTTP/1.1\r\nHost: target.local\r\n\r\n", True, "llm")
-    p2 = db.save_probe(1, "Duplicate rationale", "GET / HTTP/1.1\r\nHost: target.local\r\n\r\n", True, "permutation")
-    assert p1 == p2, "Identical raw_request probes should be deduplicated to the existing probe_id"
+        p1 = db.save_probe(1, "First rationale", "GET / HTTP/1.1\r\nHost: target.local\r\n\r\n", True, "llm")
+        p2 = db.save_probe(1, "Duplicate rationale", "GET / HTTP/1.1\r\nHost: target.local\r\n\r\n", True, "permutation")
+        assert p1 == p2, "Identical raw_request probes should be deduplicated to the existing probe_id"
 
 
 def test_target_authorization_gate_validate_target():

@@ -41,6 +41,8 @@ import json
 import re
 import shutil
 import time
+import unicodedata
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -57,6 +59,7 @@ WIN_DEVICE_NAMES = frozenset({
     "con", "prn", "aux", "nul",
     *(f"com{i}" for i in range(1, 10)),
     *(f"lpt{i}" for i in range(1, 10)),
+    "conin$", "conout$", "clock$",
 })
 STAGE_ATTEMPTS = 2
 PHASE_WIDTH = 4
@@ -168,42 +171,82 @@ def normalize_rel(rel: str, base_dir: Optional[Path] = None) -> Any:
     If base_dir is supplied, validates that the path resolves strictly inside base_dir and returns
     the canonical Path object per PROJECT.md:68. Otherwise returns the cleaned normalized relative string.
     """
-    r = str(rel).strip().replace("\\", "/")
-    r_lower = r.lower()
-    if (
-        r.startswith("/")
-        or ":" in r
-        or "%3a" in r_lower
-        or "%253a" in r_lower
-        or ".." in r.split("/")
-        or "%2e" in r_lower
-        or "%252e" in r_lower
-        or "%2f" in r_lower
-        or "%252f" in r_lower
-        or "%5c" in r_lower
-        or "%255c" in r_lower
-        or "%00" in r_lower
-        or "%2500" in r_lower
-        or "\x00" in r
-    ):
-        raise ValueError(f"path escapes the harness: {rel!r}")
-    while r.startswith("./"):
-        r = r[2:]
-    cleaned = r.strip("/")
-    if not cleaned:
+    raw = str(rel).strip()
+    if not raw:
         raise ValueError(f"empty relative path on harness surface: {rel!r}")
 
+    # 1. Iterative URL decoding (up to 10 iterations) to reach fixed point
+    curr = raw
+    for _ in range(10):
+        dec = urllib.parse.unquote(curr)
+        if dec == curr:
+            break
+        curr = dec
+
+    # 2. Normalize Unicode (NFKC) to defeat fullwidth slashes, dots, and colons
+    normalized_str = unicodedata.normalize("NFKC", curr)
+
+    # 3. Reject null bytes across raw, decoded, and normalized representations
+    if "\x00" in raw or "\x00" in curr or "\x00" in normalized_str:
+        raise ValueError(f"path escapes the harness: {rel!r}")
+
+    # 4. Multi-level percent-encoding regex interceptor for traversal, colons, nulls, slashes
+    raw_lower = raw.lower()
+    if re.search(r"%(?:25)*(?:2e|2f|5c|3a|00)", raw_lower):
+        raise ValueError(f"path escapes the harness: {rel!r}")
+
+    # 5. Normalize path separators to forward slash
+    norm_slash = normalized_str.replace("\\", "/")
+    raw_slash = raw.replace("\\", "/")
+
+    # 6. Reject absolute paths, UNC paths, and colons (drive letters and NTFS ADS)
+    if (
+        norm_slash.startswith("/")
+        or raw_slash.startswith("/")
+        or ":" in norm_slash
+        or ":" in raw_slash
+        or "//" in norm_slash
+        or "//" in raw_slash
+        or raw.startswith("//")
+        or raw.startswith(r"\\")
+        or raw_slash.startswith("//")
+    ):
+        raise ValueError(f"path escapes the harness: {rel!r}")
+
+    # 7. Strip leading relative prefixes (./)
+    while norm_slash.startswith("./"):
+        norm_slash = norm_slash[2:]
+    while raw_slash.startswith("./"):
+        raw_slash = raw_slash[2:]
+
+    # 8. Check for directory traversal sequences (..) and curdir (.)
+    parts = norm_slash.split("/")
+    raw_parts = raw_slash.split("/")
+    if any(p == ".." or p == "." for p in parts if p) or any(p == ".." for p in raw_parts if p):
+        raise ValueError(f"path escapes the harness: {rel!r}")
+
+    cleaned = norm_slash.strip("/")
+    if not cleaned or cleaned == ".":
+        raise ValueError(f"empty relative path on harness surface: {rel!r}")
+
+    # 9. Exhaustive Windows reserved device name check across normalized and decoded components
     for part in cleaned.split("/"):
-        stem = part.split(".")[0].lower()
-        if stem in WIN_DEVICE_NAMES or part.lower() in WIN_DEVICE_NAMES:
+        stem = part.split(".")[0].rstrip(" .").lower()
+        part_clean = part.rstrip(" .").lower()
+        if stem in WIN_DEVICE_NAMES or part_clean in WIN_DEVICE_NAMES:
             raise ValueError(f"path contains Windows reserved device name: {rel!r}")
 
+    for part in curr.replace("\\", "/").strip("/").split("/"):
+        stem = part.split(".")[0].rstrip(" .").lower()
+        part_clean = part.rstrip(" .").lower()
+        if stem in WIN_DEVICE_NAMES or part_clean in WIN_DEVICE_NAMES:
+            raise ValueError(f"path contains Windows reserved device name: {rel!r}")
+
+    # 10. Post-join canonical containment check against base_dir
     if base_dir is not None:
         base_path = Path(base_dir).resolve()
         resolved = (base_path / cleaned).resolve()
-        try:
-            resolved.relative_to(base_path)
-        except ValueError:
+        if resolved == base_path or not resolved.is_relative_to(base_path):
             raise ValueError(f"path escapes base directory: {rel!r}")
         return resolved
 
@@ -278,7 +321,10 @@ def validate_tree(
 ) -> None:
     """Validate c1..c8 surface constraints, caps, frontmatter rules, and Python script syntax."""
     for rel in tree:
-        norm = normalize_rel(rel)
+        try:
+            norm = normalize_rel(rel)
+        except ValueError:
+            raise ValueError(f"off-surface path rejected: {rel!r}")
         if not is_allowed(surface, norm):
             raise ValueError(f"off-surface path rejected: {rel!r}")
 

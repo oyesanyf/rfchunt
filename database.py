@@ -12,12 +12,63 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 class Database:
-    def __init__(self, db_path: str = "terminator.db"):
+    def __init__(self, db_path: str = "terminator.db", timeout: float = 30.0):
         self.db_path = Path(db_path)
-        self._lock = threading.Lock()
-        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(
+            str(self.db_path),
+            timeout=timeout,
+            check_same_thread=False
+        )
         self.conn.row_factory = sqlite3.Row
+        self._configure_pragmas()
         self._init_schema()
+
+    def _configure_pragmas(self) -> None:
+        """Configures production WAL mode, 30s busy timeout, and NORMAL synchrony."""
+        with self._lock:
+            cur = self.conn.cursor()
+            try:
+                # In-memory databases do not support WAL mode
+                is_mem = str(self.db_path) in (":memory:", "") or "mode=memory" in str(self.db_path)
+                if not is_mem:
+                    cur.execute("PRAGMA journal_mode = WAL;")
+                cur.execute("PRAGMA busy_timeout = 30000;")
+                cur.execute("PRAGMA synchronous = NORMAL;")
+                cur.execute("PRAGMA foreign_keys = ON;")
+            finally:
+                cur.close()
+
+    def close(self) -> None:
+        """Cleanly releases all SQLite locks, WAL mappings, and file handles."""
+        with self._lock:
+            if hasattr(self, "conn") and self.conn is not None:
+                try:
+                    try:
+                        self.conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                    except Exception:
+                        pass
+                    self.conn.close()
+                except Exception:
+                    pass
+                finally:
+                    self.conn = None
+
+    @property
+    def is_closed(self) -> bool:
+        return self.conn is None
+
+    def __enter__(self) -> "Database":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _init_schema(self) -> None:
         with self._lock:
@@ -209,6 +260,11 @@ class Database:
         count = 0
         with self._lock:
             with self.conn:
+                if rfc_id:
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO rfcs (rfc_id, title) VALUES (?, ?)",
+                        (rfc_id, rfc_id),
+                    )
                 for item in fragments:
                     if isinstance(item, (tuple, list)):
                         content = str(item[0]) if len(item) > 0 else ""
@@ -229,36 +285,39 @@ class Database:
         return count
 
     def get_ingested_rfc_ids(self) -> List[str]:
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT DISTINCT rfc_id FROM fragments")
-        return [row[0] for row in cursor.fetchall() if row[0]]
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT DISTINCT rfc_id FROM fragments")
+            return [row[0] for row in cursor.fetchall() if row[0]]
 
     def get_scanned_rfc_nums(self) -> List[int]:
-        ids = self.get_ingested_rfc_ids()
-        nums = []
-        for rid in ids:
-            if rid.upper() == "RFC-MCP":
-                nums.append(0)
-            elif rid.upper().startswith("RFC"):
-                try:
-                    nums.append(int(rid[3:]))
-                except ValueError:
-                    pass
-        return nums
+        with self._lock:
+            ids = self.get_ingested_rfc_ids()
+            nums = []
+            for rid in ids:
+                if rid.upper() == "RFC-MCP":
+                    nums.append(0)
+                elif rid.upper().startswith("RFC"):
+                    try:
+                        nums.append(int(rid[3:]))
+                    except ValueError:
+                        pass
+            return nums
 
     def get_unprocessed_fragments(self, limit: int = 50) -> List[sqlite3.Row]:
-        cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            SELECT f.fragment_id, f.rfc_id, f.content
-            FROM fragments f
-            LEFT JOIN probes p ON f.fragment_id = p.fragment_id
-            WHERE p.probe_id IS NULL
-            LIMIT ?
-            """,
-            (limit,),
-        )
-        return cursor.fetchall()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """
+                SELECT f.fragment_id, f.rfc_id, f.content
+                FROM fragments f
+                LEFT JOIN probes p ON f.fragment_id = p.fragment_id
+                WHERE p.probe_id IS NULL
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return cursor.fetchall()
 
     def save_probe(
         self,
@@ -287,18 +346,19 @@ class Database:
                 return cursor.lastrowid
 
     def get_pending_probes(self, target_host: str, limit: int = 50) -> List[sqlite3.Row]:
-        cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            SELECT p.probe_id, p.rationale, p.raw_request, p.is_clean, p.source_type
-            FROM probes p
-            LEFT JOIN evaluations e ON p.probe_id = e.probe_id AND e.target_host = ?
-            WHERE e.eval_id IS NULL
-            LIMIT ?
-            """,
-            (target_host, limit),
-        )
-        return cursor.fetchall()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """
+                SELECT p.probe_id, p.rationale, p.raw_request, p.is_clean, p.source_type
+                FROM probes p
+                LEFT JOIN evaluations e ON p.probe_id = e.probe_id AND e.target_host = ?
+                WHERE e.eval_id IS NULL
+                LIMIT ?
+                """,
+                (target_host, limit),
+            )
+            return cursor.fetchall()
 
     def record_evaluation(
         self,
@@ -358,18 +418,19 @@ class Database:
                 return cursor.lastrowid
 
     def get_confirmed_findings(self) -> List[sqlite3.Row]:
-        cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            SELECT e.eval_id, e.probe_id, e.target_host, e.desync_class, e.details, e.raw_evidence,
-                   p.rationale, p.raw_request, f.content AS rfc_fragment
-            FROM evaluations e
-            JOIN probes p ON e.probe_id = p.probe_id
-            LEFT JOIN fragments f ON p.fragment_id = f.fragment_id
-            WHERE e.is_vulnerable = 1
-            """
-        )
-        return cursor.fetchall()
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """
+                SELECT e.eval_id, e.probe_id, e.target_host, e.desync_class, e.details, e.raw_evidence,
+                       p.rationale, p.raw_request, f.content AS rfc_fragment
+                FROM evaluations e
+                JOIN probes p ON e.probe_id = p.probe_id
+                LEFT JOIN fragments f ON p.fragment_id = f.fragment_id
+                WHERE e.is_vulnerable = 1
+                """
+            )
+            return cursor.fetchall()
 
     def save_rfc_requirement(
         self,
@@ -533,19 +594,20 @@ class Database:
                 )
 
     def get_tier_taxonomy_counts(self) -> Dict[str, int]:
-        cursor = self.conn.cursor()
-        counts = {}
-        for table in [
-            "rfc_requirements",
-            "implementation_anomalies",
-            "reproducible_vulnerabilities",
-            "novel_techniques",
-            "arm106_defensive_rules",
-            "arm107_regression_tests",
-        ]:
-            cursor.execute(f"SELECT COUNT(*) FROM {table}")
-            counts[table] = cursor.fetchone()[0]
-        return counts
+        with self._lock:
+            cursor = self.conn.cursor()
+            counts = {}
+            for table in [
+                "rfc_requirements",
+                "implementation_anomalies",
+                "reproducible_vulnerabilities",
+                "novel_techniques",
+                "arm106_defensive_rules",
+                "arm107_regression_tests",
+            ]:
+                cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                counts[table] = cursor.fetchone()[0]
+            return counts
 
     def save_anomaly_fingerprint(
         self,
@@ -567,11 +629,12 @@ class Database:
                 return cursor.lastrowid
 
     def get_anomaly_fingerprints(self) -> List[Dict[str, Any]]:
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "SELECT fingerprint_id, anomaly_type, pattern_regex, target_part, description FROM anomaly_fingerprints"
-        )
-        return [dict(r) for r in cursor.fetchall()]
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT fingerprint_id, anomaly_type, pattern_regex, target_part, description FROM anomaly_fingerprints"
+            )
+            return [dict(r) for r in cursor.fetchall()]
 
     def save_dynamic_permutation(
         self,
@@ -593,17 +656,19 @@ class Database:
                 return cursor.lastrowid
 
     def get_dynamic_permutations(self) -> List[Dict[str, Any]]:
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "SELECT permutation_id, mutation_name, match_pattern, replacement_text, is_clean FROM dynamic_permutations"
-        )
-        return [dict(r) for r in cursor.fetchall()]
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT permutation_id, mutation_name, match_pattern, replacement_text, is_clean FROM dynamic_permutations"
+            )
+            return [dict(r) for r in cursor.fetchall()]
 
     def get_probe_evaluation_count(self, probe_id: int) -> int:
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM evaluations WHERE probe_id = ?", (probe_id,))
-        row = cursor.fetchone()
-        return row[0] if row else 0
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM evaluations WHERE probe_id = ?", (probe_id,))
+            row = cursor.fetchone()
+            return row[0] if row else 0
 
     def clean_db(
         self,

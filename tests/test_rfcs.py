@@ -18,8 +18,11 @@ def temp_env():
     temp_dir = tempfile.mkdtemp()
     db_path = os.path.join(temp_dir, "test.db")
     db = Database(db_path)
-    yield temp_dir, db
-    shutil.rmtree(temp_dir, ignore_errors=True)
+    try:
+        yield temp_dir, db
+    finally:
+        db.close()
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def test_chunker_micro_fragmentation():

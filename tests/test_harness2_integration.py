@@ -131,49 +131,52 @@ def test_parallel_and_sequential_recursion_and_library(tmp_path: Path):
     runs_dir = tmp_path / "harness2_runs"
     db_file = tmp_path / "test_h2.db"
     db = Database(str(db_file))
-    engine = Harness2ProtocolEngine(
-        runs_root=runs_dir,
-        target_host="127.0.0.1",
-        target_port=8080,
-        db_path=str(db_file),
-    )
+    try:
+        engine = Harness2ProtocolEngine(
+            runs_root=runs_dir,
+            target_host="127.0.0.1",
+            target_port=8080,
+            db_path=str(db_file),
+        )
 
-    # 1. Parallel mode with k=2 (R=8 rollouts, P=6 sessions)
-    res_agg = engine.run_mode("parallel", "RFC9112", k=2, domain="http11_framing", run_tag="exp1")
-    assert res_agg.ok
-    assert res_agg.mode == "agg"
-    assert res_agg.ledger is not None
-    assert res_agg.ledger.rollouts_count == 8
-    assert res_agg.ledger.sessions_count == 6
-    assert res_agg.adopted_label in ("agg1", "agg2")
-    assert len(res_agg.finals) == 2
+        # 1. Parallel mode with k=2 (R=8 rollouts, P=6 sessions)
+        res_agg = engine.run_mode("parallel", "RFC9112", k=2, domain="http11_framing", run_tag="exp1")
+        assert res_agg.ok
+        assert res_agg.mode == "agg"
+        assert res_agg.ledger is not None
+        assert res_agg.ledger.rollouts_count == 8
+        assert res_agg.ledger.sessions_count == 6
+        assert res_agg.adopted_label in ("agg1", "agg2")
+        assert len(res_agg.finals) == 2
 
-    # Check domain library files on disk
-    lib = Library(root=runs_dir / "exp1" / "agg", domain="http11_framing")
-    assert lib.exists()
-    assert "RFC9112" in lib.entries()
-    assert (lib.entry_dir("RFC9112") / "EXPERIENCE.md").is_file()
-    lessons = lib.load_domain_lessons()
-    assert len(lessons) == 1
-    assert "RFC9112" in lessons[0]["cue"]
+        # Check domain library files on disk
+        lib = Library(root=runs_dir / "exp1" / "agg", domain="http11_framing")
+        assert lib.exists()
+        assert "RFC9112" in lib.entries()
+        assert (lib.entry_dir("RFC9112") / "EXPERIENCE.md").is_file()
+        lessons = lib.load_domain_lessons()
+        assert len(lessons) == 1
+        assert "RFC9112" in lessons[0]["cue"]
 
-    # 2. Sequential mode with k=2 (R=8 rollouts, P=6 sessions) on second task in same domain
-    res_seq = engine.run_mode("sequential", "RFC7230", k=2, domain="http11_framing", run_tag="exp1")
-    assert res_seq.ok
-    assert res_seq.mode == "seq"
-    assert res_seq.ledger is not None
-    assert res_seq.ledger.rollouts_count == 8
-    assert res_seq.ledger.sessions_count == 6
-    assert res_seq.adopted_label in ("c1", "c2")
+        # 2. Sequential mode with k=2 (R=8 rollouts, P=6 sessions) on second task in same domain
+        res_seq = engine.run_mode("sequential", "RFC7230", k=2, domain="http11_framing", run_tag="exp1")
+        assert res_seq.ok
+        assert res_seq.mode == "seq"
+        assert res_seq.ledger is not None
+        assert res_seq.ledger.rollouts_count == 8
+        assert res_seq.ledger.sessions_count == 6
+        assert res_seq.adopted_label in ("c1", "c2")
 
-    # 3. Persist to SQLite and verify retrieval
-    row_id = db.save_harness2_run(res_agg.to_dict())
-    assert row_id > 0
-    saved_runs = db.get_harness2_runs()
-    assert len(saved_runs) == 1
-    assert saved_runs[0]["task_id"] == "RFC9112"
-    assert saved_runs[0]["rollouts_count"] == 8
-    assert saved_runs[0]["sessions_count"] == 6
+        # 3. Persist to SQLite and verify retrieval
+        row_id = db.save_harness2_run(res_agg.to_dict())
+        assert row_id > 0
+        saved_runs = db.get_harness2_runs()
+        assert len(saved_runs) == 1
+        assert saved_runs[0]["task_id"] == "RFC9112"
+        assert saved_runs[0]["rollouts_count"] == 8
+        assert saved_runs[0]["sessions_count"] == 6
+    finally:
+        db.close()
 
 
 def test_cli_harness2_execution(tmp_path: Path, capsys):

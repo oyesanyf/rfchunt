@@ -91,6 +91,13 @@ class ProtocolRuler:
     ):
         if host in ("0.0.0.0", "::"):
             raise ValueError(f"Target host cannot be {host} (INADDR_ANY listening address). Use 127.0.0.1 or localhost.")
+        is_local = host in ("127.0.0.1", "localhost", "::1", "[::1]") or host.startswith("127.")
+        from engine.safe_network_validator import validate_target_host
+        is_safe, reason = validate_target_host(host, allow_private=is_local)
+        if not is_safe:
+            raise PermissionError(f"Target '{host}' rejected by SSRF safety boundary: {reason}")
+        from mcp_server import TargetAuthorizationGate
+        TargetAuthorizationGate.check_target(host)
         self.host = host
         self.port = port
         self.use_tls = use_tls
@@ -106,6 +113,13 @@ class ProtocolRuler:
             print(msg)
 
     def _open_socket(self) -> socket.socket:
+        is_local = self.host in ("127.0.0.1", "localhost", "::1", "[::1]") or self.host.startswith("127.")
+        from engine.safe_network_validator import validate_target_host
+        is_safe, reason = validate_target_host(self.host, allow_private=is_local)
+        if not is_safe:
+            raise PermissionError(f"Target '{self.host}' rejected by SSRF safety boundary: {reason}")
+        from mcp_server import TargetAuthorizationGate
+        TargetAuthorizationGate.check_target(self.host)
         raw_sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
         if self.use_tls:
             try:
