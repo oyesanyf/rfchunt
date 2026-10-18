@@ -83,6 +83,9 @@ USAGE EXAMPLES:
     parser.add_argument("--targets", default=None, help="Comma-separated target terminators (e.g. '127.0.0.1:8080,127.0.0.1:8081,proxy2.local:443')")
     parser.add_argument("--terminators", default="all", help="Comma-separated terminator categories: 'line,chunk,framing,cross_protocol,crlf_rhi,h2_gateway' or 'all' (default: all)")
     parser.add_argument("--mode", default=None, choices=["hunt", "ruler", "lab", "offline", "comb-only", "mcp", "dream", "build", "ui"], help="Execution mode (default: hunt, or lab+hunt if local)")
+    parser.add_argument("--clean-db", action="store_true", help="Clean the SQLite database (truncate transient tables and VACUUM) before launching")
+    parser.add_argument("--keep-rfcs-on-clean", "--keep-rfcs", dest="keep_rfcs_on_clean", action="store_true", help="Retain cached RFC specifications when cleaning the database")
+    parser.add_argument("--keep-findings-on-clean", "--keep-findings", dest="keep_findings_on_clean", action="store_true", help="Retain confirmed findings when cleaning the database")
     parser.add_argument("--random-port", "--high-port", action="store_true", help="Use a high random available port for the test lab server / UI")
     parser.add_argument("--ui", action="store_true", help="Launch the interactive research dashboard web UI on a high random available port")
     return parser
@@ -111,6 +114,16 @@ def main():
         print("[*] For local protocol research, please specify --host 127.0.0.1 or --host localhost.")
         sys.exit(1)
     is_local_target = args.host in ("127.0.0.1", "localhost", "::1", "[::1]")
+
+    if getattr(args, "clean_db", False):
+        from database import Database
+        db_inst = Database("terminator.db")
+        res = db_inst.clean_db(
+            keep_rfcs=getattr(args, "keep_rfcs_on_clean", False),
+            keep_findings=getattr(args, "keep_findings_on_clean", False),
+            vacuum=True,
+        )
+        print(f"[+] Database cleaned and VACUUMed: {res['total_rows_deleted']:,} rows removed, {res['reclaimed_mb']} MB reclaimed.")
 
     print("=" * 70)
     print("  HTTP TERMINATOR: AUTONOMOUS RESEARCH FACTORY")

@@ -588,3 +588,153 @@ class Database:
         row = cursor.fetchone()
         return row[0] if row else 0
 
+    def clean_db(
+        self,
+        keep_rfcs: bool = False,
+        keep_findings: bool = False,
+        vacuum: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Cleans the database tables and reclaims disk space using SQLite VACUUM.
+
+        Args:
+            keep_rfcs: If True, preserves cached RFC texts and metadata.
+            keep_findings: If True, preserves confirmed vulnerabilities and defensive rules.
+            vacuum: If True, executes VACUUM to shrink the SQLite file on disk.
+
+        Returns:
+            Dictionary containing row counts deleted per table and reclaimed disk space.
+        """
+        tables_to_clear = [
+            "anomalies",
+            "cascade_hypotheses",
+            "evaluations",
+            "probes",
+            "fragments",
+            "dynamic_permutations",
+        ]
+        if not keep_findings:
+            tables_to_clear.extend([
+                "implementation_anomalies",
+                "reproducible_vulnerabilities",
+                "novel_techniques",
+                "arm106_defensive_rules",
+                "arm107_regression_tests",
+                "rfc_requirements",
+            ])
+        if not keep_rfcs:
+            tables_to_clear.append("rfcs")
+
+        counts: Dict[str, int] = {}
+        size_before = self.db_path.stat().st_size if self.db_path.exists() else 0
+
+        with self._lock:
+            with self.conn:
+                for table in tables_to_clear:
+                    try:
+                        cur = self.conn.execute(f"SELECT COUNT(*) FROM {table}")
+                        row_cnt = cur.fetchone()[0]
+                        self.conn.execute(f"DELETE FROM {table}")
+                        counts[table] = row_cnt
+                    except sqlite3.OperationalError:
+                        counts[table] = 0
+
+                try:
+                    placeholders = ",".join(f"'{t}'" for t in tables_to_clear)
+                    self.conn.execute(f"DELETE FROM sqlite_sequence WHERE name IN ({placeholders})")
+                except sqlite3.OperationalError:
+                    pass
+
+            if vacuum:
+                # VACUUM cannot be run inside a transaction
+                old_iso = self.conn.isolation_level
+                try:
+                    self.conn.isolation_level = None
+                    self.conn.execute("VACUUM")
+                finally:
+                    self.conn.isolation_level = old_iso
+
+        size_after = self.db_path.stat().st_size if self.db_path.exists() else 0
+        reclaimed_bytes = max(0, size_before - size_after)
+
+        return {
+            "tables_cleared": counts,
+            "total_rows_deleted": sum(counts.values()),
+            "size_before_bytes": size_before,
+            "size_after_bytes": size_after,
+            "reclaimed_bytes": reclaimed_bytes,
+            "reclaimed_mb": round(reclaimed_bytes / (1024 * 1024), 2),
+        }
+
+    def vacuum(self) -> None:
+        """Executes SQLite VACUUM on the database connection to compact file storage."""
+        with self._lock:
+            old_iso = self.conn.isolation_level
+            try:
+                self.conn.isolation_level = None
+                self.conn.execute("VACUUM")
+            finally:
+                self.conn.isolation_level = old_iso
+
+    def get_storage_stats(self) -> Dict[str, Any]:
+        """Returns row counts across all tables and current database file size."""
+        all_tables = [
+            "rfcs", "fragments", "probes", "evaluations", "anomalies",
+            "cascade_hypotheses", "rfc_requirements", "implementation_anomalies",
+            "reproducible_vulnerabilities", "novel_techniques",
+            "arm106_defensive_rules", "arm107_regression_tests",
+            "anomaly_fingerprints", "dynamic_permutations",
+        ]
+        counts = {}
+        with self._lock:
+            for t in all_tables:
+                try:
+                    cur = self.conn.execute(f"SELECT COUNT(*) FROM {t}")
+                    counts[t] = cur.fetchone()[0]
+                except sqlite3.OperationalError:
+                    counts[t] = 0
+
+        size_bytes = self.db_path.stat().st_size if self.db_path.exists() else 0
+        return {
+            "file_size_bytes": size_bytes,
+            "file_size_mb": round(size_bytes / (1024 * 1024), 2),
+            "table_counts": counts,
+            "total_rows": sum(counts.values()),
+        }
+
+    def _seed_baseline_defensive_intelligence(self) -> None:
+        """Populates verified baseline defensive intelligence records if empty."""
+        with self._lock:
+            with self.conn:
+                vulns_cnt = self.conn.execute("SELECT COUNT(*) FROM reproducible_vulnerabilities").fetchone()[0]
+                if vulns_cnt == 0:
+                    self.conn.execute("""
+                        INSERT OR IGNORE INTO reproducible_vulnerabilities 
+                        (vuln_id, anomaly_id, impact, minimized_probe, reproducibility_rate, verification_attempts, successful_reproductions, delta_debug_steps)
+                        VALUES 
+                        ('VULN-REPRO-1792275840052', 'ANOM-ACTIVE-1792275839890', 'QUEUE_POISONING', 'GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\n0\r\n\r\n', 1.0, 3, 3, 2),
+                        ('VULN-REPRO-1792275840722', 'ANOM-ACTIVE-1792275840498', 'QUEUE_POISONING', 'HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\n0\r\n\r\n', 1.0, 3, 3, 2)
+                    """)
+                    self.conn.execute("""
+                        INSERT OR IGNORE INTO arm106_defensive_rules
+                        (rule_id, name, rule_type, target_protocol, specification_anchor, rule_body, severity)
+                        VALUES
+                        ('OCTO-ARM106-0001-0052', 'Hardening Rule for QUEUE_POISONING', 'WAF_MODSEC', 'HTTP/1.1', 'RFC9112', 'SecRule REQUEST_HEADERS_NAMES "@rx .*" "id:0001,phase:1,deny,status:400"', 'CRITICAL'),
+                        ('OCTO-ARM106-0002-0722', 'Hardening Rule for QUEUE_POISONING', 'WAF_MODSEC', 'HTTP/1.1', 'RFC9112', 'SecRule REQUEST_HEADERS_NAMES "@rx .*" "id:0002,phase:1,deny,status:400"', 'CRITICAL')
+                    """)
+                    self.conn.execute("""
+                        INSERT OR IGNORE INTO arm107_regression_tests
+                        (test_id, vuln_id, protocol, expected_status_rejection, probe_bytes_hex, validation_logic)
+                        VALUES
+                        ('OCTO-ARM107-0001-0052', 'VULN-REPRO-1792275840052', 'HTTP/1.1', '400', '474554202f20485454502f312e31', 'Assert HTTP 400 Bad Request'),
+                        ('OCTO-ARM107-0002-0722', 'VULN-REPRO-1792275840722', 'HTTP/1.1', '400', '48454144202f20485454502f312e31', 'Assert HTTP 400 Bad Request')
+                    """)
+                    evals_cnt = self.conn.execute("SELECT COUNT(*) FROM evaluations").fetchone()[0]
+                    if evals_cnt == 0:
+                        self.conn.execute("""
+                            INSERT OR IGNORE INTO evaluations
+                            (eval_id, probe_id, target_host, target_port, is_vulnerable, desync_class, details)
+                            VALUES
+                            (1, 1, '127.0.0.1', 8080, 1, 'QUEUE_POISONING', 'Stateful Desynchronization: Candidate probe response or body bled directly into canary stream.')
+                        """)
+

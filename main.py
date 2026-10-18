@@ -498,6 +498,9 @@ USAGE EXAMPLES:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--db", default="terminator.db", help="SQLite database path")
+    parser.add_argument("--clean-db", action="store_true", help="Clean the SQLite database (truncate transient tables and VACUUM) before running")
+    parser.add_argument("--keep-rfcs-on-clean", "--keep-rfcs", dest="keep_rfcs_on_clean", action="store_true", help="Retain cached RFC specifications when cleaning the database")
+    parser.add_argument("--keep-findings-on-clean", "--keep-findings", dest="keep_findings_on_clean", action="store_true", help="Retain confirmed findings when cleaning the database")
     parser.add_argument("--model", default="gemma2:2b", help="Preferred base model (e.g. gemma2:2b, gemma2:9b, qwen2.5:7b)")
     parser.add_argument("--no-fusion", dest="fusion", action="store_false", help="Disable multi-model panel fusion")
     parser.set_defaults(fusion=True)
@@ -609,6 +612,17 @@ USAGE EXAMPLES:
     p_build.add_argument("--skip-tests", action="store_true", help="Skip running the pytest verification suite")
 
     args = parser.parse_args()
+
+    if getattr(args, "clean_db", False):
+        db = Database(args.db)
+        res = db.clean_db(
+            keep_rfcs=getattr(args, "keep_rfcs_on_clean", False),
+            keep_findings=getattr(args, "keep_findings_on_clean", False),
+            vacuum=True,
+        )
+        print(f"[+] Database cleaned and VACUUMed: {res['total_rows_deleted']:,} rows removed, {res['reclaimed_mb']} MB reclaimed.")
+        if not args.command:
+            sys.exit(0)
 
     if not args.command:
         parser.print_help()

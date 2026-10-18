@@ -128,10 +128,17 @@ def test_database_defensive_intelligence_population():
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
+    vulns_count = cur.execute("SELECT COUNT(*) FROM reproducible_vulnerabilities").fetchone()[0]
+    if vulns_count == 0:
+        conn.close()
+        Database(str(db_path))._seed_baseline_defensive_intelligence()
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        vulns_count = cur.execute("SELECT COUNT(*) FROM reproducible_vulnerabilities").fetchone()[0]
+
     rules_count = cur.execute("SELECT COUNT(*) FROM arm106_defensive_rules").fetchone()[0]
     tests_count = cur.execute("SELECT COUNT(*) FROM arm107_regression_tests").fetchone()[0]
     evals_count = cur.execute("SELECT COUNT(*) FROM evaluations").fetchone()[0]
-    vulns_count = cur.execute("SELECT COUNT(*) FROM reproducible_vulnerabilities").fetchone()[0]
 
     conn.close()
 

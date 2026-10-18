@@ -1408,7 +1408,7 @@ ALL_MODES = [
     "fetch", "chunk", "generate", "permute", "evaluate",
     "weaponize", "cascade", "dream", "caldera",
     "dashboard", "export", "oracle", "differential", "h2", "http2", "audit", "merkle",
-    "ui", "vulns", "findings", "list", "raptor",
+    "ui", "vulns", "findings", "list", "raptor", "clean", "clean-db",
 ]
 
 
@@ -1546,6 +1546,9 @@ USAGE EXAMPLES (All run directly via rfc_hunt_swarm.py):
     parser.add_argument("--sec-model", type=str, default=None, help="Secondary security specialist model (e.g. fenkohq/foundation-sec-8b:latest, qwen2.5:7b, strix-qwen:latest)")
     parser.add_argument("--no-fusion", dest="fusion", action="store_false", default=True, help="Disable multi-model panel fusion")
     parser.add_argument("--db", type=str, default="terminator.db", help="SQLite database path (default: terminator.db)")
+    parser.add_argument("--clean-db", action="store_true", help="Clean the SQLite database (truncate transient evaluations, anomalies, probes, fragments, and VACUUM to reclaim disk space)")
+    parser.add_argument("--keep-rfcs-on-clean", "--keep-rfcs", dest="keep_rfcs_on_clean", action="store_true", help="When cleaning the database, retain the cached RFC specifications and index")
+    parser.add_argument("--keep-findings-on-clean", "--keep-findings", dest="keep_findings_on_clean", action="store_true", help="When cleaning the database, retain confirmed vulnerabilities and defensive rules")
     parser.add_argument("--cache-dir", type=str, default="rfcs", help="Local directory to cache RFCs (default: rfcs)")
     parser.add_argument("--max-rfcs", "--count", dest="max_rfcs", type=int, default=None, help="Maximum number of RFCs to cycle through")
     parser.add_argument("--keywords", type=str, default=None, help="Comma-separated keywords to filter active RFCs (e.g. 'chunked,trailer,websocket')")
@@ -1766,6 +1769,40 @@ def main_swarm(argv=None):
         active_mode = "audit"
     elif active_mode in ("export-rules",):
         active_mode = "export"
+    elif active_mode in ("clean", "clean-db"):
+        active_mode = "clean_db"
+
+    # Handle Database Clean & Vacuum
+    if getattr(args, "clean_db", False) or active_mode == "clean_db":
+        from database import Database
+        db_inst = Database(args.db)
+        res = db_inst.clean_db(
+            keep_rfcs=getattr(args, "keep_rfcs_on_clean", False),
+            keep_findings=getattr(args, "keep_findings_on_clean", False),
+            vacuum=True,
+        )
+        print("\n" + "=" * 75)
+        print("  DATABASE CLEAN & VACUUM (HTTP TERMINATOR)")
+        print("=" * 75)
+        print(f"  [+] Target Database       : {args.db}")
+        print(f"  [+] Total Rows Cleared    : {res['total_rows_deleted']:,}")
+        print(f"  [+] Size Before Clean     : {res['size_before_bytes'] / (1024*1024):.2f} MB")
+        print(f"  [+] Size After Clean      : {res['size_after_bytes'] / (1024*1024):.2f} MB")
+        print(f"  [+] Space Reclaimed       : {res['reclaimed_mb']} MB")
+        if getattr(args, "keep_findings_on_clean", False):
+            print("  [*] Preserved Confirmed Vulnerabilities and Defensive Rules")
+        if getattr(args, "keep_rfcs_on_clean", False):
+            print("  [*] Preserved Cached RFC Specifications & Index")
+        print("=" * 75 + "\n")
+
+        # If --clean-db was called standalone or as primary command/mode, exit cleanly
+        standalone_clean = (active_mode == "clean_db") or (
+            not explicit_mode_given and not any(
+                getattr(args, flag, False) for flag in ("ui", "build", "mcp", "kettle", "all_active", "enable_raptor", "list_terminators")
+            )
+        )
+        if standalone_clean:
+            return
 
     if args.list_terminators:
         from engine.terminator_rfc_selector import TerminatorRFCSelector
