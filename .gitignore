@@ -15,6 +15,7 @@ forensics/
 caldera_export/
 plugins/
 runs/
+.agents/
 
 # Compressed Archives
 *.zip
