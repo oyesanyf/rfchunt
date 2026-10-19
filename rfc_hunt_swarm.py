@@ -1441,13 +1441,56 @@ def cmd_raptor(args):
         model = getattr(args, "raptor_model", "fenkohq/foundation-sec-8b:latest")
         pg = getattr(args, "policy_groups", "") or ""
         codeql = bool(getattr(args, "include_codeql", False))
-        res = raptor.run_scan(
-            target_path=target_repo,
-            mode=mode,
-            model=model,
-            policy_groups=pg,
-            include_codeql=codeql,
-        )
+        if mode in ("all", "full"):
+            phases = ["describe", "scan", "crypto", "sca", "agentic"]
+            combined_findings = []
+            total_ingested = 0
+            t0 = time.time()
+            for idx, phase in enumerate(phases, 1):
+                print(f"\n[*] [PHASE {idx}/{len(phases)}] Running RAPTOR `{phase}` on {target_repo}...")
+                if phase == "describe":
+                    desc_res = raptor.describe_target(target_repo)
+                    if desc_res.get("stdout"):
+                        print(desc_res["stdout"].strip()[:800])
+                    continue
+                phase_res = raptor.run_scan(
+                    target_path=target_repo,
+                    mode=phase,
+                    model=model,
+                    policy_groups=pg,
+                    include_codeql=(codeql if phase == "agentic" else False),
+                )
+                if phase_res.get("findings"):
+                    combined_findings.extend(phase_res["findings"])
+                total_ingested += int(phase_res.get("ingested_to_db") or 0)
+            res = {
+                "target": str(target_repo),
+                "mode": "all (describe + scan + crypto + sca + agentic)",
+                "duration_sec": round(time.time() - t0, 2),
+                "total_findings": len(combined_findings),
+                "ingested_to_db": total_ingested,
+                "findings": combined_findings,
+            }
+        elif mode == "describe":
+            desc_res = raptor.describe_target(target_repo)
+            if desc_res.get("stdout"):
+                print(desc_res["stdout"])
+            res = {
+                "target": str(target_repo),
+                "mode": "describe",
+                "duration_sec": 0.0,
+                "total_findings": 0,
+                "ingested_to_db": 0,
+                "findings": [],
+            }
+        else:
+            res = raptor.run_scan(
+                target_path=target_repo,
+                mode=mode,
+                model=model,
+                policy_groups=pg,
+                include_codeql=codeql,
+            )
     else:
         # Live Host Web Scan!
         # Fall back to host argument or target URL
@@ -1983,7 +2026,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     # Credit: Gadi Evron, Daniel Cuthbert, Thomas Dullien (Halvar Flake)
     # https://github.com/gadievron/raptor
     parser.add_argument("--raptor", "--enable-raptor", dest="enable_raptor", action="store_true", help="Enable RAPTOR Autonomous Framework (Web application & source code pentesting; credit: Gadi Evron, Daniel Cuthbert, Halvar Flake)")
-    parser.add_argument("--raptor-mode", type=str, choices=["web", "scan", "agentic", "crypto", "sca", "describe"], default=None, help="RAPTOR analysis mode: 'web' (live host DAST), 'scan' (fast static), 'agentic' (LLM triage), 'crypto' (PQC), 'sca' (dependencies)")
+    parser.add_argument("--raptor-mode", type=str, choices=["web", "scan", "agentic", "crypto", "sca", "describe", "all", "full"], default=None, help="RAPTOR analysis mode: 'all'/'full' (runs describe + scan + crypto + sca + agentic), 'web' (live host DAST), 'scan' (fast static), 'agentic' (LLM triage), 'crypto' (PQC), 'sca' (dependencies)")
     parser.add_argument("--raptor-target", "--repo", dest="raptor_target", type=str, default=None, help="Local repository path or directory to audit with RAPTOR")
     parser.add_argument("--raptor-model", type=str, default="fenkohq/foundation-sec-8b:latest", help="Ollama LLM for RAPTOR agentic triage (default: fenkohq/foundation-sec-8b:latest)")
     parser.add_argument("--raptor-status", "--status", dest="raptor_status", action="store_true", help="Check RAPTOR Docker container (danielcuthbert/raptor:latest) and Ollama security model readiness")
