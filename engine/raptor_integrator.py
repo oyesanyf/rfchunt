@@ -207,12 +207,23 @@ class RaptorIntegrator:
         if not target.exists():
             return {"error": f"Target path {target} does not exist."}
 
+        if mode == "full":
+            mode = "all"
+        if model and not re.match(
+            r"^(ollama|anthropic|openai|gemini|google|mistral|cohere|bedrock|openrouter|together|groq|fireworks|deepinfra)/",
+            model,
+            re.IGNORECASE,
+        ) and not re.match(r"^(claude-|gpt-|o1-|o3-|o4-|gemini-)", model, re.IGNORECASE):
+            cli_model = f"ollama/{model}"
+        else:
+            cli_model = model
+
         self.on_trace(f"\n{'='*75}")
         self.on_trace(f"[*] LAUNCHING RAPTOR SECURITY SCAN")
         self.on_trace(f"    Target Project : {target}")
         self.on_trace(f"    Scan Mode      : {mode}")
-        if mode == "agentic":
-            self.on_trace(f"    Ollama Model   : {model}")
+        if mode in ("agentic", "all"):
+            self.on_trace(f"    Ollama Model   : {cli_model}")
         self.on_trace(f"    Framework      : {RAPTOR_PROJECT_TITLE} (Authors: {RAPTOR_AUTHORS})")
         self.on_trace(f"{'='*75}\n")
 
@@ -229,8 +240,8 @@ class RaptorIntegrator:
             mode,
         ]
 
-        if mode == "agentic":
-            cmd.extend(["-Model", model])
+        if mode in ("agentic", "all"):
+            cmd.extend(["-Model", cli_model])
         if policy_groups:
             cmd.extend(["-PolicyGroups", policy_groups])
         if include_codeql:
