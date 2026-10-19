@@ -36,7 +36,59 @@ import threading
 import time
 from typing import Annotated, Any, Dict, List, Optional, Tuple, TypedDict
 
-from langgraph.graph import END, StateGraph
+try:
+    from langgraph.graph import END, StateGraph
+except ImportError:
+    END = "__end__"
+
+    class _CompiledFallbackGraph:
+        def __init__(self, entry_point, nodes, edges, cond_edges):
+            self._entry = entry_point
+            self._nodes = nodes
+            self._edges = edges
+            self._cond_edges = cond_edges
+
+        def invoke(self, state: dict, config: Optional[dict] = None) -> dict:
+            cur = dict(state)
+            recursion_limit = (config or {}).get("recursion_limit", 150)
+            node_name = self._entry
+            steps = 0
+            while node_name and node_name != END and steps < recursion_limit:
+                steps += 1
+                fn = self._nodes[node_name]
+                updates = fn(cur) or {}
+                for k, v in updates.items():
+                    if k == "history" and isinstance(cur.get("history"), list) and isinstance(v, list):
+                        cur["history"] = cur["history"] + v
+                    else:
+                        cur[k] = v
+                if node_name in self._cond_edges:
+                    node_name = self._cond_edges[node_name](cur)
+                else:
+                    node_name = self._edges.get(node_name, END)
+            return cur
+
+    class StateGraph:  # type: ignore[no-redef]
+        def __init__(self, state_schema=None):
+            self._entry = None
+            self._nodes = {}
+            self._edges = {}
+            self._cond_edges = {}
+
+        def add_node(self, name: str, fn):
+            self._nodes[name] = fn
+
+        def set_entry_point(self, name: str):
+            self._entry = name
+
+        def add_edge(self, src: str, dst: str):
+            self._edges[src] = dst
+
+        def add_conditional_edges(self, src: str, router_fn):
+            self._cond_edges[src] = router_fn
+
+        def compile(self):
+            return _CompiledFallbackGraph(self._entry, self._nodes, self._edges, self._cond_edges)
 
 # External/Core components from original continuous_scanner
 from anomaly_detector import AnomalyDetector
@@ -1441,37 +1493,9 @@ def cmd_raptor(args):
         model = getattr(args, "raptor_model", "fenkohq/foundation-sec-8b:latest")
         pg = getattr(args, "policy_groups", "") or ""
         codeql = bool(getattr(args, "include_codeql", False))
-        if mode in ("all", "full"):
-            phases = ["describe", "scan", "crypto", "sca", "agentic"]
-            combined_findings = []
-            total_ingested = 0
-            t0 = time.time()
-            for idx, phase in enumerate(phases, 1):
-                print(f"\n[*] [PHASE {idx}/{len(phases)}] Running RAPTOR `{phase}` on {target_repo}...")
-                if phase == "describe":
-                    desc_res = raptor.describe_target(target_repo)
-                    if desc_res.get("stdout"):
-                        print(desc_res["stdout"].strip()[:800])
-                    continue
-                phase_res = raptor.run_scan(
-                    target_path=target_repo,
-                    mode=phase,
-                    model=model,
-                    policy_groups=pg,
-                    include_codeql=(codeql if phase == "agentic" else False),
-                )
-                if phase_res.get("findings"):
-                    combined_findings.extend(phase_res["findings"])
-                total_ingested += int(phase_res.get("ingested_to_db") or 0)
-            res = {
-                "target": str(target_repo),
-                "mode": "all (describe + scan + crypto + sca + agentic)",
-                "duration_sec": round(time.time() - t0, 2),
-                "total_findings": len(combined_findings),
-                "ingested_to_db": total_ingested,
-                "findings": combined_findings,
-            }
-        elif mode == "describe":
+        if mode == "full":
+            mode = "all"
+        if mode == "describe":
             desc_res = raptor.describe_target(target_repo)
             if desc_res.get("stdout"):
                 print(desc_res["stdout"])
@@ -1490,6 +1514,7 @@ def cmd_raptor(args):
                 model=model,
                 policy_groups=pg,
                 include_codeql=codeql,
+                timeout_sec=3600 if mode == "all" else 1800,
             )
     else:
         # Live Host Web Scan!
