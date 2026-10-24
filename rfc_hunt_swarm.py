@@ -1493,14 +1493,20 @@ def cmd_raptor(args):
         db.close()
         return
 
-    # 3. Determine Scan Target: Live Host vs Local Project
-    target_repo = getattr(args, "raptor_target", None)
+    # 3. Determine Scan Target: Live Host vs Any Local Folder
+    target_repo = getattr(args, "raptor_target", None) or getattr(args, "target_arg", None)
     host = getattr(args, "host", None)
     raptor_mode = getattr(args, "raptor_mode", None)
 
+    # Also support passing a folder path via --host / --target, or defaulting to current directory for repo scan modes
+    if not target_repo and host and os.path.isdir(str(host)):
+        target_repo = str(host)
+    elif not target_repo and raptor_mode in ("all", "full", "scan", "agentic", "crypto", "sca", "describe"):
+        target_repo = os.getcwd()
+
     # Check if target_repo points to an existing directory
     if target_repo and os.path.exists(str(target_repo)):
-        mode = raptor_mode or "scan"
+        mode = raptor_mode or "all"
         model = getattr(args, "raptor_model", "fenkohq/foundation-sec-8b:latest")
         pg = getattr(args, "policy_groups", "") or ""
         codeql = bool(getattr(args, "include_codeql", False))
@@ -1974,7 +1980,13 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
         nargs="?",
         choices=ALL_MODES,
         default=None,
-        help="Optional positional mode/subcommand (e.g. build, ruler, lab, mcp, hunt, auto, terminator, start, dashboard, export, oracle, h2, audit, ui, harness2)",
+        help="Optional positional mode/subcommand (e.g. build, ruler, lab, mcp, hunt, auto, terminator, start, dashboard, export, oracle, h2, audit, ui, harness2, raptor)",
+    )
+    parser.add_argument(
+        "target_arg",
+        nargs="?",
+        default=None,
+        help="Optional positional target folder path or host (e.g. 'python -u rfc_hunt_swarm.py raptor D:\\any\\folder')",
     )
     parser.add_argument("--rfc", type=str, default="9112", help="Specific RFC ID to analyze (e.g. 9112 or MCP)")
     parser.add_argument(
@@ -2063,7 +2075,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     # https://github.com/gadievron/raptor
     parser.add_argument("--raptor", "--enable-raptor", dest="enable_raptor", action="store_true", help="Enable RAPTOR Autonomous Framework (Web application & source code pentesting; credit: Gadi Evron, Daniel Cuthbert, Halvar Flake)")
     parser.add_argument("--raptor-mode", type=str, choices=["web", "scan", "agentic", "crypto", "sca", "describe", "all", "full"], default=None, help="RAPTOR analysis mode: 'all'/'full' (runs describe + scan + crypto + sca + agentic), 'web' (live host DAST), 'scan' (fast static), 'agentic' (LLM triage), 'crypto' (PQC), 'sca' (dependencies)")
-    parser.add_argument("--raptor-target", "--repo", dest="raptor_target", type=str, default=None, help="Local repository path or directory to audit with RAPTOR")
+    parser.add_argument("--raptor-target", "--repo", "--folder", "--dir", "--path", dest="raptor_target", type=str, default=None, help="Any local folder or repository path to audit with RAPTOR")
     parser.add_argument("--raptor-model", type=str, default="fenkohq/foundation-sec-8b:latest", help="Ollama LLM for RAPTOR agentic triage (default: fenkohq/foundation-sec-8b:latest)")
     parser.add_argument("--raptor-status", "--status", dest="raptor_status", action="store_true", help="Check RAPTOR Docker container (danielcuthbert/raptor:latest) and Ollama security model readiness")
     parser.add_argument("--raptor-setup", "--install-raptor", dest="raptor_setup", action="store_true", help="Automatically clone, configure, and pull the RAPTOR Security Framework (https://github.com/gadievron/raptor & danielcuthbert/raptor:latest)")
