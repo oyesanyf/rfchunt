@@ -1452,7 +1452,18 @@ def cmd_raptor(args):
     print(RaptorIntegrator.get_attribution_banner())
     print(f"{'='*75}\n")
 
-    # 1. Status Check
+    # 1. Setup / Bootstrap RAPTOR if requested
+    if getattr(args, "raptor_setup", False):
+        print("[*] Bootstrapping & configuring RAPTOR Security Framework...")
+        setup_res = raptor.ensure_installed()
+        if setup_res.get("stdout"):
+            print(setup_res["stdout"])
+        if setup_res.get("stderr"):
+            print(setup_res["stderr"])
+        db.close()
+        return
+
+    # 2. Status Check
     if getattr(args, "raptor_status", False) or (hasattr(args, "status") and args.status):
         st = raptor.check_status()
         print(f"[*] RAPTOR SYSTEM STATUS:")
@@ -2055,6 +2066,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--raptor-target", "--repo", dest="raptor_target", type=str, default=None, help="Local repository path or directory to audit with RAPTOR")
     parser.add_argument("--raptor-model", type=str, default="fenkohq/foundation-sec-8b:latest", help="Ollama LLM for RAPTOR agentic triage (default: fenkohq/foundation-sec-8b:latest)")
     parser.add_argument("--raptor-status", "--status", dest="raptor_status", action="store_true", help="Check RAPTOR Docker container (danielcuthbert/raptor:latest) and Ollama security model readiness")
+    parser.add_argument("--raptor-setup", "--install-raptor", dest="raptor_setup", action="store_true", help="Automatically clone, configure, and pull the RAPTOR Security Framework (https://github.com/gadievron/raptor & danielcuthbert/raptor:latest)")
     parser.add_argument("--raptor-findings", "--findings", dest="raptor_findings", action="store_true", help="List and summarize recent SARIF vulnerability findings from RAPTOR scans")
     parser.add_argument("--policy-groups", type=str, default="", help="Optional policy groups for RAPTOR scan (e.g. 'secrets,owasp,crypto')")
     parser.add_argument("--include-codeql", action="store_true", help="Include deep CodeQL compilation during RAPTOR agentic scan")
@@ -2335,7 +2347,7 @@ def main_swarm(argv=None):
         cmd_vulns(args)
         return
 
-    if active_mode == "raptor" or getattr(args, "raptor_status", False) or getattr(args, "raptor_findings", False):
+    if active_mode == "raptor" or getattr(args, "raptor_status", False) or getattr(args, "raptor_findings", False) or getattr(args, "raptor_setup", False):
         cmd_raptor(args)
         return
 

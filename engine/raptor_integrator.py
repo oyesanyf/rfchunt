@@ -61,6 +61,9 @@ class RaptorIntegrator:
 
     DEFAULT_RAPTOR_ROOT = Path(r"D:\docker\raptor")
     INVOKE_SCRIPT = DEFAULT_RAPTOR_ROOT / "Invoke-RaptorScan.ps1"
+    REPO_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+    REPO_INVOKE_SCRIPT = REPO_SCRIPTS_DIR / "Invoke-RaptorScan.ps1"
+    REPO_SETUP_SCRIPT = REPO_SCRIPTS_DIR / "setup_raptor.ps1"
     OLLAMA_TAGS_URL = "http://127.0.0.1:11434/api/tags"
 
     def __init__(
@@ -73,6 +76,60 @@ class RaptorIntegrator:
         self.out_root = self.raptor_root / "out"
         self.db = db
         self.on_trace = on_trace or (lambda msg: print(msg, flush=True))
+
+    def ensure_installed(self, skip_docker_pull: bool = False) -> Dict[str, Any]:
+        """
+        Bootstraps and configures RAPTOR (clones https://github.com/gadievron/raptor.git into
+        self.raptor_root, writes models.json and Invoke-RaptorScan.ps1, patches the
+        host.docker.internal loopback bypass, and pulls danielcuthbert/raptor:latest).
+        """
+        if self.REPO_SETUP_SCRIPT.exists():
+            cmd = [
+                "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(self.REPO_SETUP_SCRIPT),
+                "-RaptorRoot",
+                str(self.raptor_root),
+            ]
+            if skip_docker_pull:
+                cmd.append("-SkipDockerPull")
+            proc = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=1800,
+                check=False,
+                creationflags=CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0,
+            )
+            self._ensure_docker_host_loopback_bypass()
+            return {
+                "installed": (self.raptor_root / "raptor.py").exists(),
+                "raptor_root": str(self.raptor_root),
+                "returncode": proc.returncode,
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+            }
+        self._ensure_docker_host_loopback_bypass()
+        return {
+            "installed": (self.raptor_root / "raptor.py").exists(),
+            "raptor_root": str(self.raptor_root),
+        }
+
+    def _resolve_invoke_script(self) -> Path:
+        """Returns the RAPTOR PowerShell launcher, auto-bootstrapping if missing."""
+        if not (self.raptor_root / "raptor.py").exists():
+            self.on_trace(f"[*] RAPTOR not found at {self.raptor_root}. Bootstrapping automatically...")
+            self.ensure_installed()
+        if self.INVOKE_SCRIPT.exists():
+            return self.INVOKE_SCRIPT
+        if self.REPO_INVOKE_SCRIPT.exists():
+            return self.REPO_INVOKE_SCRIPT
+        return self.INVOKE_SCRIPT
 
     def _ensure_docker_host_loopback_bypass(self) -> None:
         """
@@ -181,7 +238,8 @@ class RaptorIntegrator:
             return {"error": f"Target path {target} does not exist."}
 
         self.on_trace(f"[*] RAPTOR Target Profiler running on: {target}")
-        ps_script = self.INVOKE_SCRIPT
+        self._ensure_docker_host_loopback_bypass()
+        ps_script = self._resolve_invoke_script()
         if not ps_script.exists():
             return {"error": f"RAPTOR helper script {ps_script} not found."}
 
@@ -259,7 +317,7 @@ class RaptorIntegrator:
         self.on_trace(f"    Framework      : {RAPTOR_PROJECT_TITLE} (Authors: {RAPTOR_AUTHORS})")
         self.on_trace(f"{'='*75}\n")
 
-        ps_script = self.INVOKE_SCRIPT
+        ps_script = self._resolve_invoke_script()
         cmd = [
             "powershell",
             "-ExecutionPolicy",
@@ -356,7 +414,7 @@ class RaptorIntegrator:
         self.on_trace(f"    Authors        : {RAPTOR_AUTHORS}")
         self.on_trace(f"{'='*75}\n")
 
-        ps_script = self.INVOKE_SCRIPT
+        ps_script = self._resolve_invoke_script()
         cmd = [
             "powershell",
             "-ExecutionPolicy",
