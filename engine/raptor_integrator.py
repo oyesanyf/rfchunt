@@ -74,6 +74,37 @@ class RaptorIntegrator:
         self.db = db
         self.on_trace = on_trace or (lambda msg: print(msg, flush=True))
 
+    def _ensure_docker_host_loopback_bypass(self) -> None:
+        """
+        Ensures RAPTOR's in-process egress proxy treats 'host.docker.internal' as a local
+        loopback bypass so plain-HTTP Ollama requests from inside Docker do not fail with
+        HTTP 400 at the CONNECT-only proxy chokepoint.
+        """
+        egress_py = self.raptor_root / "core" / "llm" / "egress.py"
+        if egress_py.exists():
+            try:
+                txt = egress_py.read_text(encoding="utf-8")
+                if '"host.docker.internal"' not in txt and '"localhost", "127.0.0.1", "::1", "0.0.0.0",' in txt:
+                    txt = txt.replace(
+                        '"localhost", "127.0.0.1", "::1", "0.0.0.0",',
+                        '"localhost", "127.0.0.1", "::1", "0.0.0.0", "host.docker.internal",',
+                    )
+                    egress_py.write_text(txt, encoding="utf-8")
+            except Exception:
+                pass
+        detection_py = self.raptor_root / "core" / "llm" / "detection.py"
+        if detection_py.exists():
+            try:
+                txt = detection_py.read_text(encoding="utf-8")
+                if '"host.docker.internal"' not in txt and 'if host in ("localhost", "0.0.0.0"):' in txt:
+                    txt = txt.replace(
+                        'if host in ("localhost", "0.0.0.0"):',
+                        'if host in ("localhost", "0.0.0.0", "host.docker.internal"):',
+                    )
+                    detection_py.write_text(txt, encoding="utf-8")
+            except Exception:
+                pass
+
     @staticmethod
     def get_attribution_banner() -> str:
         """Returns the formal credit and attribution text for the RAPTOR framework."""
@@ -209,6 +240,7 @@ class RaptorIntegrator:
 
         if mode == "full":
             mode = "all"
+        self._ensure_docker_host_loopback_bypass()
         if model and not re.match(
             r"^(ollama|anthropic|openai|gemini|google|mistral|cohere|bedrock|openrouter|together|groq|fireworks|deepinfra)/",
             model,
