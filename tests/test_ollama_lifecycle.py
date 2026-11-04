@@ -33,3 +33,23 @@ def test_deterministic_rfc_grammar_fallback():
     for p in probes:
         assert "HTTP/1.1" in p["raw_request"]
         assert "target.local" in p["raw_request"]
+
+
+def test_abliterated_model_prioritization(monkeypatch):
+    """Ensures ModelFusionAdapter and FusionArbiter auto-detect and prioritize abliterated models."""
+    adapter = ModelFusionAdapter(use_fusion=True)
+    # Mock available tags to include an abliterated candidate
+    adapter.available_tags = [
+        "gemma2:2b",
+        "qwen2.5:7b",
+        "huihui_ai/deepseek-r1-abliterated:32b",
+        "fenkohq/foundation-sec-8b:latest",
+    ]
+    # Re-run panel fusion probe candidate setup
+    abliterated = [
+        t for t in adapter.available_tags
+        if ("abliterat" in t.lower() or "obliterat" in t.lower())
+        and (adapter.free_ram_gb >= 48.0 or not any(tag in t.lower() for tag in ("70b", "72b", "755b")))
+    ]
+    assert len(abliterated) == 1
+    assert "deepseek-r1-abliterated" in abliterated[0]

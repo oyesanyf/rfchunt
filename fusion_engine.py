@@ -95,15 +95,24 @@ class FusionArbiter:
         self.free_ram_gb = self._get_free_memory_gb()
         sized_qwen = self._size_qwen_for_free_memory(self.free_ram_gb)
 
-        # Dynamic Model Assignment: Foundation-Sec-8B is the primary Security/Boundary Specialist
+        # Dynamic Model Assignment: Priority to Abliterated models & Foundation-Sec-8B for Exploit/Boundary Specialist
         self.gemma_model = self._resolve_model(["gemma2:2b", "gemma2:9b", sized_qwen], fallback="gemma2:2b")
         if sec_model:
             self.sec_model = sec_model
         else:
-            self.sec_model = self._resolve_model(
-                ["fenkohq/foundation-sec-8b:latest", sized_qwen, "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "strix-qwen:latest"],
-                fallback="fenkohq/foundation-sec-8b:latest",
-            )
+            # Check for refusal-direction ablated / OBLITERATUS models in Ollama first (zero-refusal exploit synthesis)
+            abliterated_candidates = [
+                t for t in self.available_tags
+                if ("abliterat" in t.lower() or "obliterat" in t.lower())
+                and (self.free_ram_gb >= 48.0 or not any(tag in t.lower() for tag in ("70b", "72b", "755b")))
+            ]
+            if abliterated_candidates:
+                self.sec_model = abliterated_candidates[0]
+            else:
+                self.sec_model = self._resolve_model(
+                    ["fenkohq/foundation-sec-8b:latest", sized_qwen, "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "strix-qwen:latest"],
+                    fallback="fenkohq/foundation-sec-8b:latest",
+                )
         self.arbiter_model = self._resolve_model(
             ["deepseek-r1:1.5b", sized_qwen, "gemma2:2b", "strix-deepseek:latest"],
             fallback="deepseek-r1:1.5b",

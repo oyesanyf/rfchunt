@@ -205,15 +205,24 @@ class ModelFusionAdapter:
         if hasattr(self, "sec_model") and self.sec_model:
             sec_model = self.sec_model
         else:
-            sec_model = "fenkohq/foundation-sec-8b:latest"
-            for tag in ["fenkohq/foundation-sec-8b:latest", self.sized_qwen, "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "deepseek-r1:1.5b"]:
-                matched = [t for t in self.available_tags if tag == t or tag.split(":")[0] in t]
-                if matched:
-                    cand_tag = matched[0]
-                    if self.free_ram_gb < 24.0 and any(h in cand_tag for h in ("32b", "70b", "strix-deepseek")):
-                        continue
-                    sec_model = cand_tag
-                    break
+            # Priority 1: Check for refusal-direction ablated / OBLITERATUS models in Ollama (zero-refusal exploit synthesis)
+            abliterated_candidates = [
+                t for t in self.available_tags
+                if ("abliterat" in t.lower() or "obliterat" in t.lower())
+                and (self.free_ram_gb >= 48.0 or not any(tag in t.lower() for tag in ("70b", "72b", "755b")))
+            ]
+            if abliterated_candidates:
+                sec_model = abliterated_candidates[0]
+            else:
+                sec_model = "fenkohq/foundation-sec-8b:latest"
+                for tag in ["fenkohq/foundation-sec-8b:latest", self.sized_qwen, "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "deepseek-r1:1.5b"]:
+                    matched = [t for t in self.available_tags if tag == t or tag.split(":")[0] in t]
+                    if matched:
+                        cand_tag = matched[0]
+                        if self.free_ram_gb < 24.0 and any(h in cand_tag for h in ("32b", "70b", "strix-deepseek")):
+                            continue
+                        sec_model = cand_tag
+                        break
 
         fusion_panel = []
         if gemma_model:

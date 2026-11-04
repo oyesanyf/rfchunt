@@ -83,14 +83,18 @@ flowchart TD
 
 1. **Micro-Inspiration Engine**: Normative RFC specifications are split into isolated 1–3 sentence grammatical clues. Zero buzzwords (*"desync"*, *"smuggling"*) are used in prompts, forcing models to derive state-machine anomalies from first principles.
 2. **ModelFusion Consensus Panel**: Runs 100% locally via Ollama without cloud token costs:
-   - **Protocol Specialist**: `gemma2:2b`
-   - **Exploit Boundary Specialist**: `fenkohq/foundation-sec-8b:latest` (or `qwen2.5:7b`)
-   - **Reasoning Arbiter**: `deepseek-r1:1.5b`
-3. **3-Step Canary Evaluation Primitive**: Probes persistent TCP connections directly:
+   - **Protocol Specialist**: `gemma2:2b` (state machine & RFC grammar specialist)
+   - **Exploit Boundary Specialist**: **Abliterated / OBLITERATUS Models** (e.g. `huihui_ai/deepseek-r1-abliterated:32b`, `huihui_ai/qwen2.5-coder-abliterated:32b`) or Cisco `fenkohq/foundation-sec-8b:latest` / `qwen2.5:32b`
+   - **Reasoning Arbiter**: `deepseek-r1:1.5b` (or `strix-deepseek:latest` / `deepseek-r1:32b`)
+3. **Abliterated & OBLITERATUS Security Models Support**:
+   - Refusal-direction ablated models (`failspy` orthogonal projection method) are natively supported across RFC probe generation, Protocol Ruler differential fuzzing, and RAPTOR agentic source code triage.
+   - Eliminates false refusals when synthesizing raw, malformed network payloads, non-standard CRLF/NUL sequences, and HTTP desync canaries.
+   - Automatically detected and prioritized as the primary `sec_model` when installed in Ollama.
+4. **3-Step Canary Evaluation Primitive**: Probes persistent TCP connections directly:
    - **REQ 1**: Baseline measurement on clean socket channel.
    - **REQ 2**: Attacker probe with canary marker or trailing boundary bytes.
    - **REQ 3**: Pipelined canary request to detect cross-connection / pipeline state contamination.
-4. **Autonomous Discovery Cascade**: Confirmed vulnerabilities are automatically generalized into second-order hypotheses (e.g. *Shared-Parser Confusion*, *Response Forking*, *Dangling-Byte Queue Poisoning*).
+5. **Autonomous Discovery Cascade**: Confirmed vulnerabilities are automatically generalized into second-order hypotheses (e.g. *Shared-Parser Confusion*, *Response Forking*, *Dangling-Byte Queue Poisoning*).
 
 ---
 
@@ -281,6 +285,15 @@ python main.py build --skip-tests
 python -u rfc_hunt_swarm.py --mode corpus --sec-model qwen2.5:7b --timeout 300
 ```
 
+### 8. Zero-Refusal Protocol Fuzzing with Abliterated Models
+```bash
+# Explicitly pass an abliterated / OBLITERATUS model for zero-refusal raw packet & desync synthesis:
+python -u rfc_hunt_swarm.py --mode single --rfc 9112 --sec-model huihui_ai/deepseek-r1-abliterated:32b --host target.example.com --port 443 --tls
+
+# Run RAPTOR agentic source code triage with an abliterated model:
+python -u rfc_hunt_swarm.py raptor --repo D:\path\to\target --raptor-mode agentic --model ollama/huihui_ai/deepseek-r1-abliterated:32b
+```
+
 ---
 
 ## Exhaustive CLI Flag & Parameter Reference
@@ -311,7 +324,7 @@ The main entrypoint executing the 16-module LangGraph autonomous research swarm.
 | `--raptor` | `flag` | `False` | Enables RAPTOR Autonomous Framework (`web`, `scan`, `agentic`, `crypto`, `sca`). |
 | `--cycles` | `integer` | `3` | Maximum mutation and permutation cycles executed per RFC. |
 | `--timeout` | `float` | `900.0` | Process-scoped Ollama inference timeout in seconds (900s = 15m). Set to `0` for unlimited timeout on heavy models. |
-| `--sec-model` | `string` | `None` | Secondary security model for ModelFusion (e.g. `qwen2.5:7b`, `fenkohq/foundation-sec-8b:latest`, `deepseek-r1:1.5b`). |
+| `--sec-model` | `string` | `None` | Secondary security model for ModelFusion (e.g. `huihui_ai/deepseek-r1-abliterated:32b`, `fenkohq/foundation-sec-8b:latest`, `qwen2.5:32b`). Auto-detects installed abliterated models when omitted. |
 | `--debug` | `flag` | `False` | Enables James Kettle evaluation trace printing: socket status, `[REQ 1]` baseline, `[REQ 2]` probe, `[REQ 3]` canary, and compressed wire bytes. |
 | `--show-response`| `flag` | `False` | Prints sanitized host response status lines and protocol headers (`Server`, `Content-Type`, `Connection`) while filtering HTML noise. |
 | `-v`, `--verbose`| `flag` | `False` | Enables full verbose telemetry, showing raw unsanitized response bodies and socket pipeline metrics. |
