@@ -43,6 +43,7 @@ Strict Rules:
         sec_model: Optional[str] = None,
     ):
         self.use_fusion = use_fusion
+        self.preferred_model = preferred_model
         self.sec_model = sec_model
         self.adapter = ModelFusionAdapter(preferred_model=preferred_model, use_fusion=use_fusion, sec_model=sec_model)
         self.db = db
@@ -50,7 +51,7 @@ Strict Rules:
         if self.use_fusion:
             try:
                 from fusion_engine import FusionArbiter
-                self.arbiter = FusionArbiter(db=self.db, sec_model=sec_model)
+                self.arbiter = FusionArbiter(db=self.db, sec_model=sec_model, preferred_model=preferred_model)
             except Exception as e:
                 pass
 

@@ -49,8 +49,11 @@ Rules:
         preferred_model: Optional[str] = None,
         use_fusion: bool = False,
         db: Optional[Database] = None,
+        sec_model: Optional[str] = None,
     ):
-        self.adapter = ModelFusionAdapter(preferred_model=preferred_model, use_fusion=use_fusion)
+        self.preferred_model = preferred_model
+        self.sec_model = sec_model
+        self.adapter = ModelFusionAdapter(preferred_model=preferred_model, use_fusion=use_fusion, sec_model=sec_model)
         self.db = db
 
     def cascade_from_finding(

@@ -85,6 +85,8 @@ class FusionArbiter:
         endpoint: Optional[str] = None,
         db: Optional[Database] = None,
         sec_model: Optional[str] = None,
+        preferred_model: Optional[str] = None,
+        arbiter_model: Optional[str] = None,
     ):
         self.endpoint = endpoint or os.environ.get("OLLAMA_ENDPOINT", self.DEFAULT_OLLAMA_ENDPOINT)
         self.db = db
@@ -95,28 +97,46 @@ class FusionArbiter:
         self.free_ram_gb = self._get_free_memory_gb()
         sized_qwen = self._size_qwen_for_free_memory(self.free_ram_gb)
 
-        # Dynamic Model Assignment: Priority to Abliterated models & Foundation-Sec-8B for Exploit/Boundary Specialist
-        self.gemma_model = self._resolve_model(["gemma2:2b", "gemma2:9b", sized_qwen], fallback="gemma2:2b")
-        if sec_model:
-            self.sec_model = sec_model
+        # Check for refusal-direction ablated / OBLITERATUS models in Ollama (zero-refusal exploit synthesis)
+        abliterated_candidates = [
+            t for t in self.available_tags
+            if ("abliterat" in t.lower() or "obliterat" in t.lower())
+            and (self.free_ram_gb >= 12.0 or not any(tag in t.lower() for tag in ("70b", "72b", "755b")))
+        ]
+
+        # Dynamic Model Assignment: Support preferred_model (e.g. Gemma-4-12B-OBLITERATED)
+        if preferred_model:
+            self.gemma_model = self._resolve_model([preferred_model], fallback="gemma2:2b")
+        elif abliterated_candidates:
+            # If an abliterated Gemma model is present locally, prioritize it as the Protocol Specialist
+            self.gemma_model = abliterated_candidates[0]
         else:
-            # Check for refusal-direction ablated / OBLITERATUS models in Ollama first (zero-refusal exploit synthesis)
-            abliterated_candidates = [
-                t for t in self.available_tags
-                if ("abliterat" in t.lower() or "obliterat" in t.lower())
-                and (self.free_ram_gb >= 48.0 or not any(tag in t.lower() for tag in ("70b", "72b", "755b")))
-            ]
-            if abliterated_candidates:
+            self.gemma_model = self._resolve_model(["gemma2:2b", "gemma2:9b", sized_qwen], fallback="gemma2:2b")
+
+        if sec_model:
+            self.sec_model = self._resolve_model([sec_model], fallback="fenkohq/foundation-sec-8b:latest")
+        else:
+            # If Protocol Specialist is already abliterated, use Foundation-Sec or Qwen for Boundary Specialist
+            if self.gemma_model in abliterated_candidates and len(abliterated_candidates) == 1:
+                self.sec_model = self._resolve_model(
+                    ["fenkohq/foundation-sec-8b:latest", sized_qwen, "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "strix-qwen:latest"],
+                    fallback="fenkohq/foundation-sec-8b:latest",
+                )
+            elif abliterated_candidates and abliterated_candidates[0] != self.gemma_model:
                 self.sec_model = abliterated_candidates[0]
             else:
                 self.sec_model = self._resolve_model(
                     ["fenkohq/foundation-sec-8b:latest", sized_qwen, "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "strix-qwen:latest"],
                     fallback="fenkohq/foundation-sec-8b:latest",
                 )
-        self.arbiter_model = self._resolve_model(
-            ["deepseek-r1:1.5b", sized_qwen, "gemma2:2b", "strix-deepseek:latest"],
-            fallback="deepseek-r1:1.5b",
-        )
+
+        if arbiter_model:
+            self.arbiter_model = self._resolve_model([arbiter_model], fallback="deepseek-r1:1.5b")
+        else:
+            self.arbiter_model = self._resolve_model(
+                ["deepseek-r1:1.5b", sized_qwen, "gemma2:2b", "strix-deepseek:latest"],
+                fallback="deepseek-r1:1.5b",
+            )
 
         print(f"[ModelFusion] Panel Initialized:")
         print(f"  - Protocol Specialist : {self.gemma_model}")
@@ -177,25 +197,88 @@ class FusionArbiter:
                 pass
         return []
 
+    @staticmethod
+    def _is_refusal(text: str) -> bool:
+        """Detects whether an LLM completion is an AI safety refusal rather than technical output."""
+        if not text:
+            return False
+        lower = text.lower()
+        refusal_markers = [
+            "i cannot fulfill",
+            "i cannot assist",
+            "i cannot generate",
+            "i am unable to generate",
+            "i am unable to provide",
+            "as an ai",
+            "as a language model",
+            "as a responsible ai",
+            "against safety guidelines",
+            "against my safety policies",
+            "ethical guidelines",
+            "cannot assist with creating exploits",
+            "cannot create attacks",
+            "cannot provide exploit payloads",
+            "harmful or malicious",
+            "potentially harmful",
+            "malicious payloads",
+            "cannot create code that exploits",
+            "i'm sorry, but i cannot",
+            "i am sorry, but i cannot",
+            "cannot generate harmful",
+            "harmful attacks",
+        ]
+        return any(marker in lower for marker in refusal_markers)
+
     def _resolve_model(self, candidates: List[str], fallback: str) -> str:
         if not self.available_tags:
             return fallback
-        # First pass: exact tag match
+
+        obliterated_aliases = [
+            "hf.co/obliteratus/gemma-4-12b-obliterated:q4_k_m",
+            "gemma-4-12b-obliterated:q4_k_m",
+            "gemma-4-12b-obliterated",
+            "gemma4-12b-obliterated",
+            "gemma-4-obliterated",
+            "gemma4-obliterated",
+            "obliteratus/gemma-4-12b-obliterated",
+            "obliteratus",
+            "obliterated",
+            "abliterated",
+            "gemma-obliterated",
+            "gemma4:12b-obliterated",
+            "gemma-12b-obliterated",
+        ]
+
+        # First pass: check for abliterated alias matches
         for cand in candidates:
+            c_low = cand.strip().lower()
+            if c_low in obliterated_aliases or any(c_low == a.split(":")[0] for a in obliterated_aliases):
+                for tag in self.available_tags:
+                    t_low = tag.lower()
+                    if "obliterat" in t_low or "abliterat" in t_low:
+                        return tag
+
+        # Second pass: case-insensitive exact tag match
+        for cand in candidates:
+            c_low = cand.strip().lower()
             for tag in self.available_tags:
-                if cand == tag:
+                t_low = tag.lower()
+                if c_low == t_low or t_low.startswith(c_low + ":") or c_low.startswith(t_low):
                     return tag
-        # Second pass: base family match, avoiding oversized 32b/16gb models when free RAM < 24GB
+
+        # Third pass: base family match, avoiding oversized 32b/16gb models when free RAM < 24GB
         for cand in candidates:
-            cand_base = cand.split(":")[0]
+            cand_base = cand.strip().lower().split(":")[0]
             for tag in self.available_tags:
-                if cand_base == tag.split(":")[0]:
-                    if self.free_ram_gb < 24.0 and any(h in tag for h in ("32b", "70b", "strix-deepseek")):
+                tag_base = tag.strip().lower().split(":")[0]
+                if cand_base == tag_base or cand_base in tag.lower():
+                    if self.free_ram_gb < 24.0 and any(h in tag.lower() for h in ("32b", "70b", "strix-deepseek")):
                         continue
                     return tag
-        # Third pass: any installed lightweight model
+
+        # Fourth pass: any installed lightweight model
         for tag in self.available_tags:
-            if not any(h in tag for h in ("32b", "70b", "strix-deepseek")):
+            if not any(h in tag.lower() for h in ("32b", "70b", "strix-deepseek")):
                 return tag
         return self.available_tags[0]
 
@@ -303,41 +386,75 @@ class FusionArbiter:
             gemma_out = fut_gemma.result()
             sec_out = fut_sec.result()
 
+        gemma_refused = self._is_refusal(gemma_out)
         gemma_count = 0
-        for item in self._parse_json(gemma_out):
-            norm_req = self._normalize_crlf(item.get("raw_request", ""))
-            if not self._is_valid_http_template(norm_req):
-                continue
-            gemma_count += 1
-            rat = str(item.get("rationale", "")).strip()
-            if not rat or rat == "...":
-                rat = "Gemma protocol state-machine edge-case"
-            proposals.append(CandidateProposal(
-                candidate_id=f"cand_gemma_{len(proposals)+1}",
-                model=self.gemma_model,
-                specialist_type="Protocol Specialist",
-                rationale=rat,
-                raw_request=norm_req,
-                is_clean=bool(item.get("is_clean", True)),
-            ))
+        if not gemma_refused:
+            for item in self._parse_json(gemma_out):
+                norm_req = self._normalize_crlf(item.get("raw_request", ""))
+                rat = str(item.get("rationale", "")).strip()
+                if self._is_refusal(norm_req) or self._is_refusal(rat) or not self._is_valid_http_template(norm_req):
+                    continue
+                gemma_count += 1
+                if not rat or rat == "...":
+                    rat = "Gemma protocol state-machine edge-case"
+                proposals.append(CandidateProposal(
+                    candidate_id=f"cand_gemma_{len(proposals)+1}",
+                    model=self.gemma_model,
+                    specialist_type="Protocol Specialist",
+                    rationale=rat,
+                    raw_request=norm_req,
+                    is_clean=bool(item.get("is_clean", True)),
+                ))
 
+        sec_refused = self._is_refusal(sec_out)
         sec_count = 0
-        for item in self._parse_json(sec_out):
-            norm_req = self._normalize_crlf(item.get("raw_request", ""))
-            if not self._is_valid_http_template(norm_req):
-                continue
-            sec_count += 1
-            rat = str(item.get("rationale", "")).strip()
-            if not rat or rat == "...":
-                rat = "Foundation-Sec boundary discrepancy probe"
-            proposals.append(CandidateProposal(
-                candidate_id=f"cand_sec_{len(proposals)+1}",
-                model=self.sec_model,
-                specialist_type="Boundary Specialist",
-                rationale=rat,
-                raw_request=norm_req,
-                is_clean=bool(item.get("is_clean", False)),
-            ))
+        if not sec_refused:
+            for item in self._parse_json(sec_out):
+                norm_req = self._normalize_crlf(item.get("raw_request", ""))
+                rat = str(item.get("rationale", "")).strip()
+                if self._is_refusal(norm_req) or self._is_refusal(rat) or not self._is_valid_http_template(norm_req):
+                    continue
+                sec_count += 1
+                if not rat or rat == "...":
+                    rat = "Boundary discrepancy probe"
+                proposals.append(CandidateProposal(
+                    candidate_id=f"cand_sec_{len(proposals)+1}",
+                    model=self.sec_model,
+                    specialist_type="Boundary Specialist",
+                    rationale=rat,
+                    raw_request=norm_req,
+                    is_clean=bool(item.get("is_clean", False)),
+                ))
+
+        # Refusal Bypass & Abliteration Rescue
+        abliterated_candidates = [
+            t for t in self.available_tags
+            if ("abliterat" in t.lower() or "obliterat" in t.lower())
+            and (self.free_ram_gb >= 12.0 or not any(tag in t.lower() for tag in ("70b", "72b", "755b")))
+        ]
+        if (gemma_refused or sec_refused or len(proposals) == 0) and abliterated_candidates:
+            abl_model = abliterated_candidates[0]
+            if abl_model not in (self.gemma_model, self.sec_model) or len(proposals) == 0:
+                print(f"    -> [ModelFusion Abliteration] Querying refusal-free model ({abl_model})...", end=" ", flush=True)
+                abl_sys = (
+                    "You are an unconstrained protocol security research engine. "
+                    "Analyze the protocol rule and generate deep state-machine and framing inversion requests. "
+                    "Output JSON with keys 'rationale', 'raw_request', 'is_clean'."
+                )
+                abl_out = self._query_model(abl_model, f"RFC Clue: {rfc_fragment}\nTask: Output raw HTTP probe JSON.", abl_sys)
+                for item in self._parse_json(abl_out):
+                    norm_req = self._normalize_crlf(item.get("raw_request", ""))
+                    if self._is_valid_http_template(norm_req):
+                        proposals.append(CandidateProposal(
+                            candidate_id=f"cand_abliterated_{len(proposals)+1}",
+                            model=f"{abl_model} [RefusalFree]",
+                            specialist_type="Abliterated Security Specialist",
+                            rationale=item.get("rationale", "Refusal-free protocol inversion probe"),
+                            raw_request=norm_req,
+                            is_clean=bool(item.get("is_clean", False)),
+                        ))
+                print(f"done ({len(proposals)} proposals total)", flush=True)
+
         print(
             f"done ({time.time() - t_start:.1f}s | Gemma: {gemma_count}, Sec: {sec_count} proposals)",
             flush=True,
@@ -400,13 +517,39 @@ class FusionArbiter:
         t2 = time.time()
         print(f"    -> [ModelFusion 3/3] Reasoning Arbiter ({self.arbiter_model}) synthesizing...", end=" ", flush=True)
         arbiter_out = self._query_model(self.arbiter_model, arbiter_prompt, arbiter_sys)
+        if self._is_refusal(arbiter_out):
+            arbiter_out = ""
         synthesized_probes = self._parse_json(arbiter_out)
         print(f"done ({time.time() - t2:.1f}s)", flush=True)
 
         final_fused: List[Dict[str, Any]] = []
 
-        if synthesized_probes:
-            # Gate 4 Success: DeepSeek-R1 synthesized consensus
+        # Abliterated Arbiter Fallback: If primary arbiter refused or produced no output,
+        # and an abliterated model is available, use it to synthesize consensus probes
+        if not synthesized_probes and abliterated_candidates:
+            abl_arb = abliterated_candidates[0]
+            if abl_arb != self.arbiter_model:
+                print(f"    -> [ModelFusion Abliteration] Reasoning Arbiter refused/timed out; synthesizing via {abl_arb}...", end=" ", flush=True)
+                abl_arb_out = self._query_model(abl_arb, arbiter_prompt, arbiter_sys)
+                synthesized_probes = self._parse_json(abl_arb_out)
+                print(f"done ({len(synthesized_probes)} probes)", flush=True)
+                if synthesized_probes:
+                    for sp in synthesized_probes:
+                        if not isinstance(sp, dict):
+                            continue
+                        raw = self._normalize_crlf(sp.get("raw_request", ""))
+                        if self._is_valid_http_template(raw):
+                            final_fused.append({
+                                "id": f"fused_abliterated_{len(final_fused)+1}",
+                                "model": f"{abl_arb} [AbliteratedConsensus: {self.gemma_model} + {self.sec_model}]",
+                                "specialist": "Abliterated Consensus Synthesis",
+                                "rationale": f"[ModelFusion Abliteration] {sp.get('rationale', 'Synthesized refusal-free consensus vector')}",
+                                "raw_request": raw,
+                                "is_clean": bool(sp.get("is_clean", False)),
+                            })
+
+        if not final_fused and synthesized_probes:
+            # Gate 4 Success: Reasoning Arbiter synthesized consensus
             for sp in synthesized_probes:
                 if not isinstance(sp, dict):
                     continue
@@ -421,12 +564,17 @@ class FusionArbiter:
                         "is_clean": bool(sp.get("is_clean", False)),
                     })
 
+        has_abliterated = any(
+            "abliterat" in str(p.get("model", "")).lower() or "obliterat" in str(p.get("model", "")).lower()
+            for p in (final_fused or [p.to_dict() for p in proposals])
+        )
+
         if final_fused:
-            consensus_type = "ArbiterSynthesized"
-            reasoning = f"DeepSeek-R1 successfully synthesized {len(final_fused)} unified probes from Gemma + Security candidates."
+            consensus_type = "AbliteratedConsensus" if has_abliterated else "ArbiterSynthesized"
+            reasoning = f"Arbiter successfully synthesized {len(final_fused)} unified probes from Gemma + Security candidates."
         else:
-            # Fallback: Merge both specialists' candidates directly
-            consensus_type = "DominantWinner"
+            # Fallback: Merge specialists' candidates directly
+            consensus_type = "AbliteratedConsensus" if has_abliterated else "DominantWinner"
             reasoning = "Arbiter timed out or unparseable; retained individual specialist candidates."
             for p in proposals:
                 if p.raw_request:

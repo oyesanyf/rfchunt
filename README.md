@@ -324,6 +324,8 @@ The main entrypoint executing the 16-module LangGraph autonomous research swarm.
 | `--raptor` | `flag` | `False` | Enables RAPTOR Autonomous Framework (`web`, `scan`, `agentic`, `crypto`, `sca`). |
 | `--cycles` | `integer` | `3` | Maximum mutation and permutation cycles executed per RFC. |
 | `--timeout` | `float` | `900.0` | Process-scoped Ollama inference timeout in seconds (900s = 15m). Set to `0` for unlimited timeout on heavy models. |
+| `--model` | `string` | `gemma2:2b` | Primary base model for micro-inspiration generation (e.g. `hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`, `gemma-4-12b-obliterated`, `qwen2.5:7b`). |
+| `--abliteration` / `--obliterated` | `flag` | `False` | Forces refusal-free abliterated model (`hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`) across the ModelFusion panel to bypass AI safety refusals. |
 | `--sec-model` | `string` | `None` | Secondary security model for ModelFusion (e.g. `huihui_ai/deepseek-r1-abliterated:32b`, `fenkohq/foundation-sec-8b:latest`, `qwen2.5:32b`). Auto-detects installed abliterated models when omitted. |
 | `--debug` | `flag` | `False` | Enables James Kettle evaluation trace printing: socket status, `[REQ 1]` baseline, `[REQ 2]` probe, `[REQ 3]` canary, and compressed wire bytes. |
 | `--show-response`| `flag` | `False` | Prints sanitized host response status lines and protocol headers (`Server`, `Content-Type`, `Connection`) while filtering HTML noise. |
@@ -357,7 +359,8 @@ Modular toolkit providing discrete CLI commands for each phase of the research f
 | Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `--db` | `string` | `terminator.db` | SQLite database file for persisting findings and states. |
-| `--model` | `string` | `gemma2:2b` | Primary base LLM model for micro-inspiration generation. |
+| `--model` | `string` | `gemma2:2b` | Primary base LLM model for micro-inspiration generation (e.g. `hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`, `gemma-4-12b-obliterated`). |
+| `--abliteration` / `--obliterated` | `flag` | `False` | Forces refusal-free abliterated model (`hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`) across the ModelFusion panel. |
 | `--no-fusion` | `flag` | `False` | Disables multi-model consensus panel, running single generator model only. |
 
 #### Subcommands

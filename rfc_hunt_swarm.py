@@ -262,6 +262,8 @@ class ProtocolResearchSwarm:
         debug: bool = False,
         concurrency: int = 8,
         terminator_categories: Optional[List[str]] = None,
+        preferred_model: Optional[str] = None,
+        use_fusion: bool = True,
     ):
         host = re.sub(r"^https?://", "", str(host).strip(), flags=re.IGNORECASE).split("/")[0]
         if ":" in host and not host.startswith("["):
@@ -274,6 +276,8 @@ class ProtocolResearchSwarm:
         self.verbose = verbose or debug
         self.concurrency = max(1, concurrency)
         self.terminator_categories = terminator_categories
+        self.preferred_model = preferred_model or "gemma2:2b"
+        self.use_fusion = use_fusion
         self.probe_semaphore = threading.BoundedSemaphore(self.concurrency)
         self.llm_semaphore = threading.BoundedSemaphore(1)
         
@@ -281,9 +285,9 @@ class ProtocolResearchSwarm:
         self.db_path = db_path
         self.db = Database(db_path)
         self.fetcher = RFCFetcher(db=self.db)
-        self.generator = ProbeGenerator(preferred_model="gemma2:2b", use_fusion=True, db=self.db, sec_model=sec_model)
+        self.generator = ProbeGenerator(preferred_model=self.preferred_model, use_fusion=self.use_fusion, db=self.db, sec_model=sec_model)
         self.permutator = VectorPermutator(db=self.db)
-        self.cascade_engine = DiscoveryCascade(preferred_model="gemma2:2b", use_fusion=True, db=self.db)
+        self.cascade_engine = DiscoveryCascade(preferred_model=self.preferred_model, use_fusion=self.use_fusion, db=self.db, sec_model=sec_model)
         self.forensics = ForensicLogger(target_host=host, target_port=port)
         
         # The 12 Protocol Research Modules
@@ -2173,7 +2177,8 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--all-active", action="store_true", help="Shortcut to scan all active IETF protocol specifications")
     parser.add_argument("--cycles", type=int, default=3, help="Max mutation cycles to run per RFC")
     parser.add_argument("--timeout", type=float, default=900.0, help="Ollama LLM inference timeout in seconds (default: 900.0 = 15m; 0 for unlimited)")
-    parser.add_argument("--model", type=str, default="gemma2:2b", help="Preferred primary base model (default: gemma2:2b)")
+    parser.add_argument("--model", type=str, default="gemma2:2b", help="Preferred primary base model (e.g. hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M, gemma2:2b, qwen2.5:7b)")
+    parser.add_argument("--abliteration", "--obliterated", dest="abliteration", action="store_true", default=False, help="Force refuse-free abliterated model (hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M) across ModelFusion panel")
     parser.add_argument("--sec-model", type=str, default=None, help="Secondary security specialist model (e.g. fenkohq/foundation-sec-8b:latest, qwen2.5:7b, strix-qwen:latest)")
     parser.add_argument("--no-fusion", dest="fusion", action="store_false", default=True, help="Disable multi-model panel fusion")
     parser.add_argument("--db", type=str, default="terminator.db", help="SQLite database path (default: terminator.db)")
@@ -2701,6 +2706,9 @@ def main_swarm(argv=None):
                     print(f"[!] Could not auto-start local Test Lab Server on {t_host}:{t_port}: {e}")
                     bg_lab_server = None
 
+        if getattr(args, "abliteration", False):
+            args.model = "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"
+
         if active_mode == "hunt" or args.comb_only:
             from continuous_scanner import ContinuousFlawHunter
             kw_list = [k.strip() for k in args.keywords.split(",") if k.strip()] if args.keywords else None
@@ -2738,6 +2746,9 @@ def main_swarm(argv=None):
             print("[*] Deep Swarm Debug Mode: ENABLED (Live Host Responses + Pipeline Telemetry)")
         elif args.show_response or args.verbose:
             print("[*] Live Host Response Printing: ENABLED")
+        if getattr(args, "abliteration", False):
+            args.model = "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"
+
         swarm = ProtocolResearchSwarm(
             host=t_host,
             port=t_port,
@@ -2749,6 +2760,8 @@ def main_swarm(argv=None):
             debug=args.debug,
             concurrency=args.concurrency,
             terminator_categories=term_cats,
+            preferred_model=args.model,
+            use_fusion=args.fusion,
         )
         graph = swarm.build_graph()
 

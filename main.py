@@ -539,7 +539,9 @@ USAGE EXAMPLES:
     parser.add_argument("--clean-db", action="store_true", help="Clean the SQLite database (truncate transient tables and VACUUM) before running")
     parser.add_argument("--keep-rfcs-on-clean", "--keep-rfcs", dest="keep_rfcs_on_clean", action="store_true", help="Retain cached RFC specifications when cleaning the database")
     parser.add_argument("--keep-findings-on-clean", "--keep-findings", dest="keep_findings_on_clean", action="store_true", help="Retain confirmed findings when cleaning the database")
-    parser.add_argument("--model", default="gemma2:2b", help="Preferred base model (e.g. gemma2:2b, gemma2:9b, qwen2.5:7b)")
+    parser.add_argument("--model", default="gemma2:2b", help="Preferred base model (e.g. hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M, gemma2:2b, qwen2.5:7b)")
+    parser.add_argument("--sec-model", default=None, help="Secondary security specialist model (e.g. fenkohq/foundation-sec-8b:latest, qwen2.5:7b)")
+    parser.add_argument("--abliteration", "--obliterated", dest="abliteration", action="store_true", default=False, help="Force refuse-free abliterated model (hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M) across ModelFusion panel")
     parser.add_argument("--no-fusion", dest="fusion", action="store_false", help="Disable multi-model panel fusion")
     parser.set_defaults(fusion=True)
 
@@ -661,6 +663,9 @@ USAGE EXAMPLES:
     p_build.add_argument("--skip-tests", action="store_true", help="Skip running the pytest verification suite")
 
     args = parser.parse_args()
+
+    if getattr(args, "abliteration", False):
+        args.model = "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"
 
     if getattr(args, "clean_db", False):
         db = Database(args.db)

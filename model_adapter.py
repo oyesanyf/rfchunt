@@ -98,24 +98,84 @@ class ModelFusionAdapter:
                 pass
         return []
 
+    @staticmethod
+    def _is_refusal(text: str) -> bool:
+        """Detects whether an LLM completion is an AI safety refusal rather than technical output."""
+        if not text:
+            return False
+        lower = text.lower()
+        refusal_markers = [
+            "i cannot fulfill",
+            "i cannot assist",
+            "i cannot generate",
+            "i am unable to generate",
+            "i am unable to provide",
+            "as an ai",
+            "as a language model",
+            "as a responsible ai",
+            "against safety guidelines",
+            "against my safety policies",
+            "ethical guidelines",
+            "cannot assist with creating exploits",
+            "cannot create attacks",
+            "cannot provide exploit payloads",
+            "harmful or malicious",
+            "potentially harmful",
+            "malicious payloads",
+            "cannot create code that exploits",
+            "i'm sorry, but i cannot",
+            "i am sorry, but i cannot",
+            "cannot generate harmful",
+            "harmful attacks",
+        ]
+        return any(marker in lower for marker in refusal_markers)
+
     def _resolve_model(self, preferred: str) -> str:
         """
         Dynamically resolves a valid model tag to avoid 404 aborts and OOMs.
-        Hierarchy: Preferred (e.g. gemma2:2b) -> sized_qwen -> first available -> gemma2:2b
+        Supports aliases for hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M and refusal-free models.
+        Hierarchy: Preferred / Aliases -> sized_qwen -> first available -> gemma2:2b
         """
         if not self.available_tags:
             return preferred
 
-        # Exact match
+        pref_lower = (preferred or "").strip().lower()
+
+        # Alias resolution for Gemma-4-12B-OBLITERATED and abliterated models
+        obliterated_aliases = [
+            "hf.co/obliteratus/gemma-4-12b-obliterated:q4_k_m",
+            "gemma-4-12b-obliterated:q4_k_m",
+            "gemma-4-12b-obliterated",
+            "gemma4-12b-obliterated",
+            "gemma-4-obliterated",
+            "gemma4-obliterated",
+            "obliteratus/gemma-4-12b-obliterated",
+            "obliteratus",
+            "obliterated",
+            "abliterated",
+            "gemma-obliterated",
+            "gemma4:12b-obliterated",
+            "gemma-12b-obliterated",
+        ]
+
+        if pref_lower in obliterated_aliases or any(pref_lower == a.split(":")[0] for a in obliterated_aliases):
+            for tag in self.available_tags:
+                tag_lower = tag.lower()
+                if "obliterat" in tag_lower or "abliterat" in tag_lower:
+                    return tag
+
+        # Exact match (case-insensitive)
         for tag in self.available_tags:
-            if tag == preferred or tag.startswith(preferred + ":") or preferred.startswith(tag):
+            tag_lower = tag.lower()
+            if tag_lower == pref_lower or tag_lower.startswith(pref_lower + ":") or pref_lower.startswith(tag_lower):
                 return tag
 
-        # Check clean names
-        clean_pref = preferred.split(":")[0]
+        # Check clean names (case-insensitive)
+        clean_pref = pref_lower.split(":")[0]
         for tag in self.available_tags:
-            if clean_pref in tag:
-                if self.free_ram_gb < 24.0 and any(h in tag for h in ("32b", "70b", "strix-deepseek")):
+            tag_lower = tag.lower()
+            if clean_pref in tag_lower:
+                if self.free_ram_gb < 24.0 and any(h in tag_lower for h in ("32b", "70b", "strix-deepseek")):
                     continue
                 return tag
 
@@ -124,8 +184,9 @@ class ModelFusionAdapter:
         for cand in candidates:
             cand_base = cand.split(":")[0]
             for tag in self.available_tags:
-                if cand == tag or cand_base in tag:
-                    if self.free_ram_gb < 24.0 and any(h in tag for h in ("32b", "70b", "strix-deepseek")):
+                tag_lower = tag.lower()
+                if cand == tag or cand_base in tag_lower:
+                    if self.free_ram_gb < 24.0 and any(h in tag_lower for h in ("32b", "70b", "strix-deepseek")):
                         continue
                     return tag
 
@@ -191,27 +252,39 @@ class ModelFusionAdapter:
         ModelFusion Panel: Queries a fusion of Google Gemma (protocol state machine specialist)
         AND a secondary security/code model (exploit boundary specialist), merging and
         cross-pollinating their candidate probes to maximize novelty at zero cost.
+        Includes refusal bypass and abliteration rescue with Gemma-4-12B-OBLITERATED.
         """
         if not self.available_tags:
             self.available_tags = self._fetch_available_tags()
 
-        gemma_model = "gemma2:2b"
-        for tag in ["gemma2:2b", "gemma2:9b"]:
-            matched = [t for t in self.available_tags if tag in t]
-            if matched:
-                gemma_model = matched[0]
-                break
+        # Find abliterated models in available tags
+        abliterated_candidates = [
+            t for t in self.available_tags
+            if ("abliterat" in t.lower() or "obliterat" in t.lower())
+            and (self.free_ram_gb >= 12.0 or not any(tag in t.lower() for tag in ("70b", "72b", "755b")))
+        ]
+
+        # Check if caller explicitly requested an abliterated or specific model for active_model
+        active_is_abliterated = any(kw in self.active_model.lower() for kw in ("obliterat", "abliterat"))
+        pref_is_gemma4 = any(kw in self.active_model.lower() for kw in ("gemma4", "gemma-4"))
+
+        if active_is_abliterated or pref_is_gemma4:
+            gemma_model = self.active_model
+        elif abliterated_candidates and self.preferred_model in ("auto", "gemma2:2b", "gemma-4-12b-obliterated"):
+            gemma_model = abliterated_candidates[0]
+        else:
+            gemma_model = "gemma2:2b"
+            for tag in ["gemma2:2b", "gemma2:9b"]:
+                matched = [t for t in self.available_tags if tag in t]
+                if matched:
+                    gemma_model = matched[0]
+                    break
 
         if hasattr(self, "sec_model") and self.sec_model:
             sec_model = self.sec_model
         else:
-            # Priority 1: Check for refusal-direction ablated / OBLITERATUS models in Ollama (zero-refusal exploit synthesis)
-            abliterated_candidates = [
-                t for t in self.available_tags
-                if ("abliterat" in t.lower() or "obliterat" in t.lower())
-                and (self.free_ram_gb >= 48.0 or not any(tag in t.lower() for tag in ("70b", "72b", "755b")))
-            ]
-            if abliterated_candidates:
+            # If gemma_model is not already abliterated, prioritize abliterated model for sec_model
+            if not active_is_abliterated and abliterated_candidates and abliterated_candidates[0] != gemma_model:
                 sec_model = abliterated_candidates[0]
             else:
                 sec_model = "fenkohq/foundation-sec-8b:latest"
@@ -247,11 +320,30 @@ class ModelFusionAdapter:
                 if isinstance(raw_val, dict):
                     raw_val = raw_val.get("raw_request", raw_val.get("request", ""))
                 raw_req = str(raw_val).strip()
+                rat = str(p.get("rationale", "")).strip()
+
+                # Check for refusal in output
+                if self._is_refusal(raw_req) or self._is_refusal(rat):
+                    logger.info("[ModelFusion] Model %s produced refusal; dropping probe.", model)
+                    continue
+
                 if raw_req and raw_req not in seen_requests:
                     seen_requests.add(raw_req)
                     p["raw_request"] = raw_req
                     p["fused_model"] = model
                     all_probes.append(p)
+
+        # Refusal bypass rescue: If standard models returned zero probes due to refusal or parsing issues,
+        # and an abliterated model was not yet queried, query it directly with refusal-free prompt
+        if not all_probes and abliterated_candidates:
+            abl_tag = abliterated_candidates[0]
+            if abl_tag not in fusion_panel:
+                logger.info("[ModelFusion] Panel produced 0 probes; rescuing with abliterated model %s", abl_tag)
+                abl_probes = self._query_ollama(abl_tag, system_instruction, user_prompt)
+                for p in abl_probes:
+                    if isinstance(p, dict):
+                        p["fused_model"] = f"{abl_tag} [AbliteratedRescue]"
+                        all_probes.append(p)
 
         return all_probes
 
