@@ -37,7 +37,7 @@
    - [rfc_hunt_swarm.py (Swarm CLI)](#1-rfc_hunt_swarmpy-swarm-orchestrator)
    - [protocol_ruler.py (Standalone Ruler)](#2-protocol_rulerpy-standalone-ruler)
    - [main.py (Modular Subcommand Toolkit)](#3-mainpy-modular-toolkit-subcommands)
-7. [The 16 Protocol Research Modules](#the-16-protocol-research-modules)
+7. [The 19 Protocol Research Modules](#the-16-protocol-research-modules)
 8. [Research Attribution & Citations](#research-attribution--citations)
 9. [RAPTOR Framework Integration & Attribution](#raptor-framework-integration--attribution)
 10. [Google Research Harness² Integration & Attribution](#google-research-harness-integration--attribution)
@@ -386,7 +386,7 @@ Modular toolkit providing discrete CLI commands for each phase of the research f
 
 ---
 
-## The 16 Protocol Research Modules
+## The 19 Protocol Research Modules
 
 | # | Module | Source File | Core Responsibility |
 | :-: | :--- | :--- | :--- |
@@ -406,6 +406,9 @@ Modular toolkit providing discrete CLI commands for each phase of the research f
 | **14**| **MITRE Caldera Adversary Export** | `engine/caldera_integration.py`| Translates confirmed protocol flaws into MITRE Caldera adversary abilities and profiles. |
 | **15**| **RAPTOR Autonomous Framework** | `engine/raptor_engine.py` | Integrates Semgrep, CodeQL, PQC crypto audits, and live web DAST into `terminator.db`. |
 | **16**| **Google Research Harness² Engine** | `engine/harness2_engine.py` | Two-level recursive agent harnessing (`Propose–Probe–Compose` across `c1..c8` + per-domain `Library`). |
+| **17**| **BaaRai/ARTEX Dual-Graph Chainer** | `engine/dual_graph_engine.py` | Native Python Planner/Worker multi-round attack chaining using Asset & Exploration graphs. |
+| **18**| **haasonsaas/aiscan AI Auditor** | `engine/aiscan_integrator.py` | High-speed AI risk audit, prompt injection sink scanning, and model credential discovery. |
+| **19**| **Prompt Smuggling Synthesizer** | `engine/prompt_smuggling_synthesizer.py` | Novel attack class: couples wire framing desyncs (CL.TE, TE.CL) with backend AI endpoints. |
 
 ---
 
@@ -515,6 +518,50 @@ python -u rfc_hunt_swarm.py harness2 --rfc 9113 --harness2-k 2 --harness2-mode s
 
 # 3. View historical Harness² runs, R=4k/P=3k ledger verification, and learned domain lessons
 python -u rfc_hunt_swarm.py harness2 --harness2-report
+```
+
+---
+
+
+## BaaRai/ARTEX & haasonsaas/aiscan Integration (Modules 17, 18, 19)
+
+Seamlessly integrates **[BaaRai/ARTEX](https://github.com/BaaRai/ARTEX)** and **[haasonsaas/aiscan](https://github.com/haasonsaas/aiscan)** into the RFC Hunt Swarm for full-spectrum vulnerability discovery:
+
+### 1. Architectural Roles & Synergies
+- **`haasonsaas/aiscan` (Module 18)**:
+  - Hybrid scanner: invokes the Rust `aiscan` binary if present, falling back automatically to the high-performance embedded Python AST scanner.
+  - Detects exposed AI credentials (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `HUGGINGFACE_TOKEN`), prompt injection sinks in template strings, and insecure model loaders.
+  - Extracts discovered internal AI endpoints (e.g. `/api/chat`, `/v1/chat/completions`, `/agent/run`).
+- **`BaaRai/ARTEX` Dual-Graph Engine (Module 17)**:
+  - Pure Python, zero-daemon port of ARTEX's **Dual-Graph architecture**:
+    - **Asset Graph**: Tracks domains, ports, services, HTTP endpoints, and backend AI sinks.
+    - **Exploration Graph**: Tracks goals, wire primitives, attack hypotheses, and confirmed exploits.
+  - **Planner Agent**: Decomposes isolated protocol anomalies into multi-round attack objectives.
+  - **Worker Agent**: Autonomously chains wire framing desyncs into higher-order impacts (credential leaks, cache poisoning, SSRF).
+- **Novel Attack Class: Desynchronized Prompt Injection (Module 19)**:
+  - Synthesizes dual-layer HTTP streams coupling an outer RFC 9112/9113 framing desync (`CL.TE`, `TE.CL`, chunk extensions) with an inner smuggled request targeting an unauthenticated backend AI endpoint.
+  - Injects system prompt overrides directly into the LLM worker, completely bypassing frontend WAFs and content filters.
+
+### 2. Headless Zero-UI Operation & Reports Folder
+Execution is completely headless with **zero UI overhead**. All scan artifacts and findings are automatically persisted in SQLite (`terminator.db`) and written directly to the **`reports/`** directory:
+- **`reports/aiscan_report_<timestamp>.json` & `.sarif`**: AI vulnerability findings.
+- **`reports/dual_graph_report_<timestamp>.json`**: Asset and exploration graph topology.
+- **`reports/prompt_smuggling_report_<timestamp>.json`**: Synthesized cross-layer attack streams.
+- **`reports/*_summary_<timestamp>.txt`**: Clean terminal-style audit summaries.
+
+### 3. CLI Usage
+```bash
+# 1. Audit local target codebase for AI vulnerabilities, prompt injection sinks, and exposed keys:
+python -u rfc_hunt_swarm.py aiscan --aiscan-target D:\path\to\target_repo
+
+# 2. Run ARTEX Dual-Graph multi-round autonomous attack chaining:
+python -u rfc_hunt_swarm.py artex --host target.example.com --port 8080 --artex-rounds 2
+
+# 3. Synthesize novel Desynchronized Prompt Injection probes targeting an internal AI sink:
+python -u rfc_hunt_swarm.py prompt_smuggle --host target.example.com --port 8080
+
+# 4. Run full swarm scan with aiscan, dual-graph chaining, and prompt smuggling enabled:
+python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host target.example.com --port 8080 --aiscan --artex --prompt-smuggle
 ```
 
 ---

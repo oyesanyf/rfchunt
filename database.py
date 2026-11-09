@@ -243,6 +243,52 @@ class Database:
                     result_json TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS ai_security_findings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_path TEXT,
+                    finding_type TEXT,
+                    severity TEXT,
+                    file_path TEXT,
+                    line_number INTEGER,
+                    model_or_api TEXT,
+                    description TEXT,
+                    snippet TEXT,
+                    discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS dual_graph_nodes (
+                    node_id TEXT PRIMARY KEY,
+                    graph_type TEXT NOT NULL,
+                    node_type TEXT NOT NULL,
+                    label TEXT,
+                    attributes_json TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS dual_graph_edges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    relationship TEXT NOT NULL,
+                    attributes_json TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS attack_chains (
+                    chain_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    attack_type TEXT NOT NULL,
+                    target_host TEXT NOT NULL,
+                    target_endpoint TEXT NOT NULL,
+                    framing_anomaly_id TEXT,
+                    ai_sink_id INTEGER,
+                    steps_json TEXT NOT NULL,
+                    raw_payload TEXT,
+                    is_verified BOOLEAN DEFAULT 0,
+                    severity TEXT DEFAULT 'HIGH',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             """)
 
     def save_rfc(self, rfc_id: str, title: str, source_url: str, doc_path: str) -> None:
@@ -870,3 +916,148 @@ class Database:
                     """)
 
 
+
+    def save_ai_finding(
+        self,
+        target_path: str,
+        finding_type: str,
+        severity: str,
+        file_path: str,
+        line_number: int,
+        model_or_api: str,
+        description: str,
+        snippet: str = "",
+    ) -> int:
+        """Persists an AI security/risk finding discovered by aiscan or AST audit."""
+        with self._lock:
+            with self.conn:
+                cur = self.conn.execute(
+                    """
+                    INSERT INTO ai_security_findings
+                    (target_path, finding_type, severity, file_path, line_number, model_or_api, description, snippet)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (target_path, finding_type, severity, file_path, line_number, model_or_api, description, snippet),
+                )
+                return int(cur.lastrowid or 0)
+
+    def get_ai_findings(self, target_path: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """Retrieves recorded AI security findings."""
+        with self._lock:
+            cur = self.conn.cursor()
+            if target_path:
+                cur.execute(
+                    "SELECT * FROM ai_security_findings WHERE target_path = ? ORDER BY id DESC LIMIT ?",
+                    (target_path, limit),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM ai_security_findings ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                )
+            return [dict(r) for r in cur.fetchall()]
+
+    def save_dual_graph_node(
+        self,
+        node_id: str,
+        graph_type: str,
+        node_type: str,
+        label: str,
+        attributes: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Saves or updates an ARTEX Dual-Graph node (Asset or Exploration)."""
+        attrs_json = json.dumps(attributes or {})
+        with self._lock:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO dual_graph_nodes (node_id, graph_type, node_type, label, attributes_json)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (node_id, graph_type, node_type, label, attrs_json),
+                )
+
+    def save_dual_graph_edge(
+        self,
+        source_id: str,
+        target_id: str,
+        relationship: str,
+        attributes: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Saves a directed edge in the ARTEX Dual-Graph."""
+        attrs_json = json.dumps(attributes or {})
+        with self._lock:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO dual_graph_edges (source_id, target_id, relationship, attributes_json)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (source_id, target_id, relationship, attrs_json),
+                )
+
+    def get_dual_graph_nodes(self, graph_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Retrieves Dual-Graph nodes, optionally filtered by graph_type ('ASSET' or 'EXPLORATION')."""
+        with self._lock:
+            cur = self.conn.cursor()
+            if graph_type:
+                cur.execute("SELECT * FROM dual_graph_nodes WHERE graph_type = ?", (graph_type,))
+            else:
+                cur.execute("SELECT * FROM dual_graph_nodes")
+            res = []
+            for r in cur.fetchall():
+                d = dict(r)
+                d["attributes"] = json.loads(d.get("attributes_json") or "{}")
+                res.append(d)
+            return res
+
+    def get_dual_graph_edges(self) -> List[Dict[str, Any]]:
+        """Retrieves all Dual-Graph edges."""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT * FROM dual_graph_edges")
+            res = []
+            for r in cur.fetchall():
+                d = dict(r)
+                d["attributes"] = json.loads(d.get("attributes_json") or "{}")
+                res.append(d)
+            return res
+
+    def save_attack_chain(
+        self,
+        chain_id: str,
+        title: str,
+        attack_type: str,
+        target_host: str,
+        target_endpoint: str,
+        steps: List[Dict[str, Any]],
+        framing_anomaly_id: Optional[str] = None,
+        ai_sink_id: Optional[int] = None,
+        raw_payload: str = "",
+        is_verified: bool = False,
+        severity: str = "HIGH",
+    ) -> None:
+        """Records a synthesized multi-step attack chain (e.g. Desynchronized Prompt Injection)."""
+        steps_json = json.dumps(steps)
+        with self._lock:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO attack_chains
+                    (chain_id, title, attack_type, target_host, target_endpoint, framing_anomaly_id, ai_sink_id, steps_json, raw_payload, is_verified, severity)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (chain_id, title, attack_type, target_host, target_endpoint, framing_anomaly_id, ai_sink_id, steps_json, raw_payload, 1 if is_verified else 0, severity),
+                )
+
+    def get_attack_chains(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Retrieves recorded attack chains."""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT * FROM attack_chains ORDER BY created_at DESC LIMIT ?", (limit,))
+            res = []
+            for r in cur.fetchall():
+                d = dict(r)
+                d["steps"] = json.loads(d.get("steps_json") or "[]")
+                res.append(d)
+            return res

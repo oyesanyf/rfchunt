@@ -30,6 +30,8 @@ if sys.platform == "win32":
 
 import argparse
 import concurrent.futures
+import os
+from pathlib import Path
 import operator
 import re
 import threading
@@ -1431,6 +1433,163 @@ def cmd_vulns(args):
         con.close()
 
 
+
+def cmd_aiscan(args):
+    """
+    Executes AI vulnerability and prompt injection scanning on target directory
+    using haasonsaas/aiscan and Python AST fallback scanner.
+    """
+    from engine.aiscan_integrator import AiscanIntegrator
+    from database import Database
+
+    db = Database(getattr(args, "db", "terminator.db"))
+    scanner = AiscanIntegrator(db=db)
+
+    print("\n" + "=" * 75)
+    print("  HAASONSAAS/AISCAN: AI & PROMPT SECURITY AUDITOR (MODULE 18)")
+    print("  Credit: Jonathan Haas (https://github.com/haasonsaas/aiscan)")
+    print("=" * 75 + "\n")
+
+    target_path = getattr(args, "aiscan_target", ".") or "."
+    print(f"[*] Initiating AI security scan on: {target_path}")
+    res = scanner.scan_target(target_path)
+
+    print(f"[*] Engine Used      : {res.get('engine', 'unknown')}")
+    print(f"[*] Total Findings   : {res.get('total_findings', 0)}")
+    print(f"[*] Total AI Sinks   : {res.get('total_endpoints', 0)}")
+    print("-" * 75)
+
+    findings = res.get("findings", [])
+    if not findings:
+        print("[+] Zero AI vulnerabilities or prompt injection sinks detected.")
+    else:
+        print(f"{'SEVERITY':<10} {'TYPE':<28} {'LOCATION':<30} {'DESCRIPTION'}")
+        print(f"{'-'*10} {'-'*28} {'-'*30} {'-'*30}")
+        for f in findings[:25]:
+            loc = f"{Path(f['file_path']).name}:{f['line_number']}"
+            print(f"{f['severity']:<10} {f['finding_type']:<28} {loc:<30} {f['description'][:40]}")
+
+    endpoints = res.get("endpoints", [])
+    if endpoints:
+        print("\n[*] DISCOVERED AI ENDPOINTS (PROMPT SMUGGLING TARGETS):")
+        for e in endpoints:
+            print(f"    -> {e['http_method']} {e['route_path']} ({Path(e['file_path']).name}:{e['line_number']})")
+
+    report_files = res.get("report_files", {})
+    if report_files:
+        print("\n[*] Reports saved to reports/ folder:")
+        for rtype, rpath in report_files.items():
+            print(f"    - {rtype.upper()}: {rpath}")
+
+    print("=" * 75 + "\n")
+    db.close()
+
+
+def cmd_artex(args):
+    """
+    Executes BaaRai/ARTEX Dual-Graph (Asset Graph + Exploration Graph) Planner/Worker
+    autonomous attack chaining engine.
+    """
+    from engine.dual_graph_engine import DualGraphAttackEngine
+    from database import Database
+
+    db = Database(getattr(args, "db", "terminator.db"))
+    engine = DualGraphAttackEngine(db=db)
+
+    print("\n" + "=" * 75)
+    print("  BAARAI/ARTEX: DUAL-GRAPH AUTONOMOUS ATTACK CHAINER (MODULE 17)")
+    print("  Credit: BaaRai & Autumn-27 (https://github.com/BaaRai/ARTEX)")
+    print("=" * 75 + "\n")
+
+    t_host = getattr(args, "host", "127.0.0.1")
+    t_port = getattr(args, "port", 8080)
+    rounds = getattr(args, "artex_rounds", 1)
+
+    print(f"[*] Target Host: {t_host}:{t_port}")
+    print(f"[*] Ingesting target topology and prior wire primitives from terminator.db...")
+
+    # Load known AI endpoints from aiscan table if present
+    ai_sinks = []
+    try:
+        cur = db.conn.cursor()
+        cur.execute("SELECT DISTINCT file_path, line_number, model_or_api, description FROM ai_security_findings WHERE finding_type = 'unmetered_ai_endpoint'")
+        for r in cur.fetchall():
+            ai_sinks.append({"route": "/api/chat", "method": "POST", "model_provider": r["model_or_api"], "file_path": r["file_path"]})
+    except Exception:
+        pass
+
+    if not ai_sinks:
+        ai_sinks = [{"route": "/api/chat", "method": "POST", "model_provider": "local_ai", "file_path": "server.py"}]
+
+    engine.ingest_target_infrastructure(host=t_host, port=t_port, ai_sinks=ai_sinks)
+
+    # Register baseline wire primitive if available
+    engine.register_wire_primitive(
+        anomaly_id="RFC9112-CHUNK-DESYNC",
+        description="HTTP/1.1 Framing Desync (Chunk Extension & Content-Length conflict)",
+        anomaly_type="CL.TE_DESYNC",
+    )
+
+    print(f"[*] Running {rounds} multi-round planning & exploitation cycle(s)...")
+    res = engine.run_attack_chain_cycle(round_num=rounds)
+
+    print(f"[*] Total Assets Mapped : {res['total_assets']}")
+    print(f"[*] Attack Candidates   : {res['candidates_planned']}")
+    print(f"[*] Exploits Verified   : {res['exploits_verified']}")
+
+    report_files = res.get("report_files", {})
+    if report_files:
+        print("\n[*] Reports saved to reports/ folder:")
+        for rtype, rpath in report_files.items():
+            print(f"    - {rtype.upper()}: {rpath}")
+
+    print("=" * 75 + "\n")
+    db.close()
+
+
+def cmd_prompt_smuggle(args):
+    """
+    Synthesizes and verifies novel Desynchronized Prompt Injection probes.
+    """
+    from engine.prompt_smuggling_synthesizer import PromptSmugglingSynthesizer
+    from database import Database
+
+    db = Database(getattr(args, "db", "terminator.db"))
+    synthesizer = PromptSmugglingSynthesizer(db=db)
+
+    print("\n" + "=" * 75)
+    print("  NOVEL ATTACK SYNTHESIZER: DESYNCHRONIZED PROMPT INJECTION (MODULE 19)")
+    print("  Couples HTTP Framing Desynchronization with Backend AI Sinks")
+    print("=" * 75 + "\n")
+
+    t_host = getattr(args, "host", "127.0.0.1")
+    t_port = getattr(args, "port", 8080)
+    ai_route = getattr(args, "ai_route", "/api/chat") or "/api/chat"
+
+    print(f"[*] Target Host        : {t_host}:{t_port}")
+    print(f"[*] Target AI Endpoint : {ai_route}")
+    print(f"[*] Synthesizing cross-layer attack streams (CL.TE, TE.CL, Chunk-Ext)...")
+
+    probes = synthesizer.synthesize_probes_for_endpoint(
+        target_host=t_host,
+        target_port=t_port,
+        ai_endpoint=ai_route,
+        http_method="POST",
+    )
+
+    print(f"[+] Synthesized {len(probes)} novel Desynchronized Prompt Injection probe(s):\n")
+    for p in probes:
+        print(f"  -> [{p.attack_class}] ID: {p.probe_id}")
+        print(f"     Canary Token : {p.canary_token}")
+        print(f"     Target Sink  : {p.target_ai_endpoint}")
+        print(f"     Rationale    : {p.rationale[:90]}...")
+        print()
+
+    print(f"[*] Reports successfully generated in reports/ folder.")
+    print("=" * 75 + "\n")
+    db.close()
+
+
 def cmd_raptor(args):
     """
     Executes the RAPTOR Security Framework against a live host or local repository.
@@ -1728,6 +1887,7 @@ ALL_MODES = [
     "weaponize", "cascade", "dream", "caldera", "harness2",
     "dashboard", "export", "oracle", "differential", "h2", "http2", "audit", "merkle",
     "ui", "vulns", "findings", "list", "raptor", "clean", "clean-db",
+    "aiscan", "ai", "artex", "dual_graph", "dual-graph", "smuggle", "prompt_smuggle",
 ]
 
 
@@ -2082,6 +2242,19 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--raptor-findings", "--findings", dest="raptor_findings", action="store_true", help="List and summarize recent SARIF vulnerability findings from RAPTOR scans")
     parser.add_argument("--policy-groups", type=str, default="", help="Optional policy groups for RAPTOR scan (e.g. 'secrets,owasp,crypto')")
     parser.add_argument("--include-codeql", action="store_true", help="Include deep CodeQL compilation during RAPTOR agentic scan")
+    # haasonsaas/aiscan Integration (Module 18)
+    parser.add_argument("--aiscan", "--enable-aiscan", dest="enable_aiscan", action="store_true", help="Enable haasonsaas/aiscan AI & model risk scanner (Module 18)")
+    parser.add_argument("--aiscan-target", type=str, default=".", help="Target directory to audit for AI vulnerabilities, prompt injection sinks, and exposed model credentials (default: '.')")
+    parser.add_argument("--aiscan-report", action="store_true", help="Print summary of recent AI security audit findings from terminator.db")
+
+    # BaaRai/ARTEX Dual-Graph Attack Chaining (Module 17)
+    parser.add_argument("--artex", "--dual-graph", dest="enable_artex", action="store_true", help="Enable BaaRai/ARTEX Dual-Graph planner/worker attack chaining engine (Module 17)")
+    parser.add_argument("--artex-rounds", type=int, default=1, help="Number of multi-round planning cycles to execute in ARTEX Dual-Graph (default: 1)")
+
+    # Novel Attack Synthesis: Desynchronized Prompt Injection (Module 19)
+    parser.add_argument("--prompt-smuggle", dest="enable_prompt_smuggle", action="store_true", help="Synthesize and verify novel cross-layer Desynchronized Prompt Injection attack chains")
+    parser.add_argument("--export-sarif", type=str, default=None, help="Export aggregated vulnerability findings to specified SARIF file in reports/")
+
     return parser
 
 
@@ -2357,6 +2530,19 @@ def main_swarm(argv=None):
 
     if active_mode in ("vulns", "findings", "list"):
         cmd_vulns(args)
+        return
+
+
+    if active_mode in ("aiscan", "ai") or getattr(args, "enable_aiscan", False) and not explicit_mode_given:
+        cmd_aiscan(args)
+        return
+
+    if active_mode in ("artex", "dual_graph", "dual-graph") or getattr(args, "enable_artex", False) and not explicit_mode_given:
+        cmd_artex(args)
+        return
+
+    if active_mode in ("prompt_smuggle", "smuggle") or getattr(args, "enable_prompt_smuggle", False) and not explicit_mode_given:
+        cmd_prompt_smuggle(args)
         return
 
     if active_mode == "raptor" or getattr(args, "raptor_status", False) or getattr(args, "raptor_findings", False) or getattr(args, "raptor_setup", False):
