@@ -41,6 +41,7 @@
 8. [Research Attribution & Citations](#research-attribution--citations)
 9. [RAPTOR Framework Integration & Attribution](#raptor-framework-integration--attribution)
 10. [Google Research Harness² Integration & Attribution](#google-research-harness-integration--attribution)
+11. [Abliterated Models & Refusal-Free ModelFusion Guide](docs/ABLITERATED_MODELS_AND_FUSION_GUIDE.md)
 
 ---
 
@@ -83,13 +84,15 @@ flowchart TD
 
 1. **Micro-Inspiration Engine**: Normative RFC specifications are split into isolated 1–3 sentence grammatical clues. Zero buzzwords (*"desync"*, *"smuggling"*) are used in prompts, forcing models to derive state-machine anomalies from first principles.
 2. **ModelFusion Consensus Panel**: Runs 100% locally via Ollama without cloud token costs:
-   - **Protocol Specialist**: `gemma2:2b` (state machine & RFC grammar specialist)
-   - **Exploit Boundary Specialist**: **Abliterated / OBLITERATUS Models** (e.g. `huihui_ai/deepseek-r1-abliterated:32b`, `huihui_ai/qwen2.5-coder-abliterated:32b`) or Cisco `fenkohq/foundation-sec-8b:latest` / `qwen2.5:32b`
-   - **Reasoning Arbiter**: `deepseek-r1:1.5b` (or `strix-deepseek:latest` / `deepseek-r1:32b`)
-3. **Abliterated & OBLITERATUS Security Models Support**:
+   - **Protocol Specialist**: `hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M` (refusal-free 12B state-machine & RFC grammar specialist) or `gemma2:2b`
+   - **Exploit Boundary Specialist**: **Abliterated / OBLITERATUS Models** or Cisco `fenkohq/foundation-sec-8b:latest` / `qwen2.5:7b` / `qwen2.5:32b`
+   - **Reasoning Arbiter**: `deepseek-r1:1.5b` (or `strix-deepseek:latest` / `deepseek-r1:32b` / abliterated synthesis fallback)
+3. **Native Abliterated & OBLITERATUS Security Models Support**:
    - Refusal-direction ablated models (`failspy` orthogonal projection method) are natively supported across RFC probe generation, Protocol Ruler differential fuzzing, and RAPTOR agentic source code triage.
-   - Eliminates false refusals when synthesizing raw, malformed network payloads, non-standard CRLF/NUL sequences, and HTTP desync canaries.
-   - Automatically detected and prioritized as the primary `sec_model` when installed in Ollama.
+   - **`hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`** is calibrated and verified resident in local Ollama, providing unconstrained, refusal-free exploit generation.
+   - Easily activated via a single flag: `--abliteration` (or alias `--obliterated`).
+   - Automatically detected and prioritized across `ModelFusionAdapter` and `FusionArbiter` with automated **Refusal Rescue**.
+   - See the comprehensive [Abliterated Models & ModelFusion Refusal-Free Arbitration Guide](docs/ABLITERATED_MODELS_AND_FUSION_GUIDE.md).
 4. **3-Step Canary Evaluation Primitive**: Probes persistent TCP connections directly:
    - **REQ 1**: Baseline measurement on clean socket channel.
    - **REQ 2**: Attacker probe with canary marker or trailing boundary bytes.

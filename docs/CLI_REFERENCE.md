@@ -50,7 +50,8 @@
 | `--no-lab` | flag | `False` | Do not auto-spawn local mock server on localhost | `--no-lab` |
 | `--cycles` | int | `3` | Maximum mutation cycles per RFC | `--cycles 4` |
 | `--timeout` | float | `900.0` | Ollama LLM inference timeout (0 for unlimited) | `--timeout 300.0` |
-| `--model` | string | `gemma2:2b` | Primary protocol specialist model | `--model qwen2.5:7b` |
+| `--model` | string | `gemma2:2b` | Primary protocol specialist model (supports `hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`, `gemma-4-12b-obliterated`, etc.) | `--model gemma-4-12b-obliterated` |
+| `--abliteration`, `--obliterated` | flag | `False` | Forces refusal-free abliterated model (`hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`) across ModelFusion panel | `--abliteration` |
 | `--sec-model` | string | `None` | Secondary security model for ModelFusion | `--sec-model fenkohq/foundation-sec-8b:latest` |
 | `--no-fusion` | flag | `False` | Disable multi-model panel fusion | `--no-fusion` |
 | `--concurrency`, `--threads` | int | `8` | Maximum concurrent probe execution threads | `--concurrency 16` |
@@ -257,10 +258,19 @@ py -3.12 -u rfc_hunt_swarm.py audit
 py -3.12 -u rfc_hunt_swarm.py vulns --host dlptest.com
 ```
 
-### 7. AI ModelFusion & Genetic Evolutionary Tuning
+### 7. AI ModelFusion, Abliterated Models & Genetic Evolutionary Tuning
 ```powershell
-# --model (Select primary protocol specialist model)
-py -3.12 -u rfc_hunt_swarm.py --model gemma2:2b
+# --abliteration / --obliterated (Force refuse-free Gemma-4-12B-OBLITERATED across ModelFusion)
+py -3.12 -u rfc_hunt_swarm.py --mode terminator --abliteration --host 127.0.0.1 --port 3030 --debug
+
+# --model (Explicitly target hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M or aliases)
+py -3.12 -u rfc_hunt_swarm.py --model hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M
+
+# Use shorthand alias 'gemma-4-12b-obliterated' or 'obliteratus'
+py -3.12 -u rfc_hunt_swarm.py --model gemma-4-12b-obliterated
+
+# Dual-Model Abliteration Fusion: Abliterated Gemma-4-12B (Protocol) + Foundation-Sec-8B (Boundary)
+py -3.12 -u rfc_hunt_swarm.py --model gemma-4-12b-obliterated --sec-model fenkohq/foundation-sec-8b:latest
 
 # --sec-model (Select secondary security specialist model)
 py -3.12 -u rfc_hunt_swarm.py --sec-model fenkohq/foundation-sec-8b:latest
