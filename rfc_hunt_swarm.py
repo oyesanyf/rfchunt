@@ -2833,6 +2833,28 @@ def main_swarm(argv=None):
                                 "behavior": f"[{rf['severity']}] {rf['rule_id']}: {rf['message'][:60]}",
                             })
 
+            # Step 0c: haasonsaas/aiscan AI Risk Analysis (if --aiscan / --enable-aiscan enabled)
+            if getattr(args, "enable_aiscan", False):
+                from engine.aiscan_integrator import AiscanIntegrator
+                print(f"\n{'='*75}")
+                print("  HAASONSAAS/AISCAN: AI & PROMPT SECURITY AUDITOR (MODULE 18)")
+                print("  Credit: Jonathan Haas (https://github.com/haasonsaas/aiscan)")
+                print(f"{'='*75}\n")
+                ai_scanner = AiscanIntegrator(db=swarm.db)
+                ai_target = getattr(args, "aiscan_target", None) or getattr(args, "raptor_target", None) or "."
+                ai_res = ai_scanner.scan_target(ai_target)
+                if ai_res.get("findings"):
+                    for af in ai_res["findings"]:
+                        with swarm.stats_lock:
+                            swarm.run_stats["vulnerabilities_confirmed"].append({
+                                "rfc": "AISCAN",
+                                "vuln_id": f"AI-{af['finding_type'][:15].upper()}",
+                                "anomaly_id": f"AI-{af['severity']}",
+                                "impact": f"AI_{af['severity']}",
+                                "repro": "100%",
+                                "behavior": f"[{af['severity']}] {af['description'][:60]}",
+                            })
+
         try:
             swarm.containment.start()
         except Exception as e:
