@@ -81,7 +81,17 @@
 | `--mcp` | flag | `False` | Shortcut to run Model Context Protocol stdio server | `--mcp` |
 | `--raptor`, `--enable-raptor` | flag | `False` | Enable RAPTOR Autonomous Framework execution | `--raptor` |
 | `--raptor-mode` | string | `web` / `scan` | RAPTOR mode (`web`, `scan`, `agentic`, `crypto`, `sca`, `describe`) | `--raptor-mode agentic` |
-| `--raptor-target`, `--repo` | string | `None` | Path to repository/codebase for RAPTOR audit | `--repo D:\harfile\my_project` |
+| `--raptor-target` | string | `None` | Path to repository/codebase for RAPTOR audit | `--raptor-target D:\harfile\my_project` |
+| `--repo` | string | `None` | Repository directory path for `--all`, `--mantis`, or `--raptor` scans | `--all --repo .` |
+| `--path` | string | `None` | Specific file or directory path for `--all`, `--mantis`, or `--raptor` scans | `--all --path engine/mantis_integrator.py` |
+| `--all`, `--run-all`, `--all-scans` | flag | `False` | Run ALL integrated scanners (Google Mantis, aiscan, ARTEX, RAPTOR, Prompt Smuggling) with ModelFusion + Abliterated models | `--all --repo .` |
+| `--mantis`, `--enable-mantis` | flag | `False` | Enable Google Mantis Security Toolkit (Module 20) with ModelFusion + Abliterated models | `--mantis --repo .` |
+| `--mantis-mode` | string | `full` | Google Mantis mode (`full`, `fast`, `threat-model`, `scan`, `reproduce`, `patch`) | `--mantis-mode patch` |
+| `--depth`, `--mantis-depth` | int | `30` | Google Mantis audit depth `1..100` (scales coverage, passes, and rule tiers) | `--depth 100` |
+| `--mantis-target` | string | `None` | Target path for Google Mantis scan | `--mantis-target .` |
+| `--mantis-model` | string | `hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M` | Refusal-free abliterated ModelFusion model for Google Mantis | `--mantis-model hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M` |
+| `--mantis-report` | flag | `False` | Display stored Google Mantis findings from `terminator.db` | `--mantis-report` |
+| `--output-dir` | string | `reports` | Output directory for SARIF 2.1.0, JSON, and summary reports | `--output-dir reports` |
 | `--raptor-model` | string | `fenkohq/foundation-sec-8b:latest` | Ollama model for RAPTOR agentic triage | `--raptor-model fenkohq/foundation-sec-8b:latest` |
 | `--raptor-status`, `--status` | flag | `False` | Check RAPTOR Docker container and Ollama status | `--raptor-status` |
 | `--raptor-findings`, `--findings`| flag | `False` | List recent SARIF vulnerability findings from RAPTOR | `--raptor-findings` |
@@ -317,6 +327,13 @@ py -3.12 -u rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 3030 --n
 
 # --harness2-runs-dir (Custom output directory for persisted c1..c8 trees, INDEX.md & EXPERIENCE.md)
 py -3.12 -u rfc_hunt_swarm.py harness2 --rfc 9112 --harness2-runs-dir ./runs/custom_harness2
+
+# Google Mantis & Unified --all Multi-Scanner (Fusion + Abliterated Enforced)
+py -3.12 -u rfc_hunt_swarm.py --all --repo . --depth 30
+py -3.12 -u rfc_hunt_swarm.py --all --path engine/mantis_integrator.py --depth 50
+py -3.12 -u rfc_hunt_swarm.py --mantis --repo . --mantis-mode patch --depth 100
+py -3.12 -u main.py all --repo . --depth 30
+py -3.12 -u main.py mantis --path . --mantis-mode scan
 
 # --dream-rsi / --no-dream-rsi (Control recursive self-improvement)
 py -3.12 -u rfc_hunt_swarm.py --dream-rsi

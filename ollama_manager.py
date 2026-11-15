@@ -206,8 +206,14 @@ class OllamaLifecycleManager:
                 cls._daemon_checked = True
                 return tags
 
-            # Skip spawning external daemons during unit tests if offline
-            if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
+            # Skip heavy external installers / daemons inside CI or offline unit test runs
+            if (
+                "PYTEST_CURRENT_TEST" in os.environ
+                or "pytest" in sys.modules
+                or os.environ.get("CI")
+                or os.environ.get("GITHUB_ACTIONS")
+                or os.environ.get("RFCHUNT_OFFLINE") == "1"
+            ):
                 return list(cls._cached_tags)
 
             # 2. Locate or auto-install Ollama binary

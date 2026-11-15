@@ -192,34 +192,63 @@ class ModelFusionAdapter:
 
         return self.available_tags[0]
 
-    def generate_json(self, system_instruction: str, user_prompt: str) -> List[Dict[str, Any]]:
+    def generate_json(
+        self,
+        system_instruction: str,
+        user_prompt: str,
+        schema_hint: Optional[str] = None,
+        num_predict: int = 160,
+    ) -> List[Dict[str, Any]]:
         """
         Executes structured JSON generation using local Ollama model(s).
-        If use_fusion is enabled, runs panel fusion across Gemma and secondary models.
+        If use_fusion is enabled, runs panel fusion across Gemma (prioritizing abliterated Gemma-4-12B)
+        and secondary security models.
         """
         if not self.available_tags:
             self.available_tags = self._fetch_available_tags()
 
         if self.use_fusion:
-            res = self._run_panel_fusion(system_instruction, user_prompt)
+            res = self._run_panel_fusion(
+                system_instruction,
+                user_prompt,
+                schema_hint=schema_hint,
+                num_predict=num_predict,
+            )
             if res:
                 return res
 
         # Primary: Local Ollama model
-        result = self._query_ollama(self.active_model, system_instruction, user_prompt)
+        result = self._query_ollama(
+            self.active_model,
+            system_instruction,
+            user_prompt,
+            schema_hint=schema_hint,
+            num_predict=num_predict,
+        )
         if result:
             return result
 
         return []
 
-    def _query_ollama(self, model: str, system_instruction: str, user_prompt: str) -> List[Dict[str, Any]]:
+    def _query_ollama(
+        self,
+        model: str,
+        system_instruction: str,
+        user_prompt: str,
+        schema_hint: Optional[str] = None,
+        num_predict: int = 160,
+    ) -> List[Dict[str, Any]]:
         if not self.available_tags:
             self.available_tags = self._fetch_available_tags()
+        if not self.available_tags and "PYTEST_CURRENT_TEST" in os.environ:
+            # Skip network retry if Ollama is offline during unit tests unless mocked
+            return []
 
+        expected_schema = schema_hint or '{"probes": [{"rationale": "...", "raw_request": "...", "is_clean": false}]}'
         full_prompt = (
             f"### SYSTEM INSTRUCTION:\n{system_instruction}\n\n"
             f"### TASK PROMPT:\n{user_prompt}\n\n"
-            f"CRITICAL: Output ONLY valid JSON: {{\"probes\": [{{\"rationale\": \"...\", \"raw_request\": \"...\", \"is_clean\": false}}]}}."
+            f"CRITICAL: Output ONLY valid JSON matching schema: {expected_schema}."
         )
 
         payload = {
@@ -230,7 +259,7 @@ class ModelFusionAdapter:
             "keep_alive": "60m",
             "options": {
                 "temperature": 0.7,
-                "num_predict": 160,
+                "num_predict": int(num_predict),
             },
         }
 
@@ -247,7 +276,13 @@ class ModelFusionAdapter:
             logger.warning("Ollama query failed on %s: %s", model, e)
         return []
 
-    def _run_panel_fusion(self, system_instruction: str, user_prompt: str) -> List[Dict[str, Any]]:
+    def _run_panel_fusion(
+        self,
+        system_instruction: str,
+        user_prompt: str,
+        schema_hint: Optional[str] = None,
+        num_predict: int = 160,
+    ) -> List[Dict[str, Any]]:
         """
         ModelFusion Panel: Queries a fusion of Google Gemma (protocol state machine specialist)
         AND a secondary security/code model (exploit boundary specialist), merging and
@@ -256,6 +291,8 @@ class ModelFusionAdapter:
         """
         if not self.available_tags:
             self.available_tags = self._fetch_available_tags()
+        if not self.available_tags or os.environ.get("RFCHUNT_OFFLINE") == "1":
+            return []
 
         # Find abliterated models in available tags
         abliterated_candidates = [
@@ -312,10 +349,26 @@ class ModelFusionAdapter:
         seen_requests = set()
 
         for model in fusion_panel:
-            probes = self._query_ollama(model, system_instruction, user_prompt)
+            probes = self._query_ollama(
+                model,
+                system_instruction,
+                user_prompt,
+                schema_hint=schema_hint,
+                num_predict=num_predict,
+            )
             for p in probes:
                 if not isinstance(p, dict):
                     continue
+                if schema_hint is not None:
+                    # Generic structured JSON mode (e.g., Mantis threat models/hypotheses/patches)
+                    serialized = json.dumps(p, sort_keys=True)
+                    if self._is_refusal(serialized):
+                        logger.info("[ModelFusion] Model %s produced refusal; dropping candidate.", model)
+                        continue
+                    p["fused_model"] = model
+                    all_probes.append(p)
+                    continue
+
                 raw_val = p.get("raw_request", "")
                 if isinstance(raw_val, dict):
                     raw_val = raw_val.get("raw_request", raw_val.get("request", ""))
@@ -338,8 +391,14 @@ class ModelFusionAdapter:
         if not all_probes and abliterated_candidates:
             abl_tag = abliterated_candidates[0]
             if abl_tag not in fusion_panel:
-                logger.info("[ModelFusion] Panel produced 0 probes; rescuing with abliterated model %s", abl_tag)
-                abl_probes = self._query_ollama(abl_tag, system_instruction, user_prompt)
+                logger.info("[ModelFusion] Panel produced 0 items; rescuing with abliterated model %s", abl_tag)
+                abl_probes = self._query_ollama(
+                    abl_tag,
+                    system_instruction,
+                    user_prompt,
+                    schema_hint=schema_hint,
+                    num_predict=num_predict,
+                )
                 for p in abl_probes:
                     if isinstance(p, dict):
                         p["fused_model"] = f"{abl_tag} [AbliteratedRescue]"

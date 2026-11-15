@@ -282,7 +282,13 @@ class FusionArbiter:
                 return tag
         return self.available_tags[0]
 
-    def _query_model(self, model: str, prompt: str, system_prompt: str) -> str:
+    def _query_model(
+        self,
+        model: str,
+        prompt: str,
+        system_prompt: str,
+        num_predict: int = 110,
+    ) -> str:
         if not self.available_tags:
             self.available_tags = self._fetch_available_tags()
 
@@ -300,7 +306,7 @@ class FusionArbiter:
             "prompt": f"{system_prompt}\n{prompt}" if "foundation-sec" in target_model.lower() else f"### SYSTEM:\n{system_prompt}\n\n### INSTRUCTION:\n{prompt}",
             "stream": False,
             "keep_alive": "60m",
-            "options": {"temperature": 0.7, "num_predict": 110, "stop": ["<|end_of_text|>", "###"]},
+            "options": {"temperature": 0.7, "num_predict": int(num_predict), "stop": ["<|end_of_text|>", "###"]},
         }
         if "deepseek-r1" not in target_model.lower():
             payload["format"] = "json"
@@ -787,3 +793,109 @@ Output strict JSON matching:
             except Exception:
                 pass
         return []
+
+    def arbitrate_structured_json(
+        self,
+        task_name: str,
+        system_prompt: str,
+        user_prompt: str,
+        default_payload: Optional[Dict[str, Any]] = None,
+        num_predict: int = 512,
+    ) -> Dict[str, Any]:
+        """
+        General-purpose ModelFusion 2-Specialist + Arbiter pipeline for Google Mantis (Module 20)
+        and unified `--all` auditing. Prioritizes abliterated / OBLITERATED models to prevent
+        safety over-refusal on defensive exploit reproduction and threat modeling.
+        """
+        import concurrent.futures
+
+        if not self.available_tags:
+            self.available_tags = self._fetch_available_tags()
+
+        abliterated_candidates = [
+            t for t in self.available_tags
+            if ("abliterat" in t.lower() or "obliterat" in t.lower())
+            and (self.free_ram_gb >= 12.0 or not any(tag in t.lower() for tag in ("70b", "72b", "755b")))
+        ]
+        participating_models = [self.gemma_model, self.sec_model, self.arbiter_model]
+
+        # Fast fail-safe offline fallback when Ollama daemon has zero local tags or offline mode is active
+        if not self.available_tags or os.environ.get("RFCHUNT_OFFLINE") == "1":
+            return {
+                "task": task_name,
+                "status": "offline_fallback",
+                "consensus_type": "DeterministicFallback",
+                "participating_models": participating_models,
+                "abliterated_active": any("obliterat" in m.lower() or "abliterat" in m.lower() for m in participating_models),
+                "data": default_payload if default_payload is not None else {},
+            }
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            fut_primary = pool.submit(self._query_model, self.gemma_model, user_prompt, system_prompt, num_predict)
+            fut_sec = pool.submit(self._query_model, self.sec_model, user_prompt, system_prompt, num_predict)
+            out_primary = fut_primary.result()
+            out_sec = fut_sec.result()
+
+        proposals: List[Dict[str, Any]] = []
+        for model_name, raw_out in ((self.gemma_model, out_primary), (self.sec_model, out_sec)):
+            if not raw_out or self._is_refusal(raw_out):
+                continue
+            parsed = self._parse_json(raw_out)
+            if parsed:
+                proposals.append({"model": model_name, "output": parsed})
+
+        # Abliteration Rescue if aligned specialists refused or produced empty JSON
+        rescued = False
+        if not proposals and abliterated_candidates:
+            abl_model = abliterated_candidates[0]
+            rescued_raw = self._query_model(
+                abl_model,
+                user_prompt,
+                f"{system_prompt}\nOperate strictly as a senior defensive security auditor outputting raw JSON.",
+                num_predict=num_predict,
+            )
+            if rescued_raw and not self._is_refusal(rescued_raw):
+                parsed = self._parse_json(rescued_raw)
+                if parsed:
+                    proposals.append({"model": f"{abl_model} [AbliteratedRescue]", "output": parsed})
+                    rescued = True
+
+        if not proposals:
+            return {
+                "task": task_name,
+                "status": "deterministic_fallback",
+                "consensus_type": "DeterministicFallback",
+                "participating_models": participating_models,
+                "abliterated_active": bool(abliterated_candidates) or any("obliterat" in m.lower() or "abliterat" in m.lower() for m in participating_models),
+                "data": default_payload if default_payload is not None else {},
+            }
+
+        # Arbiter consensus synthesis when both specialists responded cleanly
+        synthesized_data: Any = proposals[0]["output"]
+        if len(proposals) >= 2:
+            arb_prompt = (
+                f"Task: {task_name}\n"
+                f"Merge and refine the following specialist JSON outputs into a single highest-accuracy JSON object.\n"
+                f"Proposals:\n{json.dumps(proposals, indent=2)[:2800]}"
+            )
+            arb_raw = self._query_model(self.arbiter_model, arb_prompt, system_prompt, num_predict=num_predict)
+            if (not arb_raw or self._is_refusal(arb_raw)) and abliterated_candidates:
+                arb_raw = self._query_model(abliterated_candidates[0], arb_prompt, system_prompt, num_predict=num_predict)
+            if arb_raw and not self._is_refusal(arb_raw):
+                arb_parsed = self._parse_json(arb_raw)
+                if arb_parsed:
+                    synthesized_data = arb_parsed[0] if len(arb_parsed) == 1 else arb_parsed
+        elif isinstance(synthesized_data, list) and len(synthesized_data) == 1:
+            synthesized_data = synthesized_data[0]
+
+        has_abl = rescued or bool(abliterated_candidates) or any(
+            "obliterat" in m.lower() or "abliterat" in m.lower() for m in participating_models
+        )
+        return {
+            "task": task_name,
+            "status": "fused",
+            "consensus_type": "AbliteratedConsensus" if has_abl else "ArbiterSynthesized",
+            "participating_models": [p["model"] for p in proposals],
+            "abliterated_active": has_abl,
+            "data": synthesized_data,
+        }

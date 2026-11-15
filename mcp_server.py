@@ -435,6 +435,62 @@ class TerminatorMCPServer:
                     },
                 },
             },
+            {
+                "name": "run_all_scans",
+                "description": "[Unified --all Multi-Scanner + Google Mantis] Runs ALL integrated security scanners (Google Mantis, haasonsaas/aiscan, ARTEX Dual-Graph, RAPTOR SAST/PQC/SCA, Prompt Smuggling) against a --repo or --path with mandatory ModelFusion and Abliterated models.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo": {"type": "string", "description": "Repository directory path to audit"},
+                        "path": {"type": "string", "description": "Specific file or folder path to audit"},
+                        "depth": {"type": "integer", "default": 30, "description": "Mantis audit depth (1..100)"},
+                        "mantis_mode": {
+                            "type": "string",
+                            "enum": ["full", "fast", "threat-model", "scan", "reproduce", "patch"],
+                            "default": "full",
+                        },
+                        "artex_rounds": {"type": "integer", "default": 1},
+                        "output_dir": {"type": "string", "default": "reports"},
+                    },
+                },
+            },
+            {
+                "name": "mantis_scan_all",
+                "description": "[Alias for run_all_scans] Runs all RFCHunt + Google Mantis scanners against repo/path with mandatory ModelFusion + Abliterated models.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo": {"type": "string"},
+                        "path": {"type": "string"},
+                        "depth": {"type": "integer", "default": 30},
+                        "mantis_mode": {
+                            "type": "string",
+                            "enum": ["full", "fast", "threat-model", "scan", "reproduce", "patch"],
+                            "default": "full",
+                        },
+                        "output_dir": {"type": "string", "default": "reports"},
+                    },
+                },
+            },
+            {
+                "name": "mantis_scan",
+                "description": "[Module 20: Google Mantis] Executes automated STRIDE threat modeling, depth-scaled AST/rule hypothesis synthesis, Tier 1/2 sandbox canary reproduction, calibrated CVSS v3.1 scoring, and verified adversarial patching using ModelFusion + Abliterated models.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "target_path": {"type": "string", "description": "Target file or directory path"},
+                        "repo": {"type": "string", "description": "Alternative repository directory path"},
+                        "path": {"type": "string", "description": "Alternative file or directory path"},
+                        "depth": {"type": "integer", "default": 30, "description": "Audit depth 1..100"},
+                        "mode": {
+                            "type": "string",
+                            "enum": ["full", "fast", "threat-model", "scan", "reproduce", "patch"],
+                            "default": "full",
+                        },
+                        "output_dir": {"type": "string", "default": "reports"},
+                    },
+                },
+            },
         ]
 
     def _execute_tool(self, name: str, args: Dict[str, Any]) -> Any:
@@ -597,6 +653,52 @@ class TerminatorMCPServer:
                     "url": RAPTOR_REPO_URL,
                 },
             }
+
+        elif name in ("run_all_scans", "mantis_scan_all"):
+            from engine.mantis_integrator import DEFAULT_ABLITERATED_MODEL, run_unified_all_scans
+
+            repo = args.get("repo")
+            path = args.get("path")
+            raw_target = str(repo or path or ".")
+            if "\x00" in raw_target:
+                raise ValueError("Invalid target path containing NUL byte.")
+            resolved = os.path.abspath(raw_target)
+            if not os.path.exists(resolved):
+                return {"error": f"Target path does not exist: {resolved}"}
+
+            return run_unified_all_scans(
+                repo=resolved if repo or not path else None,
+                path=resolved if path and not repo else path,
+                depth=int(args.get("depth", 30)),
+                mantis_mode=str(args.get("mantis_mode", "full")),
+                use_fusion=True,
+                preferred_model=DEFAULT_ABLITERATED_MODEL,
+                db=self.db,
+                reports_dir=args.get("output_dir") or "reports",
+                artex_rounds=int(args.get("artex_rounds", 1)),
+            )
+
+        elif name == "mantis_scan":
+            from engine.mantis_integrator import DEFAULT_ABLITERATED_MODEL, MantisIntegrator
+
+            raw_target = str(args.get("target_path") or args.get("repo") or args.get("path") or ".")
+            if "\x00" in raw_target:
+                raise ValueError("Invalid target path containing NUL byte.")
+            resolved = os.path.abspath(raw_target)
+            if not os.path.exists(resolved):
+                return {"error": f"Target path does not exist: {resolved}"}
+
+            integrator = MantisIntegrator(
+                db=self.db,
+                reports_dir=args.get("output_dir") or "reports",
+                use_fusion=True,
+                preferred_model=DEFAULT_ABLITERATED_MODEL,
+            )
+            return integrator.run_scan(
+                target_path=resolved,
+                depth=int(args.get("depth", 30)),
+                mode=str(args.get("mode", "full")),
+            )
 
         raise ValueError(f"Unknown tool: {name}")
 

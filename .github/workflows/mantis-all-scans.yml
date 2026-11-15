@@ -1,0 +1,92 @@
+name: RFCHunt Unified --all & Google Mantis Security Scan
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      depth:
+        description: "Google Mantis audit depth (1-100)"
+        required: false
+        default: "30"
+      target_path:
+        description: "Specific --path override (defaults to full repo '.')"
+        required: false
+        default: "."
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  unified-all-scans:
+    name: Unified --all Audit (Mantis + aiscan + ARTEX + RAPTOR + Smuggling)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run RFCHunt --all Scan (Fusion + Abliterated Models Enforced)
+        env:
+          CI: "true"
+          RFCHUNT_OFFLINE: "1"
+        run: |
+          TARGET="${{ github.event.inputs.target_path || '.' }}"
+          DEPTH="${{ github.event.inputs.depth || '30' }}"
+          if [ "$TARGET" = "." ]; then
+            python -u rfc_hunt_swarm.py --all --repo . --depth "$DEPTH"
+          else
+            python -u rfc_hunt_swarm.py --all --path "$TARGET" --depth "$DEPTH"
+          fi
+
+      - name: Verify Unified SARIF and Summary Outputs
+        run: |
+          python -c '
+          import json
+          with open("reports/combined_report.sarif", "r", encoding="utf-8") as f:
+              sarif = json.load(f)
+          assert sarif["version"] == "2.1.0"
+          assert len(sarif["runs"]) >= 1
+          with open("reports/combined_audit_summary.json", "r", encoding="utf-8") as f:
+              summary = json.load(f)
+          assert summary["fusion_enabled"] is True
+          assert "OBLITERATED" in summary["abliterated_model"].upper()
+          print("Verified combined SARIF results:", len(sarif["runs"][0]["results"]))
+          '
+
+      - name: Run Mantis & Fusion Integration Tests
+        env:
+          CI: "true"
+          RFCHUNT_OFFLINE: "1"
+        run: |
+          pytest tests/test_mantis_integrator.py tests/test_abliteration_fusion.py -v
+
+      - name: Upload Security Reports Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rfchunt-all-security-reports
+          path: reports/
+          if-no-files-found: error
+
+      - name: Upload Combined SARIF to GitHub Code Scanning
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/combined_report.sarif
+          category: rfchunt-unified-all

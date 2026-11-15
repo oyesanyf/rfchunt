@@ -289,6 +289,54 @@ class Database:
                     severity TEXT DEFAULT 'HIGH',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS mantis_threat_models (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_id TEXT UNIQUE NOT NULL,
+                    target_repo TEXT NOT NULL,
+                    entry_points_json TEXT,
+                    trust_boundaries_json TEXT,
+                    data_flows_json TEXT,
+                    assets_json TEXT,
+                    threat_actors_json TEXT,
+                    stride_matrix_json TEXT,
+                    risk_ranked_files_json TEXT,
+                    fusion_models_json TEXT,
+                    raw_summary TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS mantis_findings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    finding_id TEXT UNIQUE NOT NULL,
+                    target_path TEXT,
+                    component TEXT,
+                    file_path TEXT NOT NULL,
+                    line_number INTEGER DEFAULT 0,
+                    rule_id TEXT,
+                    cwe_id TEXT,
+                    threat_category TEXT,
+                    stride_category TEXT,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    hypothesis_id TEXT,
+                    hypothesis_statement TEXT,
+                    severity TEXT NOT NULL,
+                    calibrated_severity TEXT NOT NULL,
+                    raw_llm_severity TEXT,
+                    cvss_score REAL DEFAULT 0.0,
+                    cvss_vector TEXT,
+                    reproduction_tier INTEGER DEFAULT 0,
+                    reproduction_status TEXT DEFAULT 'UNVERIFIED',
+                    reproducer_code TEXT,
+                    reproduction_evidence TEXT,
+                    proposed_patch TEXT,
+                    patch_verified BOOLEAN DEFAULT 0,
+                    patch_verification_notes TEXT,
+                    fusion_consensus_model TEXT,
+                    snippet TEXT,
+                    discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             """)
 
     def save_rfc(self, rfc_id: str, title: str, source_url: str, doc_path: str) -> None:
@@ -750,6 +798,12 @@ class Database:
                 "arm106_defensive_rules",
                 "arm107_regression_tests",
                 "rfc_requirements",
+                "mantis_findings",
+                "mantis_threat_models",
+                "ai_security_findings",
+                "dual_graph_nodes",
+                "dual_graph_edges",
+                "attack_chains",
             ])
         if not keep_rfcs:
             tables_to_clear.append("rfcs")
@@ -813,6 +867,8 @@ class Database:
             "reproducible_vulnerabilities", "novel_techniques",
             "arm106_defensive_rules", "arm107_regression_tests",
             "anomaly_fingerprints", "dynamic_permutations", "harness2_runs",
+            "ai_security_findings", "dual_graph_nodes", "dual_graph_edges",
+            "attack_chains", "mantis_findings", "mantis_threat_models",
         ]
         counts = {}
         with self._lock:
@@ -1061,3 +1117,183 @@ class Database:
                 d["steps"] = json.loads(d.get("steps_json") or "[]")
                 res.append(d)
             return res
+
+    def save_mantis_threat_model(
+        self,
+        model_id: str,
+        target_repo: str,
+        entry_points: Optional[List[Any]] = None,
+        trust_boundaries: Optional[List[Any]] = None,
+        data_flows: Optional[List[Any]] = None,
+        assets: Optional[List[Any]] = None,
+        threat_actors: Optional[List[Any]] = None,
+        stride_matrix: Optional[Dict[str, Any]] = None,
+        risk_ranked_files: Optional[List[Any]] = None,
+        fusion_models: Optional[List[str]] = None,
+        raw_summary: str = "",
+    ) -> int:
+        """Persists a Google Mantis automated repository threat model."""
+        with self._lock:
+            with self.conn:
+                cur = self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO mantis_threat_models
+                    (model_id, target_repo, entry_points_json, trust_boundaries_json, data_flows_json,
+                     assets_json, threat_actors_json, stride_matrix_json, risk_ranked_files_json,
+                     fusion_models_json, raw_summary)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(model_id),
+                        str(target_repo),
+                        json.dumps(entry_points or []),
+                        json.dumps(trust_boundaries or []),
+                        json.dumps(data_flows or []),
+                        json.dumps(assets or []),
+                        json.dumps(threat_actors or []),
+                        json.dumps(stride_matrix or {}),
+                        json.dumps(risk_ranked_files or []),
+                        json.dumps(fusion_models or []),
+                        str(raw_summary or ""),
+                    ),
+                )
+                return int(cur.lastrowid or 0)
+
+    def get_mantis_threat_model(self, target_repo: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Retrieves the latest Mantis threat model for a repository."""
+        with self._lock:
+            cur = self.conn.cursor()
+            if target_repo:
+                cur.execute(
+                    "SELECT * FROM mantis_threat_models WHERE target_repo = ? ORDER BY id DESC LIMIT 1",
+                    (str(target_repo),),
+                )
+            else:
+                cur.execute("SELECT * FROM mantis_threat_models ORDER BY id DESC LIMIT 1")
+            row = cur.fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            d["entry_points"] = json.loads(d.get("entry_points_json") or "[]")
+            d["trust_boundaries"] = json.loads(d.get("trust_boundaries_json") or "[]")
+            d["data_flows"] = json.loads(d.get("data_flows_json") or "[]")
+            d["assets"] = json.loads(d.get("assets_json") or "[]")
+            d["threat_actors"] = json.loads(d.get("threat_actors_json") or "[]")
+            d["stride_matrix"] = json.loads(d.get("stride_matrix_json") or "{}")
+            d["risk_ranked_files"] = json.loads(d.get("risk_ranked_files_json") or "[]")
+            d["fusion_models"] = json.loads(d.get("fusion_models_json") or "[]")
+            return d
+
+    def save_mantis_finding(
+        self,
+        finding: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> int:
+        """Persists a Google Mantis vulnerability finding (accepts dict or kwargs)."""
+        payload: Dict[str, Any] = {}
+        if isinstance(finding, dict):
+            payload.update(finding)
+        payload.update(kwargs)
+
+        finding_id = str(payload.get("finding_id") or "")
+        if not finding_id:
+            import hashlib
+            seed = f"{payload.get('file_path', '')}:{payload.get('line_number', 0)}:{payload.get('rule_id', '')}:{payload.get('title', '')}"
+            finding_id = f"MANTIS-{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:12]}"
+
+        calibrated_sev = str(payload.get("calibrated_severity") or payload.get("severity") or "MEDIUM").upper()
+        severity = str(payload.get("severity") or calibrated_sev).upper()
+        raw_llm_sev = str(payload.get("raw_llm_severity") or severity).upper()
+
+        raw_tier = payload.get("reproduction_tier", 0)
+        if isinstance(raw_tier, int):
+            repro_tier_int = raw_tier
+        else:
+            t_str = str(raw_tier or "").upper()
+            if "2" in t_str or "SANDBOX" in t_str or "CANARY" in t_str:
+                repro_tier_int = 2
+            elif "1" in t_str or "STATIC" in t_str or "TAINT" in t_str:
+                repro_tier_int = 1
+            else:
+                try:
+                    repro_tier_int = int(raw_tier)
+                except (TypeError, ValueError):
+                    repro_tier_int = 0
+
+        repro_status = str(
+            payload.get("reproduction_status")
+            or ("VERIFIED" if payload.get("reproduced") else "UNVERIFIED")
+        )
+        fusion_val = payload.get("fusion_consensus_model") or payload.get("fusion_models") or ""
+        if isinstance(fusion_val, (list, tuple)):
+            fusion_val = ", ".join(str(m) for m in fusion_val)
+
+        with self._lock:
+            with self.conn:
+                cur = self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO mantis_findings
+                    (finding_id, target_path, component, file_path, line_number, rule_id, cwe_id,
+                     threat_category, stride_category, title, description, hypothesis_id, hypothesis_statement,
+                     severity, calibrated_severity, raw_llm_severity, cvss_score, cvss_vector,
+                     reproduction_tier, reproduction_status, reproducer_code, reproduction_evidence,
+                     proposed_patch, patch_verified, patch_verification_notes, fusion_consensus_model, snippet)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        finding_id,
+                        str(payload.get("target_path", "")),
+                        str(payload.get("component") or payload.get("sink", "")),
+                        str(payload.get("file_path", "")),
+                        int(payload.get("line_number", 0) or 0),
+                        str(payload.get("rule_id", "")),
+                        str(payload.get("cwe_id") or payload.get("cwe", "")),
+                        str(payload.get("threat_category") or payload.get("status", "")),
+                        str(payload.get("stride_category", "")),
+                        str(payload.get("title", "Mantis Security Finding")),
+                        str(payload.get("description", "")),
+                        str(payload.get("hypothesis_id", "")),
+                        str(payload.get("hypothesis_statement") or payload.get("remediation", "")),
+                        severity,
+                        calibrated_sev,
+                        raw_llm_sev,
+                        float(payload.get("cvss_score", 0.0) or 0.0),
+                        str(payload.get("cvss_vector", "")),
+                        repro_tier_int,
+                        repro_status,
+                        str(payload.get("reproducer_code", "")),
+                        str(payload.get("reproduction_evidence") or payload.get("reproduction_details", "")),
+                        str(payload.get("proposed_patch") or payload.get("patch_diff") or payload.get("patched_code", "")),
+                        1 if payload.get("patch_verified", False) else 0,
+                        str(payload.get("patch_verification_notes", "")),
+                        str(fusion_val),
+                        str(payload.get("snippet") or payload.get("evidence", "")),
+                    ),
+                )
+                return int(cur.lastrowid or 0)
+
+    def get_mantis_findings(
+        self,
+        target_path: Optional[str] = None,
+        severity: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Retrieves persisted Google Mantis findings filtered by target_path or severity."""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if target_path:
+            clauses.append("target_path = ?")
+            params.append(str(target_path))
+        if severity:
+            clauses.append("(calibrated_severity = ? OR severity = ?)")
+            sev_u = severity.upper()
+            params.extend([sev_u, sev_u])
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"SELECT * FROM mantis_findings {where_sql} ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(sql, tuple(params))
+            return [dict(r) for r in cur.fetchall()]

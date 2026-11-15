@@ -458,6 +458,72 @@ def cmd_build(args):
         sys.exit(1)
 
 
+def cmd_mantis(args):
+    """Execute Google Mantis (Module 20) with mandatory ModelFusion & Abliterated model."""
+    from engine.mantis_integrator import DEFAULT_ABLITERATED_MODEL, MantisIntegrator
+
+    args.fusion = True
+    args.abliteration = True
+    preferred_model = DEFAULT_ABLITERATED_MODEL
+    if getattr(args, "model", None) and "obliterated" in str(args.model).lower():
+        preferred_model = args.model
+    args.model = preferred_model
+
+    target = getattr(args, "repo", None) or getattr(args, "path", None) or "."
+    depth = int(getattr(args, "depth", 30) or 30)
+    mode = getattr(args, "mantis_mode", "full") or "full"
+    reports_dir = getattr(args, "output_dir", None) or "reports"
+
+    db = Database(args.db)
+    integrator = MantisIntegrator(
+        db=db,
+        reports_dir=reports_dir,
+        use_fusion=True,
+        preferred_model=preferred_model,
+        sec_model=getattr(args, "sec_model", None),
+    )
+    res = integrator.run_scan(target_path=str(target), depth=depth, mode=mode)
+    print(f"\n[+] Google Mantis Scan Complete: target={res['target_path']} depth={depth} mode={mode}")
+    print(f"    Fusion Enabled: {res['fusion_enabled']} | Abliterated Model: {res['abliterated_model']}")
+    print(f"    Total Findings: {res['total_findings']} | Reproduced: {res['reproduced_count']} | Patched Verified: {res['patched_verified_count']}")
+    print(f"    SARIF Report  : {res['report_files'].get('sarif')}")
+
+
+def cmd_all(args):
+    """Execute Unified --all Scans across --repo / --path with mandatory ModelFusion & Abliterated models."""
+    from engine.mantis_integrator import DEFAULT_ABLITERATED_MODEL, run_unified_all_scans
+
+    args.fusion = True
+    args.abliteration = True
+    preferred_model = DEFAULT_ABLITERATED_MODEL
+    if getattr(args, "model", None) and "obliterated" in str(args.model).lower():
+        preferred_model = args.model
+    args.model = preferred_model
+
+    repo = getattr(args, "repo", None)
+    path = getattr(args, "path", None)
+    depth = int(getattr(args, "depth", 30) or 30)
+    mode = getattr(args, "mantis_mode", "full") or "full"
+    reports_dir = getattr(args, "output_dir", None) or "reports"
+
+    db = Database(args.db)
+    res = run_unified_all_scans(
+        repo=repo or (None if path else "."),
+        path=path,
+        depth=depth,
+        mantis_mode=mode,
+        use_fusion=True,
+        preferred_model=preferred_model,
+        db=db,
+        reports_dir=reports_dir,
+    )
+    print(f"\n[+] Unified --all Security Scan Complete: target={res['target_path']} depth={depth}")
+    print(f"    Fusion Enforced: {res['fusion_enabled']} | Abliterated Model: {res['abliterated_model']}")
+    print(f"    Aggregated Findings: {res['total_aggregated_findings']} {res.get('severity_counts', {})}")
+    print(f"    Combined SARIF     : {res['report_files'].get('combined_sarif')}")
+    print(f"    Combined JSON      : {res['report_files'].get('combined_json')}")
+
+
 def cmd_harness2(args):
     """Executes Google Research Harness² recursive agent harnessing (Propose-Probe-Compose across c1..c8)."""
     from engine.harness2_engine import Harness2ProtocolEngine
@@ -543,6 +609,13 @@ USAGE EXAMPLES:
     parser.add_argument("--sec-model", default=None, help="Secondary security specialist model (e.g. fenkohq/foundation-sec-8b:latest, qwen2.5:7b)")
     parser.add_argument("--abliteration", "--obliterated", dest="abliteration", action="store_true", default=False, help="Force refuse-free abliterated model (hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M) across ModelFusion panel")
     parser.add_argument("--no-fusion", dest="fusion", action="store_false", help="Disable multi-model panel fusion")
+    parser.add_argument("--all", "--run-all", "--all-scans", dest="run_all_scans", action="store_true", help="Run ALL integrated scanners (Google Mantis, aiscan, ARTEX, RAPTOR, Prompt Smuggling) with mandatory Fusion & Abliterated models")
+    parser.add_argument("--mantis", action="store_true", help="Run Google Mantis (Module 20) scan")
+    parser.add_argument("--repo", dest="repo", type=str, default=None, help="Repository path for --all / --mantis scan")
+    parser.add_argument("--path", dest="path", type=str, default=None, help="Target file or folder path for --all / --mantis scan")
+    parser.add_argument("--depth", dest="depth", type=int, default=30, help="Google Mantis scan depth (1..100, default: 30)")
+    parser.add_argument("--mantis-mode", dest="mantis_mode", choices=["full", "fast", "threat-model", "scan", "reproduce", "patch"], default="full", help="Google Mantis pipeline mode")
+    parser.add_argument("--output-dir", dest="output_dir", type=str, default="reports", help="Output directory for SARIF/JSON audit reports")
     parser.set_defaults(fusion=True)
 
     subparsers = parser.add_subparsers(dest="command")
@@ -658,13 +731,30 @@ USAGE EXAMPLES:
     p_harness2.add_argument("--port", type=int, default=8080, help="Target port")
     p_harness2.add_argument("--report", "--harness2-report", dest="report", action="store_true", help="Print historical Harness2 runs and experience libraries")
 
+    # Google Mantis & Unified All Scans
+    p_all = subparsers.add_parser("all", help="Run ALL security scanners (Mantis, aiscan, ARTEX, RAPTOR, Prompt Smuggling) with Fusion + Abliterated models")
+    p_all.add_argument("--repo", default=argparse.SUPPRESS, help="Repository directory path")
+    p_all.add_argument("--path", default=argparse.SUPPRESS, help="File or directory path")
+    p_all.add_argument("--depth", type=int, default=argparse.SUPPRESS, help="Mantis depth (1..100)")
+    p_all.add_argument("--mantis-mode", choices=["full", "fast", "threat-model", "scan", "reproduce", "patch"], default=argparse.SUPPRESS, help="Mantis mode")
+    p_all.add_argument("--output-dir", default=argparse.SUPPRESS, help="Report output directory")
+
+    p_mantis = subparsers.add_parser("mantis", help="Run Google Mantis (Module 20) security pipeline")
+    p_mantis.add_argument("--repo", default=argparse.SUPPRESS, help="Repository directory path")
+    p_mantis.add_argument("--path", default=argparse.SUPPRESS, help="File or directory path")
+    p_mantis.add_argument("--depth", type=int, default=argparse.SUPPRESS, help="Mantis depth (1..100)")
+    p_mantis.add_argument("--mantis-mode", choices=["full", "fast", "threat-model", "scan", "reproduce", "patch"], default=argparse.SUPPRESS, help="Mantis mode")
+    p_mantis.add_argument("--output-dir", default=argparse.SUPPRESS, help="Report output directory")
+
     # Build All Pipeline
     p_build = subparsers.add_parser("build", help="Build all components, verify database, pre-cache RFCs, and run verification suite")
     p_build.add_argument("--skip-tests", action="store_true", help="Skip running the pytest verification suite")
 
     args = parser.parse_args()
 
-    if getattr(args, "abliteration", False):
+    if getattr(args, "abliteration", False) or getattr(args, "run_all_scans", False) or getattr(args, "mantis", False) or args.command in ("all", "mantis"):
+        args.fusion = True
+        args.abliteration = True
         args.model = "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"
 
     if getattr(args, "clean_db", False):
@@ -675,14 +765,24 @@ USAGE EXAMPLES:
             vacuum=True,
         )
         print(f"[+] Database cleaned and VACUUMed: {res['total_rows_deleted']:,} rows removed, {res['reclaimed_mb']} MB reclaimed.")
-        if not args.command:
+        if not args.command and not getattr(args, "run_all_scans", False) and not getattr(args, "mantis", False):
             sys.exit(0)
+
+    if getattr(args, "run_all_scans", False) and not args.command:
+        cmd_all(args)
+        return
+
+    if getattr(args, "mantis", False) and not args.command:
+        cmd_mantis(args)
+        return
 
     if not args.command:
         parser.print_help()
         sys.exit(0)
 
     dispatch = {
+        "all": cmd_all,
+        "mantis": cmd_mantis,
         "build": cmd_build,
         "ruler": cmd_ruler,
         "hunt": cmd_hunt,

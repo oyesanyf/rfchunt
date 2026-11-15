@@ -392,7 +392,7 @@ Modular toolkit providing discrete CLI commands for each phase of the research f
 
 ---
 
-## The 19 Protocol Research Modules
+## The 20 Protocol & Application Security Modules
 
 | # | Module | Source File | Core Responsibility |
 | :-: | :--- | :--- | :--- |
@@ -415,6 +415,25 @@ Modular toolkit providing discrete CLI commands for each phase of the research f
 | **17**| **BaaRai/ARTEX Dual-Graph Chainer** | `engine/dual_graph_engine.py` | Native Python Planner/Worker multi-round attack chaining using Asset & Exploration graphs. |
 | **18**| **haasonsaas/aiscan AI Auditor** | `engine/aiscan_integrator.py` | High-speed AI risk audit, prompt injection sink scanning, and model credential discovery. |
 | **19**| **Prompt Smuggling Synthesizer** | `engine/prompt_smuggling_synthesizer.py` | Novel attack class: couples wire framing desyncs (CL.TE, TE.CL) with backend AI endpoints. |
+| **20**| **Google Mantis Security Toolkit** | `engine/mantis_integrator.py` | Automated STRIDE threat modeling, `--depth` 1..100 hypothesis audit, Tier 1/2 sandbox canary repro, calibrated CVSS v3.1 rubric, verified patching, and unified `--all` orchestrator (ModelFusion + Abliterated models). |
+
+### Google Mantis & Unified `--all` Multi-Scanner Quickstart
+
+```powershell
+# Run ALL integrated scanners (Google Mantis, aiscan, ARTEX Dual-Graph, RAPTOR SAST/PQC/SCA, Prompt Smuggling)
+# Enforces ModelFusion + Abliterated models (hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M)
+py -3.12 -u rfc_hunt_swarm.py --all --repo . --depth 30
+
+# Target a single file or subdirectory via --path
+py -3.12 -u main.py --all --path engine/mantis_integrator.py --depth 50
+
+# Standalone Google Mantis deep audit with patch synthesis
+py -3.12 -u rfc_hunt_swarm.py --mantis --repo . --mantis-mode patch --depth 100
+```
+
+- **SARIF 2.1.0 & Reports**: Written headless to `reports/combined_report.sarif`, `reports/mantis_report.sarif`, and `reports/combined_audit_summary.json`.
+- **MCP Server Tools**: Exposes `run_all_scans`, `mantis_scan_all`, and `mantis_scan` over stdio JSON-RPC (`python main.py mcp`).
+- **GitHub Actions CI**: Automated via `.github/workflows/mantis-all-scans.yml` (executes `--all --repo .` and uploads SARIF artifacts to GitHub Code Scanning).
 
 ---
 

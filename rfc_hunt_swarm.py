@@ -1657,7 +1657,7 @@ def cmd_raptor(args):
         return
 
     # 3. Determine Scan Target: Live Host vs Any Local Folder
-    target_repo = getattr(args, "raptor_target", None) or getattr(args, "target_arg", None)
+    target_repo = getattr(args, "raptor_target", None) or getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "target_arg", None)
     host = getattr(args, "host", None)
     raptor_mode = getattr(args, "raptor_mode", None)
 
@@ -1728,6 +1728,128 @@ def cmd_raptor(args):
             for f in res["findings"][:15]:
                 loc = f"{f['file']}:{f['line']}"
                 print(f"{f['severity']:<10} {f['rule_id']:<30} {loc[:32]:<32} {f['message'][:50]}")
+    print(f"{'='*75}\n")
+    db.close()
+
+
+def cmd_mantis(args):
+    """
+    Executes Module 20 (Google Mantis) Threat Modeling, Depth-Scaled Hypothesis Generation,
+    Tier 1/2 Reproduction, Calibrated CVSS Scoring, and Adversarial Patching with
+    mandatory ModelFusion and refusal-free Abliterated models.
+    """
+    from database import Database
+    from engine.mantis_integrator import DEFAULT_ABLITERATED_MODEL, MantisIntegrator
+
+    args.fusion = True
+    args.abliteration = True
+    target = (
+        getattr(args, "mantis_target", None)
+        or getattr(args, "repo", None)
+        or getattr(args, "path", None)
+        or getattr(args, "raptor_target", None)
+        or getattr(args, "target_arg", None)
+        or "."
+    )
+    depth = int(getattr(args, "depth", 30) or 30)
+    mode = getattr(args, "mantis_mode", "full") or "full"
+    preferred_model = getattr(args, "mantis_model", None) or DEFAULT_ABLITERATED_MODEL
+    reports_dir = getattr(args, "output_dir", None) or "reports"
+
+    db = Database(args.db)
+    if getattr(args, "mantis_report", False):
+        findings = db.get_mantis_findings(limit=50)
+        print(f"\n{'='*75}")
+        print(f"[*] GOOGLE MANTIS STORED FINDINGS ({len(findings)} rows)")
+        print(f"{'='*75}")
+        for f in findings[:20]:
+            print(
+                f"  [{f.get('severity', 'INFO'):<8} CVSS {f.get('cvss_score', 0.0):<4}] "
+                f"{f.get('rule_id', '')} ({f.get('cwe', '')}) "
+                f"{os.path.basename(str(f.get('file_path', '')))}:{f.get('line_number', 0)} - {f.get('title', '')}"
+            )
+        print(f"{'='*75}\n")
+        db.close()
+        return
+
+    print(f"\n{'='*75}")
+    print(f"[*] MODULE 20: GOOGLE MANTIS SECURITY PIPELINE (Fusion + Abliterated Enforced)")
+    print(f"[*] Target: {os.path.abspath(str(target))} | Mode: {mode} | Depth: {depth}")
+    print(f"[*] Abliterated Model: {preferred_model}")
+    print(f"{'='*75}")
+
+    integrator = MantisIntegrator(
+        db=db,
+        reports_dir=reports_dir,
+        use_fusion=True,
+        preferred_model=preferred_model,
+    )
+    res = integrator.run_scan(target_path=str(target), depth=depth, mode=mode)
+
+    print(f"[+] Mantis Completed in {res['elapsed_sec']}s | Profile: {res['depth_profile']}")
+    print(f"    Threat Model ID  : {res['threat_model_id']}")
+    print(f"    Files Discovered : {res['files_discovered']}")
+    print(f"    Total Findings   : {res['total_findings']} (Reproduced: {res['reproduced_count']}, Patched Verified: {res['patched_verified_count']})")
+    print(f"    SARIF Report     : {res['report_files'].get('sarif')}")
+    print(f"    JSON Summary     : {res['report_files'].get('summary_json')}")
+    print(f"{'='*75}\n")
+    db.close()
+
+
+def cmd_all(args):
+    """
+    Unified --all orchestrator running Google Mantis, haasonsaas/aiscan, BaaRai/ARTEX Dual-Graph,
+    RAPTOR (Docker or cross-platform SAST/PQC/SCA), and Prompt Smuggling / RFC framing analyzers
+    against --repo or --path with mandatory ModelFusion and Abliterated model enforcement.
+    """
+    from database import Database
+    from engine.mantis_integrator import DEFAULT_ABLITERATED_MODEL, run_unified_all_scans
+
+    args.fusion = True
+    args.abliteration = True
+    repo = getattr(args, "repo", None) or getattr(args, "raptor_target", None)
+    path = getattr(args, "path", None)
+    if not repo and not path:
+        fallback = getattr(args, "mantis_target", None) or getattr(args, "target_arg", None)
+        if fallback and os.path.exists(str(fallback)):
+            repo = str(fallback)
+        else:
+            repo = "."
+
+    depth = int(getattr(args, "depth", 30) or 30)
+    mantis_mode = getattr(args, "mantis_mode", "full") or "full"
+    preferred_model = getattr(args, "mantis_model", None) or DEFAULT_ABLITERATED_MODEL
+    reports_dir = getattr(args, "output_dir", None) or "reports"
+    artex_rounds = int(getattr(args, "artex_rounds", 1) or 1)
+
+    db = Database(args.db)
+    print(f"\n{'='*75}")
+    print(f"[*] UNIFIED --all SECURITY AUDIT (Fusion + Abliterated Models Enforced)")
+    print(f"[*] Target: {os.path.abspath(str(repo or path))} | Depth: {depth} | Model: {preferred_model}")
+    print(f"{'='*75}")
+
+    res = run_unified_all_scans(
+        repo=repo,
+        path=path,
+        depth=depth,
+        mantis_mode=mantis_mode,
+        use_fusion=True,
+        preferred_model=preferred_model,
+        db=db,
+        reports_dir=reports_dir,
+        artex_rounds=artex_rounds,
+    )
+
+    eng = res.get("engines", {})
+    print(f"[+] Unified --all Completed in {res['elapsed_sec']}s")
+    print(f"    Fusion Enabled      : {res['fusion_enabled']} | Models: {', '.join(res.get('fusion_models', []))}")
+    print(f"    Aggregated Findings : {res['total_aggregated_findings']} {res.get('severity_counts', {})}")
+    print(f"    Module 20 Mantis    : {eng.get('mantis', {}).get('total_findings', 0)} (Reproduced: {eng.get('mantis', {}).get('reproduced_count', 0)})")
+    print(f"    Module 18 aiscan    : {eng.get('aiscan', {}).get('total_findings', 0)}")
+    print(f"    Module 15 RAPTOR    : {eng.get('raptor', {}).get('total_findings', 0)} ({eng.get('raptor', {}).get('mode', 'static')})")
+    print(f"    Module 19 Smuggling : {eng.get('prompt_smuggling', {}).get('probes_generated', 0)} probes synthesized")
+    print(f"    Combined SARIF      : {res['report_files'].get('combined_sarif')}")
+    print(f"    Combined JSON       : {res['report_files'].get('combined_json')}")
     print(f"{'='*75}\n")
     db.close()
 
@@ -1885,12 +2007,12 @@ EXAMPLES:
 
 
 ALL_MODES = [
-    "single", "terminator", "corpus", "all", "pqc", "ruler",
+    "single", "terminator", "corpus", "all", "all_scans", "pqc", "ruler",
     "build", "lab", "mcp", "hunt", "auto", "start",
     "fetch", "chunk", "generate", "permute", "evaluate",
     "weaponize", "cascade", "dream", "caldera", "harness2",
     "dashboard", "export", "oracle", "differential", "h2", "http2", "audit", "merkle",
-    "ui", "vulns", "findings", "list", "raptor", "clean", "clean-db",
+    "ui", "vulns", "findings", "list", "raptor", "mantis", "clean", "clean-db",
     "aiscan", "ai", "artex", "dual_graph", "dual-graph", "smuggle", "prompt_smuggle",
 ]
 
@@ -2240,7 +2362,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     # https://github.com/gadievron/raptor
     parser.add_argument("--raptor", "--enable-raptor", dest="enable_raptor", action="store_true", help="Enable RAPTOR Autonomous Framework (Web application & source code pentesting; credit: Gadi Evron, Daniel Cuthbert, Halvar Flake)")
     parser.add_argument("--raptor-mode", type=str, choices=["web", "scan", "agentic", "crypto", "sca", "describe", "all", "full"], default=None, help="RAPTOR analysis mode: 'all'/'full' (runs describe + scan + crypto + sca + agentic), 'web' (live host DAST), 'scan' (fast static), 'agentic' (LLM triage), 'crypto' (PQC), 'sca' (dependencies)")
-    parser.add_argument("--raptor-target", "--repo", "--folder", "--dir", "--path", dest="raptor_target", type=str, default=None, help="Any local folder or repository path to audit with RAPTOR")
+    parser.add_argument("--raptor-target", "--folder", "--dir", dest="raptor_target", type=str, default=None, help="Any local folder or repository path to audit with RAPTOR")
     parser.add_argument("--raptor-model", type=str, default="fenkohq/foundation-sec-8b:latest", help="Ollama LLM for RAPTOR agentic triage (default: fenkohq/foundation-sec-8b:latest)")
     parser.add_argument("--raptor-status", "--status", dest="raptor_status", action="store_true", help="Check RAPTOR Docker container (danielcuthbert/raptor:latest) and Ollama security model readiness")
     parser.add_argument("--raptor-setup", "--install-raptor", dest="raptor_setup", action="store_true", help="Automatically clone, configure, and pull the RAPTOR Security Framework (https://github.com/gadievron/raptor & danielcuthbert/raptor:latest)")
@@ -2259,6 +2381,18 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     # Novel Attack Synthesis: Desynchronized Prompt Injection (Module 19)
     parser.add_argument("--prompt-smuggle", dest="enable_prompt_smuggle", action="store_true", help="Synthesize and verify novel cross-layer Desynchronized Prompt Injection attack chains")
     parser.add_argument("--export-sarif", type=str, default=None, help="Export aggregated vulnerability findings to specified SARIF file in reports/")
+
+    # Google Mantis Integration (Module 20) & Unified --all Multi-Scanner Orchestrator
+    parser.add_argument("--all", "--run-all", "--all-scans", dest="run_all_scans", action="store_true", help="Execute ALL integrated scanners (Google Mantis, aiscan, ARTEX Dual-Graph, RAPTOR, Prompt Smuggling) with mandatory ModelFusion + Abliterated models")
+    parser.add_argument("--repo", dest="repo", type=str, default=None, help="Repository directory path for --all, --mantis, or --raptor audits")
+    parser.add_argument("--path", dest="path", type=str, default=None, help="Specific file or directory path for --all, --mantis, or --raptor audits")
+    parser.add_argument("--mantis", "--enable-mantis", dest="enable_mantis", action="store_true", help="Enable Google Mantis toolkit (Module 20: threat modeling, depth hypotheses, Tier 1/2 repro, CVSS rubric, patching)")
+    parser.add_argument("--mantis-mode", type=str, choices=["full", "fast", "threat-model", "scan", "reproduce", "patch"], default="full", help="Google Mantis execution mode (default: full)")
+    parser.add_argument("--depth", "--mantis-depth", dest="depth", type=int, default=30, help="Google Mantis audit depth 1..100 (default: 30; scales coverage, passes, and rule tiers)")
+    parser.add_argument("--mantis-target", type=str, default=None, help="Target repository or file path for Google Mantis scan")
+    parser.add_argument("--mantis-model", type=str, default="hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M", help="Refusal-free abliterated ModelFusion model for Google Mantis")
+    parser.add_argument("--mantis-report", action="store_true", help="Display stored Google Mantis findings from terminator.db")
+    parser.add_argument("--output-dir", type=str, default="reports", help="Output directory for SARIF, JSON, and text audit reports (default: reports)")
 
     return parser
 
@@ -2396,6 +2530,10 @@ def parse_swarm_arguments(argv=None):
             args.terminators = ["all"]
         else:
             args.terminators = [t.strip() for t in args.terminators.split(",") if t.strip()]
+    if not getattr(args, "raptor_target", None):
+        args.raptor_target = getattr(args, "repo", None) or getattr(args, "path", None)
+    if not getattr(args, "repo", None) and getattr(args, "raptor_target", None):
+        args.repo = args.raptor_target
     return args
 
 
@@ -2537,6 +2675,17 @@ def main_swarm(argv=None):
         cmd_vulns(args)
         return
 
+
+    if getattr(args, "run_all_scans", False) or (
+        active_mode in ("all", "all_scans")
+        and (getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "raptor_target", None))
+    ):
+        cmd_all(args)
+        return
+
+    if active_mode == "mantis" or getattr(args, "enable_mantis", False) or getattr(args, "mantis_report", False):
+        cmd_mantis(args)
+        return
 
     if active_mode in ("aiscan", "ai") or getattr(args, "enable_aiscan", False) and not explicit_mode_given:
         cmd_aiscan(args)
