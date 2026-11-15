@@ -301,8 +301,8 @@ class TerminatorMCPServer:
                         "target_host": {"type": "string", "default": "127.0.0.1"},
                         "target_port": {"type": "integer", "default": 8080},
                         "use_tls": {"type": "boolean", "default": False},
-                        "model": {"type": "string", "default": "gemma2:2b"},
-                        "use_fusion": {"type": "boolean", "default": False},
+                        "model": {"type": "string", "default": "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"},
+                        "use_fusion": {"type": "boolean", "default": True},
                         "max_rfcs": {"type": "integer", "default": 10},
                         "stop_on_first_flaw": {"type": "boolean", "default": True},
                         "supervisor_token": {"type": "string", "description": "Mandatory supervisor approval token for heavy research hunts"},
@@ -334,13 +334,13 @@ class TerminatorMCPServer:
             },
             {
                 "name": "generate_probes",
-                "description": "Generates novel raw HTTP candidate probes from a micro-inspiration fragment using 100% local Ollama models (Gemma 2, Foundation-Sec, DeepSeek-R1) without buzzword contamination.",
+                "description": "Generates novel raw HTTP candidate probes from a micro-inspiration fragment using 100% local refusal-free abliterated ModelFusion models (Abliterated Gemma-4-12B, Cisco Foundation-Sec-8B, GLM-4; no safety filtering) without buzzword contamination.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "rfc_fragment": {"type": "string"},
-                        "model": {"type": "string", "default": "gemma2:2b"},
-                        "use_fusion": {"type": "boolean", "default": False},
+                        "model": {"type": "string", "default": "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"},
+                        "use_fusion": {"type": "boolean", "default": True},
                     },
                     "required": ["rfc_fragment"],
                 },
@@ -384,7 +384,7 @@ class TerminatorMCPServer:
                         "rationale": {"type": "string"},
                         "rfc_fragment": {"type": "string"},
                         "raw_evidence": {"type": "string"},
-                        "model": {"type": "string", "default": "gemma2:2b"},
+                        "model": {"type": "string", "default": "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"},
                     },
                     "required": ["details", "rationale"],
                 },
@@ -506,8 +506,8 @@ class TerminatorMCPServer:
                 target_host=args.get("target_host", "127.0.0.1"),
                 target_port=args.get("target_port", 8080),
                 use_tls=args.get("use_tls", False),
-                preferred_model=args.get("model", "gemma2:2b"),
-                use_fusion=args.get("use_fusion", False),
+                preferred_model=args.get("model", "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"),
+                use_fusion=args.get("use_fusion", True),
                 db_path=self.db_path,
                 on_progress=lambda msg: sys.stderr.write(f"{msg}\n"),
             )
@@ -533,8 +533,8 @@ class TerminatorMCPServer:
 
         elif name == "generate_probes":
             generator = ProbeGenerator(
-                preferred_model=args.get("model", "gemma2:2b"),
-                use_fusion=args.get("use_fusion", False),
+                preferred_model=args.get("model", "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"),
+                use_fusion=args.get("use_fusion", True),
                 db=self.db,
             )
             probes = generator.generate_candidate_probes(args["rfc_fragment"])
@@ -587,7 +587,7 @@ class TerminatorMCPServer:
 
         elif name == "cascade_extrapolate":
             cascade = DiscoveryCascade(
-                preferred_model=args.get("model", "gemma2:2b"),
+                preferred_model=args.get("model", "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"),
                 db=self.db,
             )
             res = cascade.cascade_from_finding(args)

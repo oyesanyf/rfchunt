@@ -37,7 +37,7 @@ class ContinuousFlawHunter:
         target_host: str = "127.0.0.1",
         target_port: int = 8080,
         use_tls: bool = False,
-        preferred_model: str = "gemma2:2b",
+        preferred_model: str = "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M",
         use_fusion: bool = True,
         db_path: str = "terminator.db",
         on_progress: Optional[Callable[[str], None]] = None,

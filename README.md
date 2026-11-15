@@ -84,13 +84,14 @@ flowchart TD
 
 1. **Micro-Inspiration Engine**: Normative RFC specifications are split into isolated 1–3 sentence grammatical clues. Zero buzzwords (*"desync"*, *"smuggling"*) are used in prompts, forcing models to derive state-machine anomalies from first principles.
 2. **ModelFusion Consensus Panel**: Runs 100% locally via Ollama without cloud token costs:
-   - **Protocol Specialist**: `hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M` (refusal-free 12B state-machine & RFC grammar specialist) or `gemma2:2b`
-   - **Exploit Boundary Specialist**: **Abliterated / OBLITERATUS Models** or Cisco `fenkohq/foundation-sec-8b:latest` / `qwen2.5:7b` / `qwen2.5:32b`
-   - **Reasoning Arbiter**: `deepseek-r1:1.5b` (or `strix-deepseek:latest` / `deepseek-r1:32b` / abliterated synthesis fallback)
-3. **Native Abliterated & OBLITERATUS Security Models Support**:
+   - **Protocol Specialist (Abliterated Gemma)**: `hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M` (default primary model; refusal-direction ablated with zero safety alignment/refusal guardrails).
+   - **Exploit Boundary Specialist (Cisco Foundation-Sec)**: `huihui_ai/foundation-sec-abliterated:8b` (prioritized if installed) or Cisco `fenkohq/foundation-sec-8b:latest` (installed default).
+   - **Adversarial Reasoning Arbiter (GLM-4)**: `huihui_ai/glm-4.7-abliterated` (prioritized if installed) or `glm4:9b` / `glm-4.7-flash:latest` (installed default; falls back to `deepseek-r1:1.5b` if no GLM tag is installed).
+3. **Refusal-Free Abliterated Execution by Default (No Safety Guardrails)**:
+   > **Notice**: **Abliterated, refusal-free models are enabled BY DEFAULT (`--abliteration` defaults to `True`) across the entire `rfchunt` codebase** (CLI, `main.py`, `rfc_hunt_swarm.py`, `start.py`, MCP tools, and Module 20). There are **no AI safety refusal filters or alignment censors** gating raw exploit, smuggling, or PoC generation. Operate strictly against authorized targets and isolated lab environments.
    - Refusal-direction ablated models (`failspy` orthogonal projection method) are natively supported across RFC probe generation, Protocol Ruler differential fuzzing, and RAPTOR agentic source code triage.
-   - **`hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`** is calibrated and verified resident in local Ollama, providing unconstrained, refusal-free exploit generation.
-   - Easily activated via a single flag: `--abliteration` (or alias `--obliterated`).
+   - **`hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`**, Cisco **`fenkohq/foundation-sec-8b:latest`**, and **`glm4:9b`** form the default ModelFusion trio (automatically upgrading to abliterated Cisco/GLM tags such as `huihui_ai/foundation-sec-abliterated:8b` or `huihui_ai/glm-4.7-abliterated` when pulled in Ollama).
+   - Enabled out-of-the-box (`--abliteration` default: `True`).
    - Automatically detected and prioritized across `ModelFusionAdapter` and `FusionArbiter` with automated **Refusal Rescue**.
    - See the comprehensive [Abliterated Models & ModelFusion Refusal-Free Arbitration Guide](docs/ABLITERATED_MODELS_AND_FUSION_GUIDE.md).
 4. **3-Step Canary Evaluation Primitive**: Probes persistent TCP connections directly:
@@ -173,13 +174,16 @@ The repository includes a standalone **Generative UI** mission control panel:
 ### Prerequisites
 - Python 3.10+
 - Local [Ollama](https://ollama.ai/) daemon running on `http://127.0.0.1:11434`
-- Pull resident local models:
+- Pull default ModelFusion panel models (Abliterated Gemma + Cisco Foundation-Sec + GLM-4):
   ```bash
-  ollama pull gemma2:2b
-  ollama pull deepseek-r1:1.5b
-  ollama pull qwen2.5:7b
-  # Optional high-precision security model:
-  # ollama pull fenkohq/foundation-sec-8b:latest
+  # 1. Refusal-free Abliterated Gemma (default primary protocol specialist, NO safety guardrails)
+  ollama pull hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M
+  # 2. Cisco Foundation-Sec-8B (default boundary security specialist; optional abliterated variant)
+  ollama pull fenkohq/foundation-sec-8b:latest
+  # ollama pull huihui_ai/foundation-sec-abliterated:8b
+  # 3. GLM-4 (default verdict arbiter; optional abliterated variant automatically prioritized when installed)
+  ollama pull glm4:9b
+  # ollama pull huihui_ai/glm-4.7-abliterated
   ```
 
 ### Install Dependencies
@@ -327,9 +331,9 @@ The main entrypoint executing the 16-module LangGraph autonomous research swarm.
 | `--raptor` | `flag` | `False` | Enables RAPTOR Autonomous Framework (`web`, `scan`, `agentic`, `crypto`, `sca`). |
 | `--cycles` | `integer` | `3` | Maximum mutation and permutation cycles executed per RFC. |
 | `--timeout` | `float` | `900.0` | Process-scoped Ollama inference timeout in seconds (900s = 15m). Set to `0` for unlimited timeout on heavy models. |
-| `--model` | `string` | `gemma2:2b` | Primary base model for micro-inspiration generation (e.g. `hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`, `gemma-4-12b-obliterated`, `qwen2.5:7b`). |
-| `--abliteration` / `--obliterated` | `flag` | `False` | Forces refusal-free abliterated model (`hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`) across the ModelFusion panel to bypass AI safety refusals. |
-| `--sec-model` | `string` | `None` | Secondary security model for ModelFusion (e.g. `huihui_ai/deepseek-r1-abliterated:32b`, `fenkohq/foundation-sec-8b:latest`, `qwen2.5:32b`). Auto-detects installed abliterated models when omitted. |
+| `--model` | `string` | `hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M` | Primary refusal-free abliterated base model (no safety alignment/refusal filtering; supports explicit overrides like `gemma-4-12b-obliterated`, `glm4:9b`). |
+| `--abliteration` / `--obliterated` | `flag` | `True` | Enabled by default codebase-wide: runs refusal-free abliterated models (no safety filtering) across the ModelFusion panel (`Abliterated Gemma` + `Cisco Foundation-Sec` + `GLM`). |
+| `--sec-model` | `string` | `None` (auto Cisco `foundation-sec-8b` / abliterated) | Secondary security model for ModelFusion. Auto-prioritizes installed abliterated Cisco (`huihui_ai/foundation-sec-abliterated:8b`) or `fenkohq/foundation-sec-8b:latest`. |
 | `--debug` | `flag` | `False` | Enables James Kettle evaluation trace printing: socket status, `[REQ 1]` baseline, `[REQ 2]` probe, `[REQ 3]` canary, and compressed wire bytes. |
 | `--show-response`| `flag` | `False` | Prints sanitized host response status lines and protocol headers (`Server`, `Content-Type`, `Connection`) while filtering HTML noise. |
 | `-v`, `--verbose`| `flag` | `False` | Enables full verbose telemetry, showing raw unsanitized response bodies and socket pipeline metrics. |
@@ -362,8 +366,8 @@ Modular toolkit providing discrete CLI commands for each phase of the research f
 | Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `--db` | `string` | `terminator.db` | SQLite database file for persisting findings and states. |
-| `--model` | `string` | `gemma2:2b` | Primary base LLM model for micro-inspiration generation (e.g. `hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`, `gemma-4-12b-obliterated`). |
-| `--abliteration` / `--obliterated` | `flag` | `False` | Forces refusal-free abliterated model (`hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`) across the ModelFusion panel. |
+| `--model` | `string` | `hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M` | Primary refusal-free abliterated LLM (no safety filtering; default across all commands). |
+| `--abliteration` / `--obliterated` | `flag` | `True` | Enabled by default: uses refusal-free abliterated models (`Abliterated Gemma` + `Cisco Foundation-Sec` + `GLM`) across the ModelFusion panel. |
 | `--no-fusion` | `flag` | `False` | Disables multi-model consensus panel, running single generator model only. |
 
 #### Subcommands
@@ -421,7 +425,7 @@ Modular toolkit providing discrete CLI commands for each phase of the research f
 
 ```powershell
 # Run ALL integrated scanners (Google Mantis, aiscan, ARTEX Dual-Graph, RAPTOR SAST/PQC/SCA, Prompt Smuggling)
-# Enforces ModelFusion + Abliterated models (hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M)
+# Enforces ModelFusion + Abliterated Trio (hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M + Cisco Foundation-Sec + GLM) with zero safety filtering
 py -3.12 -u rfc_hunt_swarm.py --all --repo . --depth 30
 
 # Target a single file or subdirectory via --path

@@ -59,7 +59,7 @@ USAGE EXAMPLES:
     )
     parser.add_argument("--port", type=int, default=8080, help="Test lab server port (default: 8080)")
     parser.add_argument("--host", default="127.0.0.1", help="Target host (default: 127.0.0.1)")
-    parser.add_argument("--model", default="gemma2:2b", help="Base model (default: gemma2:2b)")
+    parser.add_argument("--model", default="hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M", help="Base model (default: refusal-free hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M)")
     parser.add_argument("--no-fusion", dest="fusion", action="store_false", help="Disable multi-model panel fusion")
     parser.set_defaults(fusion=True)
     parser.add_argument("--max-rfcs", type=int, default=None, help="Maximum RFCs to cycle through (default: all when --all-active, else 10)")

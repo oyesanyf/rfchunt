@@ -276,7 +276,7 @@ class ProtocolResearchSwarm:
         self.verbose = verbose or debug
         self.concurrency = max(1, concurrency)
         self.terminator_categories = terminator_categories
-        self.preferred_model = preferred_model or "gemma2:2b"
+        self.preferred_model = preferred_model or "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"
         self.use_fusion = use_fusion
         self.probe_semaphore = threading.BoundedSemaphore(self.concurrency)
         self.llm_semaphore = threading.BoundedSemaphore(1)
@@ -2187,9 +2187,9 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
                             Example: python -u rfc_hunt_swarm.py oracle --probe "GET / HTTP/1.1\\r\\n\\r\\n"
 
 7. AI MODELFUSION & EXPLORATION TUNING FLAGS:
-   --model MODEL            Preferred primary base model (default: gemma2:2b)
-                            Example: python -u rfc_hunt_swarm.py --model gemma2:2b
-   --sec-model MODEL        Secondary security model for ModelFusion panel
+   --model MODEL            Preferred primary base model (default: hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M)
+                            Example: python -u rfc_hunt_swarm.py --model hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M
+   --sec-model MODEL        Secondary security model for ModelFusion panel (default: fenkohq/foundation-sec-8b:latest; GLM arbiter: glm4:9b / abliterated GLM)
                             Example: python -u rfc_hunt_swarm.py --sec-model fenkohq/foundation-sec-8b:latest
    --no-fusion              Disable multi-model panel fusion (query primary model only)
                             Example: python -u rfc_hunt_swarm.py --no-fusion
@@ -2299,9 +2299,9 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--all-active", action="store_true", help="Shortcut to scan all active IETF protocol specifications")
     parser.add_argument("--cycles", type=int, default=3, help="Max mutation cycles to run per RFC")
     parser.add_argument("--timeout", type=float, default=900.0, help="Ollama LLM inference timeout in seconds (default: 900.0 = 15m; 0 for unlimited)")
-    parser.add_argument("--model", type=str, default="gemma2:2b", help="Preferred primary base model (e.g. hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M, gemma2:2b, qwen2.5:7b)")
-    parser.add_argument("--abliteration", "--obliterated", dest="abliteration", action="store_true", default=False, help="Force refuse-free abliterated model (hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M) across ModelFusion panel")
-    parser.add_argument("--sec-model", type=str, default=None, help="Secondary security specialist model (e.g. fenkohq/foundation-sec-8b:latest, qwen2.5:7b, strix-qwen:latest)")
+    parser.add_argument("--model", type=str, default="hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M", help="Preferred primary base model (default: refusal-free hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M)")
+    parser.add_argument("--abliteration", "--obliterated", dest="abliteration", action="store_true", default=True, help="Default ON: Use refusal-free abliterated models (no safety filtering) across ModelFusion panel (Gemma + Cisco Foundation-Sec + GLM)")
+    parser.add_argument("--sec-model", type=str, default=None, help="Secondary security specialist model (default: Cisco fenkohq/foundation-sec-8b:latest / abliterated)")
     parser.add_argument("--no-fusion", dest="fusion", action="store_false", default=True, help="Disable multi-model panel fusion")
     parser.add_argument("--db", type=str, default="terminator.db", help="SQLite database path (default: terminator.db)")
     parser.add_argument("--clean-db", action="store_true", help="Clean the SQLite database (truncate transient evaluations, anomalies, probes, fragments, and VACUUM to reclaim disk space)")
@@ -2855,7 +2855,7 @@ def main_swarm(argv=None):
                     print(f"[!] Could not auto-start local Test Lab Server on {t_host}:{t_port}: {e}")
                     bg_lab_server = None
 
-        if getattr(args, "abliteration", False):
+        if getattr(args, "abliteration", True) and getattr(args, "model", None) in (None, "", "auto", "gemma2:2b"):
             args.model = "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"
 
         if active_mode == "hunt" or args.comb_only:
@@ -2895,7 +2895,7 @@ def main_swarm(argv=None):
             print("[*] Deep Swarm Debug Mode: ENABLED (Live Host Responses + Pipeline Telemetry)")
         elif args.show_response or args.verbose:
             print("[*] Live Host Response Printing: ENABLED")
-        if getattr(args, "abliteration", False):
+        if getattr(args, "abliteration", True) and getattr(args, "model", None) in (None, "", "auto", "gemma2:2b"):
             args.model = "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"
 
         swarm = ProtocolResearchSwarm(

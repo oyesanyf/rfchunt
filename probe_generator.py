@@ -2,8 +2,8 @@
 LLM Hypothesis & Probe Generator:
 Prompts LLMs using micro-inspiration fragments. Strictly avoids buzzwords
 ('desync', 'request smuggling') to maximize vector novelty and prevent context-contamination.
-Integrates with ModelFusionAdapter to run Google Gemma 2 (gemma2:9b, gemma2:2b) and
-local security models via Ollama at zero cost 24/7 (100% local execution).
+Integrates with ModelFusionAdapter to run refusal-free abliterated Google Gemma 4 (hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M), Cisco Foundation-Sec-8B, and GLM-4
+local security models via Ollama at zero cost 24/7 (100% local execution, no safety refusal guardrails).
 """
 
 import json

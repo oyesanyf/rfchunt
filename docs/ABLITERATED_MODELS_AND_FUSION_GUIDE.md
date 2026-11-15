@@ -2,7 +2,9 @@
 
 > **Zero-Cost, Refusal-Free Protocol Vulnerability Discovery & Exploit Synthesis**
 > 
-> Guide to utilizing **`hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`** and refusal-direction ablated LLMs within RFC Hunt Swarm and ModelFusion.
+> Guide to utilizing **`hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`**, Cisco **Foundation-Sec**, and **GLM-4** (with refusal-direction ablated LLMs enabled **by default** and **no safety filtering**) within RFC Hunt Swarm and ModelFusion.
+>
+> **Important Notice — Zero Safety Guardrails by Default**: Abliterated, refusal-free models are the default across every entrypoint (`--abliteration` is `True` by default across `rfc_hunt_swarm.py`, `main.py`, `start.py`, `mcp_server.py`, and Module 20). Safety alignment refusals are removed so exploit synthesis, protocol fuzzing, and patch validation run without alignment blocks. Use strictly on authorized systems.
 
 ---
 
@@ -57,8 +59,9 @@ flowchart TD
 
     subgraph PANEL ["ModelFusion Specialist Panel"]
         direction TB
-        B --> C["Protocol Specialist\n(hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M)\n• Inverts RFC response rules\n• Zero-refusal exploit templates"]
-        B --> D["Boundary Specialist\n(fenkohq/foundation-sec-8b:latest or Qwen)\n• HTTP framing discrepancies\n• Content-Length vs Chunked bounds"]
+        B --> C["Protocol Specialist\n(hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M)\n• Inverts RFC response rules\n• Zero-refusal exploit templates (No Safety Alignment)"]
+        B --> D["Boundary Specialist\n(Cisco Foundation-Sec: huihui_ai/foundation-sec-abliterated:8b or fenkohq/foundation-sec-8b:latest)\n• HTTP framing discrepancies\n• Content-Length vs Chunked bounds"]
+        B --> H["Verdict Arbiter\n(GLM-4: huihui_ai/glm-4.7-abliterated or glm4:9b / glm-4.7-flash)\n• Cross-validates exploitability\n• Zero safety refusal suppression"]
     end
 
     C --> E{"Refusal Check\n(_is_refusal)"}
@@ -104,17 +107,19 @@ If any specialist returns a refusal string or an empty completion, ModelFusion a
 
 ## 4. CLI Workflows & Command-Line Usage
 
-### 1. One-Flag Activation (`--abliteration` / `--obliterated`)
-Pass `--abliteration` (or `--obliterated`) to immediately force `hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M` across all generators and ModelFusion specialists:
+### 1. Enabled by Default (`--abliteration` Default: `True`, No Safety Filtering)
+Refusal-free abliterated execution (`hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M` + Cisco `Foundation-Sec` + `GLM-4`) is enabled **by default** with **zero safety alignment filtering** across all generators, CLI entrypoints, MCP tools, and ModelFusion specialists (`--abliteration` / `--obliterated` remains supported explicitly):
 
 ```powershell
-# Scan RFC 9112 against a live target using the abliterated model
 $env:PYTHONPATH="d:\harfile\rfchunt"
+# Runs default refusal-free trio (Abliterated Gemma + Cisco Foundation-Sec + GLM-4)
+python -u rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 3030 --debug
+# Explicit flag (same refusal-free default)
 python -u rfc_hunt_swarm.py --mode terminator --abliteration --host 127.0.0.1 --port 3030 --debug
 ```
 
-### 2. Dual-Model Panel Fusion (Abliterated Gemma + Foundation-Sec)
-Pair the abliterated protocol specialist with a secondary boundary model:
+### 2. Trio Model Panel Fusion (Abliterated Gemma + Cisco Foundation-Sec + GLM-4)
+By default, ModelFusion orchestrates all three specialists (prioritizing abliterated variants of Gemma, Cisco Foundation-Sec, and GLM-4 whenever installed locally):
 
 ```powershell
 python -u rfc_hunt_swarm.py --model gemma-4-12b-obliterated --sec-model fenkohq/foundation-sec-8b:latest --host 127.0.0.1 --port 3030 --debug

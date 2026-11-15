@@ -36,7 +36,9 @@ class ModelFusionAdapter:
         self.use_fusion = use_fusion if os.environ.get("USE_MODEL_FUSION") is None else (os.environ.get("USE_MODEL_FUSION") == "1")
         self.free_ram_gb = self._get_free_memory_gb()
         self.sized_qwen = self._size_qwen_for_free_memory(self.free_ram_gb)
-        self.preferred_model = preferred_model or os.environ.get("LOCAL_MODEL", "gemma2:2b")
+        self.preferred_model = preferred_model or os.environ.get(
+            "LOCAL_MODEL", "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"
+        )
         self.sec_model = sec_model
         self.available_tags = self._fetch_available_tags()
         self.active_model = self._resolve_model(self.preferred_model)
@@ -240,7 +242,13 @@ class ModelFusionAdapter:
     ) -> List[Dict[str, Any]]:
         if not self.available_tags:
             self.available_tags = self._fetch_available_tags()
-        if not self.available_tags and "PYTEST_CURRENT_TEST" in os.environ:
+        client_is_mocked = (
+            "mock" in type(self.client).__name__.lower()
+            or "mock" in type(getattr(self.client, "post", None)).__name__.lower()
+        )
+        if os.environ.get("RFCHUNT_OFFLINE") == "1" and not client_is_mocked:
+            return []
+        if not self.available_tags and "PYTEST_CURRENT_TEST" in os.environ and not client_is_mocked:
             # Skip network retry if Ollama is offline during unit tests unless mocked
             return []
 
@@ -301,16 +309,23 @@ class ModelFusionAdapter:
             and (self.free_ram_gb >= 12.0 or not any(tag in t.lower() for tag in ("70b", "72b", "755b")))
         ]
 
+        abliterated_gemma = [t for t in abliterated_candidates if "gemma" in t.lower()]
+        abliterated_sec = [t for t in abliterated_candidates if any(k in t.lower() for k in ("foundation-sec", "cisco"))]
+        abliterated_glm = [t for t in abliterated_candidates if "glm" in t.lower()]
+        installed_glm = [t for t in self.available_tags if "glm" in t.lower()]
+
         # Check if caller explicitly requested an abliterated or specific model for active_model
         active_is_abliterated = any(kw in self.active_model.lower() for kw in ("obliterat", "abliterat"))
         pref_is_gemma4 = any(kw in self.active_model.lower() for kw in ("gemma4", "gemma-4"))
 
         if active_is_abliterated or pref_is_gemma4:
             gemma_model = self.active_model
+        elif abliterated_gemma and self.preferred_model in ("auto", "gemma2:2b", "gemma-4-12b-obliterated", "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"):
+            gemma_model = abliterated_gemma[0]
         elif abliterated_candidates and self.preferred_model in ("auto", "gemma2:2b", "gemma-4-12b-obliterated"):
             gemma_model = abliterated_candidates[0]
         else:
-            gemma_model = "gemma2:2b"
+            gemma_model = "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"
             for tag in ["gemma2:2b", "gemma2:9b"]:
                 matched = [t for t in self.available_tags if tag in t]
                 if matched:
@@ -320,12 +335,14 @@ class ModelFusionAdapter:
         if hasattr(self, "sec_model") and self.sec_model:
             sec_model = self.sec_model
         else:
-            # If gemma_model is not already abliterated, prioritize abliterated model for sec_model
-            if not active_is_abliterated and abliterated_candidates and abliterated_candidates[0] != gemma_model:
+            # Prioritize abliterated Cisco Foundation-Sec -> official Foundation-Sec-8B -> other abliterated -> Qwen
+            if abliterated_sec and abliterated_sec[0] != gemma_model:
+                sec_model = abliterated_sec[0]
+            elif not active_is_abliterated and abliterated_candidates and abliterated_candidates[0] != gemma_model:
                 sec_model = abliterated_candidates[0]
             else:
                 sec_model = "fenkohq/foundation-sec-8b:latest"
-                for tag in ["fenkohq/foundation-sec-8b:latest", self.sized_qwen, "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "deepseek-r1:1.5b"]:
+                for tag in ["huihui_ai/foundation-sec-abliterated:8b", "fenkohq/foundation-sec-8b:latest", self.sized_qwen, "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "deepseek-r1:1.5b"]:
                     matched = [t for t in self.available_tags if tag == t or tag.split(":")[0] in t]
                     if matched:
                         cand_tag = matched[0]
@@ -334,11 +351,27 @@ class ModelFusionAdapter:
                         sec_model = cand_tag
                         break
 
+        # 3rd Panel Specialist: GLM (abliterated GLM preferred, else installed glm4:9b / glm-4.7-flash)
+        glm_model = None
+        if abliterated_glm:
+            glm_model = abliterated_glm[0]
+        elif installed_glm:
+            for tag in ["glm4:9b", "glm-4.7-flash:latest", *installed_glm]:
+                matched = [t for t in self.available_tags if tag == t or tag.split(":")[0] in t]
+                if matched:
+                    cand_tag = matched[0]
+                    if self.free_ram_gb < 12.0 and any(h in cand_tag for h in ("32b", "70b")):
+                        continue
+                    glm_model = cand_tag
+                    break
+
         fusion_panel = []
         if gemma_model:
             fusion_panel.append(gemma_model)
         if sec_model and sec_model not in fusion_panel:
             fusion_panel.append(sec_model)
+        if glm_model and glm_model not in fusion_panel:
+            fusion_panel.append(glm_model)
 
         if not fusion_panel:
             fusion_panel = [self.active_model]

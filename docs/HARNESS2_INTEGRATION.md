@@ -10,7 +10,7 @@
 
 ## 1. Architectural Overview
 
-While foundation model weights remain fixed during local Ollama inference (`gemma2:2b`, `fenkohq/foundation-sec-8b:latest`, `deepseek-r1:1.5b`), agentic protocol research performance depends heavily on the **agent harness**—the surrounding configuration of system prompts, guardrails, long-term memory, tool descriptions, delegated subagents, reusable skills, helper scripts, and in-loop plugins.
+While foundation model weights remain fixed during local Ollama inference (`hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`, `fenkohq/foundation-sec-8b:latest`, `glm4:9b`), agentic protocol research performance depends heavily on the **agent harness**—the surrounding configuration of system prompts, guardrails, long-term memory, tool descriptions, delegated subagents, reusable skills, helper scripts, and in-loop plugins.
 
 **Module 16 (`engine/harness2_engine.py`)** implements Google Research's **Harness²** two-level recursive optimization framework directly inside `rfchunt`:
 

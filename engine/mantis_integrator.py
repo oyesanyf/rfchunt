@@ -58,7 +58,7 @@ MANTIS_REPO_URL = "https://github.com/google/mantis"
 MANTIS_CREDIT = "Google Security Research (google/mantis)"
 DEFAULT_ABLITERATED_MODEL = "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"
 DEFAULT_SEC_MODEL = "fenkohq/foundation-sec-8b:latest"
-DEFAULT_ARBITER_MODEL = "qwen2.5:14b"
+DEFAULT_ARBITER_MODEL = "glm4:9b"
 
 EXCLUDED_DIRS: Set[str] = {
     ".git",
@@ -735,8 +735,14 @@ class MantisHypothesisGenerator:
             reverse=True,
         )
 
-        # ModelFusion + Abliterated refinement pass on deeper audits
-        if results and profile["use_fusion_confirmation"] and self.model_adapter is not None and hasattr(self.model_adapter, "generate_json"):
+        # ModelFusion + Abliterated refinement pass on deeper audits (skip live HTTP call when RFCHUNT_OFFLINE=1)
+        if (
+            results
+            and profile["use_fusion_confirmation"]
+            and os.environ.get("RFCHUNT_OFFLINE") != "1"
+            and self.model_adapter is not None
+            and hasattr(self.model_adapter, "generate_json")
+        ):
             sample = [
                 {
                     "id": h.hypothesis_id,

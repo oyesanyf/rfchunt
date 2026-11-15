@@ -7,7 +7,7 @@ Ensures zero-crash local AI execution for RFC Hunt Swarm:
 3. Auto-installs Ollama if missing (via winget / official installer on Windows, install.sh on Unix)
    using strictly process-scoped environment variables (never mutating system/user registry PATH).
 4. Auto-starts `ollama serve` in the background if the daemon is not running.
-5. Auto-pulls missing models (`fenkohq/foundation-sec-8b:latest`, `gemma2:2b`, `deepseek-r1:1.5b`)
+5. Auto-pulls missing models (`hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`, `fenkohq/foundation-sec-8b:latest`, `glm4:9b` / abliterated variants)
    and provides interactive terminal guidance.
 """
 

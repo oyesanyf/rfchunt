@@ -103,39 +103,59 @@ class FusionArbiter:
             if ("abliterat" in t.lower() or "obliterat" in t.lower())
             and (self.free_ram_gb >= 12.0 or not any(tag in t.lower() for tag in ("70b", "72b", "755b")))
         ]
+        abliterated_gemma = [t for t in abliterated_candidates if "gemma" in t.lower()]
+        abliterated_sec = [t for t in abliterated_candidates if any(k in t.lower() for k in ("foundation-sec", "cisco"))]
+        abliterated_glm = [t for t in abliterated_candidates if "glm" in t.lower()]
+        installed_glm = [t for t in self.available_tags if "glm" in t.lower()]
 
-        # Dynamic Model Assignment: Support preferred_model (e.g. Gemma-4-12B-OBLITERATED)
-        if preferred_model:
-            self.gemma_model = self._resolve_model([preferred_model], fallback="gemma2:2b")
-        elif abliterated_candidates:
-            # If an abliterated Gemma model is present locally, prioritize it as the Protocol Specialist
-            self.gemma_model = abliterated_candidates[0]
+        # Default Panel Role 1 (Protocol Specialist): Abliterated Gemma (refusal-free, zero-safety-filter)
+        if preferred_model and preferred_model.lower() not in ("auto", "gemma2:2b"):
+            self.gemma_model = self._resolve_model(
+                [preferred_model, *abliterated_gemma, "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"],
+                fallback=preferred_model,
+            )
         else:
-            self.gemma_model = self._resolve_model(["gemma2:2b", "gemma2:9b", sized_qwen], fallback="gemma2:2b")
+            self.gemma_model = self._resolve_model(
+                [*abliterated_gemma, "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M", *abliterated_candidates, "gemma4:26b", "gemma2:9b", sized_qwen, "gemma2:2b"],
+                fallback="hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M",
+            )
 
+        # Default Panel Role 2 (Boundary Security Specialist): Cisco Foundation-Sec (abliterated preferred, else official 8B)
         if sec_model:
             self.sec_model = self._resolve_model([sec_model], fallback="fenkohq/foundation-sec-8b:latest")
         else:
-            # If Protocol Specialist is already abliterated, use Foundation-Sec or Qwen for Boundary Specialist
-            if self.gemma_model in abliterated_candidates and len(abliterated_candidates) == 1:
-                self.sec_model = self._resolve_model(
-                    ["fenkohq/foundation-sec-8b:latest", sized_qwen, "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "strix-qwen:latest"],
-                    fallback="fenkohq/foundation-sec-8b:latest",
-                )
-            elif abliterated_candidates and abliterated_candidates[0] != self.gemma_model:
-                self.sec_model = abliterated_candidates[0]
-            else:
-                self.sec_model = self._resolve_model(
-                    ["fenkohq/foundation-sec-8b:latest", sized_qwen, "qwen2.5:7b", "qwen2.5:3b", "qwen2.5:1.5b", "strix-qwen:latest"],
-                    fallback="fenkohq/foundation-sec-8b:latest",
-                )
+            other_abliterated = [t for t in abliterated_candidates if t != self.gemma_model]
+            self.sec_model = self._resolve_model(
+                [
+                    *abliterated_sec,
+                    "huihui_ai/foundation-sec-abliterated:8b",
+                    "fenkohq/foundation-sec-8b:latest",
+                    *other_abliterated,
+                    sized_qwen,
+                    "qwen2.5:7b",
+                    "qwen2.5:3b",
+                    "qwen2.5:1.5b",
+                    "strix-qwen:latest",
+                ],
+                fallback="fenkohq/foundation-sec-8b:latest",
+            )
 
+        # Default Panel Role 3 (Adversarial Verdict Arbiter): GLM (abliterated GLM preferred, else local GLM-4)
         if arbiter_model:
-            self.arbiter_model = self._resolve_model([arbiter_model], fallback="deepseek-r1:1.5b")
+            self.arbiter_model = self._resolve_model([arbiter_model], fallback="glm4:9b")
         else:
             self.arbiter_model = self._resolve_model(
-                ["deepseek-r1:1.5b", sized_qwen, "gemma2:2b", "strix-deepseek:latest"],
-                fallback="deepseek-r1:1.5b",
+                [
+                    *abliterated_glm,
+                    "huihui_ai/glm-4.7-abliterated",
+                    "glm4:9b",
+                    "glm-4.7-flash:latest",
+                    *installed_glm,
+                    "deepseek-r1:1.5b",
+                    sized_qwen,
+                    "strix-deepseek:latest",
+                ],
+                fallback="glm4:9b",
             )
 
         print(f"[ModelFusion] Panel Initialized:")
