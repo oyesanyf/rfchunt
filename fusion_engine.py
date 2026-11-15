@@ -662,6 +662,10 @@ class FusionArbiter:
             "Output strict JSON with keys: 'concept_name', 'architectural_explanation', 'rfc_clue_connection', 'generalization', 'validation_steps'."
         )
 
+        from engine.execution_policy import sanitize_for_llm_prompt
+        sanitized_probe_resp = sanitize_for_llm_prompt(probe_resp, max_chars=350)
+        sanitized_retest_resp = sanitize_for_llm_prompt(retest_resp, max_chars=350)
+
         user_prompt = f"""
 RFC FRAGMENT (THE INSPIRATION CLUE):
 \"\"\"{rfc_fragment}\"\"\"
@@ -679,10 +683,10 @@ OBSERVED LIVE ACTIVITY TRACE:
 {anom_summary}
 
 Full Probe Response Snippet (First 350 bytes):
-{probe_resp[:350]}
+{sanitized_probe_resp}
 
 Full Re-Test Response Snippet (First 350 bytes):
-{retest_resp[:350]}
+{sanitized_retest_resp}
 
 Analyze what happened. Did the server apply response parsing rules to requests (Shared-Parser Confusion)? Did the front-end proxy disagree on body length? Did cross-protocol parser reuse occur?
 Output strict JSON matching:

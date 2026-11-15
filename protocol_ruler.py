@@ -113,13 +113,15 @@ class ProtocolRuler:
             print(msg)
 
     def _open_socket(self) -> socket.socket:
-        is_local = self.host in ("127.0.0.1", "localhost", "::1", "[::1]") or self.host.startswith("127.")
-        from engine.safe_network_validator import validate_target_host
-        is_safe, reason = validate_target_host(self.host, allow_private=is_local)
-        if not is_safe:
-            raise PermissionError(f"Target '{self.host}' rejected by SSRF safety boundary: {reason}")
-        from mcp_server import TargetAuthorizationGate
-        TargetAuthorizationGate.check_target(self.host)
+        from engine.execution_policy import ExecutionPolicy, StructuredIntentProposal, ScannerTask, ActionType
+        proposal = StructuredIntentProposal(
+            task=ScannerTask.PROTOCOL_RULER,
+            action_type=ActionType.NETWORK_SOCKET,
+            target_host=self.host,
+            target_port=self.port,
+            rationale="Protocol Ruler byte-transformation length measurement probe sequence",
+        )
+        ExecutionPolicy.get_instance().validate_intent(proposal)
         raw_sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
         if self.use_tls:
             try:

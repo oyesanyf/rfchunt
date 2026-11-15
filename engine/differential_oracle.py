@@ -49,13 +49,16 @@ class MultiImplementationDifferentialOracle:
 
     def dispatch_single_target(self, target: TargetEndpoint, raw_probe: bytes) -> TargetResponse:
         """Sends raw bytes to a single target and records response telemetry."""
-        is_local = target.host in ("127.0.0.1", "localhost", "::1", "[::1]") or target.host.startswith("127.")
-        from engine.safe_network_validator import validate_target_host
-        is_safe, reason = validate_target_host(target.host, allow_private=is_local)
-        if not is_safe:
-            raise PermissionError(f"Target '{target.host}' rejected by SSRF safety boundary: {reason}")
-        from mcp_server import TargetAuthorizationGate
-        TargetAuthorizationGate.check_target(target.host)
+        from engine.execution_policy import ExecutionPolicy, StructuredIntentProposal, ScannerTask, ActionType
+        proposal = StructuredIntentProposal(
+            task=ScannerTask.DIFFERENTIAL_ORACLE,
+            action_type=ActionType.NETWORK_SOCKET,
+            target_host=target.host,
+            target_port=target.port,
+            raw_payload=raw_probe,
+            rationale="Differential oracle cross-implementation discrepancy testing",
+        )
+        ExecutionPolicy.get_instance().validate_intent(proposal)
         start_time = time.time()
         sock = None
         try:

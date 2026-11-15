@@ -183,3 +183,111 @@ def validate_target_host(target: str, allow_private: bool = False) -> Tuple[bool
                 return False, f"Host '{host}' resolved to private/reserved IP {ip_addr_str} (DNS rebinding / SSRF violation)."
 
     return True, f"Target hostname '{host}' successfully verified against SSRF invariants."
+
+
+_EXPLICIT_LOOPBACK_IPV4_RE = re.compile(r"127(?:\.(?:0|[1-9]\d{0,2})){3}")
+
+
+def is_explicit_loopback_host(host: str) -> bool:
+    """Return True only for canonical loopback hosts (localhost, ::1, or strict dotted 127.x.y.z)."""
+    cleaned = _clean_host(host)
+    if cleaned in ("127.0.0.1", "localhost", "::1", "[::1]"):
+        return True
+    if _EXPLICIT_LOOPBACK_IPV4_RE.fullmatch(cleaned):
+        try:
+            return ipaddress.IPv4Address(cleaned) in ipaddress.ip_network("127.0.0.0/8")
+        except ValueError:
+            return False
+    return False
+
+
+def parse_host_and_port(
+    raw_target: str,
+    default_port: Optional[int] = None,
+    use_tls: Optional[bool] = None,
+) -> Tuple[str, int, bool]:
+    """
+    Normalize a host/URL target string into `(hostname, port, tls_enabled)`.
+    Supports bare hosts, `host:port`, `[ipv6]:port`, and `http(s)://...` URLs.
+    """
+    text = str(raw_target or "").strip()
+    scheme: Optional[str] = None
+    if text.lower().startswith("https://"):
+        scheme = "https"
+        text = text[8:]
+    elif text.lower().startswith("http://"):
+        scheme = "http"
+        text = text[7:]
+
+    authority = text.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].strip()
+    parsed_port: Optional[int] = None
+    host_only = authority
+
+    if authority.startswith("["):
+        if "]" in authority:
+            end_idx = authority.index("]")
+            host_only = authority[1:end_idx]
+            trailing = authority[end_idx + 1 :]
+            if trailing.startswith(":") and trailing[1:].isdigit():
+                port_val = int(trailing[1:])
+                if 1 <= port_val <= 65535:
+                    parsed_port = port_val
+    elif authority.count(":") == 1:
+        h_part, p_part = authority.split(":", 1)
+        host_only = h_part
+        if p_part.isdigit():
+            port_val = int(p_part)
+            if 1 <= port_val <= 65535:
+                parsed_port = port_val
+
+    cleaned_host = host_only.strip().lower()
+    inferred_tls = bool(use_tls) or (scheme == "https")
+    if parsed_port is not None:
+        resolved_port = parsed_port
+    elif default_port is not None:
+        resolved_port = int(default_port)
+    elif inferred_tls:
+        resolved_port = 443
+    elif scheme == "http":
+        resolved_port = 80
+    else:
+        resolved_port = 443 if not is_explicit_loopback_host(cleaned_host) else 80
+
+    if resolved_port == 443 and scheme != "http":
+        inferred_tls = True
+
+    return cleaned_host, resolved_port, inferred_tls
+
+
+def validate_and_authorize_target(
+    host: str,
+    authorized: bool = False,
+    allow_private: Optional[bool] = None,
+) -> Tuple[bool, str]:
+    """
+    Fail-closed SSRF validation paired with explicit TargetAuthorizationGate checks.
+    `validate_target_host` ALWAYS executes first so RFC 1918, CGNAT, cloud metadata,
+    unspecified, and IPv4-mapped IPv6 targets are rejected even if `authorized=True`.
+    """
+    cleaned = _clean_host(str(host or ""))
+    if not cleaned:
+        return False, "Target SSRF validation error: empty target host."
+
+    local_flag = is_explicit_loopback_host(cleaned) if allow_private is None else bool(allow_private)
+    is_safe_net, net_reason = validate_target_host(cleaned, allow_private=local_flag)
+    if not is_safe_net:
+        return False, f"Target SSRF validation error for {cleaned}: {net_reason}"
+
+    from mcp_server import TargetAuthorizationGate
+
+    if authorized:
+        try:
+            TargetAuthorizationGate.authorize_target(cleaned)
+        except (ValueError, PermissionError) as exc:
+            return False, f"Target authorization error for {cleaned}: {exc}"
+
+    is_valid_target, target_reason = TargetAuthorizationGate.validate_target(cleaned)
+    if not is_valid_target:
+        return False, f"Target authorization error for {cleaned}: {target_reason}"
+
+    return True, target_reason

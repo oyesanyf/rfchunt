@@ -50,6 +50,10 @@ except ImportError:
             self._edges = edges
             self._cond_edges = cond_edges
 
+        @property
+        def nodes(self):
+            return self._nodes
+
         def invoke(self, state: dict, config: Optional[dict] = None) -> dict:
             cur = dict(state)
             recursion_limit = (config or {}).get("recursion_limit", 150)
@@ -1497,6 +1501,13 @@ def cmd_artex(args):
     from engine.dual_graph_engine import DualGraphAttackEngine
     from database import Database
 
+    t_host = getattr(args, "host", "127.0.0.1")
+    from engine.safe_network_validator import validate_and_authorize_target
+    ok, reason = validate_and_authorize_target(t_host, authorized=getattr(args, "authorized", False))
+    if not ok:
+        print(f"[!] Target authorization error for {t_host}: {reason}")
+        sys.exit(1)
+
     db = Database(getattr(args, "db", "terminator.db"))
     engine = DualGraphAttackEngine(db=db)
 
@@ -1557,6 +1568,13 @@ def cmd_prompt_smuggle(args):
     """
     from engine.prompt_smuggling_synthesizer import PromptSmugglingSynthesizer
     from database import Database
+
+    t_host = getattr(args, "host", "127.0.0.1")
+    from engine.safe_network_validator import validate_and_authorize_target
+    ok, reason = validate_and_authorize_target(t_host, authorized=getattr(args, "authorized", False))
+    if not ok:
+        print(f"[!] Target authorization error for {t_host}: {reason}")
+        sys.exit(1)
 
     db = Database(getattr(args, "db", "terminator.db"))
     synthesizer = PromptSmugglingSynthesizer(db=db)
@@ -1664,7 +1682,7 @@ def cmd_raptor(args):
     # Also support passing a folder path via --host / --target, or defaulting to current directory for repo scan modes
     if not target_repo and host and os.path.isdir(str(host)):
         target_repo = str(host)
-    elif not target_repo and raptor_mode in ("all", "full", "scan", "agentic", "crypto", "sca", "describe"):
+    elif not target_repo and not host and raptor_mode in ("all", "full", "scan", "agentic", "crypto", "sca", "describe"):
         target_repo = os.getcwd()
 
     # Check if target_repo points to an existing directory
@@ -1703,13 +1721,28 @@ def cmd_raptor(args):
             host = getattr(args, "target", host)
 
         port = getattr(args, "port", 443)
+        from engine.safe_network_validator import is_explicit_loopback_host
+        if port == 5006 and host and not is_explicit_loopback_host(str(host)):
+            port = 443
         use_tls = bool(getattr(args, "tls", False) or port == 443)
+        authorized = bool(getattr(args, "authorized", False))
 
-        res = raptor.run_host_scan(
-            host=host,
-            port=port,
-            use_tls=use_tls,
-        )
+        from engine.safe_network_validator import validate_and_authorize_target
+        ok, reason = validate_and_authorize_target(host, authorized=authorized)
+        if not ok:
+            print(f"[!] Target authorization error for {host}: {reason}")
+            sys.exit(1)
+
+        try:
+            res = raptor.run_host_scan(
+                host=host,
+                port=port,
+                use_tls=use_tls,
+                authorized=authorized,
+            )
+        except PermissionError as exc:
+            print(f"[!] Target authorization error for {host}: {exc}")
+            sys.exit(1)
 
     # 4. Display Results Summary
     if "error" in res:
@@ -1800,16 +1833,17 @@ def cmd_all(args):
     """
     Unified --all orchestrator running Google Mantis, haasonsaas/aiscan, BaaRai/ARTEX Dual-Graph,
     RAPTOR (Docker or cross-platform SAST/PQC/SCA), and Prompt Smuggling / RFC framing analyzers
-    against --repo or --path with mandatory ModelFusion and Abliterated model enforcement.
+    against --repo or --path or remote --host with mandatory ModelFusion and Abliterated model enforcement.
     """
     from database import Database
     from engine.mantis_integrator import DEFAULT_ABLITERATED_MODEL, run_unified_all_scans
 
     args.fusion = True
     args.abliteration = True
+    host = getattr(args, "host", None)
     repo = getattr(args, "repo", None) or getattr(args, "raptor_target", None)
     path = getattr(args, "path", None)
-    if not repo and not path:
+    if not repo and not path and not host:
         fallback = getattr(args, "mantis_target", None) or getattr(args, "target_arg", None)
         if fallback and os.path.exists(str(fallback)):
             repo = str(fallback)
@@ -1821,24 +1855,48 @@ def cmd_all(args):
     preferred_model = getattr(args, "mantis_model", None) or DEFAULT_ABLITERATED_MODEL
     reports_dir = getattr(args, "output_dir", None) or "reports"
     artex_rounds = int(getattr(args, "artex_rounds", 1) or 1)
+    authorized = bool(getattr(args, "authorized", False))
+    allow_destructive = bool(getattr(args, "allow_destructive", False))
+
+    if host:
+        from engine.safe_network_validator import validate_and_authorize_target
+        ok, reason = validate_and_authorize_target(host, authorized=authorized)
+        if not ok:
+            print(f"[!] Target authorization error for {host}: {reason}")
+            sys.exit(1)
 
     db = Database(args.db)
     print(f"\n{'='*75}")
     print(f"[*] UNIFIED --all SECURITY AUDIT (Fusion + Abliterated Models Enforced)")
-    print(f"[*] Target: {os.path.abspath(str(repo or path))} | Depth: {depth} | Model: {preferred_model}")
+    target_disp = f"host={host}" if host and not repo and not path else os.path.abspath(str(repo or path))
+    print(f"[*] Target: {target_disp} | Depth: {depth} | Model: {preferred_model}")
     print(f"{'='*75}")
 
-    res = run_unified_all_scans(
-        repo=repo,
-        path=path,
-        depth=depth,
-        mantis_mode=mantis_mode,
-        use_fusion=True,
-        preferred_model=preferred_model,
-        db=db,
-        reports_dir=reports_dir,
-        artex_rounds=artex_rounds,
-    )
+    port_arg = getattr(args, "port", 443)
+    from engine.safe_network_validator import is_explicit_loopback_host
+    if port_arg == 5006 and host and not is_explicit_loopback_host(str(host)):
+        port_arg = 443
+
+    try:
+        res = run_unified_all_scans(
+            repo=repo,
+            path=path,
+            host=host,
+            port=port_arg,
+            use_tls=getattr(args, "tls", None),
+            authorized=authorized,
+            allow_destructive=allow_destructive,
+            depth=depth,
+            mantis_mode=mantis_mode,
+            use_fusion=True,
+            preferred_model=preferred_model,
+            db=db,
+            reports_dir=reports_dir,
+            artex_rounds=artex_rounds,
+        )
+    except PermissionError as exc:
+        print(f"[!] Target authorization error for {host or repo or path}: {exc}")
+        sys.exit(1)
 
     eng = res.get("engines", {})
     print(f"[+] Unified --all Completed in {res['elapsed_sec']}s")
@@ -1861,6 +1919,13 @@ def cmd_harness2(args):
     """
     from database import Database
     from engine.harness2_engine import Harness2ProtocolEngine, RFCHUNT_SURFACE
+
+    t_host = getattr(args, "host", "127.0.0.1")
+    from engine.safe_network_validator import validate_and_authorize_target
+    ok, reason = validate_and_authorize_target(t_host, authorized=getattr(args, "authorized", False))
+    if not ok:
+        print(f"[!] Target authorization error for {t_host}: {reason}")
+        sys.exit(1)
 
     db = Database(args.db)
     h2_engine = Harness2ProtocolEngine(
@@ -2336,6 +2401,13 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
         action="store_true",
         help="Explicitly authorize active security testing against remote/public target (e.g. target.example.com) or allow any target",
     )
+    parser.add_argument(
+        "--allow-destructive",
+        dest="allow_destructive",
+        action="store_true",
+        default=False,
+        help="Explicitly permit state-mutating requests (PUT, DELETE, PATCH) and active response theft on authorized targets",
+    )
     parser.add_argument("--dream-rsi", dest="dream_rsi", action="store_true", default=True, help="Enable Open Dream-RSI: recursive off-policy self-improvement between cycles (enabled by default)")
     parser.add_argument("--no-dream-rsi", dest="dream_rsi", action="store_false", help="Disable default Open Dream-RSI evolution cycle")
     parser.add_argument("--dream-rollouts", "--rollouts", dest="dream_rollouts", type=int, default=300, help="Number of simulated rollouts per dream generation (default: 300)")
@@ -2631,6 +2703,23 @@ def main_swarm(argv=None):
         print("=" * 78 + "\n")
         return
 
+    # Normalize default args.host (strip http://, https://, trailing slashes/paths, and inline :port)
+    if getattr(args, "host", None):
+        raw_h = str(args.host).strip()
+        if raw_h.lower().startswith("https://"):
+            args.tls = True
+        clean_h = re.sub(r"^https?://", "", raw_h, flags=re.IGNORECASE).split("/")[0]
+        if ":" in clean_h and not clean_h.startswith("["):
+            parts = clean_h.split(":", 1)
+            clean_h = parts[0]
+            if len(parts) > 1 and parts[1].isdigit() and getattr(args, "port", 5006) == 5006:
+                args.port = int(parts[1])
+        args.host = clean_h
+
+    # Configure ExecutionPolicy singleton with CLI flags
+    from engine.execution_policy import ExecutionPolicy
+    ExecutionPolicy.get_instance().allow_destructive = getattr(args, "allow_destructive", False)
+
     # Handle standalone modes that do not require remote target authorization first
     if active_mode == "build":
         from build_all import run_full_build
@@ -2675,11 +2764,7 @@ def main_swarm(argv=None):
         cmd_vulns(args)
         return
 
-
-    if getattr(args, "run_all_scans", False) or (
-        active_mode in ("all", "all_scans")
-        and (getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "raptor_target", None))
-    ):
+    if getattr(args, "run_all_scans", False) or active_mode in ("all", "all_scans"):
         cmd_all(args)
         return
 
@@ -2728,18 +2813,11 @@ def main_swarm(argv=None):
     term_cats = parse_terminators(args.terminators)
 
     # Authorize and validate each target host specified on the CLI
-    from mcp_server import TargetAuthorizationGate
-    from engine.safe_network_validator import validate_target_host
+    from engine.safe_network_validator import validate_and_authorize_target
     for t_host, t_port, t_tls in target_list:
-        is_local = t_host in ("127.0.0.1", "localhost", "::1", "[::1]") or t_host.startswith("127.")
-        is_safe_net, net_reason = validate_target_host(t_host, allow_private=is_local)
-        if not is_safe_net:
-            print(f"[!] Target SSRF validation error for {t_host}: {net_reason}")
-            sys.exit(1)
-
-        is_valid_target, target_reason = TargetAuthorizationGate.validate_target(t_host)
-        if not is_valid_target:
-            print(f"[!] Target authorization error for {t_host}: {target_reason}")
+        ok, reason = validate_and_authorize_target(t_host, authorized=getattr(args, "authorized", False))
+        if not ok:
+            print(f"[!] Target authorization error for {t_host}: {reason}")
             sys.exit(1)
 
     import os

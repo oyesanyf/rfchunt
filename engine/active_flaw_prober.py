@@ -70,6 +70,15 @@ class ActiveFlawProber:
 
     def _check_safety(self) -> None:
         """Enforces fail-closed target validation and SSRF authorization."""
+        from engine.execution_policy import ExecutionPolicy, StructuredIntentProposal, ScannerTask, ActionType
+        proposal = StructuredIntentProposal(
+            task=ScannerTask.ACTIVE_FLAW_PROBER,
+            action_type=ActionType.NETWORK_SOCKET,
+            target_host=self.host,
+            target_port=self.port,
+            rationale="Active flaw prober canonical RFC framing audit",
+        )
+        ExecutionPolicy.get_instance().validate_intent(proposal)
         if not self._is_safe:
             raise PermissionError(f"Target '{self.host}' rejected by SSRF safety boundary: {self._safety_reason}")
         if not self._is_authorized:

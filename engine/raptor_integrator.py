@@ -396,12 +396,29 @@ class RaptorIntegrator:
         port: int = 443,
         use_tls: bool = True,
         timeout_sec: int = 600,
+        authorized: bool = False,
     ) -> Dict[str, Any]:
         """
         Executes RAPTOR Web Application Security Testing against a remote live host.
+        Enforces fail-closed SSRF validation & TargetAuthorizationGate before launching RAPTOR.
         Invokes RAPTOR's 'web' mode (--url https://<host>:<port>).
         Parses all generated web findings and ingests them into terminator.db.
         """
+        from engine.safe_network_validator import parse_host_and_port, validate_and_authorize_target
+
+        clean_host, resolved_port, resolved_tls = parse_host_and_port(
+            host,
+            default_port=port,
+            use_tls=True if use_tls else None,
+        )
+        ok, reason = validate_and_authorize_target(clean_host, authorized=authorized)
+        if not ok:
+            raise PermissionError(reason)
+
+        host = clean_host
+        port = resolved_port
+        use_tls = resolved_tls
+
         protocol = "https" if use_tls or port == 443 else "http"
         port_suffix = f":{port}" if (use_tls and port != 443) or (not use_tls and port != 80) else ""
         target_url = f"{protocol}://{host}{port_suffix}"

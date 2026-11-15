@@ -70,13 +70,16 @@ Rules:
         rfc_fragment = finding_details.get("rfc_fragment", "")
         details = finding_details.get("details", "")
 
+        from engine.execution_policy import sanitize_for_llm_prompt
+        sanitized_evidence = sanitize_for_llm_prompt(raw_evidence, max_chars=600)
+
         user_prompt = f"""
 OBSERVED SECURITY FINDING / ANOMALY:
 - Details: {details}
 - Initial Hypothesis: {rationale}
 - Relevant RFC Fragment: {rfc_fragment}
 - Observed Evidence Snippet:
-{raw_evidence[:600]}
+{sanitized_evidence}
 
 Look at the observed behavior and consider 1-3 plausible hypotheses that explain it.
 Do any of these hypotheses have security implications beyond this desync trigger?

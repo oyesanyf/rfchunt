@@ -35,13 +35,16 @@ class RQPWeaponizer:
         self.db = db
 
     def _open_connection(self) -> socket.socket:
-        is_local = self.host in ("127.0.0.1", "localhost", "::1", "[::1]") or self.host.startswith("127.")
-        from engine.safe_network_validator import validate_target_host
-        is_safe, reason = validate_target_host(self.host, allow_private=is_local)
-        if not is_safe:
-            raise PermissionError(f"Target '{self.host}' rejected by SSRF safety boundary: {reason}")
-        from mcp_server import TargetAuthorizationGate
-        TargetAuthorizationGate.check_target(self.host)
+        from engine.execution_policy import ExecutionPolicy, StructuredIntentProposal, ScannerTask, ActionType
+        proposal = StructuredIntentProposal(
+            task=ScannerTask.RQP_WEAPONIZER,
+            action_type=ActionType.NETWORK_SOCKET,
+            target_host=self.host,
+            target_port=self.port,
+            rationale="Dangling-Byte Response Queue Poisoning exploitation primitive",
+            is_destructive=True,
+        )
+        ExecutionPolicy.get_instance().validate_intent(proposal)
         raw_sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
         if self.use_tls:
             context = ssl.create_default_context()

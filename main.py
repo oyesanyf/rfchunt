@@ -490,8 +490,9 @@ def cmd_mantis(args):
 
 
 def cmd_all(args):
-    """Execute Unified --all Scans across --repo / --path with mandatory ModelFusion & Abliterated models."""
+    """Execute Unified --all Scans across --repo / --path or remote --host with mandatory ModelFusion & Abliterated models."""
     from engine.mantis_integrator import DEFAULT_ABLITERATED_MODEL, run_unified_all_scans
+    from engine.safe_network_validator import validate_and_authorize_target
 
     args.fusion = True
     args.abliteration = True
@@ -500,16 +501,30 @@ def cmd_all(args):
         preferred_model = args.model
     args.model = preferred_model
 
+    host = getattr(args, "host", None) or getattr(args, "target", None)
     repo = getattr(args, "repo", None)
     path = getattr(args, "path", None)
     depth = int(getattr(args, "depth", 30) or 30)
     mode = getattr(args, "mantis_mode", "full") or "full"
     reports_dir = getattr(args, "output_dir", None) or "reports"
+    authorized = bool(getattr(args, "authorized", False))
+    allow_destructive = bool(getattr(args, "allow_destructive", False))
+
+    if host:
+        ok, reason = validate_and_authorize_target(host, authorized=authorized)
+        if not ok:
+            print(f"[!] Target authorization error for {host}: {reason}")
+            sys.exit(1)
 
     db = Database(args.db)
     res = run_unified_all_scans(
-        repo=repo or (None if path else "."),
+        repo=repo or (None if (path or host) else "."),
         path=path,
+        host=host,
+        port=getattr(args, "port", 443),
+        use_tls=getattr(args, "tls", None),
+        authorized=authorized,
+        allow_destructive=allow_destructive,
         depth=depth,
         mantis_mode=mode,
         use_fusion=True,
@@ -527,11 +542,18 @@ def cmd_all(args):
 def cmd_harness2(args):
     """Executes Google Research Harness² recursive agent harnessing (Propose-Probe-Compose across c1..c8)."""
     from engine.harness2_engine import Harness2ProtocolEngine
+    from engine.safe_network_validator import validate_and_authorize_target
+
+    target_host = getattr(args, "target", None) or getattr(args, "host", "127.0.0.1")
+    ok, reason = validate_and_authorize_target(target_host, authorized=getattr(args, "authorized", False))
+    if not ok:
+        print(f"[!] Target authorization error for {target_host}: {reason}")
+        sys.exit(1)
 
     db = Database(args.db)
     engine = Harness2ProtocolEngine(
         runs_root=args.runs_dir,
-        target_host=args.target,
+        target_host=target_host,
         target_port=args.port,
         db_path=args.db,
     )
@@ -613,6 +635,11 @@ USAGE EXAMPLES:
     parser.add_argument("--mantis", action="store_true", help="Run Google Mantis (Module 20) scan")
     parser.add_argument("--repo", dest="repo", type=str, default=None, help="Repository path for --all / --mantis scan")
     parser.add_argument("--path", dest="path", type=str, default=None, help="Target file or folder path for --all / --mantis scan")
+    parser.add_argument("--host", "--target", dest="host", type=str, default=None, help="Target host (domain or IP)")
+    parser.add_argument("--port", type=int, default=443, help="Target port (default: 443)")
+    parser.add_argument("--tls", action="store_true", help="Enable TLS/HTTPS for target host")
+    parser.add_argument("--authorized", action="store_true", help="Explicitly authorize active security testing against remote/public target")
+    parser.add_argument("--allow-destructive", action="store_true", help="Explicitly permit state-mutating requests (PUT, DELETE, PATCH) and active response theft on authorized targets")
     parser.add_argument("--depth", dest="depth", type=int, default=30, help="Google Mantis scan depth (1..100, default: 30)")
     parser.add_argument("--mantis-mode", dest="mantis_mode", choices=["full", "fast", "threat-model", "scan", "reproduce", "patch"], default="full", help="Google Mantis pipeline mode")
     parser.add_argument("--output-dir", dest="output_dir", type=str, default="reports", help="Output directory for SARIF/JSON audit reports")
@@ -735,6 +762,11 @@ USAGE EXAMPLES:
     p_all = subparsers.add_parser("all", help="Run ALL security scanners (Mantis, aiscan, ARTEX, RAPTOR, Prompt Smuggling) with Fusion + Abliterated models")
     p_all.add_argument("--repo", default=argparse.SUPPRESS, help="Repository directory path")
     p_all.add_argument("--path", default=argparse.SUPPRESS, help="File or directory path")
+    p_all.add_argument("--host", "--target", dest="host", default=argparse.SUPPRESS, help="Target host (domain or IP)")
+    p_all.add_argument("--port", type=int, default=argparse.SUPPRESS, help="Target port")
+    p_all.add_argument("--tls", action="store_true", default=argparse.SUPPRESS, help="Enable TLS/HTTPS for target host")
+    p_all.add_argument("--authorized", action="store_true", default=argparse.SUPPRESS, help="Explicitly authorize active testing")
+    p_all.add_argument("--allow-destructive", action="store_true", default=argparse.SUPPRESS, help="Permit state-mutating requests")
     p_all.add_argument("--depth", type=int, default=argparse.SUPPRESS, help="Mantis depth (1..100)")
     p_all.add_argument("--mantis-mode", choices=["full", "fast", "threat-model", "scan", "reproduce", "patch"], default=argparse.SUPPRESS, help="Mantis mode")
     p_all.add_argument("--output-dir", default=argparse.SUPPRESS, help="Report output directory")
@@ -751,6 +783,9 @@ USAGE EXAMPLES:
     p_build.add_argument("--skip-tests", action="store_true", help="Skip running the pytest verification suite")
 
     args = parser.parse_args()
+
+    from engine.execution_policy import ExecutionPolicy
+    ExecutionPolicy.get_instance().allow_destructive = getattr(args, "allow_destructive", False)
 
     if getattr(args, "abliteration", True) or getattr(args, "run_all_scans", False) or getattr(args, "mantis", False) or args.command in ("all", "mantis"):
         if not getattr(args, "no_fusion", False):

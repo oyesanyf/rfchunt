@@ -38,8 +38,8 @@ class TargetAuthorizationGate:
                 # Disallow wildcards from bypassing target controls
                 if t_clean and t_clean not in ("*", "all"):
                     try:
-                        from engine.safe_network_validator import validate_target_host
-                        is_safe, _ = validate_target_host(t_clean, allow_private=True)
+                        from engine.safe_network_validator import validate_target_host, is_explicit_loopback_host
+                        is_safe, _ = validate_target_host(t_clean, allow_private=is_explicit_loopback_host(t_clean))
                         if is_safe:
                             targets.add(t_clean)
                     except ImportError:
@@ -54,15 +54,10 @@ class TargetAuthorizationGate:
         if cleaned in ("*", "all"):
             raise ValueError("Wildcard authorization is disallowed. Specify explicit target hostnames or IPs.")
         try:
-            from engine.safe_network_validator import is_cloud_metadata
-            import ipaddress
-            try:
-                ip = ipaddress.ip_address(cleaned)
-                if is_cloud_metadata(ip) or ip.is_unspecified:
-                    raise ValueError(f"Cannot authorize target '{host}': destination is cloud metadata or unspecified.")
-            except ValueError as e:
-                if "Cannot authorize" in str(e):
-                    raise
+            from engine.safe_network_validator import validate_target_host, is_explicit_loopback_host
+            is_safe, reason = validate_target_host(cleaned, allow_private=is_explicit_loopback_host(cleaned))
+            if not is_safe:
+                raise ValueError(f"Cannot authorize target '{host}': {reason}")
         except ImportError:
             pass
         cls.ALLOWED_TARGETS.add(cleaned)
@@ -437,12 +432,16 @@ class TerminatorMCPServer:
             },
             {
                 "name": "run_all_scans",
-                "description": "[Unified --all Multi-Scanner + Google Mantis] Runs ALL integrated security scanners (Google Mantis, haasonsaas/aiscan, ARTEX Dual-Graph, RAPTOR SAST/PQC/SCA, Prompt Smuggling) against a --repo or --path with mandatory ModelFusion and Abliterated models.",
+                "description": "[Unified --all Multi-Scanner + Google Mantis] Runs ALL integrated security scanners (Google Mantis, haasonsaas/aiscan, ARTEX Dual-Graph, RAPTOR SAST/PQC/SCA + web DAST, Prompt Smuggling, Protocol Ruler & TLS/HTTP framing) against --repo/--path and/or remote --host with mandatory ModelFusion and Abliterated models.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "repo": {"type": "string", "description": "Repository directory path to audit"},
                         "path": {"type": "string", "description": "Specific file or folder path to audit"},
+                        "host": {"type": "string", "description": "Optional remote hostname or URL to review (e.g. target.example.com)"},
+                        "port": {"type": "integer", "description": "Target port for remote --host audit (defaults to 443 for HTTPS / 80 for HTTP)"},
+                        "tls": {"type": "boolean", "description": "Enable TLS/HTTPS inspection for remote --host"},
+                        "authorized": {"type": "boolean", "default": False, "description": "Explicit authorization flag for public/remote host (SSRF checks always enforced)"},
                         "depth": {"type": "integer", "default": 30, "description": "Mantis audit depth (1..100)"},
                         "mantis_mode": {
                             "type": "string",
@@ -456,18 +455,23 @@ class TerminatorMCPServer:
             },
             {
                 "name": "mantis_scan_all",
-                "description": "[Alias for run_all_scans] Runs all RFCHunt + Google Mantis scanners against repo/path with mandatory ModelFusion + Abliterated models.",
+                "description": "[Alias for run_all_scans] Runs all RFCHunt + Google Mantis scanners against repo/path and/or remote host with mandatory ModelFusion + Abliterated models.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "repo": {"type": "string"},
                         "path": {"type": "string"},
+                        "host": {"type": "string"},
+                        "port": {"type": "integer"},
+                        "tls": {"type": "boolean"},
+                        "authorized": {"type": "boolean", "default": False},
                         "depth": {"type": "integer", "default": 30},
                         "mantis_mode": {
                             "type": "string",
                             "enum": ["full", "fast", "threat-model", "scan", "reproduce", "patch"],
                             "default": "full",
                         },
+                        "artex_rounds": {"type": "integer", "default": 1},
                         "output_dir": {"type": "string", "default": "reports"},
                     },
                 },
@@ -627,12 +631,13 @@ class TerminatorMCPServer:
             pg = args.get("policy_groups", "")
             codeql = args.get("include_codeql", False)
             if mode == "web" or t_path.startswith("http://") or t_path.startswith("https://"):
-                from urllib.parse import urlparse
-                u = urlparse(t_path if t_path.startswith("http") else f"https://{t_path}")
-                host = u.hostname or "127.0.0.1"
-                port = u.port or (443 if u.scheme == "https" else 80)
-                tls = u.scheme == "https"
-                return self.raptor.run_host_scan(host=host, port=port, use_tls=tls)
+                from engine.safe_network_validator import parse_host_and_port, validate_and_authorize_target
+                host, port, tls = parse_host_and_port(t_path, use_tls=None)
+                authorized = bool(args.get("authorized", False))
+                ok, reason = validate_and_authorize_target(host, authorized=authorized)
+                if not ok:
+                    raise PermissionError(reason)
+                return self.raptor.run_host_scan(host=host, port=port, use_tls=tls, authorized=authorized)
             return self.raptor.run_scan(
                 target_path=t_path,
                 mode=mode,
@@ -659,16 +664,26 @@ class TerminatorMCPServer:
 
             repo = args.get("repo")
             path = args.get("path")
-            raw_target = str(repo or path or ".")
-            if "\x00" in raw_target:
-                raise ValueError("Invalid target path containing NUL byte.")
-            resolved = os.path.abspath(raw_target)
-            if not os.path.exists(resolved):
-                return {"error": f"Target path does not exist: {resolved}"}
+            remote_host = args.get("host")
+            remote_port = args.get("port")
+            remote_tls = args.get("tls")
+            authorized = bool(args.get("authorized", False))
+
+            resolved_repo = None
+            resolved_path = path
+            if repo or path or not remote_host:
+                raw_target = str(repo or path or ".")
+                if "\x00" in raw_target:
+                    raise ValueError("Invalid target path containing NUL byte.")
+                resolved = os.path.abspath(raw_target)
+                if not os.path.exists(resolved):
+                    return {"error": f"Target path does not exist: {resolved}"}
+                resolved_repo = resolved if repo or not path else None
+                resolved_path = resolved if path and not repo else path
 
             return run_unified_all_scans(
-                repo=resolved if repo or not path else None,
-                path=resolved if path and not repo else path,
+                repo=resolved_repo,
+                path=resolved_path,
                 depth=int(args.get("depth", 30)),
                 mantis_mode=str(args.get("mantis_mode", "full")),
                 use_fusion=True,
@@ -676,6 +691,10 @@ class TerminatorMCPServer:
                 db=self.db,
                 reports_dir=args.get("output_dir") or "reports",
                 artex_rounds=int(args.get("artex_rounds", 1)),
+                host=remote_host,
+                port=int(remote_port) if remote_port is not None else None,
+                use_tls=bool(remote_tls) if remote_tls is not None else None,
+                authorized=authorized,
             )
 
         elif name == "mantis_scan":

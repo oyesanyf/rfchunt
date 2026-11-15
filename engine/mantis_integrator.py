@@ -1784,13 +1784,23 @@ def build_sarif_document(
                 "properties": {"cwe": str(item.get("cwe") or "")},
             }
 
-        raw_fp = str(item.get("file_path") or item.get("file") or "repo")
+        raw_fp = str(item.get("file_path") or item.get("file") or "repo").replace("\x00", "")
+        # Prevent path traversal in SARIF URI
+        parts = [p for p in raw_fp.replace("\\", "/").split("/") if p and p != ".."]
+        clean_fp = "/".join(parts) or "repo"
         try:
-            rel_uri = os.path.relpath(raw_fp, target_root).replace("\\", "/") if os.path.isdir(target_root) and os.path.isabs(raw_fp) else raw_fp.replace("\\", "/")
+            rel_uri = os.path.relpath(clean_fp, target_root).replace("\\", "/") if os.path.isdir(target_root) and os.path.isabs(clean_fp) else clean_fp.replace("\\", "/")
         except ValueError:
-            rel_uri = raw_fp.replace("\\", "/")
+            rel_uri = clean_fp.replace("\\", "/")
 
-        line_num = max(1, int(item.get("line_number") or item.get("line") or 1))
+        rel_uri = re.sub(r"^[a-zA-Z]:[/\\]*", "", rel_uri)
+        rel_uri = "/".join(p for p in rel_uri.split("/") if p != "..") or "target"
+
+        raw_line = item.get("line_number") or item.get("line") or 1
+        try:
+            line_num = max(1, int(raw_line))
+        except (ValueError, TypeError):
+            line_num = 1
         sev = str(item.get("severity") or "MEDIUM")
         msg = f"[{sev}] {item.get('title', rid)} ({item.get('cwe', 'CWE')})"
         if item.get("evidence"):
@@ -1903,6 +1913,11 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
 def run_unified_all_scans(
     repo: Optional[str] = None,
     path: Optional[str] = None,
+    host: Optional[str] = None,
+    port: int = 443,
+    use_tls: Optional[bool] = None,
+    authorized: bool = False,
+    allow_destructive: bool = False,
     depth: int = 30,
     mantis_mode: str = "full",
     use_fusion: bool = True,
@@ -1913,19 +1928,19 @@ def run_unified_all_scans(
     on_trace: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """
-    Execute ALL integrated RFCHunt security scanners against `--repo` or `--path` in one pass,
+    Execute ALL integrated RFCHunt security scanners against `--repo`, `--path`, or remote `--host` in one pass,
     STRICTLY enforcing ModelFusion (`use_fusion=True`) and Abliterated models
     (`hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`) everywhere.
 
     Engines executed:
       - Module 20: Google Mantis (Threat Model + Hypothesis + Tier1/Tier2 Repro + Rubric + Patch)
       - Module 18: haasonsaas/aiscan (AI & Prompt Injection Static Risk Scanner)
-      - Module 15: RAPTOR Security Framework (Docker if available, else cross-platform SAST/PQC/SCA)
+      - Module 15: RAPTOR Security Framework (Docker if available, else cross-platform SAST/PQC/SCA / Web DAST)
       - Module 17: BaaRai/ARTEX Dual-Graph Attack Chaining Engine
       - Module 19: Prompt Smuggling & RFC Framing Desync Probe Synthesizer
+      - ActiveFlawProber: Remote protocol research and desync probing
     """
     t0 = time.monotonic()
-    target_path = os.path.abspath(repo or path or ".")
     base_dir = Path(__file__).resolve().parent.parent
     out_dir = Path(reports_dir) if reports_dir else (base_dir / "reports")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1938,14 +1953,210 @@ def run_unified_all_scans(
         if on_trace:
             on_trace(msg)
 
-    _log(f"[*] --all Unified Scan initiated on {target_path} | depth={depth} | fusion={enforced_fusion} | model={enforced_model}")
-
     # Shared FusionArbiter instance wired across all modules
     arbiter = (
         FusionArbiter(db=db, preferred_model=enforced_model, sec_model=DEFAULT_SEC_MODEL)
         if FusionArbiter is not None
         else None
     )
+
+    clean_host: Optional[str] = None
+    resolved_port: int = port or 443
+    resolved_tls: bool = True
+    if host:
+        from engine.safe_network_validator import parse_host_and_port, validate_and_authorize_target
+        clean_host, resolved_port, resolved_tls = parse_host_and_port(
+            host,
+            default_port=port or 443,
+            use_tls=use_tls,
+        )
+        ok, reason = validate_and_authorize_target(clean_host, authorized=authorized)
+        if not ok:
+            raise PermissionError(f"Target authorization failed for {clean_host}: {reason}")
+
+    # If remote host is provided without local repo or path, execute remote review checks
+    if clean_host and not repo and not path:
+        target_path = f"{clean_host}:{resolved_port}"
+        _log(f"[*] --all Unified Remote Host Scan initiated on {target_path} | authorized={authorized} | allow_destructive={allow_destructive}")
+
+        # 1. RAPTOR Web host scan
+        raptor_res: Dict[str, Any] = {"mode": "raptor_web", "total_findings": 0, "findings": []}
+        offline_or_ci = (
+            os.environ.get("RFCHUNT_OFFLINE") == "1"
+            or bool(os.environ.get("CI"))
+            or "PYTEST_CURRENT_TEST" in os.environ
+        )
+        if not offline_or_ci:
+            try:
+                from engine.raptor_integrator import RaptorIntegrator
+                raptor = RaptorIntegrator(db=db, on_trace=on_trace)
+                raptor_res = raptor.run_host_scan(
+                    host=clean_host,
+                    port=resolved_port,
+                    use_tls=resolved_tls,
+                    authorized=authorized,
+                )
+            except Exception as exc:
+                raptor_res = {"mode": "raptor_web", "total_findings": 0, "findings": [], "error": str(exc)}
+
+        # 2. ActiveFlawProber remote audit
+        prober_res: Dict[str, Any] = {"total_findings": 0, "findings": []}
+        try:
+            from engine.active_flaw_prober import ActiveFlawProber
+            prober = ActiveFlawProber(host=clean_host, port=resolved_port, use_tls=resolved_tls, db=db)
+            p_findings = prober.run_active_audit()
+            prober_res = {"total_findings": len(p_findings), "findings": p_findings}
+        except Exception as exc:
+            prober_res = {"total_findings": 0, "findings": [], "error": str(exc)}
+
+        # 3. ARTEX Dual-Graph remote infrastructure ingestion & attack chaining
+        artex_res: Dict[str, Any] = {"chains_synthesized": 0, "chains": []}
+        try:
+            from engine.dual_graph_engine import DualGraphAttackEngine
+            artex = DualGraphAttackEngine(db=db, reports_dir=str(out_dir))
+            artex.ingest_target_infrastructure(
+                host=clean_host,
+                port=resolved_port,
+                endpoints=["/api/chat", "/api/v1", "/status", "/login"],
+                ai_sinks=["llm_prompt_sink", "rag_retrieval_sink"],
+            )
+            for idx, pfind in enumerate(prober_res.get("findings", [])[:5], start=1):
+                artex.register_wire_primitive(
+                    anomaly_id=pfind.get("finding_id", f"PROBER-{idx}"),
+                    description=f"{pfind.get('type', 'DESYNC')}: {pfind.get('description', '')}",
+                    anomaly_type=pfind.get("type", "DESYNC"),
+                    raw_probe=str(pfind.get("evidence", "")),
+                )
+            cycle_res = artex.run_attack_chain_cycle(round_num=max(1, int(artex_rounds)))
+            artex_res = cycle_res if isinstance(cycle_res, dict) else {"result": str(cycle_res)}
+        except Exception as exc:
+            artex_res = {"error": str(exc), "chains_synthesized": 0}
+
+        # 4. Prompt Smuggling probe synthesis for remote host
+        smuggle_res: Dict[str, Any] = {"probes_generated": 0, "probes": []}
+        try:
+            from engine.prompt_smuggling_synthesizer import PromptSmugglingSynthesizer
+            synth = PromptSmugglingSynthesizer(db=db, reports_dir=str(out_dir))
+            probes = synth.synthesize_probes_for_endpoint(
+                target_host=clean_host,
+                target_port=resolved_port,
+                ai_endpoint="/api/chat",
+                http_method="POST",
+            )
+            smuggle_res = {
+                "probes_generated": len(probes),
+                "ai_endpoint": "/api/chat",
+                "techniques": [getattr(p, "framing_technique", "CL.TE") for p in probes[:10]],
+            }
+        except Exception as exc:
+            smuggle_res = {"error": str(exc), "probes_generated": 0}
+
+        # Aggregate remote findings
+        aggregated_findings: List[Dict[str, Any]] = []
+        for item in raptor_res.get("findings", []):
+            if isinstance(item, dict):
+                aggregated_findings.append({
+                    "rule_id": item.get("rule_id", "RAPTOR-WEB-001"),
+                    "title": item.get("title", item.get("message", "RAPTOR Web Finding")),
+                    "severity": str(item.get("severity", "MEDIUM")).upper(),
+                    "cwe": item.get("cwe", "CWE-20"),
+                    "file_path": target_path,
+                    "line_number": 1,
+                    "description": item.get("description", item.get("title", "")),
+                    "remediation": item.get("remediation", ""),
+                    "scanner": item.get("scanner", "Module-15-RAPTOR-Web"),
+                })
+        for item in prober_res.get("findings", []):
+            if isinstance(item, dict):
+                aggregated_findings.append({
+                    "rule_id": item.get("rule_id", "PROBER-001"),
+                    "title": item.get("title", item.get("description", "Active Protocol Flaw")),
+                    "severity": str(item.get("severity", "HIGH")).upper(),
+                    "cwe": item.get("cwe", "CWE-444"),
+                    "file_path": target_path,
+                    "line_number": 1,
+                    "description": item.get("description", ""),
+                    "remediation": item.get("remediation", "Enforce strict HTTP RFC 7230/9112 framing boundaries."),
+                    "scanner": "ActiveFlawProber",
+                })
+
+        fusion_summary = (
+            f"Unified --all remote review completed on {target_path}: "
+            f"{len(aggregated_findings)} aggregated remote findings "
+            f"(RAPTOR Web={len(raptor_res.get('findings', []))}, "
+            f"ActiveFlawProber={prober_res.get('total_findings', 0)}, "
+            f"Prompt Smuggling Probes={smuggle_res.get('probes_generated', 0)})."
+        )
+
+        combined_sarif_path = out_dir / "combined_report.sarif"
+        combined_json_path = out_dir / "combined_audit_summary.json"
+        combined_txt_path = out_dir / "combined_summary.txt"
+
+        combined_sarif = build_sarif_document(
+            tool_name="RFCHunt-Unified-All-Scans",
+            tool_uri=MANTIS_REPO_URL,
+            target_root=target_path,
+            findings=aggregated_findings,
+        )
+        with open(combined_sarif_path, "w", encoding="utf-8") as f:
+            json.dump(combined_sarif, f, indent=2)
+
+        elapsed = round(time.monotonic() - t0, 3)
+        sev_breakdown: Dict[str, int] = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+        for item in aggregated_findings:
+            sev = str(item.get("severity", "INFO")).upper()
+            sev_breakdown[sev] = sev_breakdown.get(sev, 0) + 1
+
+        result_payload = {
+            "target_path": target_path,
+            "mode": "unified_all_scans_remote",
+            "depth": int(depth),
+            "fusion_enabled": enforced_fusion,
+            "abliterated_model": enforced_model,
+            "total_aggregated_findings": len(aggregated_findings),
+            "severity_counts": sev_breakdown,
+            "executive_summary": fusion_summary,
+            "engines": {
+                "mantis": {"total_findings": 0, "reproduced_count": 0, "patched_verified_count": 0, "report_files": {}},
+                "aiscan": {"total_findings": 0, "total_endpoints": 0},
+                "raptor": {"mode": raptor_res.get("mode", "raptor_web"), "total_findings": len(raptor_res.get("findings", []))},
+                "artex_dual_graph": artex_res,
+                "prompt_smuggling": smuggle_res,
+                "active_flaw_prober": prober_res,
+            },
+            "findings": aggregated_findings,
+            "report_files": {
+                "combined_sarif": str(combined_sarif_path),
+                "combined_json": str(combined_json_path),
+                "combined_txt": str(combined_txt_path),
+            },
+            "elapsed_sec": elapsed,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        with open(combined_json_path, "w", encoding="utf-8") as f:
+            json.dump(result_payload, f, indent=2)
+
+        txt_lines = [
+            "=== RFCHunt Unified --all Remote Security Scan Summary ===",
+            f"Target: {target_path}",
+            f"Authorized: {authorized} | Allow Destructive: {allow_destructive}",
+            f"Total Aggregated Findings: {len(aggregated_findings)}",
+            f"Severity Breakdown: {json.dumps(sev_breakdown)}",
+            f"RAPTOR Web Findings: {len(raptor_res.get('findings', []))}",
+            f"ActiveFlawProber Findings: {prober_res.get('total_findings', 0)}",
+            f"Prompt Smuggling Probes Synthesized: {smuggle_res.get('probes_generated', 0)}",
+            "",
+            f"Combined SARIF: {combined_sarif_path}",
+            f"Combined JSON:  {combined_json_path}",
+        ]
+        with open(combined_txt_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(txt_lines) + "\n")
+
+        return result_payload
+
+    target_path = os.path.abspath(repo or path or ".")
+    _log(f"[*] --all Unified Scan initiated on {target_path} | depth={depth} | fusion={enforced_fusion} | model={enforced_model}")
 
     candidate_files = discover_candidate_files(target_path)
 
