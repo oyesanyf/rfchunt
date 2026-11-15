@@ -20,6 +20,8 @@ Provides native, crash-safe host network isolation and traffic filtering:
    - CREATE_NO_WINDOW (0x08000000) and stdin=subprocess.DEVNULL enforcement across all callers.
 """
 
+from __future__ import annotations
+
 import atexit
 import ctypes
 from ctypes import wintypes
@@ -174,12 +176,12 @@ class WindowsWFPContainmentBackend(BaseContainmentBackend):
     def __init__(self, dll_path: str = "fwpuclnt.dll"):
         super().__init__()
         self.dll_path = dll_path
-        self._wfp_dll: Optional[ctypes.WinDLL] = None
+        self._wfp_dll: Optional[Any] = None
         self._engine_handle: Optional[wintypes.HANDLE] = None
         self._in_transaction = False
         self._rule_counter = 0
 
-    def _get_dll(self) -> ctypes.WinDLL:
+    def _get_dll(self) -> Any:
         if self._wfp_dll is None:
             if sys.platform != "win32":
                 raise OSError("Windows WFP is only available on Windows platforms.")
