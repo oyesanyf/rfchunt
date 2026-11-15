@@ -544,7 +544,7 @@ def cmd_harness2(args):
     from engine.harness2_engine import Harness2ProtocolEngine
     from engine.safe_network_validator import validate_and_authorize_target
 
-    target_host = getattr(args, "target", None) or getattr(args, "host", "127.0.0.1")
+    target_host = getattr(args, "host", None) or getattr(args, "target", None) or "127.0.0.1"
     ok, reason = validate_and_authorize_target(target_host, authorized=getattr(args, "authorized", False))
     if not ok:
         print(f"[!] Target authorization error for {target_host}: {reason}")
@@ -754,7 +754,8 @@ USAGE EXAMPLES:
     p_harness2.add_argument("--mode", "--harness2-mode", dest="mode", choices=["parallel", "sequential", "agg", "seq", "both"], default="parallel", help="Recursion topology: parallel (agg width), sequential (seq depth), or both")
     p_harness2.add_argument("--domain", "--harness2-domain", dest="domain", default="auto", help="Protocol domain for experience library")
     p_harness2.add_argument("--runs-dir", "--harness2-runs-dir", dest="runs_dir", default="runs/harness2", help="Directory for persisted Harness2 runs and experience library")
-    p_harness2.add_argument("--target", default="127.0.0.1", help="Target host")
+    p_harness2.add_argument("--host", "--target", dest="host", default=argparse.SUPPRESS, help="Target host (domain or IP)")
+    p_harness2.add_argument("--authorized", action="store_true", default=argparse.SUPPRESS, help="Explicitly authorize active testing")
     p_harness2.add_argument("--port", type=int, default=8080, help="Target port")
     p_harness2.add_argument("--report", "--harness2-report", dest="report", action="store_true", help="Print historical Harness2 runs and experience libraries")
 

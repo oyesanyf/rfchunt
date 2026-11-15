@@ -13,6 +13,8 @@ import argparse
 import os
 from pathlib import Path
 import socket
+import subprocess
+import sys
 from typing import Any, Dict
 from unittest.mock import MagicMock, patch
 import pytest
@@ -283,3 +285,90 @@ def test_main_cli_argument_parsing():
     assert args.tls is True
     assert args.authorized is True
     assert args.allow_destructive is True
+
+
+def test_main_cli_harness2_host_fails_closed():
+    """Verifies that `python main.py harness2 --host 10.0.0.1` exits with code 1."""
+    root_dir = Path(__file__).resolve().parent.parent
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(root_dir)
+    res = subprocess.run(
+        [sys.executable, "main.py", "harness2", "--host", "10.0.0.1"],
+        cwd=str(root_dir),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode == 1
+    combined = res.stdout + res.stderr
+    assert "Target authorization error for 10.0.0.1" in combined or "Target SSRF validation error" in combined
+
+
+def test_main_cli_harness2_target_authorized_fails_closed():
+    """Verifies that `python main.py harness2 --target 10.0.0.1 --authorized` exits with code 1."""
+    root_dir = Path(__file__).resolve().parent.parent
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(root_dir)
+    res = subprocess.run(
+        [sys.executable, "main.py", "harness2", "--target", "10.0.0.1", "--authorized"],
+        cwd=str(root_dir),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode == 1
+    combined = res.stdout + res.stderr
+    assert "Target authorization error for 10.0.0.1" in combined or "Target SSRF validation error" in combined
+
+
+def test_main_cli_root_host_harness2_fails_closed():
+    """Verifies that `python main.py --host 10.0.0.1 harness2` exits with code 1."""
+    root_dir = Path(__file__).resolve().parent.parent
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(root_dir)
+    res = subprocess.run(
+        [sys.executable, "main.py", "--host", "10.0.0.1", "harness2"],
+        cwd=str(root_dir),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode == 1
+    combined = res.stdout + res.stderr
+    assert "Target authorization error for 10.0.0.1" in combined or "Target SSRF validation error" in combined
+
+
+def test_main_cli_harness2_unauthorized_external_host():
+    """Verifies that `python main.py harness2 --host dlptest.com` (without authorized) exits with code 1."""
+    root_dir = Path(__file__).resolve().parent.parent
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(root_dir)
+    env.pop("RFCHUNT_AUTHORIZED_TARGETS", None)
+    res = subprocess.run(
+        [sys.executable, "main.py", "harness2", "--host", "dlptest.com"],
+        cwd=str(root_dir),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode == 1
+    combined = res.stdout + res.stderr
+    assert "Target authorization error for dlptest.com" in combined
+
+
+def test_main_cli_root_host_harness2_report_fails_closed():
+    """Verifies that `python main.py --host dlptest.com harness2 --report` (without authorized) fails closed."""
+    root_dir = Path(__file__).resolve().parent.parent
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(root_dir)
+    env.pop("RFCHUNT_AUTHORIZED_TARGETS", None)
+    res = subprocess.run(
+        [sys.executable, "main.py", "--host", "dlptest.com", "harness2", "--report"],
+        cwd=str(root_dir),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode == 1
+    combined = res.stdout + res.stderr
+    assert "Target authorization error for dlptest.com" in combined
