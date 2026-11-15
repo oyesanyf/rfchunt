@@ -786,7 +786,7 @@ USAGE EXAMPLES:
     args = parser.parse_args()
 
     from engine.execution_policy import ExecutionPolicy
-    ExecutionPolicy.get_instance().allow_destructive = getattr(args, "allow_destructive", False)
+    ExecutionPolicy.get_instance().allow_destructive = ExecutionPolicy.get_instance().allow_destructive or bool(getattr(args, "allow_destructive", False))
 
     if getattr(args, "abliteration", True) or getattr(args, "run_all_scans", False) or getattr(args, "mantis", False) or args.command in ("all", "mantis"):
         if not getattr(args, "no_fusion", False):

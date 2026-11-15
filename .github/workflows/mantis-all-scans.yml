@@ -68,12 +68,12 @@ jobs:
           print("Verified combined SARIF results:", len(sarif["runs"][0]["results"]))
           '
 
-      - name: Run Mantis & Fusion Integration Tests
+      - name: Run Mantis, Fusion, Remote Host & LLM Governance Tests
         env:
           CI: "true"
           RFCHUNT_OFFLINE: "1"
         run: |
-          pytest tests/test_mantis_integrator.py tests/test_abliteration_fusion.py -v --basetemp=/tmp/pytest_rfchunt
+          pytest tests/test_mantis_integrator.py tests/test_abliteration_fusion.py tests/test_remote_host_and_subcommands.py tests/test_llm_governance_and_schema.py tests/test_ssrf_adversarial_challenge.py tests/test_target_auth.py -v --basetemp=/tmp/pytest_rfchunt
 
       - name: Upload Security Reports Artifact
         if: always()

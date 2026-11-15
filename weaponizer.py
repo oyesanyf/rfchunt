@@ -42,7 +42,7 @@ class RQPWeaponizer:
             target_host=self.host,
             target_port=self.port,
             rationale="Dangling-Byte Response Queue Poisoning exploitation primitive",
-            is_destructive=True,
+            is_destructive=False,
         )
         ExecutionPolicy.get_instance().validate_intent(proposal)
         raw_sock = socket.create_connection((self.host, self.port), timeout=self.timeout)

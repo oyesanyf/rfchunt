@@ -228,6 +228,29 @@ def test_red_team_offensive_payloads_preserved_unhindered():
         )
         assert policy.validate_intent(proposal) is True
 
+    # Verify RQPWeaponizer red-team framing probes run unhindered on authorized targets
+    rqp_proposal = StructuredIntentProposal(
+        task=ScannerTask.RQP_WEAPONIZER,
+        action_type=ActionType.NETWORK_SOCKET,
+        target_host="127.0.0.1",
+        target_port=8080,
+        http_method="GET",
+        rationale="Authorized RQP dangling-byte verification",
+    )
+    assert policy.validate_intent(rqp_proposal) is True
+
+    # While DELETE via RQP_WEAPONIZER without --allow-destructive is still gated
+    rqp_destructive = StructuredIntentProposal(
+        task=ScannerTask.RQP_WEAPONIZER,
+        action_type=ActionType.NETWORK_SOCKET,
+        target_host="127.0.0.1",
+        target_port=8080,
+        http_method="DELETE",
+        rationale="Destructive state mutation attempt",
+    )
+    with pytest.raises(PermissionError, match=r"Destructive action gated"):
+        policy.validate_intent(rqp_destructive)
+
 
 # =====================================================================
 # 5. Prompt Injection Defense & Sanitization

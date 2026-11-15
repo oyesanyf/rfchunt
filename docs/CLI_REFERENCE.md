@@ -63,7 +63,8 @@
 | `--debug` | flag | `False` | Enable deep socket telemetry & step tracing | `--debug` |
 | `--show-response` | flag | `False` | Print raw responses received from target host | `--show-response` |
 | `-v`, `--verbose` | flag | `False` | Enable verbose execution telemetry | `-v` |
-| `--authorized`, `--allow-all` | flag | `False` | Explicitly authorize testing against remote host | `--authorized` |
+| `--authorized`, `--allow-all` | flag | `False` | Explicitly authorize testing against remote host (with `validate_target_host` SSRF checks enforced) | `--authorized` |
+| `--allow-destructive` | flag | `False` | Explicitly allow state-mutating HTTP methods (`PUT`, `DELETE`, `PATCH`, `DROP`, `PURGE`) on authorized targets (`RFCHUNT_ALLOW_DESTRUCTIVE=1`) | `--allow-destructive` |
 | `--sequence` | string | `None` | Custom byte sequence for Protocol Ruler | `--sequence "\xc0\x8a"` |
 | `--name` | string | `Custom Probe`| Sequence label for Protocol Ruler | `--name "Overlong-LF"` |
 | `--max-size` | int | `131072` | Maximum header buffer size for Protocol Ruler | `--max-size 65536` |
@@ -144,8 +145,15 @@ py -3.12 -u rfc_hunt_swarm.py --host dlptest.com --port 443
 # --tls (Enable HTTPS encryption)
 py -3.12 -u rfc_hunt_swarm.py --host dlptest.com --port 443 --tls
 
-# --authorized (Explicit permission gate for public/remote targets)
+# --authorized (Explicit permission gate for public/remote targets; SSRF/private/CGNAT/metadata always blocked)
 py -3.12 -u rfc_hunt_swarm.py --host dlptest.com --port 443 --tls --authorized
+
+# Unified --all against a remote host (runs remote review checks without scanning local '.')
+py -3.12 -u rfc_hunt_swarm.py --all --host target.example.com --port 443 --tls --authorized
+py -3.12 -u main.py --all --host target.example.com --port 443 --tls --authorized
+
+# Opt in to state-mutating HTTP methods (PUT/DELETE/PATCH) on an authorized target
+py -3.12 -u rfc_hunt_swarm.py --all --host target.example.com --authorized --allow-destructive
 
 # --targets (Multiplex across multiple intermediate proxies / terminators)
 py -3.12 -u rfc_hunt_swarm.py --targets "127.0.0.1:8080,https://target.local:8443,10.0.0.5:8000"

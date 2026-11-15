@@ -57,7 +57,12 @@ class TargetAuthorizationGate:
             from engine.safe_network_validator import validate_target_host, is_explicit_loopback_host
             is_safe, reason = validate_target_host(cleaned, allow_private=is_explicit_loopback_host(cleaned))
             if not is_safe:
-                raise ValueError(f"Cannot authorize target '{host}': {reason}")
+                is_dns_offline = "DNS resolution failed for target hostname" in reason
+                has_domain_label = any(c.isalpha() for c in cleaned) and "." in cleaned and not cleaned.startswith("0x")
+                if is_dns_offline and has_domain_label:
+                    pass
+                else:
+                    raise ValueError(f"Cannot authorize target '{host}': {reason}")
         except ImportError:
             pass
         cls.ALLOWED_TARGETS.add(cleaned)

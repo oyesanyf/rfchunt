@@ -31,7 +31,8 @@ from engine.mantis_integrator import run_unified_all_scans, build_sarif_document
 
 @pytest.fixture(autouse=True)
 def mock_dns_resolution(monkeypatch):
-    """Mocks DNS resolution for example.com to public IP 93.184.216.34 so tests do not depend on external DNS."""
+    """Mocks DNS resolution for example.com to public IP 93.184.216.34 and restores TargetAuthorizationGate state."""
+    original_allowed = set(TargetAuthorizationGate.ALLOWED_TARGETS)
     real_getaddrinfo = socket.getaddrinfo
 
     def _mock_getaddrinfo(host, port, *args, **kwargs):
@@ -40,6 +41,9 @@ def mock_dns_resolution(monkeypatch):
         return real_getaddrinfo(host, port, *args, **kwargs)
 
     monkeypatch.setattr(socket, "getaddrinfo", _mock_getaddrinfo)
+    yield
+    TargetAuthorizationGate.ALLOWED_TARGETS.clear()
+    TargetAuthorizationGate.ALLOWED_TARGETS.update(original_allowed)
 
 
 # =====================================================================
@@ -105,15 +109,21 @@ def test_validate_and_authorize_target_blocks_ssrf_even_when_authorized():
 
 def test_validate_and_authorize_target_accepts_public_when_authorized():
     """Verifies that validate_and_authorize_target succeeds on public targets when authorized=True."""
-    # When authorized is False, public target is not yet authorized
-    ok, reason = validate_and_authorize_target("target.example.com", authorized=False)
-    assert not ok
-    assert "authorization error" in reason.lower() or "not in the authorized targets" in reason.lower()
+    original_allowed = set(TargetAuthorizationGate.ALLOWED_TARGETS)
+    TargetAuthorizationGate.ALLOWED_TARGETS.discard("target.example.com")
+    try:
+        # When authorized is False, public target is not yet authorized
+        ok, reason = validate_and_authorize_target("target.example.com", authorized=False)
+        assert not ok
+        assert "authorization error" in reason.lower() or "not in the authorized targets" in reason.lower()
 
-    # When authorized is True, public target is authorized and validated
-    ok_auth, reason_auth = validate_and_authorize_target("target.example.com", authorized=True)
-    assert ok_auth
-    assert "authorized" in reason_auth.lower()
+        # When authorized is True, public target is authorized and validated
+        ok_auth, reason_auth = validate_and_authorize_target("target.example.com", authorized=True)
+        assert ok_auth
+        assert "authorized" in reason_auth.lower()
+    finally:
+        TargetAuthorizationGate.ALLOWED_TARGETS.clear()
+        TargetAuthorizationGate.ALLOWED_TARGETS.update(original_allowed)
 
 
 # =====================================================================

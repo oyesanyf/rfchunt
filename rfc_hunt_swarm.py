@@ -2716,9 +2716,9 @@ def main_swarm(argv=None):
                 args.port = int(parts[1])
         args.host = clean_h
 
-    # Configure ExecutionPolicy singleton with CLI flags
+    # Configure ExecutionPolicy singleton with CLI flags and env opt-in
     from engine.execution_policy import ExecutionPolicy
-    ExecutionPolicy.get_instance().allow_destructive = getattr(args, "allow_destructive", False)
+    ExecutionPolicy.get_instance().allow_destructive = ExecutionPolicy.get_instance().allow_destructive or bool(getattr(args, "allow_destructive", False))
 
     # Handle standalone modes that do not require remote target authorization first
     if active_mode == "build":

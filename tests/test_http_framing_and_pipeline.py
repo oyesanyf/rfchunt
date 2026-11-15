@@ -349,14 +349,20 @@ def test_target_authorization_gate_external_domain():
     Verifies that TargetAuthorizationGate blocks unauthorized testing against
     external services (like target.example.com) unless explicitly authorized.
     """
-    # target.example.com should be rejected by default
-    with pytest.raises(PermissionError):
-        TargetAuthorizationGate.check_auth("target.example.com")
+    original_allowed = set(TargetAuthorizationGate.ALLOWED_TARGETS)
+    TargetAuthorizationGate.ALLOWED_TARGETS.discard("target.example.com")
+    try:
+        # target.example.com should be rejected by default
+        with pytest.raises(PermissionError):
+            TargetAuthorizationGate.check_auth("target.example.com")
 
-    # Authorize explicitly
-    TargetAuthorizationGate.authorize_target("target.example.com")
-    TargetAuthorizationGate.check_auth("target.example.com")
-    assert "target.example.com" in TargetAuthorizationGate.get_allowed_targets()
+        # Authorize explicitly
+        TargetAuthorizationGate.authorize_target("target.example.com")
+        TargetAuthorizationGate.check_auth("target.example.com")
+        assert "target.example.com" in TargetAuthorizationGate.get_allowed_targets()
+    finally:
+        TargetAuthorizationGate.ALLOWED_TARGETS.clear()
+        TargetAuthorizationGate.ALLOWED_TARGETS.update(original_allowed)
 
 
 def test_metamorphic_validity_gate_rejects_compliant_400():

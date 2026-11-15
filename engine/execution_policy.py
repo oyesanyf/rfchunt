@@ -200,14 +200,11 @@ class ExecutionPolicy:
         # Enforce TargetAuthorizationGate
         TargetAuthorizationGate.check_target(cleaned_host)
 
-        # Destructive action gating
+        # Destructive action gating (allow extensive red-team framing probes on authorized targets;
+        # gate explicit state-mutating HTTP verbs or explicit is_destructive=True unless --allow-destructive)
         method_str = (proposal.http_method or "").strip().upper()
         method_destructive = self.is_destructive_method(method_str)
-        task_destructive = (
-            proposal.is_destructive
-            or (isinstance(proposal.task, ScannerTask) and proposal.task == ScannerTask.RQP_WEAPONIZER)
-            or (str(proposal.task).lower() == ScannerTask.RQP_WEAPONIZER.value)
-        )
+        task_destructive = bool(proposal.is_destructive)
 
         if (method_destructive or task_destructive):
             env_destructive = os.environ.get("RFCHUNT_ALLOW_DESTRUCTIVE", "").lower() in ("1", "true", "yes")
