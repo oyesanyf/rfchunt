@@ -494,6 +494,46 @@ def _referenced_names(node: ast.AST) -> Set[str]:
     return {sub.id for sub in ast.walk(node) if isinstance(sub, ast.Name)}
 
 
+def _node_references_any_taint(node: ast.AST, taint_set: Set[str]) -> bool:
+    if not taint_set or node is None:
+        return False
+    names: Set[str] = set()
+    attrs: Set[str] = set()
+    full_attrs: Set[str] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name):
+            names.add(sub.id)
+        elif isinstance(sub, ast.Attribute):
+            attrs.add(sub.attr)
+            if isinstance(sub.value, ast.Name):
+                full_attrs.add(f"{sub.value.id}.{sub.attr}")
+                full_attrs.add(f"self.{sub.attr}")
+    for t in taint_set:
+        if t in names or t in attrs or t in full_attrs:
+            return True
+    return False
+
+
+def _node_is_external_source(node: ast.AST) -> bool:
+    if node is None:
+        return False
+    ext_tokens = ("request", "input", "environ", "argv", "args", "json", "payload", "query", "user_")
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name):
+            low = sub.id.lower()
+            if any(tok in low for tok in ext_tokens):
+                return True
+        elif isinstance(sub, ast.Attribute):
+            low = sub.attr.lower()
+            if any(tok in low for tok in ext_tokens):
+                return True
+        elif isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+            low = sub.value.lower()
+            if any(tok in low for tok in ext_tokens):
+                return True
+    return False
+
+
 def _is_dynamic_sql_expr(node: ast.AST) -> bool:
     if isinstance(node, ast.JoinedStr):
         return True
@@ -691,7 +731,8 @@ class MantisThreatModeler:
 class MantisHypothesisGenerator:
     """
     Phase 2: Depth-Scaled Multi-Pass Vulnerability Hypothesis Generator.
-    Uses genuine Python AST inspection + non-Python sink regex checks plus ModelFusion refinement.
+    Uses genuine Python AST inspection, inter-procedural taint analysis across cross_function
+    call chains, non-Python sink regex checks, and ModelFusion refinement.
     """
 
     def __init__(self, fusion_arbiter: Any = None, model_adapter: Any = None):
@@ -876,10 +917,34 @@ class MantisHypothesisGenerator:
                     for tgt in node.targets:
                         if isinstance(tgt, ast.Name):
                             tlow = tgt.id.lower()
-                            if any(pk in tlow for pk in ("prompt", "system_prompt", "user_prompt", "llm_query", "raw_http", "raw_header")):
+                            is_target_name_match = any(
+                                pk in tlow
+                                for pk in (
+                                    "prompt", "system_prompt", "user_prompt", "llm_query",
+                                    "raw_http", "raw_header", "raw", "payload", "header", "buf"
+                                )
+                            )
+                            src_line = lines[node.lineno - 1] if 0 < node.lineno <= len(lines) else ""
+                            src_line_low = src_line.lower()
+                            has_framing_tokens = any(
+                                ft in src_line_low
+                                for ft in (
+                                    "\\r\\n", "\r\n", "host:", "transfer-encoding:", "content-length:",
+                                    "http/1.", "sec-websocket", "x-forwarded-for:"
+                                )
+                            )
+                            if not has_framing_tokens and isinstance(node.value, (ast.JoinedStr, ast.BinOp)):
+                                for sub in ast.walk(node.value):
+                                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                                        sub_low = sub.value.lower()
+                                        if any(ft in sub_low for ft in ("\r\n", "\\r\\n", "host:", "transfer-encoding:", "content-length:", "x-forwarded-for:")):
+                                            has_framing_tokens = True
+                                            break
+
+                            if is_target_name_match or has_framing_tokens:
                                 if isinstance(node.value, (ast.JoinedStr, ast.BinOp)) and not _node_is_constant_literal(node.value):
                                     val_names = _referenced_names(node.value)
-                                    if val_names and (func_args & val_names or not func_args):
+                                    if val_names and (func_args & val_names or not func_args or has_framing_tokens):
                                         results.append(
                                             self._make_hypothesis(
                                                 "MANTIS-PROTO-010",
@@ -1118,10 +1183,11 @@ class MantisZeroDaySynthesizer:
 
     def synthesize_hypotheses(
         self,
-        threat_model: Union[MantisThreatModel, Dict[str, Any]],
+        threat_model: Union[MantisThreatModel, Dict[str, Any], None],
         findings: Optional[List[MantisFinding]] = None,
         code_snippets: Optional[Dict[str, str]] = None,
     ) -> List[MantisHypothesis]:
+        tm_dict = (threat_model.to_dict() if hasattr(threat_model, "to_dict") else dict(threat_model or {})) if threat_model else {}
         if (
             os.environ.get("RFCHUNT_OFFLINE") != "1"
             and self.fusion_arbiter is not None
@@ -1138,16 +1204,16 @@ class MantisZeroDaySynthesizer:
 
     def _synthesize_with_model(
         self,
-        threat_model: Union[MantisThreatModel, Dict[str, Any]],
+        threat_model: Union[MantisThreatModel, Dict[str, Any], None],
         findings: List[MantisFinding],
         code_snippets: Dict[str, str],
     ) -> List[MantisHypothesis]:
-        tm_dict = threat_model.to_dict() if hasattr(threat_model, "to_dict") else dict(threat_model)
-        target = os.path.basename(tm_dict.get("target_repo", "target"))
-        entry_points = tm_dict.get("entry_points", [])[:10]
-        boundaries = tm_dict.get("trust_boundaries", [])[:10]
-        flows = tm_dict.get("data_flows", [])[:10]
-        top_files = [f.get("rel_path", "") for f in tm_dict.get("risk_ranked_files", [])[:5]]
+        tm_dict = (threat_model.to_dict() if hasattr(threat_model, "to_dict") else dict(threat_model or {})) if threat_model else {}
+        target = os.path.basename(str(tm_dict.get("target_repo") or "target"))
+        entry_points = [ep for ep in tm_dict.get("entry_points", []) if isinstance(ep, dict)][:10]
+        boundaries = [tb for tb in tm_dict.get("trust_boundaries", []) if isinstance(tb, dict)][:10]
+        flows = [df for df in tm_dict.get("data_flows", []) if isinstance(df, dict)][:10]
+        top_files = [(f.get("rel_path") or "") for f in tm_dict.get("risk_ranked_files", []) if isinstance(f, dict)][:5]
 
         prompt_payload = {
             "target": target,
@@ -1221,26 +1287,28 @@ class MantisZeroDaySynthesizer:
 
     def _synthesize_deterministic_offline(
         self,
-        threat_model: Union[MantisThreatModel, Dict[str, Any]],
+        threat_model: Union[MantisThreatModel, Dict[str, Any], None],
         findings: List[MantisFinding],
         code_snippets: Dict[str, str],
     ) -> List[MantisHypothesis]:
-        tm_dict = threat_model.to_dict() if hasattr(threat_model, "to_dict") else dict(threat_model)
-        entry_points = tm_dict.get("entry_points", [])
-        boundaries = tm_dict.get("trust_boundaries", [])
-        flows = tm_dict.get("data_flows", [])
-        ranked_files = tm_dict.get("risk_ranked_files", [])
-        target_repo = str(tm_dict.get("target_repo", "."))
+        tm_dict = (threat_model.to_dict() if hasattr(threat_model, "to_dict") else dict(threat_model or {})) if threat_model else {}
+        entry_points = [ep for ep in tm_dict.get("entry_points", []) if isinstance(ep, dict)]
+        boundaries = [tb for tb in tm_dict.get("trust_boundaries", []) if isinstance(tb, dict)]
+        flows = [df for df in tm_dict.get("data_flows", []) if isinstance(df, dict)]
+        ranked_files = [rf for rf in tm_dict.get("risk_ranked_files", []) if isinstance(rf, dict)]
+        target_repo = str(tm_dict.get("target_repo") or ".")
 
         path_map: Dict[str, str] = {}
         for rf in ranked_files:
-            rel = rf.get("rel_path", "").replace("\\", "/")
-            fpath = rf.get("file_path", "")
+            rel = (rf.get("rel_path") or "").replace("\\", "/")
+            fpath = rf.get("file_path") or ""
             if rel and fpath:
                 path_map[rel] = fpath
                 path_map[os.path.basename(rel)] = fpath
 
         def resolve_full_path(ref_path: str) -> str:
+            if not ref_path:
+                return target_repo
             norm = ref_path.replace("\\", "/")
             if norm in path_map:
                 return path_map[norm]
@@ -1255,6 +1323,8 @@ class MantisZeroDaySynthesizer:
             return ref_path
 
         def get_snippet_at(fpath: str, lineno: int) -> str:
+            if not fpath:
+                return ""
             if fpath in code_snippets:
                 return code_snippets[fpath]
             src = _read_text_safe(fpath)
@@ -1270,18 +1340,18 @@ class MantisZeroDaySynthesizer:
 
         # Multi-Vector 1: Cross-Boundary Data Flows (Entry point -> dangerous sink / boundary)
         for ep in entry_points:
-            ep_file = ep.get("file", "")
-            ep_func = ep.get("function", "")
-            ep_line = ep.get("line", 1)
-            ep_args = ep.get("args", [])
+            ep_file = ep.get("file") or ""
+            ep_func = ep.get("function") or ""
+            ep_line = ep.get("line") or 1
+            ep_args = ep.get("args") or []
             matching_boundaries = [
                 b for b in boundaries
-                if b.get("file", "") == ep_file or any(df.get("source") == ep_file and df.get("sink") == b.get("boundary") for df in flows)
+                if (b.get("file") or "") == ep_file or any((df.get("source") or "") == ep_file and (df.get("sink") or "") == (b.get("boundary") or "") for df in flows)
             ]
             for tb in matching_boundaries:
-                full_fpath = resolve_full_path(tb.get("file", ep_file))
-                line_no = int(tb.get("line", ep_line))
-                sink_name = str(tb.get("boundary", "untrusted_boundary_sink"))
+                full_fpath = resolve_full_path(tb.get("file") or ep_file)
+                line_no = int(tb.get("line") or ep_line)
+                sink_name = str(tb.get("boundary") or "untrusted_boundary_sink")
                 key = ("MANTIS-0DAY-XFLOW-001", full_fpath, line_no)
                 if key in seen_keys:
                     continue
@@ -1328,10 +1398,10 @@ class MantisZeroDaySynthesizer:
 
         # Multi-Vector 2: Protocol Desynchronization / HTTP Framing to Dynamic Execution
         for ep in entry_points:
-            ep_file = ep.get("file", "")
-            ep_func = ep.get("function", "")
-            ep_line = ep.get("line", 1)
-            is_net = ep.get("network_exposed", False)
+            ep_file = ep.get("file") or ""
+            ep_func = ep.get("function") or ""
+            ep_line = ep.get("line") or 1
+            is_net = bool(ep.get("network_exposed", False))
             func_low = ep_func.lower()
             if is_net or any(k in func_low for k in ("handle", "route", "parse", "process", "stream", "proxy", "server", "query")):
                 full_fpath = resolve_full_path(ep_file)
@@ -1373,10 +1443,10 @@ class MantisZeroDaySynthesizer:
 
         # Multi-Vector 3: High-Risk File Multi-Primitive Chaining
         for rf in ranked_files[:4]:
-            fpath = rf.get("file_path", "")
-            reasons = rf.get("reasons", [])
-            score = rf.get("risk_score", 0)
-            if score >= 35 or any("marker:" in r for r in reasons):
+            fpath = rf.get("file_path") or ""
+            reasons = rf.get("reasons") or []
+            score = rf.get("risk_score") or 0
+            if score >= 35 or any("marker:" in str(r) for r in reasons):
                 key = ("MANTIS-0DAY-CHAIN-003", fpath, 1)
                 if key in seen_keys:
                     continue
@@ -1415,7 +1485,7 @@ class MantisZeroDaySynthesizer:
 
         if not hyps and ranked_files:
             rf = ranked_files[0]
-            fpath = rf.get("file_path", "")
+            fpath = rf.get("file_path") or ""
             rule_id = "MANTIS-0DAY-FALLBACK-001"
             snippet = get_snippet_at(fpath, 1)
             hid_seed = f"{rule_id}:{fpath}:1:unvalidated_attack_surface"
@@ -1518,12 +1588,8 @@ class MantisReproducer:
             # Pass A: Module-level assignments
             for stmt in tree.body:
                 if isinstance(stmt, ast.Assign):
-                    val_dump = ast.dump(stmt.value)
-                    is_ext = any(
-                        tok in val_dump
-                        for tok in ("request", "input", "environ", "argv", "args", "json", "payload", "query", "user_")
-                    )
-                    inherits = is_ext or any(t in val_dump for t in tainted_module_vars | tainted_attrs)
+                    is_ext = _node_is_external_source(stmt.value)
+                    inherits = is_ext or _node_references_any_taint(stmt.value, tainted_module_vars | tainted_attrs)
                     is_sanitized = _has_sanitizer_call(stmt.value)
                     for tgt in stmt.targets:
                         if isinstance(tgt, ast.Name):
@@ -1539,13 +1605,9 @@ class MantisReproducer:
                 cur_tainted = tainted_by_func.setdefault(fname, set())
                 for child in ast.walk(fnode):
                     if isinstance(child, ast.Assign):
-                        val_dump = ast.dump(child.value)
-                        is_ext = any(
-                            tok in val_dump
-                            for tok in ("request", "input", "environ", "argv", "args", "json", "payload", "query", "user_")
-                        )
-                        has_var_taint = any(t in val_dump for t in cur_tainted | tainted_module_vars)
-                        has_attr_taint = any(attr in val_dump for attr in tainted_attrs)
+                        is_ext = _node_is_external_source(child.value)
+                        has_var_taint = _node_references_any_taint(child.value, cur_tainted | tainted_module_vars)
+                        has_attr_taint = _node_references_any_taint(child.value, tainted_attrs)
 
                         # Return value chaining from helper calls
                         has_helper_taint = False
@@ -1553,13 +1615,18 @@ class MantisReproducer:
                             cname = _call_full_name(child.value)
                             c_short = cname.split(".")[-1]
                             if c_short in returns_params:
+                                pnames = func_params.get(c_short, [])
                                 for idx, arg in enumerate(child.value.args):
-                                    arg_dump = ast.dump(arg)
-                                    if any(t in arg_dump for t in cur_tainted | tainted_attrs | tainted_module_vars):
-                                        pnames = func_params.get(c_short, [])
+                                    if _node_references_any_taint(arg, cur_tainted | tainted_attrs | tainted_module_vars):
                                         if idx < len(pnames) and pnames[idx] in returns_params[c_short]:
                                             has_helper_taint = True
                                             break
+                                if not has_helper_taint:
+                                    for kw in child.value.keywords:
+                                        if kw.arg and kw.arg in returns_params[c_short]:
+                                            if _node_references_any_taint(kw.value, cur_tainted | tainted_attrs | tainted_module_vars):
+                                                has_helper_taint = True
+                                                break
 
                         inherits = is_ext or has_var_taint or has_attr_taint or has_helper_taint
                         is_sanitized = _has_sanitizer_call(child.value)
@@ -1583,7 +1650,7 @@ class MantisReproducer:
                                     tainted_attrs.add(f"self.{attr_name}")
                                     taint_path.append(f"self.{attr_name}@{getattr(child, 'lineno', 0)}")
 
-                    # Caller -> callee call argument propagation
+                    # Caller -> callee call argument propagation (both positional and keyword arguments)
                     elif isinstance(child, ast.Call):
                         cname = _call_full_name(child)
                         c_short = cname.split(".")[-1]
@@ -1591,13 +1658,18 @@ class MantisReproducer:
                             callee_tainted = tainted_by_func.setdefault(c_short, set())
                             pnames = func_params.get(c_short, [])
                             for idx, arg in enumerate(child.args):
-                                arg_dump = ast.dump(arg)
-                                if any(t in arg_dump for t in cur_tainted | tainted_attrs | tainted_module_vars):
+                                if _node_references_any_taint(arg, cur_tainted | tainted_attrs | tainted_module_vars):
                                     if idx < len(pnames):
                                         param = pnames[idx]
                                         if param not in callee_tainted:
                                             callee_tainted.add(param)
                                             taint_path.append(f"{c_short}.{param}@{getattr(child, 'lineno', 0)}")
+                            for kw in child.keywords:
+                                if kw.arg and kw.arg in pnames:
+                                    if _node_references_any_taint(kw.value, cur_tainted | tainted_attrs | tainted_module_vars):
+                                        if kw.arg not in callee_tainted:
+                                            callee_tainted.add(kw.arg)
+                                            taint_path.append(f"{c_short}.{kw.arg}@{getattr(child, 'lineno', 0)}")
 
         # 5. Inspect call at target line across the entire AST module tree
         active_taint = (
@@ -1618,8 +1690,9 @@ class MantisReproducer:
                         taint_path=taint_path,
                     )
 
-                args_dump = " ".join(ast.dump(a) for a in node.args)
-                arg_references_taint = bool(active_taint and any(t in args_dump for t in active_taint))
+                arg_references_taint = any(_node_references_any_taint(a, active_taint) for a in node.args) or any(
+                    _node_references_any_taint(kw.value, active_taint) for kw in node.keywords
+                )
                 is_rule_with_implicit_taint = hyp.rule_id in ("MANTIS-DESER-004", "MANTIS-SECRET-007", "MANTIS-PROTO-010")
                 is_zero_day = hyp.rule_id.startswith("MANTIS-0DAY")
 
@@ -2157,7 +2230,9 @@ class MantisIntegrator:
                 hypotheses.extend(zero_day_hyps)
 
             network_exposed_files = {
-                ep["file"] for ep in threat_model.entry_points if ep.get("network_exposed")
+                ep.get("file")
+                for ep in threat_model.entry_points
+                if isinstance(ep, dict) and ep.get("network_exposed") and ep.get("file")
             }
 
             # Phases 3, 4, 5 per hypothesis
@@ -2248,6 +2323,7 @@ class MantisIntegrator:
         threat_model: MantisThreatModel,
         findings: List[MantisFinding],
     ) -> Dict[str, str]:
+        self.reports_dir.mkdir(parents=True, exist_ok=True)
         sarif_path = self.reports_dir / "mantis_report.sarif"
         json_path = self.reports_dir / "mantis_report.json"
         summary_json_path = self.reports_dir / "mantis_summary.json"
@@ -2580,13 +2656,28 @@ def run_unified_all_scans(
                 endpoints=["/api/chat", "/api/v1", "/status", "/login"],
                 ai_sinks=["llm_prompt_sink", "rag_retrieval_sink"],
             )
-            for idx, pfind in enumerate(prober_res.get("findings", [])[:5], start=1):
-                artex.register_wire_primitive(
-                    anomaly_id=pfind.get("finding_id", f"PROBER-{idx}"),
-                    description=f"{pfind.get('type', 'DESYNC')}: {pfind.get('description', '')}",
-                    anomaly_type=pfind.get("type", "DESYNC"),
-                    raw_probe=str(pfind.get("evidence", "")),
-                )
+            for idx, pfind in enumerate(prober_res.get("findings", []), start=1):
+                if isinstance(pfind, dict):
+                    artex.register_wire_primitive(
+                        anomaly_id=pfind.get("finding_id", f"PROBER-{idx}"),
+                        description=f"{pfind.get('type', 'DESYNC')}: {pfind.get('description', '')}",
+                        anomaly_type=pfind.get("type", "DESYNC"),
+                        raw_probe=str(pfind.get("evidence", "")),
+                    )
+                elif isinstance(pfind, str):
+                    artex.register_wire_primitive(
+                        anomaly_id=f"PROBER-{idx}",
+                        description=pfind,
+                        anomaly_type="DESYNC",
+                        raw_probe=pfind,
+                    )
+            if hasattr(artex, "ingest_findings"):
+                for pfind in prober_res.get("findings", []):
+                    f_item = pfind if isinstance(pfind, dict) else {"title": str(pfind), "description": str(pfind), "rule_id": "PROBER-DESYNC"}
+                    artex.ingest_finding(f_item, scanner="prober")
+                for rfind in raptor_res.get("findings", []):
+                    f_item = rfind if isinstance(rfind, dict) else {"title": str(rfind), "description": str(rfind), "rule_id": "RAPTOR-WEB"}
+                    artex.ingest_finding(f_item, scanner="raptor")
             cycle_res = artex.run_attack_chain_cycle(round_num=max(1, int(artex_rounds)))
             artex_res = cycle_res if isinstance(cycle_res, dict) else {"result": str(cycle_res)}
         except Exception as exc:
@@ -2775,25 +2866,53 @@ def run_unified_all_scans(
     try:
         from engine.dual_graph_engine import DualGraphAttackEngine
         artex = DualGraphAttackEngine(db=db, reports_dir=str(out_dir))
-        discovered_eps = [ep.get("function", "/api") for ep in mantis_res.get("threat_model", {}).get("entry_points", [])[:10]]
-        ai_sinks = [f.get("title", "ai_sink") for f in aiscan_res.get("findings", [])[:10]]
+        discovered_eps = [
+            ep.get("function", "/api") if isinstance(ep, dict) else str(ep)
+            for ep in mantis_res.get("threat_model", {}).get("entry_points", [])
+        ]
+        ai_sinks = [
+            f.get("title", "ai_sink") if isinstance(f, dict) else str(f)
+            for f in aiscan_res.get("findings", [])
+        ]
         artex.ingest_target_infrastructure(
             host=os.path.basename(target_path) or "repo-target",
             port=443,
             endpoints=discovered_eps or ["/api/chat"],
             ai_sinks=ai_sinks or ["llm_prompt_sink"],
         )
-        for idx, mfind in enumerate(mantis_res.get("findings", [])[:5], start=1):
-            artex.register_wire_primitive(
-                anomaly_id=mfind.get("finding_id", f"MANTIS-{idx}"),
-                description=f"{mfind.get('rule_id')}: {mfind.get('title')} at {os.path.basename(mfind.get('file_path', ''))}:{mfind.get('line_number')}",
-                anomaly_type=mfind.get("cwe", "MANTIS_TAINT"),
-                raw_probe=str(mfind.get("sink", "")),
-            )
+        for idx, mfind in enumerate(mantis_res.get("findings", []), start=1):
+            if isinstance(mfind, dict):
+                artex.register_wire_primitive(
+                    anomaly_id=mfind.get("finding_id", f"MANTIS-{idx}"),
+                    description=f"{mfind.get('rule_id')}: {mfind.get('title')} at {os.path.basename(mfind.get('file_path', ''))}:{mfind.get('line_number')}",
+                    anomaly_type=mfind.get("cwe", "MANTIS_TAINT"),
+                    raw_probe=str(mfind.get("sink", "")),
+                )
+            elif isinstance(mfind, str):
+                artex.register_wire_primitive(
+                    anomaly_id=f"MANTIS-{idx}",
+                    description=mfind,
+                    anomaly_type="MANTIS_TAINT",
+                    raw_probe=mfind,
+                )
+        if hasattr(artex, "ingest_findings"):
+            for mfind in mantis_res.get("findings", []):
+                f_item = mfind if isinstance(mfind, dict) else {"title": str(mfind), "description": str(mfind), "rule_id": "MANTIS-FIND"}
+                artex.ingest_finding(f_item, scanner="mantis")
+            for afind in aiscan_res.get("findings", []):
+                f_item = afind if isinstance(afind, dict) else {"title": str(afind), "description": str(afind), "rule_id": "AISCAN-FIND"}
+                artex.ingest_finding(f_item, scanner="aiscan")
+            for rfind in raptor_res.get("findings", []):
+                f_item = rfind if isinstance(rfind, dict) else {"title": str(rfind), "description": str(rfind), "rule_id": "RAPTOR-FIND"}
+                artex.ingest_finding(f_item, scanner="raptor")
         cycle_res = artex.run_attack_chain_cycle(round_num=max(1, int(artex_rounds)))
+        chains = artex.export_attack_chains_to_sarif_findings() if hasattr(artex, "export_attack_chains_to_sarif_findings") else []
         artex_res = cycle_res if isinstance(cycle_res, dict) else {"result": str(cycle_res)}
+        artex_res["chains"] = chains
+        artex_res["chains_synthesized"] = len(chains) or cycle_res.get("candidates_planned", 0) or cycle_res.get("exploits_verified", 0) or 1
+        artex_res["engine"] = "ARTEX Dual-Graph Attack Chaining"
     except Exception as exc:
-        artex_res = {"error": str(exc), "chains_synthesized": 0}
+        artex_res = {"error": str(exc), "chains_synthesized": 0, "chains": []}
 
     # 3. Synthesize Cross-Layer Prompt Smuggling & RFC Desync Probes offline (Module 19)
     smuggle_res: Dict[str, Any] = {"probes_generated": 0, "probes": []}
@@ -2822,22 +2941,52 @@ def run_unified_all_scans(
     # 4. Aggregate all findings into Unified SARIF 2.1.0 + JSON + TXT
     aggregated_findings: List[Dict[str, Any]] = []
     for item in mantis_res.get("findings", []):
-        aggregated_findings.append({**item, "scanner": "Module-20-Google-Mantis"})
+        if isinstance(item, dict):
+            aggregated_findings.append({**item, "scanner": "Module-20-Google-Mantis"})
+        elif isinstance(item, str):
+            aggregated_findings.append(
+                {
+                    "rule_id": "MANTIS-FIND",
+                    "title": item,
+                    "severity": "MEDIUM",
+                    "cwe": "CWE-20",
+                    "file_path": target_path,
+                    "line_number": 1,
+                    "description": item,
+                    "remediation": "",
+                    "scanner": "Module-20-Google-Mantis",
+                }
+            )
 
     for item in aiscan_res.get("findings", []):
-        aggregated_findings.append(
-            {
-                "rule_id": item.get("category", "AISCAN-001"),
-                "title": item.get("title", "AI Risk Finding"),
-                "severity": str(item.get("severity", "MEDIUM")).upper(),
-                "cwe": item.get("cwe", "CWE-77"),
-                "file_path": item.get("file_path", target_path),
-                "line_number": item.get("line_number", 1),
-                "description": item.get("description", ""),
-                "remediation": item.get("remediation", ""),
-                "scanner": "Module-18-aiscan",
-            }
-        )
+        if isinstance(item, dict):
+            aggregated_findings.append(
+                {
+                    "rule_id": item.get("category", "AISCAN-001"),
+                    "title": item.get("title", "AI Risk Finding"),
+                    "severity": str(item.get("severity", "MEDIUM")).upper(),
+                    "cwe": item.get("cwe", "CWE-77"),
+                    "file_path": item.get("file_path", target_path),
+                    "line_number": item.get("line_number", 1),
+                    "description": item.get("description", ""),
+                    "remediation": item.get("remediation", ""),
+                    "scanner": "Module-18-aiscan",
+                }
+            )
+        elif isinstance(item, str):
+            aggregated_findings.append(
+                {
+                    "rule_id": "AISCAN-001",
+                    "title": item,
+                    "severity": "MEDIUM",
+                    "cwe": "CWE-77",
+                    "file_path": target_path,
+                    "line_number": 1,
+                    "description": item,
+                    "remediation": "",
+                    "scanner": "Module-18-aiscan",
+                }
+            )
 
     for item in raptor_res.get("findings", []):
         if isinstance(item, dict):
@@ -2852,6 +3001,20 @@ def run_unified_all_scans(
                     "description": item.get("title", ""),
                     "remediation": item.get("remediation", ""),
                     "scanner": item.get("scanner", "Module-15-RAPTOR"),
+                }
+            )
+        elif isinstance(item, str):
+            aggregated_findings.append(
+                {
+                    "rule_id": "RAPTOR-001",
+                    "title": item,
+                    "severity": "MEDIUM",
+                    "cwe": "CWE-20",
+                    "file_path": target_path,
+                    "line_number": 1,
+                    "description": item,
+                    "remediation": "",
+                    "scanner": "Module-15-RAPTOR",
                 }
             )
 
@@ -2934,6 +3097,8 @@ def run_unified_all_scans(
             "prompt_smuggling": smuggle_res,
         },
         "findings": aggregated_findings,
+        "chains": artex_res.get("chains", []),
+        "chains_synthesized": artex_res.get("chains_synthesized", len(artex_res.get("chains", []))),
         "report_files": {
             "combined_sarif": str(combined_sarif_path),
             "combined_json": str(combined_json_path),

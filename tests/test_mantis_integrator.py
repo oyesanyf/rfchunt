@@ -683,3 +683,45 @@ def test_mantis_scan_with_zero_day_findings_integrated(monkeypatch: pytest.Monke
     res_list = runs[0]["results"]
     assert any(r.get("properties", {}).get("is_zero_day") is True for r in res_list)
 
+
+def test_unified_all_scans_string_entry_points_and_findings_resilience(monkeypatch: pytest.MonkeyPatch, sample_repo: Path, tmp_path: Path):
+    """Regression test: string entry_points in threat_model and string findings in aiscan do not trigger AttributeError."""
+    monkeypatch.setenv("RFCHUNT_OFFLINE", "1")
+
+    orig_run_scan = MantisIntegrator.run_scan
+
+    def mock_mantis_run_scan(self, target_path, depth=30, mode="balanced", **kwargs):
+        res = orig_run_scan(self, target_path, depth=depth, mode=mode, **kwargs)
+        if "threat_model" in res and isinstance(res["threat_model"], dict):
+            res["threat_model"]["entry_points"] = ["/api/v1/auth", "/api/v1/admin", "/api/v1/chat"]
+        return res
+
+    monkeypatch.setattr(MantisIntegrator, "run_scan", mock_mantis_run_scan)
+
+    from engine.aiscan_integrator import AiscanIntegrator
+    orig_aiscan_scan = AiscanIntegrator.scan_target
+
+    def mock_aiscan_scan(self, target_path, **kwargs):
+        res = orig_aiscan_scan(self, target_path, **kwargs)
+        res["findings"] = ["Unmetered LLM endpoint injection", "Prompt injection sink"]
+        return res
+
+    monkeypatch.setattr(AiscanIntegrator, "scan_target", mock_aiscan_scan)
+
+    reports_dir = tmp_path / "reports_resilience"
+    unified_res = run_unified_all_scans(
+        repo=str(sample_repo),
+        depth=30,
+        reports_dir=str(reports_dir),
+    )
+
+    assert "chains" in unified_res
+    engines_val = unified_res.get("engines", {})
+    if isinstance(engines_val, dict):
+        artex_status = engines_val.get("artex_dual_graph", {})
+    else:
+        artex_status = next((e for e in engines_val if isinstance(e, dict) and "ARTEX" in e.get("engine", "")), {})
+    assert "error" not in artex_status or "'str' object has no attribute 'get'" not in str(artex_status.get("error"))
+    assert unified_res.get("chains_synthesized", 0) > 0 or artex_status.get("chains_synthesized", 0) > 0
+
+
