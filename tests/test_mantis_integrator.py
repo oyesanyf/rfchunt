@@ -24,6 +24,7 @@ from engine.mantis_integrator import (  # noqa: E402
     MantisReproducer,
     MantisSeverityRubric,
     MantisThreatModeler,
+    MantisZeroDaySynthesizer,
     compute_depth_profile,
     run_unified_all_scans,
 )
@@ -423,3 +424,262 @@ def test_github_workflow_yaml_valid():
     uses_list = [s.get("uses", "") for s in steps]
     assert any("github/codeql-action/upload-sarif@v" in u for u in uses_list)
     assert any("actions/upload-artifact@v4" in u for u in uses_list)
+
+
+def test_zero_day_synthesizer_deterministic_offline_fallback(sample_repo: Path):
+    files = [str(p) for p in sorted(sample_repo.rglob("*.py"))]
+    tm = MantisThreatModeler().build_threat_model(str(sample_repo), files)
+    synthesizer = MantisZeroDaySynthesizer(fusion_arbiter=None)
+
+    hyps = synthesizer.synthesize_hypotheses(tm)
+    assert len(hyps) >= 1
+    for h in hyps:
+        assert h.rule_id.startswith("MANTIS-0DAY")
+        assert h.is_zero_day is True
+        assert h.hypothesis_id.startswith("HYP-0DAY-")
+        assert h.confidence >= 0.5
+        assert h.sink
+        assert h.file_path
+        assert h.description
+
+    rule_ids = {h.rule_id for h in hyps}
+    assert any(rid in rule_ids for rid in ("MANTIS-0DAY-XFLOW-001", "MANTIS-0DAY-DESYNC-002", "MANTIS-0DAY-CHAIN-003", "MANTIS-0DAY-FALLBACK-001"))
+
+
+def test_zero_day_synthesizer_model_mode(monkeypatch: pytest.MonkeyPatch, sample_repo: Path):
+    monkeypatch.delenv("RFCHUNT_OFFLINE", raising=False)
+    files = [str(p) for p in sorted(sample_repo.rglob("*.py"))]
+    tm = MantisThreatModeler().build_threat_model(str(sample_repo), files)
+
+    class FakeFusionArbiter:
+        def __init__(self):
+            self.gemma_model = DEFAULT_ABLITERATED_MODEL
+            self.sec_model = "fenkohq/foundation-sec-8b:latest"
+            self.called = False
+
+        def arbitrate_structured_json(self, task_name, system_prompt, user_prompt, default_payload=None, num_predict=512):
+            self.called = True
+            return {
+                "status": "fused",
+                "data": {
+                    "hypotheses": [
+                        {
+                            "rule_id": "MANTIS-0DAY-MODEL-DESER",
+                            "title": "Model-Synthesized Zero-Day Deserialization Exploit",
+                            "cwe": "CWE-502",
+                            "category": "Zero-Day Attack Surface",
+                            "file_path": str(sample_repo / "routes" / "admin_api.py"),
+                            "line_number": 15,
+                            "function_name": "load_admin_token",
+                            "sink": "pickle.loads",
+                            "source_hint": "raw_token_header",
+                            "code_snippet": "pickle.loads(token)",
+                            "raw_severity": "CRITICAL",
+                            "confidence": 0.94,
+                            "description": "Synthesized zero-day exploit chaining token header to unsafe pickle load.",
+                            "remediation": "Use safe JSON deserializer.",
+                        }
+                    ]
+                },
+            }
+
+    fake_arbiter = FakeFusionArbiter()
+    synthesizer = MantisZeroDaySynthesizer(fusion_arbiter=fake_arbiter)
+    hyps = synthesizer.synthesize_hypotheses(tm)
+
+    assert fake_arbiter.called is True
+    assert len(hyps) == 1
+    assert hyps[0].rule_id == "MANTIS-0DAY-MODEL-DESER"
+    assert hyps[0].is_zero_day is True
+    assert hyps[0].confidence == 0.94
+
+
+def test_interprocedural_ast_taint_caller_callee():
+    src = (
+        "import subprocess\n"
+        "\n"
+        "def exec_sink(cmd):\n"
+        "    subprocess.run(cmd, shell=True)\n"
+        "\n"
+        "def handle_entry(user_param):\n"
+        "    exec_sink(user_param)\n"
+    )
+    hyp = MantisHypothesis(
+        hypothesis_id="HYP-TEST-001",
+        rule_id="MANTIS-CMD-001",
+        title="Command Injection",
+        cwe="CWE-78",
+        category="Command Execution",
+        file_path="virtual_target.py",
+        line_number=4,
+        function_name="handle_entry",
+        sink="subprocess.run(shell=True)",
+        source_hint="user_param",
+        code_snippet="subprocess.run(cmd, shell=True)",
+        raw_severity="CRITICAL",
+        confidence=0.92,
+        description="Command injection sink in helper called by entry.",
+        remediation="shell=False",
+    )
+    reproducer = MantisReproducer()
+    res = reproducer._tier1_ast_taint(src, hyp)
+    assert res.reproduced is True
+    assert res.tier == "TIER_1_STATIC_TAINT"
+    assert any("exec_sink.cmd" in step for step in res.taint_path)
+
+
+def test_interprocedural_ast_taint_object_attribute():
+    src = (
+        "import os\n"
+        "\n"
+        "class Handler:\n"
+        "    def set_data(self, user_val):\n"
+        "        self.cached_command = user_val\n"
+        "\n"
+        "    def run_cached(self):\n"
+        "        os.system(self.cached_command)\n"
+    )
+    hyp = MantisHypothesis(
+        hypothesis_id="HYP-TEST-002",
+        rule_id="MANTIS-CMD-001",
+        title="Command Injection via Attribute",
+        cwe="CWE-78",
+        category="Command Execution",
+        file_path="virtual_attr.py",
+        line_number=8,
+        function_name="run_cached",
+        sink="os.system",
+        source_hint="self.cached_command",
+        code_snippet="os.system(self.cached_command)",
+        raw_severity="CRITICAL",
+        confidence=0.90,
+        description="Command injection via self attribute assignment.",
+        remediation="Validate attribute.",
+    )
+    reproducer = MantisReproducer()
+    res = reproducer._tier1_ast_taint(src, hyp)
+    assert res.reproduced is True
+    assert res.tier == "TIER_1_STATIC_TAINT"
+    assert any("cached_command" in step for step in res.taint_path)
+
+
+def test_interprocedural_ast_taint_return_chain():
+    src = (
+        "import os\n"
+        "\n"
+        "def sanitize_strip(data):\n"
+        "    return data.strip()\n"
+        "\n"
+        "def process_input(raw_input):\n"
+        "    cleaned = sanitize_strip(raw_input)\n"
+        "    os.system(cleaned)\n"
+    )
+    hyp = MantisHypothesis(
+        hypothesis_id="HYP-TEST-003",
+        rule_id="MANTIS-CMD-001",
+        title="Command Injection via Return Chain",
+        cwe="CWE-78",
+        category="Command Execution",
+        file_path="virtual_chain.py",
+        line_number=8,
+        function_name="process_input",
+        sink="os.system",
+        source_hint="raw_input",
+        code_snippet="os.system(cleaned)",
+        raw_severity="CRITICAL",
+        confidence=0.88,
+        description="Taint forwarded through return value chain.",
+        remediation="Avoid shell evaluation.",
+    )
+    reproducer = MantisReproducer()
+    res = reproducer._tier1_ast_taint(src, hyp)
+    assert res.reproduced is True
+    assert res.tier == "TIER_1_STATIC_TAINT"
+    assert any("cleaned@" in step for step in res.taint_path)
+
+
+def test_mantis_proto_010_ast_detection():
+    src = (
+        "def ai_query(user_query):\n"
+        "    prompt = f'System: You are an agent.\\nUser: {user_query}\\nAssistant:'\n"
+        "    return model.generate(prompt)\n"
+        "\n"
+        "def forward_wire(hdr, sock):\n"
+        "    raw = f'GET / HTTP/1.1\\r\\nTransfer-Encoding: {hdr}\\r\\n\\r\\n'\n"
+        "    sock.sendall(raw.encode())\n"
+    )
+    lines = src.splitlines()
+    gen = MantisHypothesisGenerator()
+    hyps = gen._scan_python_ast(
+        file_path="proto_sample.py",
+        src=src,
+        lines=lines,
+        allowed_tiers={"HIGH", "MEDIUM", "LOW"},
+        pass_idx=1,
+    )
+    proto_hyps = [h for h in hyps if h.rule_id == "MANTIS-PROTO-010"]
+    assert len(proto_hyps) >= 1
+    assert any("header_framing" in h.sink or "unframed_prompt" in h.sink or "assign:prompt" in h.sink for h in proto_hyps)
+
+
+def test_model_adapter_unpacking_data_nested(monkeypatch: pytest.MonkeyPatch, sample_repo: Path, tmp_path: Path):
+    monkeypatch.setenv("RFCHUNT_OFFLINE", "1")
+    files = [str(sample_repo / "routes" / "admin_api.py")]
+
+    class FakeNestedArbiter:
+        def arbitrate_structured_json(self, task_name, system_prompt, user_prompt, default_payload=None, num_predict=256):
+            if "Threat Modeling" in task_name:
+                return {
+                    "status": "fused",
+                    "data": {
+                        "summary": "Deep Nested STRIDE Summary via Data Key",
+                        "threat_actors": ["APT-Protocol-Attacker", "AI-Prompt-Smuggler"],
+                    },
+                }
+            if "Unified All-Scan" in task_name:
+                return {
+                    "status": "fused",
+                    "data": {
+                        "executive_summary": "Deep Nested Executive Summary via Data Key",
+                    },
+                }
+            return {"status": "default", "data": default_payload or {}}
+
+    fake_arb = FakeNestedArbiter()
+    modeler = MantisThreatModeler(fusion_arbiter=fake_arb)
+    tm = modeler.build_threat_model(str(sample_repo), files)
+    assert tm.raw_summary == "Deep Nested STRIDE Summary via Data Key"
+    assert "APT-Protocol-Attacker" in tm.threat_actors
+    assert "AI-Prompt-Smuggler" in tm.threat_actors
+
+    res = run_unified_all_scans(
+        repo=str(sample_repo),
+        depth=30,
+        arbiter=fake_arb,
+        reports_dir=str(tmp_path / "reports_nested"),
+    )
+    assert res["executive_summary"] == "Deep Nested Executive Summary via Data Key"
+
+
+def test_mantis_scan_with_zero_day_findings_integrated(monkeypatch: pytest.MonkeyPatch, sample_repo: Path, tmp_path: Path):
+    monkeypatch.setenv("RFCHUNT_OFFLINE", "1")
+    integrator = MantisIntegrator(reports_dir=str(tmp_path / "zero_day_reports"))
+    scan_res = integrator.run_scan(str(sample_repo), depth=100)
+
+    assert scan_res["total_findings"] >= 1
+    zero_day_findings = [f for f in scan_res["findings"] if f.get("is_zero_day") is True]
+    assert len(zero_day_findings) >= 1
+    for zf in zero_day_findings:
+        assert zf["rule_id"].startswith("MANTIS-0DAY")
+        assert zf["finding_id"].startswith("MANTIS-0DAY")
+        assert zf["cwe"]
+
+    # Verify SARIF document includes zero_day properties
+    sarif_file = Path(scan_res["report_files"]["sarif"])
+    assert sarif_file.exists()
+    sarif_data = json.loads(sarif_file.read_text(encoding="utf-8"))
+    runs = sarif_data["runs"]
+    assert len(runs) >= 1
+    res_list = runs[0]["results"]
+    assert any(r.get("properties", {}).get("is_zero_day") is True for r in res_list)
+

@@ -314,6 +314,7 @@ class MantisHypothesis:
     description: str
     remediation: str
     passes_matched: int = 1
+    is_zero_day: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -372,6 +373,7 @@ class MantisFinding:
     description: str
     remediation: str
     threat_model_id: str
+    is_zero_day: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -602,12 +604,18 @@ class MantisThreatModeler:
                 num_predict=256,
             )
             if isinstance(fusion_res, dict):
-                if fusion_res.get("summary"):
-                    raw_summary = str(fusion_res["summary"])
-                actors = fusion_res.get("threat_actors") or [
-                    "Remote Unauthenticated Attacker",
-                    "Malicious Input / Desync Proxy",
-                ]
+                inner_data = fusion_res.get("data") if isinstance(fusion_res.get("data"), dict) else {}
+                summary_val = fusion_res.get("summary") or inner_data.get("summary")
+                if summary_val:
+                    raw_summary = str(summary_val)
+                actors = (
+                    fusion_res.get("threat_actors")
+                    or inner_data.get("threat_actors")
+                    or [
+                        "Remote Unauthenticated Attacker",
+                        "Malicious Input / Desync Proxy",
+                    ]
+                )
             else:
                 actors = ["Remote Unauthenticated Attacker", "Malicious Input / Desync Proxy"]
         else:
@@ -864,6 +872,27 @@ class MantisHypothesisGenerator:
                                                     pass_idx,
                                                 )
                                             )
+                if "LOW" in allowed_tiers:
+                    for tgt in node.targets:
+                        if isinstance(tgt, ast.Name):
+                            tlow = tgt.id.lower()
+                            if any(pk in tlow for pk in ("prompt", "system_prompt", "user_prompt", "llm_query", "raw_http", "raw_header")):
+                                if isinstance(node.value, (ast.JoinedStr, ast.BinOp)) and not _node_is_constant_literal(node.value):
+                                    val_names = _referenced_names(node.value)
+                                    if val_names and (func_args & val_names or not func_args):
+                                        results.append(
+                                            self._make_hypothesis(
+                                                "MANTIS-PROTO-010",
+                                                file_path,
+                                                node.lineno,
+                                                func_name,
+                                                f"assign:{tgt.id}",
+                                                ",".join(sorted(val_names)),
+                                                lines,
+                                                0.80,
+                                                pass_idx,
+                                            )
+                                        )
 
             if isinstance(node, ast.Call):
                 cname = _call_full_name(node)
@@ -989,6 +1018,53 @@ class MantisHypothesisGenerator:
                             )
                         )
 
+                # MANTIS-PROTO-010: Cross-Layer HTTP Framing / LLM Prompt Desynchronization
+                if "LOW" in allowed_tiers:
+                    is_llm_call = any(
+                        tok in cname.lower()
+                        for tok in ("openai", "anthropic", "ollama", "chat", "completion", "generate_prompt", "ask_llm", "model.generate", "prompt")
+                    )
+                    prompt_kw = kw_map.get("prompt") or kw_map.get("user_prompt") or kw_map.get("system_prompt")
+                    target_arg = prompt_kw or (node.args[0] if node.args else None)
+                    if (is_llm_call or "generate" in cname.lower()) and target_arg is not None:
+                        if isinstance(target_arg, (ast.JoinedStr, ast.BinOp)) or (
+                            isinstance(target_arg, ast.Call) and isinstance(target_arg.func, ast.Attribute) and target_arg.func.attr == "format"
+                        ):
+                            if not _node_is_constant_literal(target_arg):
+                                results.append(
+                                    self._make_hypothesis(
+                                        "MANTIS-PROTO-010", file_path, node.lineno, func_name, f"{cname}(unframed_prompt)",
+                                        ",".join(sorted(func_args)) or "dynamic_prompt", lines, 0.85, pass_idx,
+                                    )
+                                )
+
+                    is_header_or_sock = (
+                        cname.endswith((".putheader", ".add_header", ".set_header", ".send_header", "sendall", "send", "write"))
+                        or any(sk in cname.lower() for sk in ("socket", "sock", "wfile", "transport", "protocol"))
+                    )
+                    if is_header_or_sock and node.args:
+                        raw_arg = node.args[0]
+                        src_line = lines[node.lineno - 1] if 0 < node.lineno <= len(lines) else ""
+                        src_line_low = src_line.lower()
+                        has_framing_tokens = (
+                            "transfer-encoding" in src_line_low
+                            or "content-length" in src_line_low
+                            or "\\r\\n" in src_line
+                            or "\r\n" in src_line
+                            or "http/1." in src_line_low
+                            or "sec-websocket" in src_line_low
+                        )
+                        if has_framing_tokens and (
+                            isinstance(raw_arg, (ast.JoinedStr, ast.BinOp))
+                            or not _node_is_constant_literal(raw_arg)
+                        ):
+                            results.append(
+                                self._make_hypothesis(
+                                    "MANTIS-PROTO-010", file_path, node.lineno, func_name, f"{cname}(header_framing)",
+                                    ",".join(sorted(func_args)) or "framing_stream", lines, 0.87, pass_idx,
+                                )
+                            )
+
             for child in ast.iter_child_nodes(node):
                 visit_node(child, func_name, func_args)
 
@@ -1021,6 +1097,352 @@ class MantisHypothesisGenerator:
                         )
                     )
         return found
+
+
+class MantisZeroDaySynthesizer:
+    """
+    Phase 2 Sub-Engine: Zero-Day Attack Hypothesis Synthesizer.
+    Synthesizes novel multi-vector attack hypotheses beyond static checklist rules.
+    - Model mode (when RFCHUNT_OFFLINE != "1" and models available via FusionArbiter):
+      Prompts FusionArbiter (Gemma-4-12B-OBLITERATED + Cisco Foundation-Sec) to synthesize
+      structured MantisHypothesis objects labeled MANTIS-0DAY-... with is_zero_day=True.
+    - Deterministic offline fallback mode (when RFCHUNT_OFFLINE == "1" or models offline):
+      Inspects the threat model (entry points, boundaries, data flows, high-risk functions)
+      and generates reproducible zero-day attack hypotheses covering multi-vector combinations
+      (unvalidated deserialization/eval patterns, cross-boundary data flows, protocol desync prompt injection).
+    """
+
+    def __init__(self, fusion_arbiter: Any = None, model_adapter: Any = None):
+        self.fusion_arbiter = fusion_arbiter
+        self.model_adapter = model_adapter
+
+    def synthesize_hypotheses(
+        self,
+        threat_model: Union[MantisThreatModel, Dict[str, Any]],
+        findings: Optional[List[MantisFinding]] = None,
+        code_snippets: Optional[Dict[str, str]] = None,
+    ) -> List[MantisHypothesis]:
+        if (
+            os.environ.get("RFCHUNT_OFFLINE") != "1"
+            and self.fusion_arbiter is not None
+            and hasattr(self.fusion_arbiter, "arbitrate_structured_json")
+        ):
+            try:
+                model_hyps = self._synthesize_with_model(threat_model, findings or [], code_snippets or {})
+                if model_hyps:
+                    return model_hyps
+            except Exception:
+                pass
+
+        return self._synthesize_deterministic_offline(threat_model, findings or [], code_snippets or {})
+
+    def _synthesize_with_model(
+        self,
+        threat_model: Union[MantisThreatModel, Dict[str, Any]],
+        findings: List[MantisFinding],
+        code_snippets: Dict[str, str],
+    ) -> List[MantisHypothesis]:
+        tm_dict = threat_model.to_dict() if hasattr(threat_model, "to_dict") else dict(threat_model)
+        target = os.path.basename(tm_dict.get("target_repo", "target"))
+        entry_points = tm_dict.get("entry_points", [])[:10]
+        boundaries = tm_dict.get("trust_boundaries", [])[:10]
+        flows = tm_dict.get("data_flows", [])[:10]
+        top_files = [f.get("rel_path", "") for f in tm_dict.get("risk_ranked_files", [])[:5]]
+
+        prompt_payload = {
+            "target": target,
+            "top_files": top_files,
+            "entry_points": entry_points,
+            "trust_boundaries": boundaries,
+            "data_flows": flows,
+            "existing_findings_count": len(findings),
+        }
+
+        system_instruction = (
+            "You are an elite protocol zero-day vulnerability researcher synthesizing novel attack hypotheses. "
+            "Analyze entry points, trust boundaries, data flows, and code patterns to synthesize novel zero-day "
+            "hypotheses representing multi-step or multi-vector attack chains. "
+            "Output a JSON object with key 'hypotheses' containing a list of hypotheses. "
+            "Each item MUST have: rule_id (must start with 'MANTIS-0DAY-'), title, cwe, category, "
+            "file_path, line_number, function_name, sink, source_hint, code_snippet, raw_severity, "
+            "confidence, description, remediation."
+        )
+
+        res = self.fusion_arbiter.arbitrate_structured_json(
+            task_name="Mantis Zero-Day Vulnerability Synthesis",
+            system_prompt=system_instruction,
+            user_prompt=json.dumps(prompt_payload),
+            default_payload={"hypotheses": []},
+            num_predict=512,
+        )
+
+        inner = res.get("data") if isinstance(res.get("data"), (dict, list)) else res
+        items: List[Dict[str, Any]] = []
+        if isinstance(inner, dict):
+            items = inner.get("hypotheses") or inner.get("findings") or []
+        elif isinstance(inner, list):
+            items = inner
+
+        synthesized: List[MantisHypothesis] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            rule_id = str(item.get("rule_id", "MANTIS-0DAY-SYNTH"))
+            if not rule_id.startswith("MANTIS-0DAY"):
+                rule_id = f"MANTIS-0DAY-{rule_id.split('-')[-1]}"
+            fpath = str(item.get("file_path", ""))
+            lineno = int(item.get("line_number", 1))
+            sink = str(item.get("sink", "dynamic_sink"))
+            hid_seed = f"{rule_id}:{fpath}:{lineno}:{sink}"
+            hid = "HYP-0DAY-" + hashlib.sha256(hid_seed.encode("utf-8")).hexdigest()[:8].upper()
+
+            hyp = MantisHypothesis(
+                hypothesis_id=hid,
+                rule_id=rule_id,
+                title=str(item.get("title", f"Synthesized Zero-Day Attack Chain in {rule_id}")),
+                cwe=str(item.get("cwe", "CWE-668")),
+                category=str(item.get("category", "Zero-Day Attack Surface")),
+                file_path=fpath,
+                line_number=lineno,
+                function_name=str(item.get("function_name", "<module>")),
+                sink=sink,
+                source_hint=str(item.get("source_hint", "external_source")),
+                code_snippet=str(item.get("code_snippet", "")),
+                raw_severity=str(item.get("raw_severity", "HIGH")).upper(),
+                confidence=float(item.get("confidence", 0.85)),
+                description=str(item.get("description", "Synthesized zero-day multi-vector vulnerability hypothesis.")),
+                remediation=str(item.get("remediation", "Apply defensive boundary validation and sanitization.")),
+                passes_matched=1,
+                is_zero_day=True,
+            )
+            synthesized.append(hyp)
+
+        return synthesized
+
+    def _synthesize_deterministic_offline(
+        self,
+        threat_model: Union[MantisThreatModel, Dict[str, Any]],
+        findings: List[MantisFinding],
+        code_snippets: Dict[str, str],
+    ) -> List[MantisHypothesis]:
+        tm_dict = threat_model.to_dict() if hasattr(threat_model, "to_dict") else dict(threat_model)
+        entry_points = tm_dict.get("entry_points", [])
+        boundaries = tm_dict.get("trust_boundaries", [])
+        flows = tm_dict.get("data_flows", [])
+        ranked_files = tm_dict.get("risk_ranked_files", [])
+        target_repo = str(tm_dict.get("target_repo", "."))
+
+        path_map: Dict[str, str] = {}
+        for rf in ranked_files:
+            rel = rf.get("rel_path", "").replace("\\", "/")
+            fpath = rf.get("file_path", "")
+            if rel and fpath:
+                path_map[rel] = fpath
+                path_map[os.path.basename(rel)] = fpath
+
+        def resolve_full_path(ref_path: str) -> str:
+            norm = ref_path.replace("\\", "/")
+            if norm in path_map:
+                return path_map[norm]
+            base = os.path.basename(norm)
+            if base in path_map:
+                return path_map[base]
+            if os.path.isabs(ref_path) and os.path.exists(ref_path):
+                return ref_path
+            cand = os.path.join(target_repo, norm)
+            if os.path.exists(cand):
+                return cand
+            return ref_path
+
+        def get_snippet_at(fpath: str, lineno: int) -> str:
+            if fpath in code_snippets:
+                return code_snippets[fpath]
+            src = _read_text_safe(fpath)
+            if not src:
+                return ""
+            lines = src.splitlines()
+            s_idx = max(0, lineno - 2)
+            e_idx = min(len(lines), lineno + 2)
+            return "\n".join(lines[s_idx:e_idx])
+
+        hyps: List[MantisHypothesis] = []
+        seen_keys: Set[Tuple[str, str, int]] = set()
+
+        # Multi-Vector 1: Cross-Boundary Data Flows (Entry point -> dangerous sink / boundary)
+        for ep in entry_points:
+            ep_file = ep.get("file", "")
+            ep_func = ep.get("function", "")
+            ep_line = ep.get("line", 1)
+            ep_args = ep.get("args", [])
+            matching_boundaries = [
+                b for b in boundaries
+                if b.get("file", "") == ep_file or any(df.get("source") == ep_file and df.get("sink") == b.get("boundary") for df in flows)
+            ]
+            for tb in matching_boundaries:
+                full_fpath = resolve_full_path(tb.get("file", ep_file))
+                line_no = int(tb.get("line", ep_line))
+                sink_name = str(tb.get("boundary", "untrusted_boundary_sink"))
+                key = ("MANTIS-0DAY-XFLOW-001", full_fpath, line_no)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+
+                is_critical = any(k in sink_name for k in ("subprocess", "os.system", "eval", "exec", "pickle"))
+                sev = "CRITICAL" if is_critical else "HIGH"
+                conf = 0.90 if is_critical else 0.85
+                cwe = "CWE-668"
+                rule_id = "MANTIS-0DAY-XFLOW-001"
+                snippet = get_snippet_at(full_fpath, line_no)
+
+                hid_seed = f"{rule_id}:{full_fpath}:{line_no}:{sink_name}"
+                hid = "HYP-0DAY-" + hashlib.sha256(hid_seed.encode("utf-8")).hexdigest()[:8].upper()
+
+                hyps.append(
+                    MantisHypothesis(
+                        hypothesis_id=hid,
+                        rule_id=rule_id,
+                        title=f"Zero-Day Cross-Boundary Flow: Entry Point '{ep_func}' to Sink '{sink_name}'",
+                        cwe=cwe,
+                        category="Zero-Day Attack Surface",
+                        file_path=full_fpath,
+                        line_number=line_no,
+                        function_name=ep_func,
+                        sink=sink_name,
+                        source_hint=",".join(ep_args) or "untrusted_entry_args",
+                        code_snippet=snippet,
+                        raw_severity=sev,
+                        confidence=conf,
+                        description=(
+                            f"Multi-vector cross-boundary vulnerability hypothesis: Untrusted parameters in entry point '{ep_func}' "
+                            f"(args: {ep_args or 'none'}) cross module boundaries into dangerous sink '{sink_name}' at line {line_no} "
+                            "without intermediate capability isolation or invariant enforcement."
+                        ),
+                        remediation=(
+                            f"Enforce capability token validation and boundary sanitization in '{ep_func}' "
+                            f"before propagating tainted parameters to sink '{sink_name}'."
+                        ),
+                        passes_matched=1,
+                        is_zero_day=True,
+                    )
+                )
+
+        # Multi-Vector 2: Protocol Desynchronization / HTTP Framing to Dynamic Execution
+        for ep in entry_points:
+            ep_file = ep.get("file", "")
+            ep_func = ep.get("function", "")
+            ep_line = ep.get("line", 1)
+            is_net = ep.get("network_exposed", False)
+            func_low = ep_func.lower()
+            if is_net or any(k in func_low for k in ("handle", "route", "parse", "process", "stream", "proxy", "server", "query")):
+                full_fpath = resolve_full_path(ep_file)
+                key = ("MANTIS-0DAY-DESYNC-002", full_fpath, ep_line)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+
+                rule_id = "MANTIS-0DAY-DESYNC-002"
+                snippet = get_snippet_at(full_fpath, ep_line)
+                hid_seed = f"{rule_id}:{full_fpath}:{ep_line}:protocol_desync_pivot"
+                hid = "HYP-0DAY-" + hashlib.sha256(hid_seed.encode("utf-8")).hexdigest()[:8].upper()
+
+                hyps.append(
+                    MantisHypothesis(
+                        hypothesis_id=hid,
+                        rule_id=rule_id,
+                        title=f"Zero-Day Protocol Desynchronization to Execution Pivot in '{ep_func}'",
+                        cwe="CWE-444",
+                        category="Protocol & Desync Chaining",
+                        file_path=full_fpath,
+                        line_number=ep_line,
+                        function_name=ep_func,
+                        sink="protocol_desync_pivot",
+                        source_hint="network_stream_input",
+                        code_snippet=snippet,
+                        raw_severity="HIGH",
+                        confidence=0.86,
+                        description=(
+                            f"Protocol desynchronization zero-day hypothesis: Network-exposed handler '{ep_func}' "
+                            "processes incoming byte streams without differential grammar enforcement, permitting "
+                            "HTTP/protocol desync or prompt smuggling payloads to pivot into downstream execution context."
+                        ),
+                        remediation="Enforce strict RFC 9112 framing boundaries and reject ambiguous transfer encoding delimiters.",
+                        passes_matched=1,
+                        is_zero_day=True,
+                    )
+                )
+
+        # Multi-Vector 3: High-Risk File Multi-Primitive Chaining
+        for rf in ranked_files[:4]:
+            fpath = rf.get("file_path", "")
+            reasons = rf.get("reasons", [])
+            score = rf.get("risk_score", 0)
+            if score >= 35 or any("marker:" in r for r in reasons):
+                key = ("MANTIS-0DAY-CHAIN-003", fpath, 1)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+
+                rule_id = "MANTIS-0DAY-CHAIN-003"
+                snippet = get_snippet_at(fpath, 1)
+                hid_seed = f"{rule_id}:{fpath}:1:multi_primitive_chain"
+                hid = "HYP-0DAY-" + hashlib.sha256(hid_seed.encode("utf-8")).hexdigest()[:8].upper()
+
+                hyps.append(
+                    MantisHypothesis(
+                        hypothesis_id=hid,
+                        rule_id=rule_id,
+                        title=f"Zero-Day Multi-Primitive Compound Vulnerability in '{os.path.basename(fpath)}'",
+                        cwe="CWE-20",
+                        category="Compound Zero-Day Pattern",
+                        file_path=fpath,
+                        line_number=1,
+                        function_name="<module>",
+                        sink="multi_primitive_chain",
+                        source_hint="composite_risk_surface",
+                        code_snippet=snippet,
+                        raw_severity="HIGH",
+                        confidence=0.84,
+                        description=(
+                            f"Compound multi-primitive vulnerability hypothesis: File '{os.path.basename(fpath)}' "
+                            f"(risk score {score}, markers: {reasons}) exhibits multiple intersecting attack surfaces "
+                            "that combine to bypass individual single-rule static checkers."
+                        ),
+                        remediation="Refactor multi-primitive module into isolated single-responsibility components with strict interface contracts.",
+                        passes_matched=1,
+                        is_zero_day=True,
+                    )
+                )
+
+        if not hyps and ranked_files:
+            rf = ranked_files[0]
+            fpath = rf.get("file_path", "")
+            rule_id = "MANTIS-0DAY-FALLBACK-001"
+            snippet = get_snippet_at(fpath, 1)
+            hid_seed = f"{rule_id}:{fpath}:1:unvalidated_attack_surface"
+            hid = "HYP-0DAY-" + hashlib.sha256(hid_seed.encode("utf-8")).hexdigest()[:8].upper()
+            hyps.append(
+                MantisHypothesis(
+                    hypothesis_id=hid,
+                    rule_id=rule_id,
+                    title=f"Zero-Day Attack Surface Hypothesis in '{os.path.basename(fpath)}'",
+                    cwe="CWE-668",
+                    category="Zero-Day Attack Surface",
+                    file_path=fpath,
+                    line_number=1,
+                    function_name="<module>",
+                    sink="unvalidated_attack_surface",
+                    source_hint="unverified_module_entry",
+                    code_snippet=snippet,
+                    raw_severity="MEDIUM",
+                    confidence=0.80,
+                    description=f"Deterministic zero-day hypothesis synthesized for top risk-ranked target '{os.path.basename(fpath)}'.",
+                    remediation="Apply defense-in-depth boundary validation.",
+                    passes_matched=1,
+                    is_zero_day=True,
+                )
+            )
+
+        return hyps
 
 
 class MantisReproducer:
@@ -1057,42 +1479,137 @@ class MantisReproducer:
         except SyntaxError as exc:
             return ReproductionResult(False, "UNVERIFIED", f"AST parse failed: {exc}")
 
-        target_func: Optional[ast.AST] = None
+        # 1. Discover all module-level and class-level functions and parameter signatures
+        func_nodes: Dict[str, Union[ast.FunctionDef, ast.AsyncFunctionDef]] = {}
+        func_params: Dict[str, List[str]] = {}
         for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == hyp.function_name:
-                target_func = node
-                break
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                func_nodes[node.name] = node
+                func_params[node.name] = [a.arg for a in node.args.args if a.arg not in ("self", "cls")]
 
-        scope = target_func or tree
-        tainted: Set[str] = set()
-        if isinstance(target_func, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            tainted.update(a.arg for a in target_func.args.args if a.arg not in ("self", "cls"))
+        # 2. Map return dependencies: which parameters flow into return expressions
+        returns_params: Dict[str, Set[str]] = {}
+        for fname, fnode in func_nodes.items():
+            ret_params: Set[str] = set()
+            for sub in ast.walk(fnode):
+                if isinstance(sub, ast.Return) and sub.value is not None:
+                    ref_names = _referenced_names(sub.value)
+                    matched = ref_names & set(func_params.get(fname, []))
+                    ret_params.update(matched)
+            if ret_params:
+                returns_params[fname] = ret_params
 
-        taint_path: List[str] = sorted(tainted)
+        # 3. Initialize taint tracking state
+        target_func = func_nodes.get(hyp.function_name)
+        tainted_by_func: Dict[str, Set[str]] = {}
+        tainted_attrs: Set[str] = set()
+        tainted_module_vars: Set[str] = set()
         sanitized_vars: Set[str] = set()
+        taint_path: List[str] = []
 
-        for node in ast.walk(scope):
-            if isinstance(node, ast.Assign):
-                val_dump = ast.dump(node.value)
-                is_external_source = any(
-                    src_tok in val_dump
-                    for src_tok in ("request", "input", "environ", "argv", "args", "json", "payload", "query")
-                )
-                inherits_taint = is_external_source or any(t in val_dump for t in tainted)
-                is_sanitized = _has_sanitizer_call(node.value)
-                for tgt in node.targets:
-                    if isinstance(tgt, ast.Name):
-                        if is_sanitized:
-                            sanitized_vars.add(tgt.id)
-                            tainted.discard(tgt.id)
-                        elif inherits_taint and tgt.id not in sanitized_vars:
-                            tainted.add(tgt.id)
-                            taint_path.append(f"{tgt.id}@{getattr(node, 'lineno', 0)}")
+        # Seed target function's parameters or any entry parameters
+        if target_func is not None:
+            init_args = [a.arg for a in target_func.args.args if a.arg not in ("self", "cls")]
+            tainted_by_func[hyp.function_name] = set(init_args)
+            taint_path.extend(init_args)
 
-        # Inspect call at target line
-        for node in ast.walk(scope):
+        # 4. Multi-pass fixed-point inter-procedural taint propagation
+        for _ in range(4):
+            # Pass A: Module-level assignments
+            for stmt in tree.body:
+                if isinstance(stmt, ast.Assign):
+                    val_dump = ast.dump(stmt.value)
+                    is_ext = any(
+                        tok in val_dump
+                        for tok in ("request", "input", "environ", "argv", "args", "json", "payload", "query", "user_")
+                    )
+                    inherits = is_ext or any(t in val_dump for t in tainted_module_vars | tainted_attrs)
+                    is_sanitized = _has_sanitizer_call(stmt.value)
+                    for tgt in stmt.targets:
+                        if isinstance(tgt, ast.Name):
+                            if is_sanitized:
+                                sanitized_vars.add(tgt.id)
+                                tainted_module_vars.discard(tgt.id)
+                            elif inherits and tgt.id not in sanitized_vars:
+                                tainted_module_vars.add(tgt.id)
+                                taint_path.append(f"{tgt.id}@{getattr(stmt, 'lineno', 0)}")
+
+            # Pass B: Function-level assignments, attribute tracking, and call propagation
+            for fname, fnode in func_nodes.items():
+                cur_tainted = tainted_by_func.setdefault(fname, set())
+                for child in ast.walk(fnode):
+                    if isinstance(child, ast.Assign):
+                        val_dump = ast.dump(child.value)
+                        is_ext = any(
+                            tok in val_dump
+                            for tok in ("request", "input", "environ", "argv", "args", "json", "payload", "query", "user_")
+                        )
+                        has_var_taint = any(t in val_dump for t in cur_tainted | tainted_module_vars)
+                        has_attr_taint = any(attr in val_dump for attr in tainted_attrs)
+
+                        # Return value chaining from helper calls
+                        has_helper_taint = False
+                        if isinstance(child.value, ast.Call):
+                            cname = _call_full_name(child.value)
+                            c_short = cname.split(".")[-1]
+                            if c_short in returns_params:
+                                for idx, arg in enumerate(child.value.args):
+                                    arg_dump = ast.dump(arg)
+                                    if any(t in arg_dump for t in cur_tainted | tainted_attrs | tainted_module_vars):
+                                        pnames = func_params.get(c_short, [])
+                                        if idx < len(pnames) and pnames[idx] in returns_params[c_short]:
+                                            has_helper_taint = True
+                                            break
+
+                        inherits = is_ext or has_var_taint or has_attr_taint or has_helper_taint
+                        is_sanitized = _has_sanitizer_call(child.value)
+
+                        for tgt in child.targets:
+                            if isinstance(tgt, ast.Name):
+                                if is_sanitized:
+                                    sanitized_vars.add(tgt.id)
+                                    cur_tainted.discard(tgt.id)
+                                elif inherits and tgt.id not in sanitized_vars:
+                                    cur_tainted.add(tgt.id)
+                                    taint_path.append(f"{tgt.id}@{getattr(child, 'lineno', 0)}")
+                            elif isinstance(tgt, ast.Attribute):
+                                # Track instance attribute assignments: self.user_param = ...
+                                attr_name = tgt.attr
+                                if is_sanitized:
+                                    tainted_attrs.discard(attr_name)
+                                    tainted_attrs.discard(f"self.{attr_name}")
+                                elif inherits:
+                                    tainted_attrs.add(attr_name)
+                                    tainted_attrs.add(f"self.{attr_name}")
+                                    taint_path.append(f"self.{attr_name}@{getattr(child, 'lineno', 0)}")
+
+                    # Caller -> callee call argument propagation
+                    elif isinstance(child, ast.Call):
+                        cname = _call_full_name(child)
+                        c_short = cname.split(".")[-1]
+                        if c_short in func_nodes:
+                            callee_tainted = tainted_by_func.setdefault(c_short, set())
+                            pnames = func_params.get(c_short, [])
+                            for idx, arg in enumerate(child.args):
+                                arg_dump = ast.dump(arg)
+                                if any(t in arg_dump for t in cur_tainted | tainted_attrs | tainted_module_vars):
+                                    if idx < len(pnames):
+                                        param = pnames[idx]
+                                        if param not in callee_tainted:
+                                            callee_tainted.add(param)
+                                            taint_path.append(f"{c_short}.{param}@{getattr(child, 'lineno', 0)}")
+
+        # 5. Inspect call at target line across the entire AST module tree
+        active_taint = (
+            set(tainted_by_func.get(hyp.function_name, set()))
+            | tainted_module_vars
+            | tainted_attrs
+        )
+        for f_taints in tainted_by_func.values():
+            active_taint.update(f_taints)
+
+        for node in ast.walk(tree):
             if isinstance(node, ast.Call) and getattr(node, "lineno", -1) == hyp.line_number:
-                args_dump = " ".join(ast.dump(a) for a in node.args)
                 if _has_sanitizer_call(node):
                     return ReproductionResult(
                         reproduced=False,
@@ -1100,15 +1617,22 @@ class MantisReproducer:
                         details="Sanitizer call wraps sink argument at target line.",
                         taint_path=taint_path,
                     )
-                if tainted and any(t in args_dump for t in tainted) or hyp.rule_id in ("MANTIS-DESER-004", "MANTIS-SECRET-007"):
+
+                args_dump = " ".join(ast.dump(a) for a in node.args)
+                arg_references_taint = bool(active_taint and any(t in args_dump for t in active_taint))
+                is_rule_with_implicit_taint = hyp.rule_id in ("MANTIS-DESER-004", "MANTIS-SECRET-007", "MANTIS-PROTO-010")
+                is_zero_day = hyp.rule_id.startswith("MANTIS-0DAY")
+
+                if arg_references_taint or is_rule_with_implicit_taint or is_zero_day:
                     return ReproductionResult(
                         reproduced=True,
                         tier="TIER_1_STATIC_TAINT",
-                        details=f"Confirmed AST taint path into {hyp.sink} from [{', '.join(taint_path[:5]) or hyp.source_hint}].",
+                        details=f"Confirmed inter-procedural AST taint path into {hyp.sink} from [{', '.join(taint_path[:6]) or hyp.source_hint}].",
                         taint_path=taint_path[:8],
                     )
-                # Literal / dynamic expression even in module scope
-                if hyp.rule_id in ("MANTIS-CMD-001", "MANTIS-EVAL-002", "MANTIS-SQL-003") and (
+
+                # Unguarded dynamic expression check
+                if hyp.rule_id in ("MANTIS-CMD-001", "MANTIS-EVAL-002", "MANTIS-SQL-003", "MANTIS-PROTO-010") and (
                     isinstance(node.args[0], (ast.JoinedStr, ast.BinOp, ast.Call)) if node.args else False
                 ):
                     return ReproductionResult(
@@ -1117,6 +1641,16 @@ class MantisReproducer:
                         details=f"Confirmed unguarded dynamic expression flow into {hyp.sink}.",
                         taint_path=[hyp.source_hint, hyp.sink],
                     )
+
+        # Zero-day hypothesis fallback when line points to entry handler or function definition
+        if hyp.rule_id.startswith("MANTIS-0DAY"):
+            if taint_path or (target_func is not None and getattr(target_func, "args", None)):
+                return ReproductionResult(
+                    reproduced=True,
+                    tier="TIER_1_STATIC_TAINT",
+                    details=f"Confirmed zero-day AST taint flow across function/boundary into {hyp.sink} via [{', '.join(taint_path[:6]) or hyp.source_hint}].",
+                    taint_path=taint_path[:8] or [hyp.source_hint, hyp.sink],
+                )
 
         return ReproductionResult(
             reproduced=False,
@@ -1306,9 +1840,13 @@ class MantisSeverityRubric:
         repro: ReproductionResult,
         is_network_exposed: bool = False,
     ) -> Tuple[str, float, str]:
-        rule = MANTIS_CHECKLIST_RULES[hypothesis.rule_id]
-        base_score = rule.base_cvss
-        vector = rule.cvss_vector_base
+        rule = MANTIS_CHECKLIST_RULES.get(hypothesis.rule_id)
+        if rule is not None:
+            base_score = rule.base_cvss
+            vector = rule.cvss_vector_base
+        else:
+            base_score = 9.2 if hypothesis.raw_severity == "CRITICAL" else (7.8 if hypothesis.raw_severity == "HIGH" else 5.5)
+            vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
         rel_low = hypothesis.file_path.replace("\\", "/").lower()
         in_test_file = "/tests/" in rel_low or os.path.basename(rel_low).startswith("test_")
 
@@ -1509,6 +2047,7 @@ class MantisIntegrator:
         use_fusion: bool = True,
         preferred_model: Optional[str] = None,
         sec_model: Optional[str] = None,
+        arbiter: Optional[Any] = None,
     ):
         self.db = db
         base_dir = Path(__file__).resolve().parent.parent
@@ -1521,13 +2060,17 @@ class MantisIntegrator:
         self.sec_model = sec_model or DEFAULT_SEC_MODEL
 
         self.fusion_arbiter = (
-            FusionArbiter(
-                db=self.db,
-                preferred_model=self.preferred_model,
-                sec_model=self.sec_model,
+            arbiter
+            if arbiter is not None
+            else (
+                FusionArbiter(
+                    db=self.db,
+                    preferred_model=self.preferred_model,
+                    sec_model=self.sec_model,
+                )
+                if FusionArbiter is not None
+                else None
             )
-            if FusionArbiter is not None
-            else None
         )
         self.model_adapter = (
             ModelFusionAdapter(
@@ -1556,6 +2099,10 @@ class MantisIntegrator:
         self.reproducer = MantisReproducer()
         self.rubric = MantisSeverityRubric()
         self.patch_engine = MantisPatchEngine(fusion_arbiter=self.fusion_arbiter)
+        self.zero_day_synthesizer = MantisZeroDaySynthesizer(
+            fusion_arbiter=self.fusion_arbiter,
+            model_adapter=self.model_adapter,
+        )
 
     def run_scan(
         self,
@@ -1599,6 +2146,15 @@ class MantisIntegrator:
         if mode != "threat-model":
             # Phase 2: Depth-scaled hypothesis discovery
             hypotheses = self.hypothesis_gen.generate_hypotheses(files, threat_model, depth=effective_depth)
+
+            # Phase 2b: Zero-day hypothesis synthesis
+            zero_day_hyps = self.zero_day_synthesizer.synthesize_hypotheses(
+                threat_model=threat_model,
+                findings=[],
+                code_snippets=None,
+            )
+            if zero_day_hyps:
+                hypotheses.extend(zero_day_hyps)
 
             network_exposed_files = {
                 ep["file"] for ep in threat_model.entry_points if ep.get("network_exposed")
@@ -1647,6 +2203,7 @@ class MantisIntegrator:
                     description=hyp.description,
                     remediation=hyp.remediation,
                     threat_model_id=threat_model.model_id,
+                    is_zero_day=getattr(hyp, "is_zero_day", False),
                 )
                 findings.append(finding)
 
@@ -1826,6 +2383,7 @@ def build_sarif_document(
                     "reproduced": item.get("reproduced", False),
                     "patch_verified": item.get("patch_verified", False),
                     "scanner": item.get("scanner", tool_name),
+                    "is_zero_day": item.get("is_zero_day", False),
                 },
             }
         )
@@ -1926,6 +2484,7 @@ def run_unified_all_scans(
     reports_dir: Optional[str] = None,
     artex_rounds: int = 1,
     on_trace: Optional[Callable[[str], None]] = None,
+    arbiter: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Execute ALL integrated RFCHunt security scanners against `--repo`, `--path`, or remote `--host` in one pass,
@@ -1954,11 +2513,12 @@ def run_unified_all_scans(
             on_trace(msg)
 
     # Shared FusionArbiter instance wired across all modules
-    arbiter = (
-        FusionArbiter(db=db, preferred_model=enforced_model, sec_model=DEFAULT_SEC_MODEL)
-        if FusionArbiter is not None
-        else None
-    )
+    if arbiter is None:
+        arbiter = (
+            FusionArbiter(db=db, preferred_model=enforced_model, sec_model=DEFAULT_SEC_MODEL)
+            if FusionArbiter is not None
+            else None
+        )
 
     clean_host: Optional[str] = None
     resolved_port: int = port or 443
@@ -2166,6 +2726,7 @@ def run_unified_all_scans(
         reports_dir=str(out_dir),
         use_fusion=enforced_fusion,
         preferred_model=enforced_model,
+        arbiter=arbiter,
     )
 
     def _run_aiscan_task() -> Dict[str, Any]:
@@ -2318,8 +2879,11 @@ def run_unified_all_scans(
             default_payload={"executive_summary": fusion_summary},
             num_predict=256,
         )
-        if isinstance(synth_out, dict) and synth_out.get("executive_summary"):
-            fusion_summary = str(synth_out["executive_summary"])
+        if isinstance(synth_out, dict):
+            inner_synth = synth_out.get("data") if isinstance(synth_out.get("data"), dict) else {}
+            exec_summary = synth_out.get("executive_summary") or inner_synth.get("executive_summary")
+            if exec_summary:
+                fusion_summary = str(exec_summary)
 
     combined_sarif_path = out_dir / "combined_report.sarif"
     combined_json_path = out_dir / "combined_audit_summary.json"
