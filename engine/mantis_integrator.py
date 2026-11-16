@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 import difflib
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -1220,7 +1221,7 @@ class MantisZeroDaySynthesizer:
         flows = [df for df in raw_dfs if isinstance(df, dict)][:10] if isinstance(raw_dfs, list) else []
 
         raw_rfs = tm_dict.get("risk_ranked_files")
-        top_files = [(f.get("rel_path") or "") for f in raw_rfs if isinstance(f, dict)][:5] if isinstance(raw_rfs, list) else []
+        top_files = [str(f.get("rel_path") or "") for f in raw_rfs if isinstance(f, dict)][:5] if isinstance(raw_rfs, list) else []
 
         prompt_payload = {
             "target": target,
@@ -1265,12 +1266,29 @@ class MantisZeroDaySynthesizer:
                 rule_id = f"MANTIS-0DAY-{rule_id.split('-')[-1]}"
             fpath = str(item.get("file_path", ""))
             try:
-                lineno = int(item.get("line_number", 1))
-            except (ValueError, TypeError):
+                raw_l = item.get("line_number", 1)
+                if isinstance(raw_l, (int, float)):
+                    if raw_l == float("inf") or raw_l == float("-inf") or (isinstance(raw_l, float) and math.isnan(raw_l)):
+                        lineno = 1
+                    else:
+                        lineno = max(1, int(raw_l))
+                else:
+                    lineno = max(1, int(float(str(raw_l).strip())))
+            except (ValueError, TypeError, OverflowError):
                 lineno = 1
             sink = str(item.get("sink", "dynamic_sink"))
             hid_seed = f"{rule_id}:{fpath}:{lineno}:{sink}"
             hid = "HYP-0DAY-" + hashlib.sha256(hid_seed.encode("utf-8")).hexdigest()[:8].upper()
+
+            raw_conf = item.get("confidence", 0.85)
+            try:
+                conf = float(raw_conf)
+                if conf == float("inf") or conf > 1.0:
+                    conf = 1.0
+                elif conf == float("-inf") or conf < 0.0 or math.isnan(conf):
+                    conf = 0.85
+            except (ValueError, TypeError, OverflowError):
+                conf = 0.85
 
             hyp = MantisHypothesis(
                 hypothesis_id=hid,
@@ -1285,7 +1303,7 @@ class MantisZeroDaySynthesizer:
                 source_hint=str(item.get("source_hint", "external_source")),
                 code_snippet=str(item.get("code_snippet", "")),
                 raw_severity=str(item.get("raw_severity", "HIGH")).upper(),
-                confidence=float(item.get("confidence", 0.85)),
+                confidence=conf,
                 description=str(item.get("description", "Synthesized zero-day multi-vector vulnerability hypothesis.")),
                 remediation=str(item.get("remediation", "Apply defensive boundary validation and sanitization.")),
                 passes_matched=1,
@@ -1317,13 +1335,14 @@ class MantisZeroDaySynthesizer:
 
         path_map: Dict[str, str] = {}
         for rf in ranked_files:
-            rel = (rf.get("rel_path") or "").replace("\\", "/")
-            fpath = rf.get("file_path") or ""
+            rel = str(rf.get("rel_path") or "").replace("\\", "/")
+            fpath = str(rf.get("file_path") or "")
             if rel and fpath:
                 path_map[rel] = fpath
                 path_map[os.path.basename(rel)] = fpath
 
-        def resolve_full_path(ref_path: str) -> str:
+        def resolve_full_path(ref_path: Any) -> str:
+            ref_path = str(ref_path or "")
             if not ref_path:
                 return target_repo
             norm = ref_path.replace("\\", "/")
@@ -1339,7 +1358,8 @@ class MantisZeroDaySynthesizer:
                 return cand
             return ref_path
 
-        def get_snippet_at(fpath: str, lineno: int) -> str:
+        def get_snippet_at(fpath: Any, lineno: int) -> str:
+            fpath = str(fpath or "")
             if not fpath:
                 return ""
             if fpath in code_snippets:
@@ -1352,28 +1372,75 @@ class MantisZeroDaySynthesizer:
             e_idx = min(len(lines), lineno + 2)
             return "\n".join(lines[s_idx:e_idx])
 
+        def _safe_line(raw: Any, default: int = 1) -> int:
+            if raw is None:
+                return default
+            if isinstance(raw, (int, float)):
+                if raw == float("inf") or raw == float("-inf") or (isinstance(raw, float) and math.isnan(raw)):
+                    return default
+                try:
+                    res = int(raw)
+                    return res if res > 0 else default
+                except (ValueError, TypeError, OverflowError):
+                    return default
+            try:
+                raw_s = str(raw).strip()
+                if raw_s.lower() in ("inf", "+inf", "-inf", "infinity", "+infinity", "-infinity", "nan"):
+                    return default
+                f = float(raw_s)
+                if f == float("inf") or f == float("-inf") or math.isnan(f):
+                    return default
+                res = int(f)
+                return res if res > 0 else default
+            except (ValueError, TypeError, OverflowError):
+                return default
+
+        def _safe_risk_score(raw: Any) -> int:
+            if raw is None:
+                return 0
+            if isinstance(raw, (int, float)):
+                if raw == float("inf") or raw > 100:
+                    return 100
+                if raw == float("-inf") or raw < 0:
+                    return 0
+                if isinstance(raw, float) and math.isnan(raw):
+                    return 0
+                try:
+                    return int(raw)
+                except (ValueError, TypeError, OverflowError):
+                    return 0
+            try:
+                raw_s = str(raw).strip().lower()
+                if raw_s in ("inf", "+inf", "infinity", "+infinity"):
+                    return 100
+                if raw_s in ("-inf", "-infinity"):
+                    return 0
+                f = float(raw_s)
+                if f == float("inf") or f > 100:
+                    return 100
+                if f == float("-inf") or f < 0 or math.isnan(f):
+                    return 0
+                return int(f)
+            except (ValueError, TypeError, OverflowError):
+                return 0
+
         hyps: List[MantisHypothesis] = []
         seen_keys: Set[Tuple[str, str, int]] = set()
 
         # Multi-Vector 1: Cross-Boundary Data Flows (Entry point -> dangerous sink / boundary)
         for ep in entry_points:
-            ep_file = ep.get("file") or ""
-            ep_func = ep.get("function") or ""
-            try:
-                ep_line = int(ep.get("line") or 1)
-            except (ValueError, TypeError):
-                ep_line = 1
+            ep_file = str(ep.get("file") or "")
+            ep_func = str(ep.get("function") or "")
+            ep_line = _safe_line(ep.get("line"), 1)
             ep_args = ep.get("args") or []
             matching_boundaries = [
                 b for b in boundaries
-                if (b.get("file") or "") == ep_file or any((df.get("source") or "") == ep_file and (df.get("sink") or "") == (b.get("boundary") or "") for df in flows)
+                if str(b.get("file") or "") == ep_file
+                or any(str(df.get("source") or "") == ep_file and str(df.get("sink") or "") == str(b.get("boundary") or "") for df in flows)
             ]
             for tb in matching_boundaries:
-                full_fpath = resolve_full_path(tb.get("file") or ep_file)
-                try:
-                    line_no = int(tb.get("line") or ep_line)
-                except (ValueError, TypeError):
-                    line_no = 1
+                full_fpath = resolve_full_path(str(tb.get("file") or ep_file))
+                line_no = _safe_line(tb.get("line"), ep_line)
                 sink_name = str(tb.get("boundary") or "untrusted_boundary_sink")
                 key = ("MANTIS-0DAY-XFLOW-001", full_fpath, line_no)
                 if key in seen_keys:
@@ -1421,12 +1488,9 @@ class MantisZeroDaySynthesizer:
 
         # Multi-Vector 2: Protocol Desynchronization / HTTP Framing to Dynamic Execution
         for ep in entry_points:
-            ep_file = ep.get("file") or ""
-            ep_func = ep.get("function") or ""
-            try:
-                ep_line = int(ep.get("line") or 1)
-            except (ValueError, TypeError):
-                ep_line = 1
+            ep_file = str(ep.get("file") or "")
+            ep_func = str(ep.get("function") or "")
+            ep_line = _safe_line(ep.get("line"), 1)
             is_net = bool(ep.get("network_exposed", False))
             func_low = ep_func.lower()
             if is_net or any(k in func_low for k in ("handle", "route", "parse", "process", "stream", "proxy", "server", "query")):
@@ -1469,15 +1533,12 @@ class MantisZeroDaySynthesizer:
 
         # Multi-Vector 3: High-Risk File Multi-Primitive Chaining
         for rf in ranked_files[:4]:
-            fpath = rf.get("file_path") or ""
+            fpath = str(rf.get("file_path") or "")
             reasons = rf.get("reasons")
             if not isinstance(reasons, (list, tuple, set)):
                 reasons = [reasons] if reasons is not None else []
             raw_score = rf.get("risk_score")
-            try:
-                score = int(raw_score) if raw_score is not None else 0
-            except (ValueError, TypeError):
-                score = 0
+            score = _safe_risk_score(raw_score)
             if score >= 35 or any("marker:" in str(r) for r in reasons):
                 key = ("MANTIS-0DAY-CHAIN-003", fpath, 1)
                 if key in seen_keys:
@@ -1517,7 +1578,7 @@ class MantisZeroDaySynthesizer:
 
         if not hyps and ranked_files:
             rf = ranked_files[0]
-            fpath = rf.get("file_path") or ""
+            fpath = str(rf.get("file_path") or "")
             rule_id = "MANTIS-0DAY-FALLBACK-001"
             snippet = get_snippet_at(fpath, 1)
             hid_seed = f"{rule_id}:{fpath}:1:unvalidated_attack_surface"
@@ -2463,8 +2524,14 @@ def build_sarif_document(
 
         raw_line = item.get("line_number") or item.get("line") or 1
         try:
-            line_num = max(1, int(raw_line))
-        except (ValueError, TypeError):
+            if isinstance(raw_line, (int, float)):
+                if raw_line == float("inf") or raw_line == float("-inf") or (isinstance(raw_line, float) and math.isnan(raw_line)):
+                    line_num = 1
+                else:
+                    line_num = max(1, int(raw_line))
+            else:
+                line_num = max(1, int(float(str(raw_line).strip())))
+        except (ValueError, TypeError, OverflowError):
             line_num = 1
         sev = str(item.get("severity") or "MEDIUM")
         msg = f"[{sev}] {item.get('title', rid)} ({item.get('cwe', 'CWE')})"

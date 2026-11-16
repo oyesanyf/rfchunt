@@ -810,5 +810,101 @@ def test_unified_all_scans_none_findings_and_none_threat_model(monkeypatch: pyte
         assert res2["engines"]["artex_dual_graph"].get("chains_synthesized", 0) >= 0
 
 
+def test_zero_day_synthesizer_adversarial_infinity_and_non_string_types():
+    """Regression test for Bugs 1, 2, 3, 4:
+    - float('inf') and float('-inf') risk scores do not cause OverflowError.
+    - non-string entry point function (e.g. int) does not cause AttributeError.
+    - non-string rel_path (e.g. int) does not cause AttributeError.
+    - float('inf') line numbers in entry points and trust boundaries do not cause OverflowError.
+    """
+    synth = MantisZeroDaySynthesizer()
+
+    # 1. Bug 1: Infinite risk score (positive infinity clamped to 100, negative infinity clamped to 0)
+    tm_inf_score = {
+        "risk_ranked_files": [
+            {"file_path": "server.py", "risk_score": float("inf")},
+            {"file_path": "client.py", "risk_score": float("-inf")},
+            {"file_path": "util.py", "risk_score": 999999},
+            {"file_path": "log.py", "risk_score": -50},
+        ]
+    }
+    hyps_inf = synth.synthesize_hypotheses(tm_inf_score)
+    assert isinstance(hyps_inf, list)
+    assert len(hyps_inf) > 0
+    # Server.py should be synthesized with clamped score 100
+    inf_hyp = next(h for h in hyps_inf if "server.py" in h.file_path)
+    assert "100" in inf_hyp.description
+
+    # 2. Bug 2: Non-string entry point function and file attributes
+    tm_non_str_func = {
+        "entry_points": [
+            {"file": "api.py", "function": 12345},
+            {"file": 999, "function": 67890, "network_exposed": True},
+            {"file": None, "function": None},
+        ]
+    }
+    hyps_func = synth.synthesize_hypotheses(tm_non_str_func)
+    assert isinstance(hyps_func, list)
+    # The network-exposed entry point with int function 67890 should produce a hypothesis
+    assert any(h.function_name == "67890" for h in hyps_func)
+
+    # 3. Bug 3: Non-string rel_path and file_path in risk_ranked_files
+    tm_non_str_path = {
+        "risk_ranked_files": [
+            {"file_path": "engine.py", "rel_path": 12345, "risk_score": 40},
+            {"file_path": 67890, "rel_path": None, "risk_score": 50},
+        ]
+    }
+    hyps_path = synth.synthesize_hypotheses(tm_non_str_path)
+    assert isinstance(hyps_path, list)
+    assert len(hyps_path) > 0
+
+    # 4. Bug 4: Float infinity line numbers in entry points and trust boundaries
+    tm_inf_line = {
+        "entry_points": [
+            {"file": "handler.py", "function": "handle_request", "line": float("inf")},
+            {"file": "worker.py", "function": "process_job", "line": float("-inf")},
+            {"file": "stream.py", "function": "stream_data", "line": float("nan")},
+        ],
+        "trust_boundaries": [
+            {"file": "handler.py", "boundary": "os.system", "line": float("inf")},
+        ],
+    }
+    hyps_line = synth.synthesize_hypotheses(tm_inf_line)
+    assert isinstance(hyps_line, list)
+    assert len(hyps_line) > 0
+    for h in hyps_line:
+        assert isinstance(h.line_number, int)
+        assert h.line_number >= 1
+
+    # 5. Combined adversarial stress test: all 4 edge cases together in a single threat model
+    tm_combined = {
+        "entry_points": [
+            {"file": 101, "function": 202, "line": float("inf"), "network_exposed": True},
+            {"file": "main.py", "function": "handle_stream", "line": float("-inf")},
+        ],
+        "trust_boundaries": [
+            {"file": 101, "boundary": 303, "line": float("inf")},
+        ],
+        "data_flows": [
+            {"source": 101, "sink": 303},
+        ],
+        "risk_ranked_files": [
+            {"file_path": "main.py", "rel_path": 404, "risk_score": float("inf")},
+            {"file_path": 505, "rel_path": 606, "risk_score": float("-inf")},
+        ],
+    }
+    hyps_combined = synth.synthesize_hypotheses(tm_combined)
+    assert isinstance(hyps_combined, list)
+    assert len(hyps_combined) > 0
+    for h in hyps_combined:
+        assert isinstance(h, MantisHypothesis)
+        assert h.rule_id.startswith("MANTIS-0DAY")
+        assert h.is_zero_day is True
+        assert isinstance(h.line_number, int)
+        assert h.line_number >= 1
+
+
+
 
 
