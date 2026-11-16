@@ -1210,10 +1210,17 @@ class MantisZeroDaySynthesizer:
     ) -> List[MantisHypothesis]:
         tm_dict = (threat_model.to_dict() if hasattr(threat_model, "to_dict") else dict(threat_model or {})) if threat_model else {}
         target = os.path.basename(str(tm_dict.get("target_repo") or "target"))
-        entry_points = [ep for ep in tm_dict.get("entry_points", []) if isinstance(ep, dict)][:10]
-        boundaries = [tb for tb in tm_dict.get("trust_boundaries", []) if isinstance(tb, dict)][:10]
-        flows = [df for df in tm_dict.get("data_flows", []) if isinstance(df, dict)][:10]
-        top_files = [(f.get("rel_path") or "") for f in tm_dict.get("risk_ranked_files", []) if isinstance(f, dict)][:5]
+        raw_eps = tm_dict.get("entry_points")
+        entry_points = [ep for ep in raw_eps if isinstance(ep, dict)][:10] if isinstance(raw_eps, list) else []
+
+        raw_tbs = tm_dict.get("trust_boundaries")
+        boundaries = [tb for tb in raw_tbs if isinstance(tb, dict)][:10] if isinstance(raw_tbs, list) else []
+
+        raw_dfs = tm_dict.get("data_flows")
+        flows = [df for df in raw_dfs if isinstance(df, dict)][:10] if isinstance(raw_dfs, list) else []
+
+        raw_rfs = tm_dict.get("risk_ranked_files")
+        top_files = [(f.get("rel_path") or "") for f in raw_rfs if isinstance(f, dict)][:5] if isinstance(raw_rfs, list) else []
 
         prompt_payload = {
             "target": target,
@@ -1257,7 +1264,10 @@ class MantisZeroDaySynthesizer:
             if not rule_id.startswith("MANTIS-0DAY"):
                 rule_id = f"MANTIS-0DAY-{rule_id.split('-')[-1]}"
             fpath = str(item.get("file_path", ""))
-            lineno = int(item.get("line_number", 1))
+            try:
+                lineno = int(item.get("line_number", 1))
+            except (ValueError, TypeError):
+                lineno = 1
             sink = str(item.get("sink", "dynamic_sink"))
             hid_seed = f"{rule_id}:{fpath}:{lineno}:{sink}"
             hid = "HYP-0DAY-" + hashlib.sha256(hid_seed.encode("utf-8")).hexdigest()[:8].upper()
@@ -1292,10 +1302,17 @@ class MantisZeroDaySynthesizer:
         code_snippets: Dict[str, str],
     ) -> List[MantisHypothesis]:
         tm_dict = (threat_model.to_dict() if hasattr(threat_model, "to_dict") else dict(threat_model or {})) if threat_model else {}
-        entry_points = [ep for ep in tm_dict.get("entry_points", []) if isinstance(ep, dict)]
-        boundaries = [tb for tb in tm_dict.get("trust_boundaries", []) if isinstance(tb, dict)]
-        flows = [df for df in tm_dict.get("data_flows", []) if isinstance(df, dict)]
-        ranked_files = [rf for rf in tm_dict.get("risk_ranked_files", []) if isinstance(rf, dict)]
+        raw_eps = tm_dict.get("entry_points")
+        entry_points = [ep for ep in raw_eps if isinstance(ep, dict)] if isinstance(raw_eps, list) else []
+
+        raw_tbs = tm_dict.get("trust_boundaries")
+        boundaries = [tb for tb in raw_tbs if isinstance(tb, dict)] if isinstance(raw_tbs, list) else []
+
+        raw_dfs = tm_dict.get("data_flows")
+        flows = [df for df in raw_dfs if isinstance(df, dict)] if isinstance(raw_dfs, list) else []
+
+        raw_rfs = tm_dict.get("risk_ranked_files")
+        ranked_files = [rf for rf in raw_rfs if isinstance(rf, dict)] if isinstance(raw_rfs, list) else []
         target_repo = str(tm_dict.get("target_repo") or ".")
 
         path_map: Dict[str, str] = {}
@@ -1342,7 +1359,10 @@ class MantisZeroDaySynthesizer:
         for ep in entry_points:
             ep_file = ep.get("file") or ""
             ep_func = ep.get("function") or ""
-            ep_line = ep.get("line") or 1
+            try:
+                ep_line = int(ep.get("line") or 1)
+            except (ValueError, TypeError):
+                ep_line = 1
             ep_args = ep.get("args") or []
             matching_boundaries = [
                 b for b in boundaries
@@ -1350,7 +1370,10 @@ class MantisZeroDaySynthesizer:
             ]
             for tb in matching_boundaries:
                 full_fpath = resolve_full_path(tb.get("file") or ep_file)
-                line_no = int(tb.get("line") or ep_line)
+                try:
+                    line_no = int(tb.get("line") or ep_line)
+                except (ValueError, TypeError):
+                    line_no = 1
                 sink_name = str(tb.get("boundary") or "untrusted_boundary_sink")
                 key = ("MANTIS-0DAY-XFLOW-001", full_fpath, line_no)
                 if key in seen_keys:
@@ -1378,7 +1401,7 @@ class MantisZeroDaySynthesizer:
                         line_number=line_no,
                         function_name=ep_func,
                         sink=sink_name,
-                        source_hint=",".join(ep_args) or "untrusted_entry_args",
+                        source_hint=",".join(str(a) for a in ep_args) if isinstance(ep_args, list) else (str(ep_args) if ep_args else "untrusted_entry_args"),
                         code_snippet=snippet,
                         raw_severity=sev,
                         confidence=conf,
@@ -1400,7 +1423,10 @@ class MantisZeroDaySynthesizer:
         for ep in entry_points:
             ep_file = ep.get("file") or ""
             ep_func = ep.get("function") or ""
-            ep_line = ep.get("line") or 1
+            try:
+                ep_line = int(ep.get("line") or 1)
+            except (ValueError, TypeError):
+                ep_line = 1
             is_net = bool(ep.get("network_exposed", False))
             func_low = ep_func.lower()
             if is_net or any(k in func_low for k in ("handle", "route", "parse", "process", "stream", "proxy", "server", "query")):
@@ -1444,8 +1470,14 @@ class MantisZeroDaySynthesizer:
         # Multi-Vector 3: High-Risk File Multi-Primitive Chaining
         for rf in ranked_files[:4]:
             fpath = rf.get("file_path") or ""
-            reasons = rf.get("reasons") or []
-            score = rf.get("risk_score") or 0
+            reasons = rf.get("reasons")
+            if not isinstance(reasons, (list, tuple, set)):
+                reasons = [reasons] if reasons is not None else []
+            raw_score = rf.get("risk_score")
+            try:
+                score = int(raw_score) if raw_score is not None else 0
+            except (ValueError, TypeError):
+                score = 0
             if score >= 35 or any("marker:" in str(r) for r in reasons):
                 key = ("MANTIS-0DAY-CHAIN-003", fpath, 1)
                 if key in seen_keys:

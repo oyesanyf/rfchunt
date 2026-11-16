@@ -725,3 +725,47 @@ def test_unified_all_scans_string_entry_points_and_findings_resilience(monkeypat
     assert unified_res.get("chains_synthesized", 0) > 0 or artex_status.get("chains_synthesized", 0) > 0
 
 
+def test_zero_day_synthesizer_none_list_fields_and_string_scores():
+    """Regression test: adversarial threat models with None list fields and non-int scores do not raise exceptions."""
+    synth = MantisZeroDaySynthesizer()
+
+    adversarial_threat_models = [
+        {
+            "entry_points": None,
+            "data_flows": None,
+            "trust_boundaries": None,
+            "risk_ranked_files": None,
+        },
+        {
+            "entry_points": None,
+        },
+        {
+            "data_flows": None,
+        },
+        {
+            "trust_boundaries": None,
+        },
+        {
+            "risk_ranked_files": None,
+        },
+        {
+            "risk_ranked_files": [{"file_path": "test.py", "risk_score": "not_an_int"}],
+        },
+        {
+            "entry_points": [None, 999, "invalid_ep", {"file": "a.py", "function": "fn", "line": "not_an_int", "args": [1, 2, "arg3"]}],
+            "trust_boundaries": [None, "invalid_tb", {"file": "a.py", "boundary": "os.system", "line": "bad_line"}],
+            "data_flows": [None, 123, {"source": "a.py", "sink": "os.system"}],
+            "risk_ranked_files": [None, 999, "str_file", {"file_path": "a.py", "risk_score": "not_an_int", "reasons": None}],
+        },
+    ]
+
+    for tm in adversarial_threat_models:
+        hyps = synth.synthesize_hypotheses(tm)
+        assert isinstance(hyps, list)
+        for h in hyps:
+            assert isinstance(h, MantisHypothesis)
+            assert h.rule_id.startswith("MANTIS-0DAY")
+            assert h.is_zero_day is True
+
+
+
