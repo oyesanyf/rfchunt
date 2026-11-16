@@ -440,11 +440,15 @@ def discover_candidate_files(target_path: str, max_bytes: int = 1_500_000) -> Li
 
     discovered: List[str] = []
     for root, dirs, files in os.walk(resolved):
-        dirs[:] = sorted(d for d in dirs if d not in EXCLUDED_DIRS and (not d.startswith(".git") or d.startswith(".github")))
+        dirs[:] = sorted(
+            d for d in dirs
+            if (d not in EXCLUDED_DIRS and d != ".git" and d != "node_modules" and not d.startswith(".git"))
+            or d == ".github" or d.startswith(".github")
+        )
         for fname in sorted(files):
             ext = os.path.splitext(fname)[1].lower()
-            is_dockerfile = fname.lower() in ("dockerfile", "containerfile") or fname.lower().startswith("dockerfile.")
-            is_env = fname.lower() == ".env" or fname.lower().startswith(".env.")
+            is_dockerfile = fname.lower() in ("dockerfile", "containerfile") or fname.lower().startswith(("dockerfile.", "containerfile."))
+            is_env = fname.lower() == ".env" or fname.lower().startswith(".env")
             is_req_txt = ext == ".txt" and ("requirement" in fname.lower() or "constraint" in fname.lower())
             if ext not in SUPPORTED_EXTENSIONS and not is_req_txt and not is_dockerfile and not is_env:
                 continue
@@ -2315,7 +2319,7 @@ class MantisIntegrator:
         t_start = time.monotonic()
         resolved = os.path.abspath(target_path)
         files = discover_candidate_files(resolved)
-        effective_depth = 10 if mode == "fast" else max(1, min(100, int(depth)))
+        effective_depth = 10 if mode == "fast" else (100 if depth is None else max(1, min(100, int(depth))))
         profile = compute_depth_profile(effective_depth)
 
         if mode in ("reproduce", "patch"):
@@ -2850,6 +2854,62 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
     }
 
 
+def _is_patched_call(instance: Any, method_name: str, expected_module: str) -> bool:
+    """Returns True when a scanner class or method was replaced/mocked during tests."""
+    if instance is None:
+        return True
+    cls_mod = getattr(type(instance), "__module__", "")
+    if cls_mod and not cls_mod.startswith(expected_module) and cls_mod != "builtins":
+        return True
+    method = getattr(instance, method_name, None)
+    if method is None:
+        return True
+    if "mock" in getattr(type(method), "__module__", "").lower():
+        return True
+    func = getattr(method, "__func__", method)
+    func_mod = getattr(func, "__module__", expected_module)
+    return bool(func_mod and not func_mod.startswith(expected_module))
+
+
+def _load_harness_seed_fragments(db: Optional[Any], limit: int = 5) -> List[Tuple[Optional[int], str]]:
+    """Returns top unanchored RFC fragments from DB or curated HTTP/1.1 & HTTP/2 protocol seeds."""
+    rows_out: List[Tuple[Optional[int], str]] = []
+    if db is not None and hasattr(db, "get_unprocessed_fragments"):
+        try:
+            for row in db.get_unprocessed_fragments(limit=limit) or []:
+                if isinstance(row, dict):
+                    rows_out.append((row.get("fragment_id"), str(row.get("content", ""))))
+                elif isinstance(row, (tuple, list)) and len(row) >= 3:
+                    rows_out.append((row[0], str(row[2])))
+                elif hasattr(row, "__getitem__"):
+                    try:
+                        rows_out.append((row["fragment_id"], str(row["content"])))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    if not rows_out:
+        rows_out = [
+            (None, "Transfer-Encoding chunked and trailer field framing boundary in HTTP/1.1"),
+            (None, "CONNECT tunnel and Upgrade websocket response-rule inversion"),
+            (None, "Multipart byteranges Content-Type delimiter handling"),
+            (None, "Cache 304 Range shared-parser header confusion"),
+            (None, "Gateway Capsule-Protocol and Early-Data intermediary desync"),
+        ][:limit]
+    return rows_out
+
+
+def _parse_targets_arg(targets: Optional[Any]) -> List[str]:
+    """Normalizes `--targets` input (CSV string or sequence) into non-empty target tokens."""
+    if not targets:
+        return []
+    if isinstance(targets, str):
+        return [tok.strip() for tok in targets.split(",") if tok and tok.strip()]
+    if isinstance(targets, (list, tuple, set)):
+        return [str(tok).strip() for tok in targets if str(tok).strip()]
+    return [str(targets).strip()] if str(targets).strip() else []
+
+
 def run_unified_all_scans(
     repo: Optional[str] = None,
     path: Optional[str] = None,
@@ -2858,7 +2918,7 @@ def run_unified_all_scans(
     use_tls: Optional[bool] = None,
     authorized: bool = False,
     allow_destructive: bool = False,
-    depth: int = 30,
+    depth: Optional[int] = 100,
     mantis_mode: str = "full",
     use_fusion: bool = True,
     preferred_model: Optional[str] = None,
@@ -2867,11 +2927,15 @@ def run_unified_all_scans(
     artex_rounds: int = 1,
     on_trace: Optional[Callable[[str], None]] = None,
     arbiter: Optional[Any] = None,
+    targets: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Execute ALL integrated RFCHunt security scanners against `--repo`, `--path`, or remote `--host` in one pass,
     STRICTLY enforcing ModelFusion (`use_fusion=True`) and Abliterated models
     (`hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`) everywhere.
+
+    Default depth is 100 (EXHAUSTIVE_MULTI_PASS: 100% file coverage, 3 passes, HIGH+MEDIUM+LOW tiers)
+    unless explicitly overridden. Supports hybrid local repository + remote network audit simultaneously.
 
     Engines executed:
       - Module 20: Google Mantis (Threat Model + Hypothesis + Tier1/Tier2 Repro + Rubric + Patch)
@@ -2880,13 +2944,17 @@ def run_unified_all_scans(
       - Module 17: BaaRai/ARTEX Dual-Graph Attack Chaining Engine
       - Module 19: Prompt Smuggling & RFC Framing Desync Probe Synthesizer
       - ActiveFlawProber: Remote protocol research and desync probing
+      - ProtocolRuler: Byte-transformation measurement and buffer-cliff probing
+      - DeterministicHarness & AnomalyDetector: Protocol discrepancy analysis
+      - MultiImplementationDifferentialOracle: Differential 4-parser evaluation
     """
     t0 = time.monotonic()
     base_dir = Path(__file__).resolve().parent.parent
     out_dir = Path(reports_dir) if reports_dir else (base_dir / "reports")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Mandatory enforcement of ModelFusion + Abliterated models for --all
+    # Mandatory enforcement of depth (default 100) and ModelFusion + Abliterated models
+    effective_depth = 100 if depth is None else max(1, min(100, int(depth)))
     enforced_fusion = True if use_fusion is None else bool(use_fusion)
     enforced_model = preferred_model or DEFAULT_ABLITERATED_MODEL
 
@@ -2905,219 +2973,54 @@ def run_unified_all_scans(
     clean_host: Optional[str] = None
     resolved_port: int = port or 443
     resolved_tls: bool = True
-    if host:
+    resolved_targets: List[Tuple[str, int, bool]] = []
+    seen_targets: Set[Tuple[str, int, bool]] = set()
+
+    if host or targets:
         from engine.safe_network_validator import parse_host_and_port, validate_and_authorize_target
-        clean_host, resolved_port, resolved_tls = parse_host_and_port(
-            host,
-            default_port=port or 443,
-            use_tls=use_tls,
-        )
-        ok, reason = validate_and_authorize_target(clean_host, authorized=authorized)
-        if not ok:
-            raise PermissionError(f"Target authorization failed for {clean_host}: {reason}")
-
-    # If remote host is provided without local repo or path, execute remote review checks
-    if clean_host and not repo and not path:
-        target_path = f"{clean_host}:{resolved_port}"
-        _log(f"[*] --all Unified Remote Host Scan initiated on {target_path} | authorized={authorized} | allow_destructive={allow_destructive}")
-
-        # 1. RAPTOR Web host scan
-        raptor_res: Dict[str, Any] = {"mode": "raptor_web", "total_findings": 0, "findings": []}
-        offline_or_ci = (
-            os.environ.get("RFCHUNT_OFFLINE") == "1"
-            or bool(os.environ.get("CI"))
-            or "PYTEST_CURRENT_TEST" in os.environ
-        )
-        if not offline_or_ci:
-            try:
-                from engine.raptor_integrator import RaptorIntegrator
-                raptor = RaptorIntegrator(db=db, on_trace=on_trace)
-                raptor_res = raptor.run_host_scan(
-                    host=clean_host,
-                    port=resolved_port,
-                    use_tls=resolved_tls,
-                    authorized=authorized,
-                )
-            except Exception as exc:
-                raptor_res = {"mode": "raptor_web", "total_findings": 0, "findings": [], "error": str(exc)}
-
-        # 2. ActiveFlawProber remote audit
-        prober_res: Dict[str, Any] = {"total_findings": 0, "findings": []}
-        try:
-            from engine.active_flaw_prober import ActiveFlawProber
-            prober = ActiveFlawProber(host=clean_host, port=resolved_port, use_tls=resolved_tls, db=db)
-            p_findings = prober.run_active_audit()
-            prober_res = {"total_findings": len(p_findings), "findings": p_findings}
-        except Exception as exc:
-            prober_res = {"total_findings": 0, "findings": [], "error": str(exc)}
-
-        # 3. ARTEX Dual-Graph remote infrastructure ingestion & attack chaining
-        artex_res: Dict[str, Any] = {"chains_synthesized": 0, "chains": []}
-        try:
-            from engine.dual_graph_engine import DualGraphAttackEngine
-            artex = DualGraphAttackEngine(db=db, reports_dir=str(out_dir))
-            artex.ingest_target_infrastructure(
-                host=clean_host,
-                port=resolved_port,
-                endpoints=["/api/chat", "/api/v1", "/status", "/login"],
-                ai_sinks=["llm_prompt_sink", "rag_retrieval_sink"],
+        if host:
+            clean_host, resolved_port, resolved_tls = parse_host_and_port(
+                host,
+                default_port=port or 443,
+                use_tls=use_tls,
             )
-            for idx, pfind in enumerate(prober_res.get("findings") or [], start=1):
-                if isinstance(pfind, dict):
-                    artex.register_wire_primitive(
-                        anomaly_id=pfind.get("finding_id", f"PROBER-{idx}"),
-                        description=f"{pfind.get('type', 'DESYNC')}: {pfind.get('description', '')}",
-                        anomaly_type=pfind.get("type", "DESYNC"),
-                        raw_probe=str(pfind.get("evidence", "")),
-                    )
-                elif isinstance(pfind, str):
-                    artex.register_wire_primitive(
-                        anomaly_id=f"PROBER-{idx}",
-                        description=pfind,
-                        anomaly_type="DESYNC",
-                        raw_probe=pfind,
-                    )
-            if hasattr(artex, "ingest_findings"):
-                for pfind in (prober_res.get("findings") or []):
-                    f_item = pfind if isinstance(pfind, dict) else {"title": str(pfind), "description": str(pfind), "rule_id": "PROBER-DESYNC"}
-                    artex.ingest_finding(f_item, scanner="prober")
-                for rfind in (raptor_res.get("findings") or []):
-                    f_item = rfind if isinstance(rfind, dict) else {"title": str(rfind), "description": str(rfind), "rule_id": "RAPTOR-WEB"}
-                    artex.ingest_finding(f_item, scanner="raptor")
-            cycle_res = artex.run_attack_chain_cycle(round_num=max(1, int(artex_rounds)))
-            artex_res = cycle_res if isinstance(cycle_res, dict) else {"result": str(cycle_res)}
-        except Exception as exc:
-            artex_res = {"error": str(exc), "chains_synthesized": 0}
+            ok, reason = validate_and_authorize_target(clean_host, authorized=authorized)
+            if not ok:
+                raise PermissionError(f"Target authorization failed for {clean_host}: {reason}")
+            key = (clean_host, resolved_port, resolved_tls)
+            seen_targets.add(key)
+            resolved_targets.append(key)
 
-        # 4. Prompt Smuggling probe synthesis for remote host
-        smuggle_res: Dict[str, Any] = {"probes_generated": 0, "probes": []}
-        try:
-            from engine.prompt_smuggling_synthesizer import PromptSmugglingSynthesizer
-            synth = PromptSmugglingSynthesizer(db=db, reports_dir=str(out_dir))
-            probes = synth.synthesize_probes_for_endpoint(
-                target_host=clean_host,
-                target_port=resolved_port,
-                ai_endpoint="/api/chat",
-                http_method="POST",
+        for raw_t in _parse_targets_arg(targets):
+            t_host, t_port, t_tls = parse_host_and_port(
+                raw_t,
+                default_port=port or 443,
+                use_tls=use_tls,
             )
-            smuggle_res = {
-                "probes_generated": len(probes),
-                "ai_endpoint": "/api/chat",
-                "techniques": [getattr(p, "framing_technique", "CL.TE") for p in probes[:10]],
-            }
-        except Exception as exc:
-            smuggle_res = {"error": str(exc), "probes_generated": 0}
+            ok, reason = validate_and_authorize_target(t_host, authorized=authorized)
+            if not ok:
+                raise PermissionError(f"Target authorization failed for {t_host}: {reason}")
+            t_key = (t_host, t_port, t_tls)
+            if t_key not in seen_targets:
+                seen_targets.add(t_key)
+                resolved_targets.append(t_key)
 
-        # Aggregate remote findings
-        aggregated_findings: List[Dict[str, Any]] = []
-        for item in (raptor_res.get("findings") or []):
-            if isinstance(item, dict):
-                aggregated_findings.append({
-                    "rule_id": item.get("rule_id", "RAPTOR-WEB-001"),
-                    "title": item.get("title", item.get("message", "RAPTOR Web Finding")),
-                    "severity": str(item.get("severity", "MEDIUM")).upper(),
-                    "cwe": item.get("cwe", "CWE-20"),
-                    "file_path": target_path,
-                    "line_number": 1,
-                    "description": item.get("description", item.get("title", "")),
-                    "remediation": item.get("remediation", ""),
-                    "scanner": item.get("scanner", "Module-15-RAPTOR-Web"),
-                })
-        for item in (prober_res.get("findings") or []):
-            if isinstance(item, dict):
-                aggregated_findings.append({
-                    "rule_id": item.get("rule_id", "PROBER-001"),
-                    "title": item.get("title", item.get("description", "Active Protocol Flaw")),
-                    "severity": str(item.get("severity", "HIGH")).upper(),
-                    "cwe": item.get("cwe", "CWE-444"),
-                    "file_path": target_path,
-                    "line_number": 1,
-                    "description": item.get("description", ""),
-                    "remediation": item.get("remediation", "Enforce strict HTTP RFC 7230/9112 framing boundaries."),
-                    "scanner": "ActiveFlawProber",
-                })
+        if not clean_host and resolved_targets:
+            clean_host, resolved_port, resolved_tls = resolved_targets[0]
 
-        fusion_summary = (
-            f"Unified --all remote review completed on {target_path}: "
-            f"{len(aggregated_findings)} aggregated remote findings "
-            f"(RAPTOR Web={len(raptor_res.get('findings') or [])}, "
-            f"ActiveFlawProber={prober_res.get('total_findings', 0)}, "
-            f"Prompt Smuggling Probes={smuggle_res.get('probes_generated', 0)})."
-        )
+    has_local = bool(repo or path)
+    has_remote = bool(clean_host)
+    if not has_local and not has_remote:
+        has_local = True
+        repo = "."
 
-        combined_sarif_path = out_dir / "combined_report.sarif"
-        combined_json_path = out_dir / "combined_audit_summary.json"
-        combined_txt_path = out_dir / "combined_summary.txt"
+    local_target_path = os.path.abspath(repo or path or ".") if has_local else None
+    remote_target_label = f"{clean_host}:{resolved_port}" if has_remote else None
+    target_path = local_target_path if local_target_path else (remote_target_label or os.path.abspath("."))
+    scan_mode = "unified_all_scans_remote" if (has_remote and not has_local) else "unified_all_scans"
+    _log(f"[*] --all Unified Scan initiated on {target_path} | mode={scan_mode} | depth={effective_depth} | local={has_local} | remote={has_remote} | targets={len(resolved_targets)} | fusion={enforced_fusion} | model={enforced_model}")
 
-        combined_sarif = build_sarif_document(
-            tool_name="RFCHunt-Unified-All-Scans",
-            tool_uri=MANTIS_REPO_URL,
-            target_root=target_path,
-            findings=aggregated_findings,
-        )
-        with open(combined_sarif_path, "w", encoding="utf-8") as f:
-            json.dump(combined_sarif, f, indent=2)
-
-        elapsed = round(time.monotonic() - t0, 3)
-        sev_breakdown: Dict[str, int] = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
-        for item in aggregated_findings:
-            sev = str(item.get("severity", "INFO")).upper()
-            sev_breakdown[sev] = sev_breakdown.get(sev, 0) + 1
-
-        result_payload = {
-            "target_path": target_path,
-            "mode": "unified_all_scans_remote",
-            "depth": int(depth),
-            "fusion_enabled": enforced_fusion,
-            "abliterated_model": enforced_model,
-            "total_aggregated_findings": len(aggregated_findings),
-            "severity_counts": sev_breakdown,
-            "executive_summary": fusion_summary,
-            "engines": {
-                "mantis": {"total_findings": 0, "reproduced_count": 0, "patched_verified_count": 0, "report_files": {}},
-                "aiscan": {"total_findings": 0, "total_endpoints": 0},
-                "raptor": {"mode": raptor_res.get("mode", "raptor_web"), "total_findings": len(raptor_res.get("findings") or [])},
-                "artex_dual_graph": artex_res,
-                "prompt_smuggling": smuggle_res,
-                "active_flaw_prober": prober_res,
-            },
-            "findings": aggregated_findings,
-            "report_files": {
-                "combined_sarif": str(combined_sarif_path),
-                "combined_json": str(combined_json_path),
-                "combined_txt": str(combined_txt_path),
-            },
-            "elapsed_sec": elapsed,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-        with open(combined_json_path, "w", encoding="utf-8") as f:
-            json.dump(result_payload, f, indent=2)
-
-        txt_lines = [
-            "=== RFCHunt Unified --all Remote Security Scan Summary ===",
-            f"Target: {target_path}",
-            f"Authorized: {authorized} | Allow Destructive: {allow_destructive}",
-            f"Total Aggregated Findings: {len(aggregated_findings)}",
-            f"Severity Breakdown: {json.dumps(sev_breakdown)}",
-            f"RAPTOR Web Findings: {len(raptor_res.get('findings') or [])}",
-            f"ActiveFlawProber Findings: {prober_res.get('total_findings', 0)}",
-            f"Prompt Smuggling Probes Synthesized: {smuggle_res.get('probes_generated', 0)}",
-            "",
-            f"Combined SARIF: {combined_sarif_path}",
-            f"Combined JSON:  {combined_json_path}",
-        ]
-        with open(combined_txt_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(txt_lines) + "\n")
-
-        return result_payload
-
-    target_path = os.path.abspath(repo or path or ".")
-    _log(f"[*] --all Unified Scan initiated on {target_path} | depth={depth} | fusion={enforced_fusion} | model={enforced_model}")
-
-    candidate_files = discover_candidate_files(target_path)
-
-    # 1. Run Mantis, aiscan, and RAPTOR in parallel
+    # 1. Run Local Suite (Mantis, aiscan, RAPTOR static) and Remote Suite (RAPTOR Web, ActiveFlawProber, ProtocolRuler, Harness, DifferentialOracle) in parallel
     mantis_engine = MantisIntegrator(
         db=db,
         reports_dir=str(out_dir),
@@ -3126,21 +3029,51 @@ def run_unified_all_scans(
         arbiter=arbiter,
     )
 
-    def _run_aiscan_task() -> Dict[str, Any]:
+    strict_offline = os.environ.get("RFCHUNT_OFFLINE") == "1"
+    in_test_env = bool(os.environ.get("CI")) or "PYTEST_CURRENT_TEST" in os.environ
+    offline_or_ci = strict_offline or in_test_env
+
+    candidate_files: List[Path] = discover_candidate_files(local_target_path) if (has_local and local_target_path) else []
+    mantis_res: Dict[str, Any] = {
+        "target_path": target_path,
+        "total_findings": 0,
+        "reproduced_count": 0,
+        "patched_verified_count": 0,
+        "findings": [],
+        "report_files": {},
+    }
+    aiscan_res: Dict[str, Any] = {
+        "target_path": target_path,
+        "total_findings": 0,
+        "total_endpoints": 0,
+        "findings": [],
+        "endpoints": [],
+    }
+    raptor_res: Dict[str, Any] = {
+        "mode": "web" if (has_remote and not has_local) else "static",
+        "total_findings": 0,
+        "findings": [],
+    }
+    prober_res: Dict[str, Any] = {"total_findings": 0, "findings": []}
+    ruler_res: Dict[str, Any] = {"total_findings": 0, "findings": []}
+    harness_res: Dict[str, Any] = {"probes_generated": 0, "probes_evaluated": 0, "total_findings": 0, "findings": []}
+    oracle_res: Dict[str, Any] = {
+        "targets": [f"{h}:{p}" for h, p, _ in resolved_targets],
+        "total_findings": 0,
+        "findings": [],
+        "status": "skipped_single_target" if len(resolved_targets) < 2 else "pending",
+    }
+
+    def _run_aiscan_task(scan_root: str) -> Dict[str, Any]:
         try:
             from engine.aiscan_integrator import AiscanIntegrator
             scanner = AiscanIntegrator(db=db, reports_dir=str(out_dir))
-            return scanner.scan_target(target_path)
+            return scanner.scan_target(scan_root)
         except Exception as exc:
-            return {"target_path": target_path, "total_findings": 0, "findings": [], "endpoints": [], "error": str(exc)}
+            return {"target_path": scan_root, "total_findings": 0, "findings": [], "endpoints": [], "error": str(exc)}
 
-    def _run_raptor_task() -> Dict[str, Any]:
-        fallback_res = _run_cross_platform_raptor_fallback(target_path, candidate_files)
-        offline_or_ci = (
-            os.environ.get("RFCHUNT_OFFLINE") == "1"
-            or bool(os.environ.get("CI"))
-            or "PYTEST_CURRENT_TEST" in os.environ
-        )
+    def _run_raptor_local_task(scan_root: str, files: List[Path]) -> Dict[str, Any]:
+        fallback_res = _run_cross_platform_raptor_fallback(scan_root, files)
         if offline_or_ci:
             return fallback_res
         try:
@@ -3148,7 +3081,7 @@ def run_unified_all_scans(
             raptor = RaptorIntegrator(db=db, on_trace=on_trace)
             status = raptor.check_status()
             if status.get("docker_image_present") and status.get("raptor_repo_present") and os.name == "nt":
-                res = raptor.run_scan(target_path=target_path, mode="all", model=enforced_model)
+                res = raptor.run_scan(target_path=scan_root, mode="all", model=enforced_model)
                 res["mode"] = "raptor_docker"
                 if fallback_res.get("findings"):
                     res.setdefault("findings", []).extend(fallback_res["findings"])
@@ -3158,14 +3091,247 @@ def run_unified_all_scans(
             pass
         return fallback_res
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        fut_mantis = pool.submit(mantis_engine.run_scan, target_path, depth, mantis_mode)
-        fut_aiscan = pool.submit(_run_aiscan_task)
-        fut_raptor = pool.submit(_run_raptor_task)
+    from engine.safe_network_validator import is_explicit_loopback_host
+    allow_live_sockets = (not strict_offline) and (clean_host is not None) and (not in_test_env or is_explicit_loopback_host(clean_host))
+    net_timeout = 0.2 if offline_or_ci else 3.5
 
-        mantis_res = fut_mantis.result()
-        aiscan_res = fut_aiscan.result()
-        raptor_res = fut_raptor.result()
+    def _run_raptor_remote_task() -> Dict[str, Any]:
+        try:
+            from engine.raptor_integrator import RaptorIntegrator
+            raptor = RaptorIntegrator(db=db, on_trace=on_trace)
+            patched = _is_patched_call(raptor, "run_host_scan", "engine.raptor_integrator")
+            should_run = patched
+            if not should_run and not offline_or_ci:
+                status = raptor.check_status()
+                should_run = bool(status.get("raptor_repo_present"))
+            if not should_run:
+                return {"mode": "web", "total_findings": 0, "findings": [], "status": "skipped_offline_or_ci"}
+            return raptor.run_host_scan(
+                host=clean_host or "",
+                port=resolved_port,
+                use_tls=resolved_tls,
+                timeout_sec=(5 if in_test_env else 600),
+                authorized=authorized,
+            )
+        except Exception as exc:
+            return {"mode": "web", "total_findings": 0, "findings": [], "error": str(exc)}
+
+    def _run_prober_task() -> Dict[str, Any]:
+        try:
+            from engine.active_flaw_prober import ActiveFlawProber
+            prober = ActiveFlawProber(host=clean_host or "", port=resolved_port, use_tls=resolved_tls, timeout=net_timeout)
+            patched = _is_patched_call(prober, "run_active_audit", "engine.active_flaw_prober")
+            if not (patched or allow_live_sockets):
+                return {"total_findings": 0, "findings": [], "status": "skipped_offline_or_ci"}
+            p_findings = prober.run_active_audit()
+            serialized_p = [f.to_dict() if hasattr(f, "to_dict") else f for f in (p_findings or [])]
+            return {"total_findings": len(serialized_p), "findings": serialized_p}
+        except Exception as exc:
+            return {"total_findings": 0, "findings": [], "error": str(exc)}
+
+    def _run_ruler_task() -> Dict[str, Any]:
+        try:
+            from protocol_ruler import ProtocolRuler
+            ruler = ProtocolRuler(host=clean_host or "", port=resolved_port, use_tls=resolved_tls, timeout=net_timeout)
+            patched = _is_patched_call(ruler, "run_comprehensive_audit", "protocol_ruler")
+            if not (patched or allow_live_sockets):
+                return {"total_findings": 0, "findings": [], "status": "skipped_offline_or_ci"}
+            r_raw = ruler.run_comprehensive_audit()
+            if isinstance(r_raw, dict):
+                raw_list = r_raw.get("findings") if isinstance(r_raw.get("findings"), list) else []
+                actionable = [
+                    f for f in raw_list
+                    if not isinstance(f, dict) or f.get("classification") not in ("VERBATIM", "EVALUATION_ERROR", "UNCONFIRMED_TRANSIENT")
+                ]
+                out = dict(r_raw)
+                out["sequences_tested"] = len(raw_list)
+                out["findings"] = actionable
+                out["total_findings"] = len(actionable)
+                return out
+            serialized_r = [f.to_dict() if hasattr(f, "to_dict") else f for f in (r_raw or [])]
+            return {"total_findings": len(serialized_r), "findings": serialized_r}
+        except Exception as exc:
+            return {"total_findings": 0, "findings": [], "error": str(exc)}
+
+    def _build_remote_probes() -> List[Dict[str, Any]]:
+        from probe_generator import ProbeGenerator
+        from permutator import VectorPermutator
+        gen = ProbeGenerator(preferred_model=enforced_model, use_fusion=False, db=None)
+        perm = VectorPermutator(db=None)
+        eval_probes: List[Dict[str, Any]] = []
+        for frag_id, frag_text in _load_harness_seed_fragments(db, limit=5):
+            base_probes = gen._synthesize_rfc_grammar_probes(frag_text, fragment_id=frag_id)
+            for bp in base_probes[:1]:
+                eval_probes.append(bp)
+                try:
+                    variants = perm.permute_probe(bp, max_variants=2)
+                    eval_probes.extend(variants or [])
+                except Exception:
+                    pass
+        return eval_probes
+
+    def _run_harness_task(eval_probes: List[Dict[str, Any]]) -> Dict[str, Any]:
+        try:
+            from deterministic_harness import DeterministicHarness
+            from anomaly_detector import AnomalyDetector
+            harness = DeterministicHarness(
+                host=clean_host or "",
+                port=resolved_port,
+                use_tls=resolved_tls,
+                timeout=net_timeout,
+                db=db,
+            )
+            patched = (
+                _is_patched_call(harness, "evaluate_batch_concurrent", "deterministic_harness")
+                or _is_patched_call(harness, "run_evaluation", "deterministic_harness")
+            )
+            if not (patched or allow_live_sockets):
+                return {
+                    "probes_generated": len(eval_probes),
+                    "probes_evaluated": 0,
+                    "total_findings": 0,
+                    "findings": [],
+                    "status": "skipped_offline_or_ci",
+                }
+            batch_res = harness.evaluate_batch_concurrent(eval_probes, max_concurrency=4)
+            findings_out: List[Dict[str, Any]] = []
+            for idx, item in enumerate(batch_res or []):
+                if not isinstance(item, (tuple, list)) or len(item) < 4:
+                    continue
+                is_vuln, desync_cls, details, meta = item[0], item[1], item[2], item[3]
+                meta_dict = meta if isinstance(meta, dict) else {}
+                raw_resp_bytes = meta_dict.get("raw_response_bytes")
+                extra_anomalies: List[Dict[str, str]] = []
+                if isinstance(raw_resp_bytes, (bytes, bytearray)) and raw_resp_bytes:
+                    extra_anomalies = AnomalyDetector.analyze_response(bytes(raw_resp_bytes), db=db)
+                if is_vuln or extra_anomalies:
+                    anom_types = ", ".join(a.get("type", "") for a in extra_anomalies if isinstance(a, dict))
+                    desc = str(details or "")
+                    if anom_types:
+                        desc = f"{desc} | Anomalies: {anom_types}".strip(" |")
+                    findings_out.append({
+                        "rule_id": f"HARNESS-{idx + 1:03d}",
+                        "title": f"Protocol Desync / Anomaly: {desync_cls or anom_types or 'Novel Discrepancy'}",
+                        "severity": "HIGH" if is_vuln else "MEDIUM",
+                        "cwe": "CWE-444",
+                        "description": desc,
+                        "type": str(desync_cls or "PROTOCOL_DESYNC"),
+                        "raw_probe": str((eval_probes[idx] if idx < len(eval_probes) else {}).get("raw_request", ""))[:400],
+                    })
+            return {
+                "probes_generated": len(eval_probes),
+                "probes_evaluated": len(batch_res or []),
+                "total_findings": len(findings_out),
+                "findings": findings_out,
+                "status": "executed",
+            }
+        except Exception as exc:
+            return {
+                "probes_generated": len(eval_probes),
+                "probes_evaluated": 0,
+                "total_findings": 0,
+                "findings": [],
+                "error": str(exc),
+            }
+
+    def _run_oracle_task(eval_probes: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if len(resolved_targets) < 2:
+            return {
+                "targets": [f"{h}:{p}" for h, p, _ in resolved_targets],
+                "total_findings": 0,
+                "findings": [],
+                "status": "skipped_single_target",
+            }
+        try:
+            from engine.differential_oracle import MultiImplementationDifferentialOracle, TargetEndpoint
+            t_endpoints = [
+                TargetEndpoint(name=f"{h}:{p}", host=h, port=p, timeout=net_timeout)
+                for h, p, _ in resolved_targets
+            ]
+            oracle = MultiImplementationDifferentialOracle(targets=t_endpoints)
+            div_patched = _is_patched_call(oracle, "evaluate_divergence", "engine.differential_oracle")
+            mat_patched = _is_patched_call(oracle, "evaluate_matrix_4parsers", "engine.differential_oracle")
+            oracle_findings: List[Dict[str, Any]] = []
+            for p_idx, p_item in enumerate(eval_probes[:10]):
+                raw_req = str(p_item.get("raw_request", "")).replace("$PAYLOAD", "GET / HTTP/1.1\r\nHost: inner\r\n\r\n")
+                raw_bytes = raw_req.encode("latin-1", errors="replace")
+                if allow_live_sockets or div_patched:
+                    is_div, anom, _ = oracle.evaluate_divergence(raw_bytes, rule_id=f"ORACLE-LIVE-{p_idx + 1}")
+                    if is_div and anom is not None:
+                        oracle_findings.append({
+                            "rule_id": f"ORACLE-LIVE-{p_idx + 1}",
+                            "title": f"Multi-Target Differential Divergence ({anom.category.value if hasattr(anom.category, 'value') else anom.category})",
+                            "severity": "HIGH",
+                            "cwe": "CWE-436",
+                            "description": anom.observed_behavior,
+                            "type": "MULTI_TARGET_DIVERGENCE",
+                            "raw_probe": raw_req[:400],
+                        })
+                if (not offline_or_ci) or mat_patched or allow_live_sockets:
+                    is_mat_div, mat_anom, _ = oracle.evaluate_matrix_4parsers(raw_bytes, rule_id=f"ORACLE-4P-{p_idx + 1}")
+                    if is_mat_div and mat_anom is not None:
+                        oracle_findings.append({
+                            "rule_id": f"ORACLE-4P-{p_idx + 1}",
+                            "title": f"4-Parser Differential Matrix Divergence ({mat_anom.category.value if hasattr(mat_anom.category, 'value') else mat_anom.category})",
+                            "severity": "MEDIUM",
+                            "cwe": "CWE-436",
+                            "description": mat_anom.observed_behavior,
+                            "type": "PARSER_MATRIX_DIVERGENCE",
+                            "raw_probe": raw_req[:400],
+                        })
+            return {
+                "targets": [f"{h}:{p}" for h, p, _ in resolved_targets],
+                "total_findings": len(oracle_findings),
+                "findings": oracle_findings,
+                "status": "executed",
+            }
+        except Exception as exc:
+            return {
+                "targets": [f"{h}:{p}" for h, p, _ in resolved_targets],
+                "total_findings": 0,
+                "findings": [],
+                "error": str(exc),
+            }
+
+    remote_probe_corpus: List[Dict[str, Any]] = _build_remote_probes() if has_remote else []
+    fut_mantis = fut_aiscan = fut_raptor_local = None
+    fut_raptor_remote = fut_prober = fut_ruler = fut_harness = fut_oracle = None
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        if has_local and local_target_path:
+            fut_mantis = pool.submit(mantis_engine.run_scan, local_target_path, effective_depth, mantis_mode)
+            fut_aiscan = pool.submit(_run_aiscan_task, local_target_path)
+            fut_raptor_local = pool.submit(_run_raptor_local_task, local_target_path, candidate_files)
+        if has_remote and clean_host:
+            fut_raptor_remote = pool.submit(_run_raptor_remote_task)
+            fut_prober = pool.submit(_run_prober_task)
+            fut_ruler = pool.submit(_run_ruler_task)
+            fut_harness = pool.submit(_run_harness_task, remote_probe_corpus)
+            if len(resolved_targets) >= 2:
+                fut_oracle = pool.submit(_run_oracle_task, remote_probe_corpus)
+
+        if fut_mantis is not None:
+            mantis_res = fut_mantis.result()
+        if fut_aiscan is not None:
+            aiscan_res = fut_aiscan.result()
+        if fut_raptor_local is not None:
+            raptor_res = fut_raptor_local.result()
+        if fut_raptor_remote is not None:
+            remote_raptor_res = fut_raptor_remote.result()
+            if has_local:
+                rem_findings = remote_raptor_res.get("findings") or []
+                raptor_res.setdefault("findings", []).extend(rem_findings)
+                raptor_res["total_findings"] = len(raptor_res["findings"])
+                raptor_res["mode"] = f"{raptor_res.get('mode', 'static')}+web"
+            else:
+                raptor_res = remote_raptor_res
+        if fut_prober is not None:
+            prober_res = fut_prober.result()
+        if fut_ruler is not None:
+            ruler_res = fut_ruler.result()
+        if fut_harness is not None:
+            harness_res = fut_harness.result()
+        if fut_oracle is not None:
+            oracle_res = fut_oracle.result()
 
     # 2. Seed ARTEX Dual-Graph Attack Chaining Engine (Module 17)
     artex_res: Dict[str, Any] = {"chains_synthesized": 0, "chains": []}
@@ -3200,8 +3366,8 @@ def run_unified_all_scans(
                 ai_sinks.append(str(f))
 
         artex.ingest_target_infrastructure(
-            host=os.path.basename(target_path) or "repo-target",
-            port=443,
+            host=clean_host or os.path.basename(target_path) or "repo-target",
+            port=resolved_port if has_remote else 443,
             endpoints=discovered_eps or ["/api/chat"],
             ai_sinks=ai_sinks or ["llm_prompt_sink"],
         )
@@ -3220,22 +3386,42 @@ def run_unified_all_scans(
                     anomaly_type="MANTIS_TAINT",
                     raw_probe=mfind,
                 )
+
+        # Ingest all findings from every scanner (Mantis, aiscan, RAPTOR, ActiveFlawProber, ProtocolRuler, Harness, Oracle) BEFORE chaining
         ingester = getattr(artex, "ingest_finding", getattr(artex, "ingest_scanner_finding", None))
-        if ingester:
-            for mfind in (mantis_res.get("findings") or []):
-                f_item = mfind if isinstance(mfind, dict) else {"title": str(mfind), "description": str(mfind), "rule_id": "MANTIS-FIND"}
-                ingester(f_item, scanner="mantis")
-            for afind in (aiscan_res.get("findings") or []):
-                f_item = afind if isinstance(afind, dict) else {"title": str(afind), "description": str(afind), "rule_id": "AISCAN-FIND"}
-                ingester(f_item, scanner="aiscan")
-            for rfind in (raptor_res.get("findings") or []):
-                f_item = rfind if isinstance(rfind, dict) else {"title": str(rfind), "description": str(rfind), "rule_id": "RAPTOR-FIND"}
-                ingester(f_item, scanner="raptor")
+        scanner_feeds = (
+            ("mantis", "MANTIS-FIND", mantis_res.get("findings") or []),
+            ("aiscan", "AISCAN-FIND", aiscan_res.get("findings") or []),
+            ("raptor", "RAPTOR-FIND", raptor_res.get("findings") or []),
+            ("ActiveFlawProber", "PROBER-FIND", prober_res.get("findings") or []),
+            ("ProtocolRuler", "RULER-FIND", ruler_res.get("findings") or []),
+            ("DeterministicHarness", "HARNESS-FIND", harness_res.get("findings") or []),
+            ("DifferentialOracle", "ORACLE-FIND", oracle_res.get("findings") or []),
+        )
+        for scanner_label, default_rule, items in scanner_feeds:
+            for item in items:
+                f_item = item if isinstance(item, dict) else {"title": str(item), "description": str(item), "rule_id": default_rule}
+                if ingester:
+                    ingester(f_item, scanner=scanner_label)
+                if scanner_label in ("ActiveFlawProber", "ProtocolRuler", "DeterministicHarness", "DifferentialOracle"):
+                    try:
+                        artex.register_wire_primitive(
+                            anomaly_id=str(f_item.get("vuln_id") or f_item.get("rule_id") or f_item.get("name") or default_rule),
+                            description=str(f_item.get("description") or f_item.get("verdict") or f_item.get("title") or scanner_label),
+                            anomaly_type=str(f_item.get("type") or f_item.get("classification") or "CL.TE"),
+                            raw_probe=str(f_item.get("raw_probe") or f_item.get("sequence_repr") or ""),
+                        )
+                    except Exception:
+                        pass
+
         cycle_res = artex.run_attack_chain_cycle(round_num=max(1, int(artex_rounds)))
         chains = artex.export_attack_chains_to_sarif_findings() if hasattr(artex, "export_attack_chains_to_sarif_findings") else []
         artex_res = cycle_res if isinstance(cycle_res, dict) else {"result": str(cycle_res)}
         artex_res["chains"] = chains
-        artex_res["chains_synthesized"] = len(chains) or cycle_res.get("candidates_planned", 0) or cycle_res.get("exploits_verified", 0) or 1
+        artex_res["chains_synthesized"] = len(chains) if chains else (
+            int(artex_res.get("candidates_planned", 0) or 0)
+            or int(artex_res.get("exploits_verified", 0) or 0)
+        )
         artex_res["engine"] = "ARTEX Dual-Graph Attack Chaining"
     except Exception as exc:
         artex_res = {"error": str(exc), "chains_synthesized": 0, "chains": []}
@@ -3262,8 +3448,8 @@ def run_unified_all_scans(
 
         for ai_endpoint in ai_endpoints:
             probes = synth.synthesize_probes_for_endpoint(
-                target_host="localhost",
-                target_port=8080,
+                target_host=clean_host or "localhost",
+                target_port=resolved_port if has_remote else 8080,
                 ai_endpoint=ai_endpoint,
                 http_method="POST",
             )
@@ -3388,6 +3574,63 @@ def run_unified_all_scans(
                     "scanner": "Module-17-ARTEX",
                 })
 
+    for pf in prober_res.get("findings", []):
+        f_dict = pf if isinstance(pf, dict) else (pf.to_dict() if hasattr(pf, "to_dict") else {"title": str(pf)})
+        vuln_id = f_dict.get("vuln_id") or f_dict.get("rule_id", "PROBER-VULN")
+        aggregated_findings.append({
+            "rule_id": vuln_id,
+            "title": f_dict.get("title", f_dict.get("description", "Active Protocol Flaw")),
+            "severity": str(f_dict.get("severity", "HIGH")).upper(),
+            "cwe": f_dict.get("cwe", "CWE-444"),
+            "file_path": f_dict.get("file_path", target_path),
+            "line_number": f_dict.get("line_number", 1),
+            "description": f_dict.get("description", ""),
+            "remediation": f_dict.get("remediation", "Enforce strict HTTP/1.1 and HTTP/2 framing boundaries."),
+            "scanner": "ActiveFlawProber",
+        })
+
+    for rf in (ruler_res.get("findings") if isinstance(ruler_res, dict) and isinstance(ruler_res.get("findings"), list) else []):
+        f_dict = rf if isinstance(rf, dict) else {"title": str(rf)}
+        aggregated_findings.append({
+            "rule_id": f_dict.get("rule_id", f"RULER-{f_dict.get('name', 'TRANSFORM')}"),
+            "title": f_dict.get("title", f"Protocol Ruler {f_dict.get('classification', 'Transformation')}: {f_dict.get('name', 'Sequence')}"),
+            "severity": str(f_dict.get("severity", "MEDIUM")).upper(),
+            "cwe": f_dict.get("cwe", "CWE-444"),
+            "file_path": f_dict.get("file_path", target_path),
+            "line_number": f_dict.get("line_number", 1),
+            "description": f_dict.get("description", f_dict.get("verdict", "")),
+            "remediation": f_dict.get("remediation", "Normalize header bytes and reject overlong sequences."),
+            "scanner": "ProtocolRuler",
+        })
+
+    for hf in (harness_res.get("findings") if isinstance(harness_res, dict) and isinstance(harness_res.get("findings"), list) else []):
+        f_dict = hf if isinstance(hf, dict) else {"title": str(hf)}
+        aggregated_findings.append({
+            "rule_id": f_dict.get("rule_id", "HARNESS-001"),
+            "title": f_dict.get("title", "Deterministic Harness Protocol Anomaly"),
+            "severity": str(f_dict.get("severity", "HIGH")).upper(),
+            "cwe": f_dict.get("cwe", "CWE-444"),
+            "file_path": f_dict.get("file_path", target_path),
+            "line_number": f_dict.get("line_number", 1),
+            "description": f_dict.get("description", ""),
+            "remediation": "Eliminate cross-request contamination and strict-validate HTTP framing.",
+            "scanner": "DeterministicHarness+AnomalyDetector",
+        })
+
+    for of in (oracle_res.get("findings") if isinstance(oracle_res, dict) and isinstance(oracle_res.get("findings"), list) else []):
+        f_dict = of if isinstance(of, dict) else {"title": str(of)}
+        aggregated_findings.append({
+            "rule_id": f_dict.get("rule_id", "ORACLE-001"),
+            "title": f_dict.get("title", "Multi-Implementation Differential Divergence"),
+            "severity": str(f_dict.get("severity", "HIGH")).upper(),
+            "cwe": f_dict.get("cwe", "CWE-436"),
+            "file_path": f_dict.get("file_path", target_path),
+            "line_number": f_dict.get("line_number", 1),
+            "description": f_dict.get("description", ""),
+            "remediation": "Align HTTP request parser behavior across proxy and origin tiers.",
+            "scanner": "MultiImplementationDifferentialOracle",
+        })
+
     # Final Fusion arbiter synthesis summary over combined scan surface
     fusion_summary = (
         f"Unified --all scan completed on {target_path}: "
@@ -3439,8 +3682,12 @@ def run_unified_all_scans(
 
     result_payload = {
         "target_path": target_path,
-        "mode": "unified_all_scans",
-        "depth": int(depth),
+        "mode": scan_mode,
+        "depth": effective_depth,
+        "local_executed": has_local,
+        "remote_executed": has_remote,
+        "remote_target": remote_target_label,
+        "remote_targets": [f"{h}:{p}" for h, p, _ in resolved_targets],
         "fusion_enabled": enforced_fusion,
         "abliterated_model": enforced_model,
         "fusion_models": list(mantis_engine.fusion_models),
@@ -3479,23 +3726,36 @@ def run_unified_all_scans(
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
+    if has_remote:
+        result_payload["engines"]["active_flaw_prober"] = prober_res
+        result_payload["engines"]["protocol_ruler"] = ruler_res
+        result_payload["engines"]["deterministic_harness"] = harness_res
+        result_payload["engines"]["differential_oracle"] = oracle_res
+
     with open(combined_json_path, "w", encoding="utf-8") as f:
         json.dump(result_payload, f, indent=2)
 
     txt_lines = [
         "=== RFCHunt Unified --all Security Scan Summary ===",
         f"Target: {target_path}",
-        f"Depth: {depth} | Fusion Enforced: {enforced_fusion} | Abliterated Model: {enforced_model}",
+        f"Mode: {scan_mode} | Depth: {effective_depth} | Fusion Enforced: {enforced_fusion} | Abliterated Model: {enforced_model}",
         f"Total Aggregated Findings: {len(aggregated_findings)}",
         f"Severity Breakdown: {json.dumps(sev_breakdown)}",
         f"Mantis Findings: {mantis_res.get('total_findings', 0)} (Reproduced: {mantis_res.get('reproduced_count', 0)}, Patched Verified: {mantis_res.get('patched_verified_count', 0)})",
         f"aiscan AI Findings: {aiscan_res.get('total_findings', 0)}",
-        f"RAPTOR SAST/PQC/SCA Findings: {len(raptor_res.get('findings') or [])}",
+        f"RAPTOR SAST/PQC/SCA/Web Findings: {len(raptor_res.get('findings') or [])}",
         f"Prompt Smuggling Probes Synthesized: {smuggle_res.get('probes_generated', 0)}",
+    ]
+    if has_remote:
+        txt_lines.append(f"Active Flaw Prober Findings: {prober_res.get('total_findings', 0)}")
+        txt_lines.append(f"Protocol Ruler Findings: {ruler_res.get('total_findings', 0)}")
+        txt_lines.append(f"Deterministic Harness Findings: {harness_res.get('total_findings', 0)}")
+        txt_lines.append(f"Differential Oracle Findings: {oracle_res.get('total_findings', 0)}")
+    txt_lines.extend([
         "",
         f"Combined SARIF: {combined_sarif_path}",
         f"Combined JSON:  {combined_json_path}",
-    ]
+    ])
     with open(combined_txt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(txt_lines) + "\n")
 

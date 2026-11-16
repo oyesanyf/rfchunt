@@ -10,7 +10,7 @@ on:
       depth:
         description: "Google Mantis audit depth (1-100)"
         required: false
-        default: "30"
+        default: "100"
       target_path:
         description: "Specific --path override (defaults to full repo '.')"
         required: false
@@ -46,7 +46,7 @@ jobs:
           RFCHUNT_OFFLINE: "1"
         run: |
           TARGET="${{ github.event.inputs.target_path || '.' }}"
-          DEPTH="${{ github.event.inputs.depth || '30' }}"
+          DEPTH="${{ github.event.inputs.depth || '100' }}"
           if [ "$TARGET" = "." ]; then
             python -u rfc_hunt_swarm.py --all --repo . --depth "$DEPTH"
           else
@@ -73,7 +73,7 @@ jobs:
           CI: "true"
           RFCHUNT_OFFLINE: "1"
         run: |
-          pytest tests/test_mantis_integrator.py tests/test_abliteration_fusion.py tests/test_remote_host_and_subcommands.py tests/test_llm_governance_and_schema.py tests/test_ssrf_adversarial_challenge.py tests/test_target_auth.py -v --basetemp=/tmp/pytest_rfchunt
+          pytest tests/test_e2e_unified_scans.py tests/test_mantis_integrator.py tests/test_abliteration_fusion.py tests/test_remote_host_and_subcommands.py tests/test_llm_governance_and_schema.py tests/test_ssrf_adversarial_challenge.py tests/test_target_auth.py -v --basetemp=/tmp/pytest_rfchunt
 
       - name: Upload Security Reports Artifact
         if: always()

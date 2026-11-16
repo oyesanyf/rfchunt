@@ -470,7 +470,8 @@ def cmd_mantis(args):
     args.model = preferred_model
 
     target = getattr(args, "repo", None) or getattr(args, "path", None) or "."
-    depth = int(getattr(args, "depth", 30) or 30)
+    raw_depth = getattr(args, "depth", None)
+    depth = 30 if raw_depth is None else int(raw_depth)
     mode = getattr(args, "mantis_mode", "full") or "full"
     reports_dir = getattr(args, "output_dir", None) or "reports"
 
@@ -502,9 +503,11 @@ def cmd_all(args):
     args.model = preferred_model
 
     host = getattr(args, "host", None) or getattr(args, "target", None)
+    targets = getattr(args, "targets", None)
     repo = getattr(args, "repo", None)
     path = getattr(args, "path", None)
-    depth = int(getattr(args, "depth", 30) or 30)
+    raw_depth = getattr(args, "depth", None)
+    depth = 100 if raw_depth is None else int(raw_depth)
     mode = getattr(args, "mantis_mode", "full") or "full"
     reports_dir = getattr(args, "output_dir", None) or "reports"
     authorized = bool(getattr(args, "authorized", False))
@@ -517,21 +520,26 @@ def cmd_all(args):
             sys.exit(1)
 
     db = Database(args.db)
-    res = run_unified_all_scans(
-        repo=repo or (None if (path or host) else "."),
-        path=path,
-        host=host,
-        port=getattr(args, "port", 443),
-        use_tls=getattr(args, "tls", None),
-        authorized=authorized,
-        allow_destructive=allow_destructive,
-        depth=depth,
-        mantis_mode=mode,
-        use_fusion=True,
-        preferred_model=preferred_model,
-        db=db,
-        reports_dir=reports_dir,
-    )
+    try:
+        res = run_unified_all_scans(
+            repo=repo or (None if (path or host or targets) else "."),
+            path=path,
+            host=host,
+            targets=targets,
+            port=getattr(args, "port", 443),
+            use_tls=getattr(args, "tls", None),
+            authorized=authorized,
+            allow_destructive=allow_destructive,
+            depth=depth,
+            mantis_mode=mode,
+            use_fusion=True,
+            preferred_model=preferred_model,
+            db=db,
+            reports_dir=reports_dir,
+        )
+    except PermissionError as exc:
+        print(f"[!] Target authorization error for {host or targets or repo or path}: {exc}")
+        sys.exit(1)
     print(f"\n[+] Unified --all Security Scan Complete: target={res['target_path']} depth={depth}")
     print(f"    Fusion Enforced: {res['fusion_enabled']} | Abliterated Model: {res['abliterated_model']}")
     print(f"    Aggregated Findings: {res['total_aggregated_findings']} {res.get('severity_counts', {})}")
@@ -636,11 +644,12 @@ USAGE EXAMPLES:
     parser.add_argument("--repo", dest="repo", type=str, default=None, help="Repository path for --all / --mantis scan")
     parser.add_argument("--path", dest="path", type=str, default=None, help="Target file or folder path for --all / --mantis scan")
     parser.add_argument("--host", "--target", dest="host", type=str, default=None, help="Target host (domain or IP)")
+    parser.add_argument("--targets", dest="targets", type=str, default=None, help="Comma-separated target endpoints for differential scans (e.g. '127.0.0.1:8080,target.example.com:443')")
     parser.add_argument("--port", type=int, default=443, help="Target port (default: 443)")
     parser.add_argument("--tls", action="store_true", help="Enable TLS/HTTPS for target host")
     parser.add_argument("--authorized", action="store_true", help="Explicitly authorize active security testing against remote/public target")
     parser.add_argument("--allow-destructive", action="store_true", help="Explicitly permit state-mutating requests (PUT, DELETE, PATCH) and active response theft on authorized targets")
-    parser.add_argument("--depth", dest="depth", type=int, default=30, help="Google Mantis scan depth (1..100, default: 30)")
+    parser.add_argument("--depth", dest="depth", type=int, default=None, help="Google Mantis scan depth (1..100, default: 100 for --all, 30 for mantis)")
     parser.add_argument("--mantis-mode", dest="mantis_mode", choices=["full", "fast", "threat-model", "scan", "reproduce", "patch"], default="full", help="Google Mantis pipeline mode")
     parser.add_argument("--output-dir", dest="output_dir", type=str, default="reports", help="Output directory for SARIF/JSON audit reports")
     parser.set_defaults(fusion=True)
@@ -764,18 +773,19 @@ USAGE EXAMPLES:
     p_all.add_argument("--repo", default=argparse.SUPPRESS, help="Repository directory path")
     p_all.add_argument("--path", default=argparse.SUPPRESS, help="File or directory path")
     p_all.add_argument("--host", "--target", dest="host", default=argparse.SUPPRESS, help="Target host (domain or IP)")
+    p_all.add_argument("--targets", dest="targets", default=argparse.SUPPRESS, help="Comma-separated target endpoints for multi-target differential scans")
     p_all.add_argument("--port", type=int, default=argparse.SUPPRESS, help="Target port")
     p_all.add_argument("--tls", action="store_true", default=argparse.SUPPRESS, help="Enable TLS/HTTPS for target host")
     p_all.add_argument("--authorized", action="store_true", default=argparse.SUPPRESS, help="Explicitly authorize active testing")
     p_all.add_argument("--allow-destructive", action="store_true", default=argparse.SUPPRESS, help="Permit state-mutating requests")
-    p_all.add_argument("--depth", type=int, default=argparse.SUPPRESS, help="Mantis depth (1..100)")
+    p_all.add_argument("--depth", type=int, default=None, help="Mantis depth (1..100, default: 100)")
     p_all.add_argument("--mantis-mode", choices=["full", "fast", "threat-model", "scan", "reproduce", "patch"], default=argparse.SUPPRESS, help="Mantis mode")
     p_all.add_argument("--output-dir", default=argparse.SUPPRESS, help="Report output directory")
 
     p_mantis = subparsers.add_parser("mantis", help="Run Google Mantis (Module 20) security pipeline")
     p_mantis.add_argument("--repo", default=argparse.SUPPRESS, help="Repository directory path")
     p_mantis.add_argument("--path", default=argparse.SUPPRESS, help="File or directory path")
-    p_mantis.add_argument("--depth", type=int, default=argparse.SUPPRESS, help="Mantis depth (1..100)")
+    p_mantis.add_argument("--depth", type=int, default=None, help="Mantis depth (1..100, default: 30)")
     p_mantis.add_argument("--mantis-mode", choices=["full", "fast", "threat-model", "scan", "reproduce", "patch"], default=argparse.SUPPRESS, help="Mantis mode")
     p_mantis.add_argument("--output-dir", default=argparse.SUPPRESS, help="Report output directory")
 

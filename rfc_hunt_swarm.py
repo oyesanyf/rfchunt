@@ -1784,7 +1784,8 @@ def cmd_mantis(args):
         or getattr(args, "target_arg", None)
         or "."
     )
-    depth = int(getattr(args, "depth", 30) or 30)
+    raw_depth = getattr(args, "depth", None)
+    depth = 30 if raw_depth is None else int(raw_depth)
     mode = getattr(args, "mantis_mode", "full") or "full"
     preferred_model = getattr(args, "mantis_model", None) or DEFAULT_ABLITERATED_MODEL
     reports_dir = getattr(args, "output_dir", None) or "reports"
@@ -1841,16 +1842,18 @@ def cmd_all(args):
     args.fusion = True
     args.abliteration = True
     host = getattr(args, "host", None)
+    targets = getattr(args, "targets", None)
     repo = getattr(args, "repo", None) or getattr(args, "raptor_target", None)
     path = getattr(args, "path", None)
-    if not repo and not path and not host:
+    if not repo and not path and not host and not targets:
         fallback = getattr(args, "mantis_target", None) or getattr(args, "target_arg", None)
         if fallback and os.path.exists(str(fallback)):
             repo = str(fallback)
         else:
             repo = "."
 
-    depth = int(getattr(args, "depth", 30) or 30)
+    raw_depth = getattr(args, "depth", None)
+    depth = 100 if raw_depth is None else int(raw_depth)
     mantis_mode = getattr(args, "mantis_mode", "full") or "full"
     preferred_model = getattr(args, "mantis_model", None) or DEFAULT_ABLITERATED_MODEL
     reports_dir = getattr(args, "output_dir", None) or "reports"
@@ -1868,7 +1871,7 @@ def cmd_all(args):
     db = Database(args.db)
     print(f"\n{'='*75}")
     print(f"[*] UNIFIED --all SECURITY AUDIT (Fusion + Abliterated Models Enforced)")
-    target_disp = f"host={host}" if host and not repo and not path else os.path.abspath(str(repo or path))
+    target_disp = f"host={host or targets}" if (host or targets) and not repo and not path else os.path.abspath(str(repo or path))
     print(f"[*] Target: {target_disp} | Depth: {depth} | Model: {preferred_model}")
     print(f"{'='*75}")
 
@@ -1882,6 +1885,7 @@ def cmd_all(args):
             repo=repo,
             path=path,
             host=host,
+            targets=targets,
             port=port_arg,
             use_tls=getattr(args, "tls", None),
             authorized=authorized,
@@ -1895,7 +1899,7 @@ def cmd_all(args):
             artex_rounds=artex_rounds,
         )
     except PermissionError as exc:
-        print(f"[!] Target authorization error for {host or repo or path}: {exc}")
+        print(f"[!] Target authorization error for {host or targets or repo or path}: {exc}")
         sys.exit(1)
 
     eng = res.get("engines", {})
@@ -2460,7 +2464,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--path", dest="path", type=str, default=None, help="Specific file or directory path for --all, --mantis, or --raptor audits")
     parser.add_argument("--mantis", "--enable-mantis", dest="enable_mantis", action="store_true", help="Enable Google Mantis toolkit (Module 20: threat modeling, depth hypotheses, Tier 1/2 repro, CVSS rubric, patching)")
     parser.add_argument("--mantis-mode", type=str, choices=["full", "fast", "threat-model", "scan", "reproduce", "patch"], default="full", help="Google Mantis execution mode (default: full)")
-    parser.add_argument("--depth", "--mantis-depth", dest="depth", type=int, default=30, help="Google Mantis audit depth 1..100 (default: 30; scales coverage, passes, and rule tiers)")
+    parser.add_argument("--depth", "--mantis-depth", dest="depth", type=int, default=None, help="Google Mantis audit depth 1..100 (default: 100 for --all, 30 for mantis; scales coverage, passes, and rule tiers)")
     parser.add_argument("--mantis-target", type=str, default=None, help="Target repository or file path for Google Mantis scan")
     parser.add_argument("--mantis-model", type=str, default="hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M", help="Refusal-free abliterated ModelFusion model for Google Mantis")
     parser.add_argument("--mantis-report", action="store_true", help="Display stored Google Mantis findings from terminator.db")

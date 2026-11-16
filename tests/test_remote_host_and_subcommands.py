@@ -382,3 +382,236 @@ def test_main_cli_root_host_harness2_report_fails_closed():
     assert res.returncode == 1
     combined = res.stdout + res.stderr
     assert "Target authorization error for dlptest.com" in combined
+
+
+# =====================================================================
+# 5. Milestone 4 Regression Coverage (--all depth=100, Hybrid, Protocol Engines, --targets)
+# =====================================================================
+
+def test_cmd_all_defaults_depth_to_100_and_preserves_explicit_override(monkeypatch, tmp_path):
+    """Verifies main.cmd_all and rfc_hunt_swarm.cmd_all default depth=100 unless --depth is explicitly provided."""
+    import main as main_cli
+    import rfc_hunt_swarm as swarm_cli
+
+    recorded = []
+
+    def _fake_unified(**kwargs):
+        recorded.append(kwargs)
+        return {
+            "target_path": kwargs.get("repo") or kwargs.get("host") or ".",
+            "depth": kwargs.get("depth"),
+            "fusion_enabled": True,
+            "abliterated_model": "test-model",
+            "fusion_models": ["test-model"],
+            "total_aggregated_findings": 0,
+            "severity_counts": {},
+            "elapsed_sec": 0.01,
+            "engines": {"mantis": {}, "aiscan": {}, "raptor": {}, "prompt_smuggling": {}},
+            "report_files": {"combined_sarif": "a.sarif", "combined_json": "a.json"},
+        }
+
+    class _DummyDB:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("engine.mantis_integrator.run_unified_all_scans", _fake_unified)
+    monkeypatch.setattr(main_cli, "Database", _DummyDB)
+    monkeypatch.setattr("database.Database", _DummyDB)
+
+    # Default omitted depth -> 100
+    main_args = argparse.Namespace(
+        host=None,
+        targets="target.example.com:443,target.example.com:8443",
+        repo=str(tmp_path),
+        path=None,
+        depth=None,
+        mantis_mode="full",
+        output_dir=str(tmp_path / "out1"),
+        db=str(tmp_path / "t.db"),
+        authorized=True,
+        allow_destructive=False,
+    )
+    main_cli.cmd_all(main_args)
+    assert recorded[-1]["depth"] == 100
+    assert recorded[-1]["targets"] == "target.example.com:443,target.example.com:8443"
+
+    # Explicit override -> 10
+    swarm_args = argparse.Namespace(
+        host=None,
+        targets="target.example.com:8443",
+        repo=str(tmp_path),
+        raptor_target=None,
+        path=None,
+        depth=10,
+        mantis_mode="fast",
+        mantis_model=None,
+        output_dir=str(tmp_path / "out2"),
+        db=str(tmp_path / "t.db"),
+        authorized=True,
+        allow_destructive=False,
+        artex_rounds=1,
+        port=443,
+        tls=True,
+    )
+    swarm_cli.cmd_all(swarm_args)
+    assert recorded[-1]["depth"] == 10
+    assert recorded[-1]["targets"] == "target.example.com:8443"
+
+
+def test_run_unified_all_scans_targets_fails_closed_on_unauthorized_and_ssrf():
+    """Verifies multi-target --targets enforces TargetAuthorizationGate and SSRF blocking fail-closed."""
+    with pytest.raises(PermissionError):
+        run_unified_all_scans(
+            host="target.example.com",
+            targets="target.example.com:443,10.0.0.1:8080",
+            authorized=True,
+        )
+
+    with pytest.raises(PermissionError):
+        run_unified_all_scans(
+            targets="unauthorized.example.com:443",
+            authorized=False,
+        )
+
+
+def test_hybrid_repo_and_host_runs_local_and_remote_and_feeds_artex_before_chaining(monkeypatch, tmp_path):
+    """
+    Verifies hybrid --all (--repo + --host + --targets) runs local and remote scanners
+    and ingests remote protocol discoveries into ARTEX BEFORE run_attack_chain_cycle().
+    """
+    from engine.dual_graph_engine import DualGraphAttackEngine
+    from engine.active_flaw_prober import ActiveFlawProber
+    from protocol_ruler import ProtocolRuler
+    from deterministic_harness import DeterministicHarness
+    from engine.differential_oracle import MultiImplementationDifferentialOracle
+    from engine.raptor_integrator import RaptorIntegrator
+    from engine.taxonomy import AnomalyCategory, ImplementationAnomaly
+
+    repo_dir = tmp_path / "hybrid_app"
+    repo_dir.mkdir(parents=True)
+    (repo_dir / "app.py").write_text(
+        "import subprocess\n"
+        "from openai import OpenAI\n"
+        "def run_cmd(user_cmd):\n"
+        "    return subprocess.check_output(user_cmd, shell=True)\n"
+        "def chat(prompt):\n"
+        "    return OpenAI().chat.completions.create(model='gpt-4', messages=[{'role': 'user', 'content': prompt}])\n",
+        encoding="utf-8",
+    )
+
+    events = []
+    orig_ingest = DualGraphAttackEngine.ingest_finding
+    orig_cycle = DualGraphAttackEngine.run_attack_chain_cycle
+
+    def _spy_ingest(self, finding, scanner="generic"):
+        events.append(("ingest", scanner))
+        return orig_ingest(self, finding, scanner=scanner)
+
+    def _spy_cycle(self, round_num=1):
+        events.append(("cycle", round_num))
+        return orig_cycle(self, round_num=round_num)
+
+    monkeypatch.setattr(DualGraphAttackEngine, "ingest_finding", _spy_ingest)
+    monkeypatch.setattr(DualGraphAttackEngine, "run_attack_chain_cycle", _spy_cycle)
+    monkeypatch.setattr(
+        RaptorIntegrator,
+        "run_host_scan",
+        lambda self, **kw: {
+            "mode": "web",
+            "total_findings": 1,
+            "findings": [{"rule_id": "RAPTOR-WEB-01", "title": "Exposed admin endpoint", "severity": "HIGH", "cwe": "CWE-284"}],
+        },
+    )
+    monkeypatch.setattr(
+        ActiveFlawProber,
+        "run_active_audit",
+        lambda self: [
+            {"vuln_id": "PROBER-CLTE-1", "title": "CL.TE Request Smuggling", "severity": "CRITICAL", "type": "CL.TE", "description": "CL/TE desync confirmed"}
+        ],
+    )
+    monkeypatch.setattr(
+        ProtocolRuler,
+        "run_comprehensive_audit",
+        lambda self, **kw: {
+            "success": True,
+            "baseline_limit": 8192,
+            "findings": [
+                {"name": "Overlong-UTF8-LF", "classification": "EXPANSION", "delta_bytes": 4, "verdict": "EXPANDED by 4 bytes on front-end!"}
+            ],
+            "expansions": [{"name": "Overlong-UTF8-LF", "delta_bytes": 4}],
+            "contractions": [],
+        },
+    )
+    monkeypatch.setattr(
+        DeterministicHarness,
+        "evaluate_batch_concurrent",
+        lambda self, probes, max_concurrency=4: [
+            (True, "CL.0 Desync", "Cross-connection contamination observed", {"raw_response_bytes": b"HTTP/1.1 200 OK\r\n\r\n"})
+        ],
+    )
+    monkeypatch.setattr(
+        MultiImplementationDifferentialOracle,
+        "evaluate_divergence",
+        lambda self, raw_probe, rule_id=None: (
+            True,
+            ImplementationAnomaly(
+                anomaly_id="ANOM-DIFF-TEST",
+                target_engine="DifferentialMatrix(target,edge)",
+                category=AnomalyCategory.PARSER_DIVERGENCE,
+                observed_behavior="Divergent status codes 200 vs 400 across targets",
+                expected_behavior="Consistent framing",
+                raw_probe=raw_probe,
+                raw_response=b"",
+                triggering_rule_id=rule_id,
+            ),
+            {},
+        ),
+    )
+    monkeypatch.setattr(
+        MultiImplementationDifferentialOracle,
+        "evaluate_matrix_4parsers",
+        lambda self, raw_probe, rule_id=None: (False, None, {}),
+    )
+
+    out_dir = tmp_path / "reports"
+    res = run_unified_all_scans(
+        repo=str(repo_dir),
+        host="target.example.com",
+        port=8443,
+        use_tls=True,
+        targets="target.example.com:8443,edge.example.com:443",
+        authorized=True,
+        depth=100,
+        reports_dir=str(out_dir),
+        db=None,
+    )
+
+    assert res["mode"] == "unified_all_scans"
+    assert res["local_executed"] is True
+    assert res["remote_executed"] is True
+    assert res["engines"]["mantis"]["total_findings"] >= 1
+    assert res["engines"]["active_flaw_prober"]["total_findings"] == 1
+    assert res["engines"]["protocol_ruler"]["total_findings"] == 1
+    assert res["engines"]["deterministic_harness"]["total_findings"] == 1
+    assert res["engines"]["differential_oracle"]["total_findings"] >= 1
+    assert "+web" in res["engines"]["raptor"]["mode"]
+    assert "differential_oracle" in res["engines"]
+
+    # Confirm ARTEX ingested remote engines BEFORE running the attack chain cycle
+    cycle_idx = next(i for i, ev in enumerate(events) if ev[0] == "cycle")
+    pre_cycle_scanners = {ev[1] for ev in events[:cycle_idx] if ev[0] == "ingest"}
+    assert "ActiveFlawProber" in pre_cycle_scanners
+    assert "ProtocolRuler" in pre_cycle_scanners
+    assert "DeterministicHarness" in pre_cycle_scanners
+    assert "DifferentialOracle" in pre_cycle_scanners
+
+    scanners_in_findings = {f.get("scanner") for f in res["findings"]}
+    assert "Module-20-Google-Mantis" in scanners_in_findings
+    assert "ActiveFlawProber" in scanners_in_findings
+    assert "ProtocolRuler" in scanners_in_findings
+    assert "DeterministicHarness+AnomalyDetector" in scanners_in_findings
+    assert "MultiImplementationDifferentialOracle" in scanners_in_findings
+
