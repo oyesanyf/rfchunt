@@ -70,6 +70,7 @@ class PromptSmugglingSynthesizer:
         Synthesizes CL.TE, TE.CL, and Chunked Desync probes embedding a smuggled
         system prompt override targeting the specified AI endpoint.
         """
+        resolved_endpoint = ai_endpoint or "/api/chat"
         techniques = framing_techniques or ["CL.TE", "TE.CL", "CHUNK_EXTENSION_OBLIQUE"]
         probes: List[SmuggledPromptProbe] = []
 
@@ -85,7 +86,7 @@ class PromptSmugglingSynthesizer:
             ]
         })
         inner_request = (
-            f"{http_method} {ai_endpoint} HTTP/1.1\r\n"
+            f"{http_method} {resolved_endpoint} HTTP/1.1\r\n"
             f"Host: {target_host}\r\n"
             f"Content-Type: application/json\r\n"
             f"Content-Length: {len(inner_body)}\r\n"
@@ -117,7 +118,7 @@ class PromptSmugglingSynthesizer:
                 rationale = (
                     f"CL.TE Desynchronized Prompt Injection: Frontend proxy respects Content-Length and forwards "
                     f"the entire payload, while the backend HTTP parser terminates at the zero-chunk. The smuggled "
-                    f"request is left in the backend TCP socket buffer to execute against '{ai_endpoint}'."
+                    f"request is left in the backend TCP socket buffer to execute against '{resolved_endpoint}'."
                 )
 
             elif tech == "TE.CL":
@@ -137,7 +138,7 @@ class PromptSmugglingSynthesizer:
                 rationale = (
                     f"TE.CL Desynchronized Prompt Injection: Frontend proxy chunks through the entire stream, "
                     f"while the backend parser reads only 4 bytes (the chunk length) and treats the rest of "
-                    f"the stream as a new smuggled request to '{ai_endpoint}' with the injected prompt."
+                    f"the stream as a new smuggled request to '{resolved_endpoint}' with the injected prompt."
                 )
 
             else:  # CHUNK_EXTENSION_OBLIQUE
@@ -153,14 +154,14 @@ class PromptSmugglingSynthesizer:
                 )
                 rationale = (
                     f"Chunk Extension Desynchronized Prompt Injection: Uses James Kettle obsolete extension syntax "
-                    f"to create parser disagreement on chunk trailer boundary, delivering prompt override to '{ai_endpoint}'."
+                    f"to create parser disagreement on chunk trailer boundary, delivering prompt override to '{resolved_endpoint}'."
                 )
 
             probe = SmuggledPromptProbe(
                 probe_id=probe_id,
                 attack_class=f"{tech}_PROMPT_INJECTION",
                 target_host=target_host,
-                target_ai_endpoint=ai_endpoint,
+                target_ai_endpoint=resolved_endpoint,
                 wire_anomaly_technique=tech,
                 canary_token=canary,
                 raw_smuggled_stream=raw_stream,
@@ -168,16 +169,60 @@ class PromptSmugglingSynthesizer:
             )
             probes.append(probe)
 
+        # Persist probes to terminator.db if database available
+        if self.db:
+            for probe in probes:
+                try:
+                    if hasattr(self.db, "save_probe"):
+                        self.db.save_probe(
+                            fragment_id=None,
+                            rationale=probe.rationale,
+                            raw_request=probe.raw_smuggled_stream,
+                            is_clean=False,
+                            source_type=f"prompt_smuggling_{probe.wire_anomaly_technique.lower()}",
+                        )
+                    if hasattr(self.db, "save_ai_finding"):
+                        self.db.save_ai_finding(
+                            target_path=target_host,
+                            finding_type="desynchronized_prompt_injection",
+                            severity="CRITICAL",
+                            file_path=probe.target_ai_endpoint,
+                            line_number=1,
+                            model_or_api=f"PromptSmuggler-{probe.wire_anomaly_technique}",
+                            description=probe.rationale,
+                            snippet=probe.raw_smuggled_stream[:200],
+                        )
+                except Exception as e:
+                    logger.debug("Failed saving prompt smuggling probe to database: %s", e)
+
         # Write reports directly to reports/ folder
         self.generate_reports(target_host, probes)
 
         return probes
+
+    def to_sarif_findings(self, probes: List[SmuggledPromptProbe]) -> List[Dict[str, Any]]:
+        """Converts synthesized probes into normalized finding dictionaries for SARIF export."""
+        return [
+            {
+                "rule_id": p.probe_id,
+                "title": f"Desynchronized Prompt Injection: {p.wire_anomaly_technique}",
+                "severity": "CRITICAL",
+                "cwe": "CWE-444",
+                "file_path": p.target_ai_endpoint,
+                "line_number": 1,
+                "description": p.rationale,
+                "remediation": "Enforce strict HTTP framing boundaries.",
+                "scanner": "Module-19-PromptSmuggler",
+            }
+            for p in probes
+        ]
 
     def generate_reports(self, target_host: str, probes: List[SmuggledPromptProbe]) -> Dict[str, str]:
         """Outputs synthesis reports into reports/ folder without any UI."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         json_file = self.reports_dir / f"prompt_smuggling_report_{timestamp}.json"
         summary_file = self.reports_dir / f"prompt_smuggling_summary_{timestamp}.txt"
+        sarif_file = self.reports_dir / f"prompt_smuggling_report_{timestamp}.sarif"
 
         json_data = {
             "timestamp": timestamp,
@@ -186,6 +231,35 @@ class PromptSmugglingSynthesizer:
             "probes": [p.to_dict() for p in probes],
         }
         json_file.write_text(json.dumps(json_data, indent=2), encoding="utf-8")
+
+        # Generate SARIF report
+        findings = self.to_sarif_findings(probes)
+        try:
+            from engine.mantis_integrator import build_sarif_document
+            sarif_data = build_sarif_document("PromptSmuggler", "https://rfchunt", target_host, findings)
+        except Exception:
+            sarif_data = {
+                "version": "2.1.0",
+                "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+                "runs": [{
+                    "tool": {"driver": {"name": "PromptSmuggler", "version": "1.0.0"}},
+                    "results": [
+                        {
+                            "ruleId": f["rule_id"],
+                            "level": "error",
+                            "message": {"text": f["description"]},
+                            "locations": [{
+                                "physicalLocation": {
+                                    "artifactLocation": {"uri": f["file_path"]},
+                                    "region": {"startLine": f["line_number"]},
+                                }
+                            }],
+                        }
+                        for f in findings
+                    ]
+                }]
+            }
+        sarif_file.write_text(json.dumps(sarif_data, indent=2), encoding="utf-8")
 
         lines = [
             "=" * 70,
@@ -212,4 +286,5 @@ class PromptSmugglingSynthesizer:
         return {
             "json": str(json_file),
             "summary": str(summary_file),
+            "sarif": str(sarif_file),
         }

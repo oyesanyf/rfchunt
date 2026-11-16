@@ -69,18 +69,32 @@ class PythonAIScanner:
         (re.compile(r'(?i)(?:hf[_-]?token|HUGGINGFACE_TOKEN|HUGGING_FACE_HUB_TOKEN)\s*[:=]\s*["\'](hf_[a-zA-Z0-9]{20,})["\']'), "Hugging Face Token", "CRITICAL"),
         (re.compile(r'(?i)(?:cohere[_-]?api[_-]?key|COHERE_API_KEY)\s*[:=]\s*["\']([a-zA-Z0-9_-]{30,})["\']'), "Cohere API Key", "HIGH"),
         (re.compile(r'(?i)(?:gemini[_-]?api[_-]?key|GEMINI_API_KEY)\s*[:=]\s*["\'](AIzaSy[a-zA-Z0-9_-]{33})["\']'), "Google Gemini Key", "CRITICAL"),
+        (re.compile(r'(?i)(?:mistral[_-]?api[_-]?key|MISTRAL_API_KEY)\s*[:=]\s*["\']([a-zA-Z0-9_-]{32})["\']'), "Mistral API Key", "CRITICAL"),
+        (re.compile(r'(?i)(?:groq[_-]?api[_-]?key|GROQ_API_KEY)\s*[:=]\s*["\'](gsk_[a-zA-Z0-9_-]{40,})["\']'), "Groq API Key", "CRITICAL"),
+        (re.compile(r'(?i)(?:perplexity[_-]?api[_-]?key|PERPLEXITY_API_KEY)\s*[:=]\s*["\'](pplx-[a-zA-Z0-9_-]{40,})["\']'), "Perplexity API Key", "CRITICAL"),
+        (re.compile(r'(?i)(?:together[_-]?api[_-]?key|TOGETHER_API_KEY)\s*[:=]\s*["\']([a-f0-9]{64})["\']'), "Together AI Key", "HIGH"),
+        (re.compile(r'(?i)(?:replicate[_-]?api[_-]?token|REPLICATE_API_TOKEN)\s*[:=]\s*["\'](r8_[a-zA-Z0-9]{30,})["\']'), "Replicate API Token", "HIGH"),
+        (re.compile(r'(?i)(?:aws[_-]?bedrock[_-]?key|BEDROCK_AWS_SECRET_ACCESS_KEY)\s*[:=]\s*["\']([a-zA-Z0-9/+=]{40})["\']'), "AWS Bedrock Key", "CRITICAL"),
+        (re.compile(r'(?i)(?:azure[_-]?openai[_-]?key|AZURE_OPENAI_API_KEY)\s*[:=]\s*["\']([a-f0-9]{32})["\']'), "Azure OpenAI Key", "CRITICAL"),
     ]
 
     UNSAFE_DESERIALIZATION = [
         (re.compile(r'(?i)\bpickle\.load(?:s)?\s*\('), "pickle.load", "CRITICAL", "Unsafe pickle deserialization allows remote code execution when loading untrusted model weights."),
         (re.compile(r'(?i)\btorch\.load\s*\((?![^)]*weights_only\s*=\s*True)'), "torch.load (without weights_only=True)", "HIGH", "PyTorch load without weights_only=True allows arbitrary code execution via malicious .pt/.bin weights."),
         (re.compile(r'(?i)\bjoblib\.load\s*\('), "joblib.load", "HIGH", "Joblib model deserialization executes arbitrary code during unpickling."),
+        (re.compile(r'(?i)\b(?:numpy|np)\.load\s*\([^)]*allow_pickle\s*=\s*True'), "numpy.load (allow_pickle=True)", "HIGH", "Numpy deserialization with allow_pickle=True permits arbitrary code execution."),
+        (re.compile(r'(?i)\byaml\.(?:unsafe_load|load\s*\([^)]*Loader\s*=\s*(?:yaml\.)?(?:UnsafeLoader|Loader|CLoader)\b)'), "yaml.unsafe_load / UnsafeLoader", "CRITICAL", "Unsafe YAML deserialization allows arbitrary code execution during object construction."),
     ]
 
     PROMPT_INJECTION_SINKS = [
         (re.compile(r'(?i)f["\'].*?(?:system|prompt|instruction).*?\{(?P<var>[a-zA-Z0-9_]+)\}.*?["\']'), "Direct f-string injection into system prompt"),
         (re.compile(r'(?i)["\'].*?(?:system|prompt|instruction).*?["\']\s*\+\s*(?P<var>[a-zA-Z0-9_]+)'), "Direct string concatenation into prompt"),
         (re.compile(r'(?i)(?:prompt|messages|input)\s*=\s*(?:request\.(?:args|form|json|data)|req\.body)'), "Unsanitized client request body passed directly to LLM context"),
+        (re.compile(r'(?i)(?:system|prompt|instruction).*?\.format\s*\('), "Direct .format() interpolation into system prompt"),
+        (re.compile(r'(?i)(?:system|prompt|instruction).*?%\s*(?:\([^)]*\)|[a-zA-Z0-9_]+)'), "Direct % printf-style formatting into prompt"),
+        (re.compile(r'(?i)\bPromptTemplate(?:\.from_template)?\s*\('), "LangChain PromptTemplate unescaped user parameter interpolation"),
+        (re.compile(r'(?i)["\'].*?["\']\.join\s*\([^)]*(?:prompt|system|instruction|message)[^)]*\)'), "String join concatenation into system prompt"),
+        (re.compile(r'(?i)\$\{(?:prompt|user_input|instruction|system|query)\}'), "Template literal interpolation into prompt"),
     ]
 
     ROUTE_DECORATOR_PATTERN = re.compile(
@@ -88,7 +102,11 @@ class PythonAIScanner:
     )
 
     AI_FRAMEWORK_IMPORTS = re.compile(
-        r'(?i)\b(?:import\s+(?:openai|anthropic|langchain|llamaindex|ollama|transformers)|from\s+(?:openai|anthropic|langchain|llamaindex|ollama|transformers))'
+        r'(?i)\b(?:import\s+(?:openai|anthropic|langchain|llamaindex|ollama|transformers|torch)|from\s+(?:openai|anthropic|langchain|llamaindex|ollama|transformers|torch))'
+    )
+
+    AI_ROUTE_KEYWORDS = re.compile(
+        r'(?i)/(?:api/)?(?:v\d+/)?(?:chat|generate|prompt|llm|ai|rag|completion|predict|embeddings?|infer)'
     )
 
     def scan_file(self, file_path: Path) -> Tuple[List[AIFinding], List[DiscoveredAIEndpoint]]:
@@ -97,7 +115,8 @@ class PythonAIScanner:
 
         try:
             content = file_path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
+        except Exception as e:
+            logger.warning("Error reading file %s: %s", file_path, e)
             return findings, endpoints
 
         lines = content.splitlines()
@@ -147,12 +166,12 @@ class PythonAIScanner:
                     ))
 
         # 4. Detect AI Endpoints in Web Frameworks (Flask, FastAPI, Express)
-        has_ai = bool(self.AI_FRAMEWORK_IMPORTS.search(content))
-        if has_ai:
-            for line_num, line in enumerate(lines, 1):
-                route_match = self.ROUTE_DECORATOR_PATTERN.search(line)
-                if route_match:
-                    route = route_match.group("route")
+        has_ai_import = bool(self.AI_FRAMEWORK_IMPORTS.search(content))
+        for line_num, line in enumerate(lines, 1):
+            route_match = self.ROUTE_DECORATOR_PATTERN.search(line)
+            if route_match:
+                route = route_match.group("route")
+                if has_ai_import or self.AI_ROUTE_KEYWORDS.search(route):
                     method = (route_match.group(2) or "POST").upper()
                     endpoints.append(DiscoveredAIEndpoint(
                         file_path=str(file_path),
@@ -179,13 +198,17 @@ class PythonAIScanner:
         all_endpoints: List[DiscoveredAIEndpoint] = []
 
         skip_dirs = {".git", "node_modules", "target", "venv", ".venv", "__pycache__", "out", "reports"}
-        valid_exts = {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".json", ".yaml", ".yml", ".env"}
+        valid_exts = {
+            ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".json", ".yaml", ".yml", ".env",
+            ".rego", ".cedar", ".tf", ".hcl", ".sh", ".ps1", ".toml",
+        }
 
         for root, dirs, files in os.walk(root_dir):
             dirs[:] = [d for d in dirs if d not in skip_dirs]
             for file in files:
                 ext = Path(file).suffix.lower()
-                if ext in valid_exts:
+                is_dockerfile = file.lower() in ("dockerfile", "containerfile") or file.lower().startswith("dockerfile.")
+                if ext in valid_exts or is_dockerfile:
                     fp = Path(root) / file
                     f_list, e_list = self.scan_file(fp)
                     all_findings.extend(f_list)
@@ -266,11 +289,11 @@ class AiscanIntegrator:
             except Exception as e:
                 logger.warning("aiscan binary execution failed, using Python fallback: %s", e)
 
-        # If binary produced no findings or was missing, run embedded scanner
-        if not findings:
-            f_ast, e_ast = self.python_scanner.scan_directory(tp)
-            findings.extend(f_ast)
-            endpoints.extend(e_ast)
+        # Always run embedded scanner to discover web AI endpoints and AST sinks so endpoints are never dropped
+        f_ast, e_ast = self.python_scanner.scan_directory(tp)
+        findings.extend(f_ast)
+        endpoints.extend(e_ast)
+        if not findings and engine_used != "haasonsaas/aiscan":
             engine_used = "python_ast_fallback"
 
         # Persist into terminator.db if database available

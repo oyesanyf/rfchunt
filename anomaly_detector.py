@@ -7,8 +7,11 @@ Implements the 4 core anomaly detectors from the HTTP Terminator research:
 4. Clean-Probe Multi-Response (RFC-compliant request triggering multiple responses)
 """
 
+import logging
 import re
 from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger("terminator.anomaly")
 
 
 class AnomalyDetector:
@@ -117,8 +120,8 @@ class AnomalyDetector:
                             "type": fp.get("name", "custom_fingerprint"),
                             "description": fp.get("description", f"Matched custom fingerprint: {pat}"),
                         })
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Error evaluating database anomaly fingerprints: %s", e)
 
         return anomalies
 

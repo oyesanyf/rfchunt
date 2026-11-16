@@ -99,6 +99,10 @@ SUPPORTED_EXTENSIONS: Set[str] = {
     ".toml",
     ".sql",
     ".tf",
+    ".hcl",
+    ".rego",
+    ".cedar",
+    ".env",
     ".sv",
     ".v",
 }
@@ -436,11 +440,13 @@ def discover_candidate_files(target_path: str, max_bytes: int = 1_500_000) -> Li
 
     discovered: List[str] = []
     for root, dirs, files in os.walk(resolved):
-        dirs[:] = sorted(d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".git"))
+        dirs[:] = sorted(d for d in dirs if d not in EXCLUDED_DIRS and (not d.startswith(".git") or d.startswith(".github")))
         for fname in sorted(files):
             ext = os.path.splitext(fname)[1].lower()
+            is_dockerfile = fname.lower() in ("dockerfile", "containerfile") or fname.lower().startswith("dockerfile.")
+            is_env = fname.lower() == ".env" or fname.lower().startswith(".env.")
             is_req_txt = ext == ".txt" and ("requirement" in fname.lower() or "constraint" in fname.lower())
-            if ext not in SUPPORTED_EXTENSIONS and not is_req_txt:
+            if ext not in SUPPORTED_EXTENSIONS and not is_req_txt and not is_dockerfile and not is_env:
                 continue
             full_path = os.path.join(root, fname)
             try:
@@ -1212,16 +1218,28 @@ class MantisZeroDaySynthesizer:
         tm_dict = (threat_model.to_dict() if hasattr(threat_model, "to_dict") else dict(threat_model or {})) if threat_model else {}
         target = os.path.basename(str(tm_dict.get("target_repo") or "target"))
         raw_eps = tm_dict.get("entry_points")
-        entry_points = [ep for ep in raw_eps if isinstance(ep, dict)][:10] if isinstance(raw_eps, list) else []
+        entry_points = [
+            ep if isinstance(ep, dict) else {"function": str(ep), "source": "threat_model"}
+            for ep in (raw_eps if isinstance(raw_eps, list) else [])
+        ]
 
         raw_tbs = tm_dict.get("trust_boundaries")
-        boundaries = [tb for tb in raw_tbs if isinstance(tb, dict)][:10] if isinstance(raw_tbs, list) else []
+        boundaries = [
+            tb if isinstance(tb, dict) else {"boundary": str(tb)}
+            for tb in (raw_tbs if isinstance(raw_tbs, list) else [])
+        ]
 
         raw_dfs = tm_dict.get("data_flows")
-        flows = [df for df in raw_dfs if isinstance(df, dict)][:10] if isinstance(raw_dfs, list) else []
+        flows = [
+            df if isinstance(df, dict) else {"flow": str(df)}
+            for df in (raw_dfs if isinstance(raw_dfs, list) else [])
+        ]
 
         raw_rfs = tm_dict.get("risk_ranked_files")
-        top_files = [str(f.get("rel_path") or "") for f in raw_rfs if isinstance(f, dict)][:5] if isinstance(raw_rfs, list) else []
+        top_files = [
+            str(f.get("rel_path") if isinstance(f, dict) else f)
+            for f in (raw_rfs if isinstance(raw_rfs, list) else [])
+        ]
 
         prompt_payload = {
             "target": target,
@@ -1321,16 +1339,28 @@ class MantisZeroDaySynthesizer:
     ) -> List[MantisHypothesis]:
         tm_dict = (threat_model.to_dict() if hasattr(threat_model, "to_dict") else dict(threat_model or {})) if threat_model else {}
         raw_eps = tm_dict.get("entry_points")
-        entry_points = [ep for ep in raw_eps if isinstance(ep, dict)] if isinstance(raw_eps, list) else []
+        entry_points = [
+            ep if isinstance(ep, dict) else {"function": str(ep), "source": "threat_model"}
+            for ep in (raw_eps if isinstance(raw_eps, list) else [])
+        ]
 
         raw_tbs = tm_dict.get("trust_boundaries")
-        boundaries = [tb for tb in raw_tbs if isinstance(tb, dict)] if isinstance(raw_tbs, list) else []
+        boundaries = [
+            tb if isinstance(tb, dict) else {"boundary": str(tb)}
+            for tb in (raw_tbs if isinstance(raw_tbs, list) else [])
+        ]
 
         raw_dfs = tm_dict.get("data_flows")
-        flows = [df for df in raw_dfs if isinstance(df, dict)] if isinstance(raw_dfs, list) else []
+        flows = [
+            df if isinstance(df, dict) else {"flow": str(df)}
+            for df in (raw_dfs if isinstance(raw_dfs, list) else [])
+        ]
 
         raw_rfs = tm_dict.get("risk_ranked_files")
-        ranked_files = [rf for rf in raw_rfs if isinstance(rf, dict)] if isinstance(raw_rfs, list) else []
+        ranked_files = [
+            rf if isinstance(rf, dict) else {"file_path": str(rf), "rel_path": str(rf), "risk_score": 40}
+            for rf in (raw_rfs if isinstance(raw_rfs, list) else [])
+        ]
         target_repo = str(tm_dict.get("target_repo") or ".")
 
         path_map: Dict[str, str] = {}
@@ -1429,19 +1459,21 @@ class MantisZeroDaySynthesizer:
 
         # Multi-Vector 1: Cross-Boundary Data Flows (Entry point -> dangerous sink / boundary)
         for ep in entry_points:
-            ep_file = str(ep.get("file") or "")
-            ep_func = str(ep.get("function") or "")
-            ep_line = _safe_line(ep.get("line"), 1)
-            ep_args = ep.get("args") or []
+            ep_file = str(ep.get("file") or "") if isinstance(ep, dict) else ""
+            ep_func = str(ep.get("function") or "") if isinstance(ep, dict) else str(ep)
+            ep_line = _safe_line(ep.get("line"), 1) if isinstance(ep, dict) else 1
+            ep_args = ep.get("args") or [] if isinstance(ep, dict) else []
             matching_boundaries = [
                 b for b in boundaries
-                if str(b.get("file") or "") == ep_file
-                or any(str(df.get("source") or "") == ep_file and str(df.get("sink") or "") == str(b.get("boundary") or "") for df in flows)
+                if (isinstance(b, dict) and str(b.get("file") or "") == ep_file)
+                or (isinstance(b, dict) and any((isinstance(df, dict) and str(df.get("source") or "") == ep_file and str(df.get("sink") or "") == str(b.get("boundary") or "")) for df in flows))
+                or not ep_file
             ]
             for tb in matching_boundaries:
-                full_fpath = resolve_full_path(str(tb.get("file") or ep_file))
-                line_no = _safe_line(tb.get("line"), ep_line)
-                sink_name = str(tb.get("boundary") or "untrusted_boundary_sink")
+                tb_file = str(tb.get("file") or ep_file) if isinstance(tb, dict) else ep_file
+                full_fpath = resolve_full_path(tb_file)
+                line_no = _safe_line(tb.get("line"), ep_line) if isinstance(tb, dict) else ep_line
+                sink_name = str(tb.get("boundary") or "untrusted_boundary_sink") if isinstance(tb, dict) else str(tb)
                 key = ("MANTIS-0DAY-XFLOW-001", full_fpath, line_no)
                 if key in seen_keys:
                     continue
@@ -1488,10 +1520,10 @@ class MantisZeroDaySynthesizer:
 
         # Multi-Vector 2: Protocol Desynchronization / HTTP Framing to Dynamic Execution
         for ep in entry_points:
-            ep_file = str(ep.get("file") or "")
-            ep_func = str(ep.get("function") or "")
-            ep_line = _safe_line(ep.get("line"), 1)
-            is_net = bool(ep.get("network_exposed", False))
+            ep_file = str(ep.get("file") or "") if isinstance(ep, dict) else ""
+            ep_func = str(ep.get("function") or "") if isinstance(ep, dict) else str(ep)
+            ep_line = _safe_line(ep.get("line"), 1) if isinstance(ep, dict) else 1
+            is_net = bool(ep.get("network_exposed", False)) if isinstance(ep, dict) else True
             func_low = ep_func.lower()
             if is_net or any(k in func_low for k in ("handle", "route", "parse", "process", "stream", "proxy", "server", "query")):
                 full_fpath = resolve_full_path(ep_file)
@@ -1532,12 +1564,12 @@ class MantisZeroDaySynthesizer:
                 )
 
         # Multi-Vector 3: High-Risk File Multi-Primitive Chaining
-        for rf in ranked_files[:4]:
-            fpath = str(rf.get("file_path") or "")
-            reasons = rf.get("reasons")
+        for rf in ranked_files:
+            fpath = str(rf.get("file_path") or rf.get("rel_path") or "") if isinstance(rf, dict) else str(rf)
+            reasons = rf.get("reasons") if isinstance(rf, dict) else []
             if not isinstance(reasons, (list, tuple, set)):
                 reasons = [reasons] if reasons is not None else []
-            raw_score = rf.get("risk_score")
+            raw_score = rf.get("risk_score") if isinstance(rf, dict) else 40
             score = _safe_risk_score(raw_score)
             if score >= 35 or any("marker:" in str(r) for r in reasons):
                 key = ("MANTIS-0DAY-CHAIN-003", fpath, 1)
@@ -2583,11 +2615,15 @@ def build_sarif_document(
 
 def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> Dict[str, Any]:
     """
-    Cross-platform static SAST + PQC/Crypto + SCA fallback used when Windows Docker RAPTOR
-    is not running (e.g., Linux GitHub Actions CI or non-Docker environments).
+    Cross-platform static SAST + PQC/Crypto + SCA + Policy + Workflow fallback used when
+    Windows Docker RAPTOR is not running (e.g., Linux GitHub Actions CI or non-Docker environments).
     """
     sca_findings: List[Dict[str, Any]] = []
     pqc_findings: List[Dict[str, Any]] = []
+    policy_findings: List[Dict[str, Any]] = []
+    workflow_findings: List[Dict[str, Any]] = []
+    crypto_findings: List[Dict[str, Any]] = []
+    secret_findings: List[Dict[str, Any]] = []
 
     req_files = [
         fp for fp in files
@@ -2613,32 +2649,203 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
                     }
                 )
 
+    valid_exts = (
+        ".rego", ".cedar", ".tf", ".hcl", ".yaml", ".yml", ".json", ".toml",
+        ".sh", ".ps1", ".py", ".js", ".ts", ".go", ".rs", ".c", ".cpp", ".java", ".env",
+    )
+
     for fp in files:
-        if not fp.endswith((".py", ".go", ".rs", ".js", ".ts")):
+        base = os.path.basename(fp).lower()
+        ext = os.path.splitext(fp)[1].lower()
+        is_docker = base in ("dockerfile", "containerfile") or base.startswith("dockerfile.")
+        is_env = base == ".env" or base.startswith(".env.")
+        if ext not in valid_exts and not is_docker and not is_env:
             continue
+
         text = _read_text_safe(fp)
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            if "rsa" in line.lower() and "1024" in line:
-                pqc_findings.append(
-                    {
+        lines = text.splitlines()
+
+        # 1. OPA Rego Policies
+        if ext == ".rego":
+            for lineno, line in enumerate(lines, start=1):
+                sline = line.strip()
+                if sline.startswith("#"):
+                    continue
+                if re.search(r'(?i)\bdefault\s+allow\s*[:=]\s*true\b', sline):
+                    policy_findings.append({
+                        "rule_id": "RAPTOR-POLICY-REGO-ALLOW",
+                        "title": "Overly permissive OPA Rego default allow policy",
+                        "severity": "HIGH",
+                        "cwe": "CWE-285",
+                        "file_path": fp,
+                        "line_number": lineno,
+                        "scanner": "RAPTOR-CrossPlatform-Policy",
+                        "remediation": "Set 'default allow = false' to enforce fail-closed authorization.",
+                    })
+
+        # 2. Cedar Policies
+        if ext == ".cedar":
+            for lineno, line in enumerate(lines, start=1):
+                sline = line.strip()
+                if sline.startswith("//"):
+                    continue
+                if re.search(r'(?i)\bpermit\s*\(\s*(?:principal\s*,\s*action\s*,\s*resource|\s*)\s*\)\s*;', sline):
+                    policy_findings.append({
+                        "rule_id": "RAPTOR-POLICY-CEDAR-PERMIT",
+                        "title": "Unconstrained Cedar authorization permit policy",
+                        "severity": "HIGH",
+                        "cwe": "CWE-285",
+                        "file_path": fp,
+                        "line_number": lineno,
+                        "scanner": "RAPTOR-CrossPlatform-Policy",
+                        "remediation": "Add specific 'when' conditions restricting principal and resource attributes.",
+                    })
+
+        # 3. GitHub Actions Workflows
+        norm_fp = fp.replace("\\", "/").lower()
+        if (".github/workflows" in norm_fp or norm_fp.endswith((".github/workflows/pr.yml", "workflows/pr.yml", "pr.yml"))) and ext in (".yml", ".yaml"):
+            for lineno, line in enumerate(lines, start=1):
+                sline = line.strip()
+                if sline.startswith("#"):
+                    continue
+                if "pull_request_target" in sline:
+                    workflow_findings.append({
+                        "rule_id": "RAPTOR-GHA-PR-TARGET",
+                        "title": "Insecure pull_request_target trigger in GitHub Actions workflow",
+                        "severity": "HIGH",
+                        "cwe": "CWE-829",
+                        "file_path": fp,
+                        "line_number": lineno,
+                        "scanner": "RAPTOR-CrossPlatform-Workflow",
+                        "remediation": "Avoid pull_request_target with checkout of untrusted PR branches.",
+                    })
+                unpinned_m = re.search(r'(?i)\buses:\s*([a-zA-Z0-9_\-\.\/]+)@(master|main|v\d+(?:\.\d+)*)\b', sline)
+                if unpinned_m and not sline.startswith("#"):
+                    workflow_findings.append({
+                        "rule_id": "RAPTOR-GHA-UNPINNED",
+                        "title": f"Unpinned third-party GitHub Action reference: {unpinned_m.group(0)}",
+                        "severity": "MEDIUM",
+                        "cwe": "CWE-1357",
+                        "file_path": fp,
+                        "line_number": lineno,
+                        "scanner": "RAPTOR-CrossPlatform-Workflow",
+                        "remediation": "Pin third-party GitHub Actions to a full 40-character commit SHA.",
+                    })
+                if re.search(r'\$\{\{\s*(?:github\.event\.|inputs\.|github\.head_ref)', sline):
+                    workflow_findings.append({
+                        "rule_id": "RAPTOR-GHA-INJECTION",
+                        "title": "Potential script injection in GitHub Actions workflow expression",
+                        "severity": "HIGH",
+                        "cwe": "CWE-78",
+                        "file_path": fp,
+                        "line_number": lineno,
+                        "scanner": "RAPTOR-CrossPlatform-Workflow",
+                        "remediation": "Pass github context variables through intermediate environment variables (env:) rather than inline expressions.",
+                    })
+
+        # 4. Weak Cryptography & Quantum Vulnerability
+        if ext in (".py", ".go", ".rs", ".js", ".ts", ".c", ".cpp", ".java"):
+            for lineno, line in enumerate(lines, start=1):
+                low_line = line.lower()
+                if "rsa" in low_line and any(k in line for k in ("1024", "512", "768")):
+                    pqc_findings.append({
                         "rule_id": "RAPTOR-PQC-1024",
-                        "title": "Weak RSA-1024 key size (Quantum-Vulnerable)",
+                        "title": "Weak RSA key size < 2048 bits (Quantum-Vulnerable)",
                         "severity": "HIGH",
                         "cwe": "CWE-326",
                         "file_path": fp,
                         "line_number": lineno,
                         "scanner": "RAPTOR-CrossPlatform-PQC",
                         "remediation": "Migrate to >= 3072-bit RSA or NIST PQC (ML-KEM / ML-DSA).",
-                    }
-                )
+                    })
+                if re.search(r'(?i)\b(?:hashlib\.(?:md5|sha1)|crypto/(?:md5|sha1)|md5\.new|sha1\.new|MessageDigest\.getInstance\("MD5"\)|MessageDigest\.getInstance\("SHA-1"\))\b', line):
+                    crypto_findings.append({
+                        "rule_id": "RAPTOR-CRYPTO-WEAK-HASH",
+                        "title": "Weak cryptographic hash algorithm (MD5/SHA1)",
+                        "severity": "MEDIUM",
+                        "cwe": "CWE-328",
+                        "file_path": fp,
+                        "line_number": lineno,
+                        "scanner": "RAPTOR-CrossPlatform-Crypto",
+                        "remediation": "Upgrade to SHA-256, SHA-3, or BLAKE3.",
+                    })
+                if re.search(r'(?i)\b(?:DES\.new|ARC4\.new|MODE_ECB|AES/ECB/PKCS5Padding)\b', line):
+                    crypto_findings.append({
+                        "rule_id": "RAPTOR-CRYPTO-WEAK-CIPHER",
+                        "title": "Insecure cipher algorithm or ECB cipher mode (DES, RC4, or ECB)",
+                        "severity": "HIGH",
+                        "cwe": "CWE-327",
+                        "file_path": fp,
+                        "line_number": lineno,
+                        "scanner": "RAPTOR-CrossPlatform-Crypto",
+                        "remediation": "Use AES-GCM, ChaCha20-Poly1305, or authenticated AEAD cipher mode.",
+                    })
 
-    combined = sca_findings + pqc_findings
+        # 5. Hardcoded Secrets
+        for lineno, line in enumerate(lines, start=1):
+            sline = line.strip()
+            if sline.startswith("#") or sline.startswith("//"):
+                continue
+            if re.search(r'\bAKIA[0-9A-Z]{16}\b', line):
+                secret_findings.append({
+                    "rule_id": "RAPTOR-SECRET-EXPOSED",
+                    "title": "Hardcoded AWS Access Key ID exposed",
+                    "severity": "CRITICAL",
+                    "cwe": "CWE-798",
+                    "file_path": fp,
+                    "line_number": lineno,
+                    "scanner": "RAPTOR-CrossPlatform-Secrets",
+                    "remediation": "Revoke AWS credential immediately and load via IAM role or environment variable.",
+                })
+            elif re.search(r'\b(?:ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9]{36}\b', line):
+                secret_findings.append({
+                    "rule_id": "RAPTOR-SECRET-EXPOSED",
+                    "title": "Hardcoded GitHub Personal Access Token exposed",
+                    "severity": "CRITICAL",
+                    "cwe": "CWE-798",
+                    "file_path": fp,
+                    "line_number": lineno,
+                    "scanner": "RAPTOR-CrossPlatform-Secrets",
+                    "remediation": "Revoke GitHub token immediately and load via secret manager.",
+                })
+            elif "-----BEGIN " in line and "PRIVATE KEY-----" in line:
+                secret_findings.append({
+                    "rule_id": "RAPTOR-SECRET-EXPOSED",
+                    "title": "Hardcoded Private Key block exposed",
+                    "severity": "CRITICAL",
+                    "cwe": "CWE-798",
+                    "file_path": fp,
+                    "line_number": lineno,
+                    "scanner": "RAPTOR-CrossPlatform-Secrets",
+                    "remediation": "Store private keys in local secrets engine or TPM/HSM.",
+                })
+
+        # 6. Dangerous Pipe-to-Shell Supply Chain
+        if ext in (".sh", ".ps1") or is_docker:
+            for lineno, line in enumerate(lines, start=1):
+                if re.search(r'(?i)\b(?:curl|wget)\s+[^|]+\|\s*(?:ba)?sh\b', line):
+                    sca_findings.append({
+                        "rule_id": "RAPTOR-SUPPLY-CHAIN-PIPE-SH",
+                        "title": "Dangerous pipe-to-shell in script or container build",
+                        "severity": "HIGH",
+                        "cwe": "CWE-829",
+                        "file_path": fp,
+                        "line_number": lineno,
+                        "scanner": "RAPTOR-CrossPlatform-SCA",
+                        "remediation": "Download script, verify cryptographic hash/signature, then execute.",
+                    })
+
+    combined = sca_findings + pqc_findings + policy_findings + workflow_findings + crypto_findings + secret_findings
     return {
         "mode": "cross_platform_static_sast_pqc_sca",
         "available_docker": False,
         "total_findings": len(combined),
         "sca_findings": sca_findings,
         "pqc_findings": pqc_findings,
+        "policy_findings": policy_findings,
+        "workflow_findings": workflow_findings,
+        "crypto_findings": crypto_findings,
+        "secret_findings": secret_findings,
         "findings": combined,
     }
 
@@ -2941,7 +3148,7 @@ def run_unified_all_scans(
             raptor = RaptorIntegrator(db=db, on_trace=on_trace)
             status = raptor.check_status()
             if status.get("docker_image_present") and status.get("raptor_repo_present") and os.name == "nt":
-                res = raptor.run_scan(target_path=target_path, mode="scan", model=enforced_model)
+                res = raptor.run_scan(target_path=target_path, mode="all", model=enforced_model)
                 res["mode"] = "raptor_docker"
                 if fallback_res.get("findings"):
                     res.setdefault("findings", []).extend(fallback_res["findings"])
@@ -2967,15 +3174,31 @@ def run_unified_all_scans(
         artex = DualGraphAttackEngine(db=db, reports_dir=str(out_dir))
         tm_dict = mantis_res.get("threat_model")
         raw_eps = tm_dict.get("entry_points") if isinstance(tm_dict, dict) else []
-        discovered_eps = [
-            ep.get("function", "/api") if isinstance(ep, dict) else str(ep)
-            for ep in (raw_eps if isinstance(raw_eps, list) else [])
-        ]
+        discovered_eps = []
+        for ep in (raw_eps if isinstance(raw_eps, list) else []):
+            if isinstance(ep, dict):
+                discovered_eps.append(ep.get("function") or ep.get("route") or "/api")
+            else:
+                discovered_eps.append(str(ep))
+        raw_ai_eps = aiscan_res.get("endpoints")
+        for aep in (raw_ai_eps if isinstance(raw_ai_eps, list) else []):
+            if isinstance(aep, dict):
+                discovered_eps.append(aep.get("route_path") or aep.get("route") or "/api/ai")
+            elif hasattr(aep, "route_path"):
+                discovered_eps.append(str(aep.route_path))
+            else:
+                discovered_eps.append(str(aep))
+
         raw_sinks = aiscan_res.get("findings")
-        ai_sinks = [
-            f.get("title", "ai_sink") if isinstance(f, dict) else str(f)
-            for f in (raw_sinks if isinstance(raw_sinks, list) else [])
-        ]
+        ai_sinks = []
+        for f in (raw_sinks if isinstance(raw_sinks, list) else []):
+            if isinstance(f, dict):
+                ai_sinks.append(f.get("title") or f.get("name") or "ai_sink")
+            elif hasattr(f, "description"):
+                ai_sinks.append(str(f.description))
+            else:
+                ai_sinks.append(str(f))
+
         artex.ingest_target_infrastructure(
             host=os.path.basename(target_path) or "repo-target",
             port=443,
@@ -2997,16 +3220,17 @@ def run_unified_all_scans(
                     anomaly_type="MANTIS_TAINT",
                     raw_probe=mfind,
                 )
-        if hasattr(artex, "ingest_findings"):
+        ingester = getattr(artex, "ingest_finding", getattr(artex, "ingest_scanner_finding", None))
+        if ingester:
             for mfind in (mantis_res.get("findings") or []):
                 f_item = mfind if isinstance(mfind, dict) else {"title": str(mfind), "description": str(mfind), "rule_id": "MANTIS-FIND"}
-                artex.ingest_finding(f_item, scanner="mantis")
+                ingester(f_item, scanner="mantis")
             for afind in (aiscan_res.get("findings") or []):
                 f_item = afind if isinstance(afind, dict) else {"title": str(afind), "description": str(afind), "rule_id": "AISCAN-FIND"}
-                artex.ingest_finding(f_item, scanner="aiscan")
+                ingester(f_item, scanner="aiscan")
             for rfind in (raptor_res.get("findings") or []):
                 f_item = rfind if isinstance(rfind, dict) else {"title": str(rfind), "description": str(rfind), "rule_id": "RAPTOR-FIND"}
-                artex.ingest_finding(f_item, scanner="raptor")
+                ingester(f_item, scanner="raptor")
         cycle_res = artex.run_attack_chain_cycle(round_num=max(1, int(artex_rounds)))
         chains = artex.export_attack_chains_to_sarif_findings() if hasattr(artex, "export_attack_chains_to_sarif_findings") else []
         artex_res = cycle_res if isinstance(cycle_res, dict) else {"result": str(cycle_res)}
@@ -3018,25 +3242,37 @@ def run_unified_all_scans(
 
     # 3. Synthesize Cross-Layer Prompt Smuggling & RFC Desync Probes offline (Module 19)
     smuggle_res: Dict[str, Any] = {"probes_generated": 0, "probes": []}
+    all_smuggle_probes = []
+    has_real_ai_endpoints = False
     try:
         from engine.prompt_smuggling_synthesizer import PromptSmugglingSynthesizer
         synth = PromptSmugglingSynthesizer(db=db, reports_dir=str(out_dir))
         raw_endpoints = aiscan_res.get("endpoints")
-        ai_endpoints = [
-            ep.get("route", "/api/chat")
-            for ep in (raw_endpoints if isinstance(raw_endpoints, list) else [])
-            if isinstance(ep, dict)
-        ] or ["/api/chat"]
-        probes = synth.synthesize_probes_for_endpoint(
-            target_host="localhost",
-            target_port=8080,
-            ai_endpoint=ai_endpoints[0],
-            http_method="POST",
-        )
+        ai_endpoints: List[str] = []
+        for ep in (raw_endpoints if isinstance(raw_endpoints, list) else []):
+            if isinstance(ep, dict):
+                ai_endpoints.append(str(ep.get("route") or ep.get("route_path") or "/api/chat"))
+            elif hasattr(ep, "route_path"):
+                ai_endpoints.append(str(ep.route_path))
+            elif ep:
+                ai_endpoints.append(str(ep))
+        has_real_ai_endpoints = len(ai_endpoints) > 0
+        if not ai_endpoints:
+            ai_endpoints = ["/api/chat"]
+
+        for ai_endpoint in ai_endpoints:
+            probes = synth.synthesize_probes_for_endpoint(
+                target_host="localhost",
+                target_port=8080,
+                ai_endpoint=ai_endpoint,
+                http_method="POST",
+            )
+            all_smuggle_probes.extend(probes)
+
         smuggle_res = {
-            "probes_generated": len(probes),
-            "ai_endpoint": ai_endpoints[0],
-            "techniques": [getattr(p, "framing_technique", "CL.TE") for p in probes[:10]],
+            "probes_generated": len(all_smuggle_probes),
+            "ai_endpoints": ai_endpoints,
+            "techniques": [getattr(p, "wire_anomaly_technique", "CL.TE") for p in all_smuggle_probes],
         }
     except Exception as exc:
         smuggle_res = {"error": str(exc), "probes_generated": 0}
@@ -3120,6 +3356,37 @@ def run_unified_all_scans(
                     "scanner": "Module-15-RAPTOR",
                 }
             )
+
+    # Append synthesized prompt smuggling findings when real AI endpoints were discovered
+    if has_real_ai_endpoints:
+        for probe in all_smuggle_probes:
+            aggregated_findings.append({
+                "rule_id": probe.probe_id,
+                "title": f"Desynchronized Prompt Injection: {probe.wire_anomaly_technique}",
+                "severity": "CRITICAL",
+                "cwe": "CWE-444",
+                "file_path": probe.target_ai_endpoint,
+                "line_number": 1,
+                "description": probe.rationale,
+                "remediation": "Enforce strict HTTP framing boundaries.",
+                "scanner": "Module-19-PromptSmuggler",
+            })
+
+    # Append synthesized ARTEX attack chains
+    if artex_res.get("chains"):
+        for ch in artex_res["chains"]:
+            if isinstance(ch, dict):
+                aggregated_findings.append({
+                    "rule_id": ch.get("rule_id", "ARTEX-CHAIN-001"),
+                    "title": ch.get("title", "Multi-Hop Cross-Scanner Attack Chain"),
+                    "severity": ch.get("severity", "CRITICAL"),
+                    "cwe": ch.get("cwe", "CWE-444"),
+                    "file_path": ch.get("file_path", target_path),
+                    "line_number": ch.get("line_number", 1),
+                    "description": ch.get("description", "Compound vulnerability attack path synthesized by ARTEX."),
+                    "remediation": ch.get("remediation", "Remediate initial framing primitive or auth secret exposure."),
+                    "scanner": "Module-17-ARTEX",
+                })
 
     # Final Fusion arbiter synthesis summary over combined scan surface
     fusion_summary = (

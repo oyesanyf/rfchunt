@@ -783,6 +783,7 @@ def test_unified_all_scans_none_findings_and_none_threat_model(monkeypatch: pyte
 
     reports_dir = tmp_path / "reports_none_test"
     with patch("engine.mantis_integrator.MantisIntegrator.run_scan", return_value=mock_mantis), \
+         patch("engine.aiscan_integrator.AiscanIntegrator.scan_target", return_value=mock_aiscan), \
          patch("engine.mantis_integrator._run_cross_platform_raptor_fallback", return_value=mock_raptor):
 
         res = run_unified_all_scans(
@@ -799,6 +800,7 @@ def test_unified_all_scans_none_findings_and_none_threat_model(monkeypatch: pyte
     # 2. Test case: findings present but threat_model is None (Bug 2 reproduction scenario)
     mock_mantis_with_finding = {"findings": ["finding1", {"title": "f2", "rule_id": "M1"}], "threat_model": None, "total_findings": 2}
     with patch("engine.mantis_integrator.MantisIntegrator.run_scan", return_value=mock_mantis_with_finding), \
+         patch("engine.aiscan_integrator.AiscanIntegrator.scan_target", return_value={"findings": [], "endpoints": []}), \
          patch("engine.mantis_integrator._run_cross_platform_raptor_fallback", return_value={"findings": []}):
 
         res2 = run_unified_all_scans(
@@ -903,6 +905,62 @@ def test_zero_day_synthesizer_adversarial_infinity_and_non_string_types():
         assert h.is_zero_day is True
         assert isinstance(h.line_number, int)
         assert h.line_number >= 1
+
+
+def test_unified_all_scans_string_entry_points_and_sinks_no_slicing(monkeypatch: pytest.MonkeyPatch, sample_repo: Path, tmp_path: Path):
+    """Regression test for string entry points, trust boundaries, and sinks.
+    Verifies that run_unified_all_scans:
+    1. Handles plain strings in entry_points, trust_boundaries, data_flows, risk_ranked_files,
+       and aiscan findings/endpoints without AttributeError: 'str' object has no attribute 'get'.
+    2. Does not truncate findings with [:10] or [:5].
+    3. ARTEX dual graph synthesizes chains without error.
+    """
+    from unittest.mock import patch
+    monkeypatch.setenv("RFCHUNT_OFFLINE", "1")
+
+    mock_tm = {
+        "entry_points": ["/api/v1/chat", "/api/v2/generate", "/login", "/health"],
+        "trust_boundaries": ["cloud_gateway", "waf_boundary"],
+        "data_flows": ["user -> db", "client -> api"],
+        "risk_ranked_files": ["server.py", "auth.py", "worker.py"],
+    }
+    mock_mantis = {
+        "findings": [
+            {"rule_id": f"MANTIS-{i}", "title": f"Mantis Finding {i}", "file": "app.py", "line": i + 1}
+            for i in range(15)
+        ],
+        "threat_model": mock_tm,
+        "total_findings": 15,
+    }
+    mock_aiscan = {
+        "findings": ["leaked_token", "unmetered_sink", "prompt_injection_sink"],
+        "endpoints": ["/api/v1/chat", "/generate"],
+        "total_findings": 3,
+    }
+    mock_raptor = {
+        "findings": [
+            {"rule_id": f"RAPTOR-{i}", "message": f"Raptor Finding {i}", "file": "main.py", "line": i + 1}
+            for i in range(20)
+        ],
+        "total_findings": 20,
+    }
+
+    reports_dir = tmp_path / "reports_str_test"
+    with patch("engine.mantis_integrator.MantisIntegrator.run_scan", return_value=mock_mantis), \
+         patch("engine.aiscan_integrator.AiscanIntegrator.scan_target", return_value=mock_aiscan), \
+         patch("engine.mantis_integrator._run_cross_platform_raptor_fallback", return_value=mock_raptor):
+
+        res = run_unified_all_scans(
+            repo=str(sample_repo),
+            use_fusion=False,
+            reports_dir=str(reports_dir),
+        )
+
+        assert res["total_aggregated_findings"] >= 35, "All findings must be preserved without [:10] slicing"
+        artex_engine = res["engines"]["artex_dual_graph"]
+        assert artex_engine.get("error") is None
+        assert "chains_synthesized" in artex_engine
+
 
 
 

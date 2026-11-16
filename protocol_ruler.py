@@ -77,6 +77,16 @@ class ProtocolRuler:
         ("Null Byte (0x00)", b"\x00", "Tests if front-end truncates header at C-string null terminator"),
         ("Vertical Tab (0x0B)", b"\x0b", "Tests whitespace normalization or sanitization stripping"),
         ("Escaped Quote (\\\")", b'\\"', "Tests quote escaping or backslash stripping in WAFs"),
+        ("HTTP/2 Pseudo-Header :path", b":path: /admin\r\n", "HTTP/2 pseudo-header injection into HTTP/1.1 stream"),
+        ("HTTP/2 Pseudo-Header :authority", b":authority: internal.local\r\n", "HTTP/2 authority pseudo-header override"),
+        ("Unicode Homoglyph Division Slash (e2 88 95)", b"\xe2\x88\x95", "Unicode division slash homoglyph U+2215 for WAF path bypass"),
+        ("Unicode Homoglyph One-Dot Leader (e2 80 a4)", b"\xe2\x80\xa4", "Unicode one-dot leader homoglyph U+2024 for directory traversal"),
+        ("UTF-8 Byte Order Mark BOM (ef bb bf)", b"\xef\xbb\xbf", "UTF-8 BOM header prefix injection for parser stripping"),
+        ("Proxy Header Spoofing (CF-Connecting-IP)", b"CF-Connecting-IP: 127.0.0.1\r\n", "Cloudflare client IP header spoofing / override"),
+        ("Proxy Header Spoofing (X-Forwarded-Host)", b"X-Forwarded-Host: evil.corp\r\n", "Reverse proxy host header poisoning"),
+        ("Proxy Header Spoofing (True-Client-IP)", b"True-Client-IP: 127.0.0.1\r\n", "Akamai / Cloudflare true client IP header spoofing"),
+        ("Unicode Fullwidth Reverse Solidus Backslash (ef bc bc)", b"\xef\xbc\xbc", "U+FF3C fullwidth reverse solidus multi-byte backslash path normalization"),
+        ("Overlong UTF-8 Backslash (c0 5c)", b"\xc0\x5c", "Overlong 2-byte backslash for Windows/IIS path traversal normalization"),
     ]
 
     def __init__(
@@ -154,8 +164,11 @@ class ProtocolRuler:
             response_bytes = framed.raw_response
             latency = (time.time() - t0) * 1000
             return status_code, response_bytes, latency
-        except Exception:
+        except Exception as e:
             latency = (time.time() - t0) * 1000
+            self._last_probe_error = str(e)
+            if getattr(self, "debug", False) or getattr(self, "verbose", False):
+                self._log(f"[DEBUG] Socket probe failed ({type(e).__name__}): {e}")
             return 0, b"", latency
         finally:
             if sock is not None:
@@ -432,6 +445,16 @@ class ProtocolRuler:
                 findings.append(res)
             except Exception as e:
                 self._log(f"[!] Error evaluating sequence '{name}': {e}")
+                findings.append({
+                    "name": name,
+                    "sequence_hex": seq_bytes.hex(),
+                    "sequence_len": len(seq_bytes),
+                    "classification": "EVALUATION_ERROR",
+                    "delta_bytes": 0,
+                    "measured_limit": 0,
+                    "description": desc,
+                    "error": str(e),
+                })
 
         # Summary Analysis
         expansions = [f for f in findings if f["classification"] == "EXPANSION"]

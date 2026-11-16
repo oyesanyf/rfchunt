@@ -91,3 +91,75 @@ prompt = f"System prompt with {user_input}"
     db_findings = db.get_ai_findings()
     assert len(db_findings) >= 2
     db.close()
+
+
+def test_python_ai_scanner_expanded_keys_and_deserialization(tmp_path):
+    """Verifies newly expanded AI keys, unsafe deserializers, and prompt sinks."""
+    code = '''
+MISTRAL_API_KEY = "0123456789abcdef0123456789abcdef"
+GROQ_API_KEY = "gsk_1234567890abcdef1234567890abcdef12345678"
+PERPLEXITY_API_KEY = "pplx-1234567890abcdef1234567890abcdef12345678"
+TOGETHER_API_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+import numpy as np
+import yaml
+
+def load_data(p):
+    data = np.load(p, allow_pickle=True)
+    cfg = yaml.unsafe_load(p)
+    return data, cfg
+
+def format_prompt(user_text):
+    s = "System: instructions here: {}".format(user_text)
+    pt = PromptTemplate.from_template("Template: {query}")
+    return s, pt
+'''
+    target = tmp_path / "expanded_app.py"
+    target.write_text(code, encoding="utf-8")
+
+    scanner = PythonAIScanner()
+    findings, endpoints = scanner.scan_file(target)
+
+    models_or_apis = {f.model_or_api for f in findings}
+    assert "Mistral API Key" in models_or_apis
+    assert "Groq API Key" in models_or_apis
+    assert "Perplexity API Key" in models_or_apis
+    assert "Together AI Key" in models_or_apis
+    assert any("numpy.load" in m for m in models_or_apis)
+    assert any("yaml" in m.lower() for m in models_or_apis)
+
+
+def test_python_ai_scanner_discovers_dockerfile_and_rego(tmp_path):
+    """Verifies directory scanning picks up Dockerfile, .rego, .cedar, .tf, .toml files."""
+    (tmp_path / "Dockerfile").write_text("FROM python:3.11\nENV OPENAI_API_KEY=\"sk-proj-docker1234567890abcdef123456\"\n", encoding="utf-8")
+    (tmp_path / "policy.rego").write_text("package ai.auth\ndefault allow = false\n", encoding="utf-8")
+
+    scanner = PythonAIScanner()
+    findings, endpoints = scanner.scan_directory(tmp_path)
+    assert any("OpenAI API Key" in f.model_or_api for f in findings)
+
+
+def test_aiscan_integrator_preserves_endpoints_with_native_findings(tmp_path, monkeypatch):
+    """Verifies Python AST endpoints are never dropped even if native binary findings exist."""
+    app_code = '''
+@app.post("/api/v1/chat")
+def chat():
+    return "ok"
+'''
+    (tmp_path / "app.py").write_text(app_code, encoding="utf-8")
+
+    integrator = AiscanIntegrator(reports_dir=tmp_path / "reports")
+    # Simulate binary path being set and returning a finding
+    import subprocess
+    class FakeProc:
+        returncode = 0
+        stdout = json.dumps({"findings": [{"type": "credential", "severity": "HIGH", "file": "app.py", "line": 1, "model": "test", "message": "found"}]})
+    monkeypatch.setattr(integrator, "binary_path", Path("fake_aiscan"))
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: FakeProc())
+
+    res = integrator.scan_target(tmp_path)
+    # Endpoints must be preserved!
+    assert len(res["endpoints"]) >= 1
+    assert any(ep["route_path"] == "/api/v1/chat" for ep in res["endpoints"])
+    assert res["total_findings"] >= 1
+

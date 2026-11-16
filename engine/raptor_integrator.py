@@ -382,7 +382,7 @@ class RaptorIntegrator:
             "output_directory": str(out_dir) if out_dir else None,
             "total_findings": len(findings),
             "ingested_to_db": ingested_count,
-            "findings": findings[:50],  # Return top 50 in summary
+            "findings": findings,
             "credit": {
                 "framework": RAPTOR_PROJECT_TITLE,
                 "authors": RAPTOR_AUTHORS,
@@ -490,7 +490,7 @@ class RaptorIntegrator:
             "output_directory": str(out_dir) if out_dir else None,
             "total_findings": len(findings),
             "ingested_to_db": ingested_count,
-            "findings": findings[:50],
+            "findings": findings,
             "credit": {
                 "framework": RAPTOR_PROJECT_TITLE,
                 "authors": RAPTOR_AUTHORS,
