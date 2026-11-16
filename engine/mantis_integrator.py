@@ -2688,7 +2688,7 @@ def run_unified_all_scans(
                 endpoints=["/api/chat", "/api/v1", "/status", "/login"],
                 ai_sinks=["llm_prompt_sink", "rag_retrieval_sink"],
             )
-            for idx, pfind in enumerate(prober_res.get("findings", []), start=1):
+            for idx, pfind in enumerate(prober_res.get("findings") or [], start=1):
                 if isinstance(pfind, dict):
                     artex.register_wire_primitive(
                         anomaly_id=pfind.get("finding_id", f"PROBER-{idx}"),
@@ -2704,10 +2704,10 @@ def run_unified_all_scans(
                         raw_probe=pfind,
                     )
             if hasattr(artex, "ingest_findings"):
-                for pfind in prober_res.get("findings", []):
+                for pfind in (prober_res.get("findings") or []):
                     f_item = pfind if isinstance(pfind, dict) else {"title": str(pfind), "description": str(pfind), "rule_id": "PROBER-DESYNC"}
                     artex.ingest_finding(f_item, scanner="prober")
-                for rfind in raptor_res.get("findings", []):
+                for rfind in (raptor_res.get("findings") or []):
                     f_item = rfind if isinstance(rfind, dict) else {"title": str(rfind), "description": str(rfind), "rule_id": "RAPTOR-WEB"}
                     artex.ingest_finding(f_item, scanner="raptor")
             cycle_res = artex.run_attack_chain_cycle(round_num=max(1, int(artex_rounds)))
@@ -2736,7 +2736,7 @@ def run_unified_all_scans(
 
         # Aggregate remote findings
         aggregated_findings: List[Dict[str, Any]] = []
-        for item in raptor_res.get("findings", []):
+        for item in (raptor_res.get("findings") or []):
             if isinstance(item, dict):
                 aggregated_findings.append({
                     "rule_id": item.get("rule_id", "RAPTOR-WEB-001"),
@@ -2749,7 +2749,7 @@ def run_unified_all_scans(
                     "remediation": item.get("remediation", ""),
                     "scanner": item.get("scanner", "Module-15-RAPTOR-Web"),
                 })
-        for item in prober_res.get("findings", []):
+        for item in (prober_res.get("findings") or []):
             if isinstance(item, dict):
                 aggregated_findings.append({
                     "rule_id": item.get("rule_id", "PROBER-001"),
@@ -2766,7 +2766,7 @@ def run_unified_all_scans(
         fusion_summary = (
             f"Unified --all remote review completed on {target_path}: "
             f"{len(aggregated_findings)} aggregated remote findings "
-            f"(RAPTOR Web={len(raptor_res.get('findings', []))}, "
+            f"(RAPTOR Web={len(raptor_res.get('findings') or [])}, "
             f"ActiveFlawProber={prober_res.get('total_findings', 0)}, "
             f"Prompt Smuggling Probes={smuggle_res.get('probes_generated', 0)})."
         )
@@ -2802,7 +2802,7 @@ def run_unified_all_scans(
             "engines": {
                 "mantis": {"total_findings": 0, "reproduced_count": 0, "patched_verified_count": 0, "report_files": {}},
                 "aiscan": {"total_findings": 0, "total_endpoints": 0},
-                "raptor": {"mode": raptor_res.get("mode", "raptor_web"), "total_findings": len(raptor_res.get("findings", []))},
+                "raptor": {"mode": raptor_res.get("mode", "raptor_web"), "total_findings": len(raptor_res.get("findings") or [])},
                 "artex_dual_graph": artex_res,
                 "prompt_smuggling": smuggle_res,
                 "active_flaw_prober": prober_res,
@@ -2826,7 +2826,7 @@ def run_unified_all_scans(
             f"Authorized: {authorized} | Allow Destructive: {allow_destructive}",
             f"Total Aggregated Findings: {len(aggregated_findings)}",
             f"Severity Breakdown: {json.dumps(sev_breakdown)}",
-            f"RAPTOR Web Findings: {len(raptor_res.get('findings', []))}",
+            f"RAPTOR Web Findings: {len(raptor_res.get('findings') or [])}",
             f"ActiveFlawProber Findings: {prober_res.get('total_findings', 0)}",
             f"Prompt Smuggling Probes Synthesized: {smuggle_res.get('probes_generated', 0)}",
             "",
@@ -2898,13 +2898,16 @@ def run_unified_all_scans(
     try:
         from engine.dual_graph_engine import DualGraphAttackEngine
         artex = DualGraphAttackEngine(db=db, reports_dir=str(out_dir))
+        tm_dict = mantis_res.get("threat_model")
+        raw_eps = tm_dict.get("entry_points") if isinstance(tm_dict, dict) else []
         discovered_eps = [
             ep.get("function", "/api") if isinstance(ep, dict) else str(ep)
-            for ep in mantis_res.get("threat_model", {}).get("entry_points", [])
+            for ep in (raw_eps if isinstance(raw_eps, list) else [])
         ]
+        raw_sinks = aiscan_res.get("findings")
         ai_sinks = [
             f.get("title", "ai_sink") if isinstance(f, dict) else str(f)
-            for f in aiscan_res.get("findings", [])
+            for f in (raw_sinks if isinstance(raw_sinks, list) else [])
         ]
         artex.ingest_target_infrastructure(
             host=os.path.basename(target_path) or "repo-target",
@@ -2912,7 +2915,7 @@ def run_unified_all_scans(
             endpoints=discovered_eps or ["/api/chat"],
             ai_sinks=ai_sinks or ["llm_prompt_sink"],
         )
-        for idx, mfind in enumerate(mantis_res.get("findings", []), start=1):
+        for idx, mfind in enumerate(mantis_res.get("findings") or [], start=1):
             if isinstance(mfind, dict):
                 artex.register_wire_primitive(
                     anomaly_id=mfind.get("finding_id", f"MANTIS-{idx}"),
@@ -2928,13 +2931,13 @@ def run_unified_all_scans(
                     raw_probe=mfind,
                 )
         if hasattr(artex, "ingest_findings"):
-            for mfind in mantis_res.get("findings", []):
+            for mfind in (mantis_res.get("findings") or []):
                 f_item = mfind if isinstance(mfind, dict) else {"title": str(mfind), "description": str(mfind), "rule_id": "MANTIS-FIND"}
                 artex.ingest_finding(f_item, scanner="mantis")
-            for afind in aiscan_res.get("findings", []):
+            for afind in (aiscan_res.get("findings") or []):
                 f_item = afind if isinstance(afind, dict) else {"title": str(afind), "description": str(afind), "rule_id": "AISCAN-FIND"}
                 artex.ingest_finding(f_item, scanner="aiscan")
-            for rfind in raptor_res.get("findings", []):
+            for rfind in (raptor_res.get("findings") or []):
                 f_item = rfind if isinstance(rfind, dict) else {"title": str(rfind), "description": str(rfind), "rule_id": "RAPTOR-FIND"}
                 artex.ingest_finding(f_item, scanner="raptor")
         cycle_res = artex.run_attack_chain_cycle(round_num=max(1, int(artex_rounds)))
@@ -2951,9 +2954,10 @@ def run_unified_all_scans(
     try:
         from engine.prompt_smuggling_synthesizer import PromptSmugglingSynthesizer
         synth = PromptSmugglingSynthesizer(db=db, reports_dir=str(out_dir))
+        raw_endpoints = aiscan_res.get("endpoints")
         ai_endpoints = [
             ep.get("route", "/api/chat")
-            for ep in aiscan_res.get("endpoints", [])
+            for ep in (raw_endpoints if isinstance(raw_endpoints, list) else [])
             if isinstance(ep, dict)
         ] or ["/api/chat"]
         probes = synth.synthesize_probes_for_endpoint(
@@ -2972,7 +2976,7 @@ def run_unified_all_scans(
 
     # 4. Aggregate all findings into Unified SARIF 2.1.0 + JSON + TXT
     aggregated_findings: List[Dict[str, Any]] = []
-    for item in mantis_res.get("findings", []):
+    for item in (mantis_res.get("findings") or []):
         if isinstance(item, dict):
             aggregated_findings.append({**item, "scanner": "Module-20-Google-Mantis"})
         elif isinstance(item, str):
@@ -2990,7 +2994,7 @@ def run_unified_all_scans(
                 }
             )
 
-    for item in aiscan_res.get("findings", []):
+    for item in (aiscan_res.get("findings") or []):
         if isinstance(item, dict):
             aggregated_findings.append(
                 {
@@ -3020,7 +3024,7 @@ def run_unified_all_scans(
                 }
             )
 
-    for item in raptor_res.get("findings", []):
+    for item in (raptor_res.get("findings") or []):
         if isinstance(item, dict):
             aggregated_findings.append(
                 {
@@ -3056,7 +3060,7 @@ def run_unified_all_scans(
         f"{len(aggregated_findings)} aggregated findings "
         f"(Mantis={mantis_res.get('total_findings', 0)}, "
         f"aiscan={aiscan_res.get('total_findings', 0)}, "
-        f"raptor={len(raptor_res.get('findings', []))})."
+        f"raptor={len(raptor_res.get('findings') or [])})."
     )
     if arbiter is not None and hasattr(arbiter, "arbitrate_structured_json"):
         synth_out = arbiter.arbitrate_structured_json(
@@ -3067,7 +3071,7 @@ def run_unified_all_scans(
                     "target": os.path.basename(target_path),
                     "mantis_count": mantis_res.get("total_findings", 0),
                     "aiscan_count": aiscan_res.get("total_findings", 0),
-                    "raptor_count": len(raptor_res.get("findings", [])),
+                    "raptor_count": len(raptor_res.get("findings") or []),
                     "smuggle_probes": smuggle_res.get("probes_generated", 0),
                 }
             ),
@@ -3115,7 +3119,7 @@ def run_unified_all_scans(
                 "reproduced_count": mantis_res.get("reproduced_count", 0),
                 "patched_verified_count": mantis_res.get("patched_verified_count", 0),
                 "threat_model_id": mantis_res.get("threat_model_id"),
-                "report_files": mantis_res.get("report_files", {}),
+                "report_files": mantis_res.get("report_files") or {},
             },
             "aiscan": {
                 "total_findings": aiscan_res.get("total_findings", 0),
@@ -3123,19 +3127,19 @@ def run_unified_all_scans(
             },
             "raptor": {
                 "mode": raptor_res.get("mode", "static"),
-                "total_findings": len(raptor_res.get("findings", [])),
+                "total_findings": len(raptor_res.get("findings") or []),
             },
             "artex_dual_graph": artex_res,
             "prompt_smuggling": smuggle_res,
         },
         "findings": aggregated_findings,
-        "chains": artex_res.get("chains", []),
-        "chains_synthesized": artex_res.get("chains_synthesized", len(artex_res.get("chains", []))),
+        "chains": artex_res.get("chains") or [],
+        "chains_synthesized": artex_res.get("chains_synthesized", len(artex_res.get("chains") or [])),
         "report_files": {
             "combined_sarif": str(combined_sarif_path),
             "combined_json": str(combined_json_path),
             "combined_txt": str(combined_txt_path),
-            "mantis_sarif": mantis_res.get("report_files", {}).get("sarif", ""),
+            "mantis_sarif": (mantis_res.get("report_files") or {}).get("sarif", "") if isinstance(mantis_res.get("report_files"), dict) else "",
         },
         "elapsed_sec": elapsed,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -3152,7 +3156,7 @@ def run_unified_all_scans(
         f"Severity Breakdown: {json.dumps(sev_breakdown)}",
         f"Mantis Findings: {mantis_res.get('total_findings', 0)} (Reproduced: {mantis_res.get('reproduced_count', 0)}, Patched Verified: {mantis_res.get('patched_verified_count', 0)})",
         f"aiscan AI Findings: {aiscan_res.get('total_findings', 0)}",
-        f"RAPTOR SAST/PQC/SCA Findings: {len(raptor_res.get('findings', []))}",
+        f"RAPTOR SAST/PQC/SCA Findings: {len(raptor_res.get('findings') or [])}",
         f"Prompt Smuggling Probes Synthesized: {smuggle_res.get('probes_generated', 0)}",
         "",
         f"Combined SARIF: {combined_sarif_path}",

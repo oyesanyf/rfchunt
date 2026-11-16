@@ -768,4 +768,47 @@ def test_zero_day_synthesizer_none_list_fields_and_string_scores():
             assert h.is_zero_day is True
 
 
+def test_unified_all_scans_none_findings_and_none_threat_model(monkeypatch: pytest.MonkeyPatch, sample_repo: Path, tmp_path: Path):
+    """Regression test for Bug 1 and Bug 2:
+    Scanners returning None for findings, endpoints, and threat_model
+    are handled cleanly by run_unified_all_scans without TypeError or AttributeError.
+    """
+    from unittest.mock import patch
+    monkeypatch.setenv("RFCHUNT_OFFLINE", "1")
+
+    # 1. Test case: all scanner components return None for findings, threat_model, endpoints
+    mock_mantis = {"findings": None, "threat_model": None, "total_findings": 0}
+    mock_aiscan = {"findings": None, "endpoints": None, "total_findings": 0}
+    mock_raptor = {"findings": None, "total_findings": 0}
+
+    reports_dir = tmp_path / "reports_none_test"
+    with patch("engine.mantis_integrator.MantisIntegrator.run_scan", return_value=mock_mantis), \
+         patch("engine.mantis_integrator._run_cross_platform_raptor_fallback", return_value=mock_raptor):
+
+        res = run_unified_all_scans(
+            repo=str(sample_repo),
+            use_fusion=False,
+            reports_dir=str(reports_dir),
+        )
+
+        assert res["total_aggregated_findings"] == 0
+        artex_engine = res["engines"]["artex_dual_graph"]
+        assert artex_engine.get("error") is None
+        assert artex_engine.get("chains_synthesized", 0) >= 0
+
+    # 2. Test case: findings present but threat_model is None (Bug 2 reproduction scenario)
+    mock_mantis_with_finding = {"findings": ["finding1", {"title": "f2", "rule_id": "M1"}], "threat_model": None, "total_findings": 2}
+    with patch("engine.mantis_integrator.MantisIntegrator.run_scan", return_value=mock_mantis_with_finding), \
+         patch("engine.mantis_integrator._run_cross_platform_raptor_fallback", return_value={"findings": []}):
+
+        res2 = run_unified_all_scans(
+            repo=str(sample_repo),
+            use_fusion=False,
+            reports_dir=str(tmp_path / "reports_none_tm"),
+        )
+        assert res2["engines"]["artex_dual_graph"].get("error") is None
+        assert res2["engines"]["artex_dual_graph"].get("chains_synthesized", 0) >= 0
+
+
+
 
