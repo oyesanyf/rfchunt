@@ -26,13 +26,18 @@ class DashboardGenerator:
         flaws: Optional[List[Dict[str, Any]]] = None,
         arm106_count: int = 0,
         arm107_count: int = 0,
+        attack_chains: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
-        tot = scan_stats.get("total_evaluated", 0)
-        pa = scan_stats.get("passed", 0)
-        an = scan_stats.get("anomalies", 0)
-        fl = scan_stats.get("flaws", 0)
-        merkle_root = merkle_audit_log.get("merkle_root", "N/A") if merkle_audit_log else "SHA-256 Root Uninitialized"
-        total_leaves = merkle_audit_log.get("total_leaves", 0) if merkle_audit_log else 0
+        stats_dict = scan_stats or {}
+        tot = int(stats_dict.get("total_evaluated") or 0)
+        pa = int(stats_dict.get("passed") or 0)
+        an = int(stats_dict.get("anomalies") or 0)
+        fl = int(stats_dict.get("flaws") or 0)
+        safe_host = html.escape(str(target_host or "localhost"))
+        safe_port = int(target_port or 80)
+        raw_root = (merkle_audit_log.get("merkle_root") or "N/A") if merkle_audit_log else "SHA-256 Root Uninitialized"
+        merkle_root = html.escape(str(raw_root))
+        total_leaves = int((merkle_audit_log.get("total_leaves") or 0) if merkle_audit_log else 0)
 
         pa_pct = (pa / tot * 100.0) if tot > 0 else 100.0
         fl_pct = (fl / tot * 100.0) if tot > 0 else 0.0
@@ -41,9 +46,9 @@ class DashboardGenerator:
         flaws_list = flaws or []
         flaw_rows = ""
         for idx, f in enumerate(flaws_list[:10], start=1):
-            f_rfc = f.get("rfc_num", "N/A")
-            f_class = html.escape(str(f.get("desync_class", "Novel Discrepancy")))
-            f_detail = html.escape(str(f.get("details", ""))[:80])
+            f_rfc = html.escape(str(f.get("rfc_num") or "N/A"))
+            f_class = html.escape(str(f.get("desync_class") or "Novel Discrepancy"))
+            f_detail = html.escape(str(f.get("details") or "")[:80])
             flaw_rows += f"""
             <tr>
                 <td>#{idx}</td>
@@ -56,6 +61,27 @@ class DashboardGenerator:
 
         if not flaw_rows:
             flaw_rows = "<tr><td colspan='5' style='text-align:center; color:#888;'>No confirmed desynchronization flaws detected. Target is conformant.</td></tr>"
+
+        chains_list = attack_chains or []
+        chain_rows = ""
+        for idx, ch in enumerate(chains_list[:15], start=1):
+            c_type = html.escape(str(ch.get("attack_type") or ch.get("rule_id") or "MULTI_HOP_CHAIN"))
+            c_title = html.escape(str(ch.get("title") or ch.get("chain_id") or "Attack Chain")[:95])
+            c_hops = int(ch.get("hop_count") or len(ch.get("steps") or ch.get("chain_steps") or []) or 1)
+            c_poe = int(ch.get("poe_level") or (1 if ch.get("is_verified") else 0))
+            c_status = html.escape(str(ch.get("verification_status") or ("VERIFIED" if ch.get("is_verified") else "UNVERIFIED")))
+            badge_cls = "badge-fail" if c_status == "VERIFIED" else ("badge-pass" if c_status == "FIXED" else "badge-warn")
+            chain_rows += f"""
+            <tr>
+                <td>#{idx}</td>
+                <td><span class="badge badge-rfc">{c_hops}-HOP</span></td>
+                <td><strong>{c_type}</strong><div style="font-size:12px; color:#8b949e; margin-top:2px;">{c_title}</div></td>
+                <td>POE-{c_poe}</td>
+                <td><span class="badge {badge_cls}">{c_status}</span></td>
+            </tr>
+            """
+        if not chain_rows:
+            chain_rows = "<tr><td colspan='5' style='text-align:center; color:#888;'>No multi-step ARTEX attack chains recorded yet. Run <code>--all</code> or <code>artex</code> to synthesize chains.</td></tr>"
 
         html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -143,7 +169,7 @@ class DashboardGenerator:
     <div class="header">
         <h1>RFCHunt // Protocol Research & Autonomous Terminator Engine</h1>
         <div class="meta">
-            Target Endpoint: <strong>{target_host}:{target_port}</strong> |
+            Target Endpoint: <strong>{safe_host}:{safe_port}</strong> |
             Generated: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())} |
             Engines: PortSwigger HTTP Terminator (James Kettle) &amp; RAPTOR Framework (Gadi Evron, Daniel Cuthbert, Halvar Flake)
         </div>
@@ -191,6 +217,10 @@ class DashboardGenerator:
             <div class="card-title">Arm 106 & 107 Defenses</div>
             <div class="card-value" style="color:#58a6ff;">{arm106_count} / {arm107_count}</div>
         </div>
+        <div class="card">
+            <div class="card-title">ARTEX Attack Chains</div>
+            <div class="card-value" style="color:#f85149;">{len(chains_list)}</div>
+        </div>
     </div>
 
     <div class="card" style="margin-bottom:24px;">
@@ -215,6 +245,24 @@ class DashboardGenerator:
             </thead>
             <tbody>
                 {flaw_rows}
+            </tbody>
+        </table>
+    </div>
+
+    <div class="card" style="margin-top:24px;">
+        <div class="card-title">BaaRai/ARTEX Dual-Graph Multi-Step Attack Chains (Module 17)</div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Index</th>
+                    <th>Depth</th>
+                    <th>Attack Chain Path</th>
+                    <th>POE Level</th>
+                    <th>Verification</th>
+                </tr>
+            </thead>
+            <tbody>
+                {chain_rows}
             </tbody>
         </table>
     </div>

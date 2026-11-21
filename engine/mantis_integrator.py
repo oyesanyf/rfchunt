@@ -22,10 +22,12 @@ from __future__ import annotations
 
 import ast
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import contextlib
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import difflib
 import hashlib
+import io
 import json
 import math
 import os
@@ -35,6 +37,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tokenize
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import uuid
 
@@ -58,6 +61,165 @@ MANTIS_PROJECT_TITLE = "Google Mantis: Portable Toolkit for Building Secure Soft
 MANTIS_REPO_URL = "https://github.com/google/mantis"
 MANTIS_CREDIT = "Google Security Research (google/mantis)"
 DEFAULT_ABLITERATED_MODEL = "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"
+
+_NON_PY_SVC_ROUTE_RX = re.compile(
+    r"""['"`](/[^'"`]*(?:internal|service|admin|worker|rpc|agent|governance)[^'"`]*)['"`]""",
+    re.IGNORECASE,
+)
+_NON_PY_OIDC_RX = re.compile(
+    r"\b(verifyOIDC|verifyIdToken|oidcVerifier|verifyOidcToken|jwt\.Verify|jwt\.Parse|jwt\.verify|authenticateUser|verifyJWT|idToken)\b",
+    re.IGNORECASE,
+)
+_NON_PY_GUARD_RX = re.compile(
+    r"\b("
+    r"serviceAccount|service_account|isServiceAccount|is_service_account|"
+    r"callerType|caller_type|tokenType|token_type|azp|"
+    r"allowedAudiences|serviceAudience|requireService|isServicePrincipal|"
+    r"verifyServiceToken|clientCert|mtls|"
+    r"(?:check|verify|require|validate|assert|allow\w*|with)\w*Audience"
+    r")\b"
+    r"|\bclaims\.Aud\s*(?:!=|==)"
+    r"|(?:!=|==)\s*claims\.Aud\b"
+    r"|\b(?:[\w.]+\.)?audience\s*(?:!==?|===?|!=|==)"
+    r"|(?:!==?|===?|!=|==)\s*(?:[\w.]+\.)?audience\b",
+    re.IGNORECASE,
+)
+_NON_PY_ROUTE_BOUNDARY_RX = re.compile(
+    r"\b(?:router|app|mux|server|api|http|r|e|g)\s*\.\s*(?:get|post|put|patch|delete|options|head|all|any|route|handle|handlefunc)\s*\(",
+    re.IGNORECASE,
+)
+_NON_PY_COMMENT_OR_STR_RX = re.compile(
+    r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|`(?:\\.|[^`\\])*`)'
+    r"|//[^\r\n]*"
+    r"|/\*[\s\S]*?\*/"
+)
+_PY_COMMENT_OR_STR_RX = re.compile(
+    r'("""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')'
+    r"|#[^\r\n]*"
+)
+
+
+def _strip_non_py_comments(text: str) -> str:
+    """Strips `//...` and `/*...*/` comments while preserving string literals and line count."""
+    def _repl(m: re.Match[str]) -> str:
+        if m.group(1) is not None:
+            return m.group(1)
+        return re.sub(r"[^\r\n]", " ", m.group(0))
+
+    return _NON_PY_COMMENT_OR_STR_RX.sub(_repl, text)
+
+
+def _strip_python_comments(src: str, lines: List[str]) -> List[str]:
+    """Strips `#...` comments from Python source lines while preserving line alignment."""
+    clean_lines = list(lines)
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+            if tok.type == tokenize.COMMENT:
+                srow, scol = tok.start
+                if 1 <= srow <= len(clean_lines):
+                    clean_lines[srow - 1] = clean_lines[srow - 1][:scol]
+        return clean_lines
+    except tokenize.TokenError:
+        def _repl(m: re.Match[str]) -> str:
+            if m.group(1) is not None:
+                return m.group(1)
+            return re.sub(r"[^\r\n]", " ", m.group(0))
+
+        return _PY_COMMENT_OR_STR_RX.sub(_repl, "\n".join(lines)).split("\n")
+
+
+_NON_PY_HANDLER_CLOSE_RX = re.compile(r"^\s*\}\s*(?:[),;]+)?\s*$")
+
+
+def _is_py_aud_expr(expr: ast.AST) -> bool:
+    """Returns True for `.get("aud"|"audience")`, `["aud"|"audience"]`, or `.aud|.audience`."""
+    if isinstance(expr, ast.Call):
+        if (
+            isinstance(expr.func, ast.Attribute)
+            and expr.func.attr == "get"
+            and expr.args
+            and isinstance(expr.args[0], ast.Constant)
+            and isinstance(expr.args[0].value, str)
+            and expr.args[0].value.strip().lower() in ("aud", "audience")
+        ):
+            return True
+    elif isinstance(expr, ast.Subscript):
+        slc = expr.slice
+        if isinstance(slc, ast.Constant) and isinstance(slc.value, str):
+            return slc.value.strip().lower() in ("aud", "audience")
+    elif isinstance(expr, ast.Attribute):
+        return expr.attr.lower() in ("aud", "audience")
+    return False
+
+
+def _is_nonempty_str_or_literal_seq(expr: ast.AST) -> bool:
+    """Returns True for a non-empty string literal or a tuple/list/set of non-empty string literals."""
+    if isinstance(expr, ast.Constant):
+        return isinstance(expr.value, str) and bool(expr.value.strip())
+    if isinstance(expr, (ast.Tuple, ast.List, ast.Set)):
+        return bool(expr.elts) and all(
+            isinstance(el, ast.Constant) and isinstance(el.value, str) and bool(el.value.strip())
+            for el in expr.elts
+        )
+    return False
+
+
+def _has_py_aud_comparison_guard(fn_node: ast.AST) -> bool:
+    """
+    Detects AST `Compare` (`Eq`/`NotEq`/`In`/`NotIn`) comparing `.get("aud"|"audience")`,
+    `["aud"|"audience"]`, or `.aud|.audience` against non-empty string literal(s).
+    """
+    for sub in ast.walk(fn_node):
+        if not isinstance(sub, ast.Compare):
+            continue
+        operands = [sub.left, *sub.comparators]
+        for idx, op in enumerate(sub.ops):
+            if not isinstance(op, (ast.Eq, ast.NotEq, ast.In, ast.NotIn)):
+                continue
+            lhs = operands[idx]
+            rhs = operands[idx + 1]
+            if (_is_py_aud_expr(lhs) and _is_nonempty_str_or_literal_seq(rhs)) or (
+                _is_py_aud_expr(rhs) and _is_nonempty_str_or_literal_seq(lhs)
+            ):
+                return True
+    return False
+
+
+def _extract_non_py_route_window(
+    clean_lines: List[str],
+    lineno: int,
+    *,
+    back: int = 3,
+    forward: int = 14,
+) -> str:
+    """
+    Extracts a comment-stripped window around `lineno` (1-based) and truncates
+    at adjacent route-registration or handler-closing boundaries so neighboring
+    guarded routes (before or after `lineno`) cannot mask an unguarded route.
+    """
+    if not (1 <= lineno <= len(clean_lines)):
+        return "\n".join(clean_lines)
+    base_start = max(0, lineno - back)
+    win_start = base_start
+    scan_limit = max(0, lineno - 26)
+    # Scan upward past `base_start` to prevent earlier sibling handlers (including 4-5+ line handlers)
+    # from bleeding downward across closing braces or prior route headers.
+    for k in range(lineno - 2, scan_limit - 1, -1):
+        line_k = clean_lines[k]
+        if _NON_PY_HANDLER_CLOSE_RX.match(line_k) or line_k.count("}") > line_k.count("{"):
+            win_start = max(base_start, k + 1)
+            break
+        if _NON_PY_ROUTE_BOUNDARY_RX.search(line_k) or _NON_PY_SVC_ROUTE_RX.search(line_k):
+            if ".use(" not in line_k.lower():
+                win_start = (lineno - 1) if (k < base_start or bool(re.search(r"""['"`]""", line_k))) else max(base_start, k + 1)
+                break
+
+    win_end = min(len(clean_lines), lineno + forward)
+    for j in range(lineno, win_end):
+        if _NON_PY_SVC_ROUTE_RX.search(clean_lines[j]) or _NON_PY_ROUTE_BOUNDARY_RX.search(clean_lines[j]):
+            win_end = j
+            break
+    return "\n".join(clean_lines[win_start:win_end])
 DEFAULT_SEC_MODEL = "fenkohq/foundation-sec-8b:latest"
 DEFAULT_ARBITER_MODEL = "glm4:9b"
 
@@ -279,6 +441,26 @@ MANTIS_CHECKLIST_RULES: Dict[str, ChecklistRule] = {
         remediation="Normalize HTTP framing strictly per RFC 9112 and enforce role-delimited structured messages.",
         cvss_vector_base="CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:C/C:L/I:L/A:N",
         base_cvss=5.4,
+    ),
+    "MANTIS-AUTH-011": ChecklistRule(
+        rule_id="MANTIS-AUTH-011",
+        title="OIDC / End-User Token Accepted on Service-Only Route",
+        cwe="CWE-287",
+        category="Authentication Boundary",
+        base_severity="HIGH",
+        min_tier="MEDIUM",
+        sink_name="oidc_service_route_auth",
+        description=(
+            "Internal, service, admin, worker, RPC, or agent route validates a generic end-user OIDC/JWT token "
+            "without enforcing service-account caller-type separation, audience (`aud`), or authorized-party (`azp`) checks "
+            "(GHSA-797p-rrgm-4p56 authentication boundary pattern)."
+        ),
+        remediation=(
+            "Enforce strict audience (`aud`), authorized party (`azp`), and service-principal/mTLS caller separation "
+            "so end-user OIDC tokens are rejected on service-only routes."
+        ),
+        cvss_vector_base="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N",
+        base_cvss=7.6,
     ),
 }
 
@@ -694,6 +876,34 @@ class MantisThreatModeler:
         boundaries: List[Dict[str, Any]] = []
         flows: List[Dict[str, Any]] = []
         found_assets: Set[str] = set()
+        rel = risk["rel_path"]
+        ext = os.path.splitext(file_path)[1].lower()
+
+        if ext in (".go", ".ts", ".tsx", ".js", ".jsx"):
+            src = _read_text_safe(file_path)
+            if src:
+                route_rx = re.compile(
+                    r"""(?:HandleFunc|Handle|router\.(get|post|put|delete|patch|use|all)|app\.(get|post|put|delete|patch|use|all))\s*\(\s*['"`](/[^'"`]*)['"`]""",
+                    re.IGNORECASE,
+                )
+                for lineno, line in enumerate(src.splitlines(), start=1):
+                    m = route_rx.search(line)
+                    if m:
+                        method = (m.group(1) or m.group(2) or "GET").upper()
+                        route_path = m.group(3)
+                        entries.append(
+                            {
+                                "file": rel,
+                                "function": route_path,
+                                "route": route_path,
+                                "method": "ALL" if method == "USE" else method,
+                                "line": lineno,
+                                "args": [],
+                                "network_exposed": True,
+                            }
+                        )
+                        found_assets.add(f"Route:{method} {route_path}")
+            return risk, entries, boundaries, flows, found_assets
 
         if not file_path.endswith(".py"):
             return risk, entries, boundaries, flows, found_assets
@@ -704,34 +914,66 @@ class MantisThreatModeler:
         except SyntaxError:
             return risk, entries, boundaries, flows, found_assets
 
-        rel = risk["rel_path"]
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 dec_names = []
+                extracted_route = ""
+                extracted_method = "GET"
                 for dec in node.decorator_list:
                     if isinstance(dec, ast.Call):
-                        dec_names.append(_call_full_name(dec))
+                        dname = _call_full_name(dec)
+                        dec_names.append(dname)
+                        dlow = dname.lower()
+                        for m_cand in ("get", "post", "put", "delete", "patch", "options", "head"):
+                            if dlow.endswith(f".{m_cand}") or dlow == m_cand:
+                                extracted_method = m_cand.upper()
+                                break
+                        if dec.args and isinstance(dec.args[0], ast.Constant) and isinstance(dec.args[0].value, str):
+                            if dec.args[0].value.startswith("/"):
+                                extracted_route = dec.args[0].value
+                        for kw in dec.keywords:
+                            if kw.arg in ("path", "rule") and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                                if kw.value.value.startswith("/"):
+                                    extracted_route = kw.value.value
+                            elif kw.arg == "methods" and isinstance(kw.value, (ast.List, ast.Tuple)) and kw.value.elts:
+                                first_m = kw.value.elts[0]
+                                if isinstance(first_m, ast.Constant) and isinstance(first_m.value, str):
+                                    extracted_method = first_m.value.upper()
                     elif isinstance(dec, ast.Attribute):
                         dec_names.append(dec.attr)
                     elif isinstance(dec, ast.Name):
                         dec_names.append(dec.id)
-                is_web_handler = any(
-                    any(k in d.lower() for k in ("route", "get", "post", "put", "delete", "tool", "endpoint"))
+                is_web_handler = bool(extracted_route) or any(
+                    any(k in d.lower() for k in ("route", "get", "post", "put", "delete", "patch", "tool", "endpoint"))
                     for d in dec_names
                 )
                 arg_names = [a.arg for a in node.args.args if a.arg not in ("self", "cls")]
                 if is_web_handler or any(k in node.name.lower() for k in ("handle", "parse", "run", "execute", "login", "fetch", "search", "query", "process")):
-                    entries.append(
-                        {
-                            "file": rel,
-                            "function": node.name,
-                            "line": node.lineno,
-                            "args": arg_names,
-                            "network_exposed": bool(is_web_handler),
-                        }
-                    )
+                    ep_entry: Dict[str, Any] = {
+                        "file": rel,
+                        "function": node.name,
+                        "line": node.lineno,
+                        "args": arg_names,
+                        "network_exposed": bool(is_web_handler),
+                    }
+                    if extracted_route:
+                        ep_entry["route"] = extracted_route
+                        ep_entry["method"] = extracted_method
+                        found_assets.add(f"Route:{extracted_method} {extracted_route}")
+                    entries.append(ep_entry)
             elif isinstance(node, ast.Call):
                 cname = _call_full_name(node)
+                if cname.endswith(("add_url_rule", "include_router")) and node.args:
+                    if isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str) and node.args[0].value.startswith("/"):
+                        entries.append({
+                            "file": rel,
+                            "function": node.args[0].value,
+                            "route": node.args[0].value,
+                            "method": "GET",
+                            "line": node.lineno,
+                            "args": [],
+                            "network_exposed": True,
+                        })
                 if any(k in cname for k in ("subprocess", "os.system", "eval", "exec", "execute", "pickle", "yaml.load", "requests.", "httpx.")):
                     boundaries.append({"file": rel, "line": node.lineno, "boundary": cname})
                     flows.append({"source": rel, "sink": cname, "line": node.lineno})
@@ -892,10 +1134,67 @@ class MantisHypothesisGenerator:
         except SyntaxError:
             return []
 
+        clean_py_lines = _strip_python_comments(src, lines)
         results: List[MantisHypothesis] = []
+
+        _SERVICE_ROUTE_RE = re.compile(
+            r"""['"](/[^'"]*(?:internal|service|admin|worker|rpc|agent|governance|control-plane)[^'"]*)['"]""",
+            re.IGNORECASE,
+        )
+        _OIDC_USER_AUTH_TOKENS = (
+            "verify_oidc",
+            "verify_id_token",
+            "decode_jwt",
+            "jwt.decode",
+            "verify_jwt",
+            "get_current_user",
+            "authenticate_user",
+            "oidc_claims",
+            "oidc_token",
+            "end_user",
+        )
+        _SERVICE_GUARD_TOKENS = (
+            "service_account",
+            "caller_type",
+            "token_type",
+            "azp",
+            "allowed_audiences",
+            "service_audience",
+            "require_service_auth",
+            "require_service_principal",
+            "is_service_principal",
+            "verify_service_token",
+            "client_cert",
+            "mtls",
+            "service_only_aud",
+            "audience=",
+        )
 
         def visit_node(node: ast.AST, func_name: str, func_args: Set[str]) -> None:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # MANTIS-AUTH-011: OIDC / End-User Token Accepted on Service-Only Route
+                if "MEDIUM" in allowed_tiers or "LOW" in allowed_tiers:
+                    dec_start = min((getattr(d, "lineno", node.lineno) for d in node.decorator_list), default=node.lineno)
+                    fn_end = getattr(node, "end_lineno", None) or min(len(lines), node.lineno + 30)
+                    fn_block_clean = "\n".join(clean_py_lines[max(0, dec_start - 1):min(len(clean_py_lines), fn_end)])
+                    dec_block_clean = "\n".join(clean_py_lines[max(0, dec_start - 1):max(0, node.lineno - 1)])
+                    fn_low = fn_block_clean.lower()
+                    route_match = _SERVICE_ROUTE_RE.search(dec_block_clean) or _SERVICE_ROUTE_RE.search(fn_block_clean)
+                    if route_match and any(tok in fn_low for tok in _OIDC_USER_AUTH_TOKENS):
+                        if not any(guard in fn_low for guard in _SERVICE_GUARD_TOKENS) and not _has_py_aud_comparison_guard(node):
+                            results.append(
+                                self._make_hypothesis(
+                                    "MANTIS-AUTH-011",
+                                    file_path,
+                                    node.lineno,
+                                    node.name,
+                                    f"oidc_service_route_auth({route_match.group(1)})",
+                                    "oidc_token_without_service_guard",
+                                    lines,
+                                    0.88,
+                                    pass_idx,
+                                )
+                            )
                 args_set = {a.arg for a in node.args.args if a.arg not in ("self", "cls")}
                 for child in ast.iter_child_nodes(node):
                     visit_node(child, node.name, args_set)
@@ -974,6 +1273,31 @@ class MantisHypothesisGenerator:
                 cname = _call_full_name(node)
                 arg0 = node.args[0] if node.args else None
                 kw_map = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+
+                # MANTIS-AUTH-011: Router/middleware-level service mount with OIDC/user auth & no service guard
+                if ("MEDIUM" in allowed_tiers or "LOW" in allowed_tiers) and (
+                    cname.endswith(("APIRouter", "include_router", ".use", ".mount", "FastAPI"))
+                    or "router" in cname.lower()
+                ):
+                    call_end = getattr(node, "end_lineno", None) or node.lineno
+                    call_block_clean = "\n".join(clean_py_lines[max(0, node.lineno - 1):min(len(clean_py_lines), call_end)])
+                    call_low = call_block_clean.lower()
+                    route_m = _SERVICE_ROUTE_RE.search(call_block_clean)
+                    if route_m and any(tok in call_low for tok in _OIDC_USER_AUTH_TOKENS):
+                        if not any(guard in call_low for guard in _SERVICE_GUARD_TOKENS):
+                            results.append(
+                                self._make_hypothesis(
+                                    "MANTIS-AUTH-011",
+                                    file_path,
+                                    node.lineno,
+                                    func_name or "<router>",
+                                    f"oidc_service_route_auth({route_m.group(1)})",
+                                    "oidc_router_middleware_without_service_guard",
+                                    lines,
+                                    0.87,
+                                    pass_idx,
+                                )
+                            )
 
                 # MANTIS-CMD-001: Command Injection
                 if "HIGH" in allowed_tiers:
@@ -1170,6 +1494,31 @@ class MantisHypothesisGenerator:
                         self._make_hypothesis(
                             rule_id, file_path, lineno, "<script>", sink,
                             "script_input", lines, 0.76, pass_idx,
+                        )
+                    )
+
+        # MANTIS-AUTH-011 for Go / TypeScript / JavaScript service routes accepting end-user OIDC tokens
+        if "MEDIUM" in allowed_tiers or "LOW" in allowed_tiers:
+            clean_lines = _strip_non_py_comments("\n".join(lines)).split("\n")
+            for lineno, clean_line in enumerate(clean_lines, start=1):
+                if not clean_line.strip():
+                    continue
+                m = _NON_PY_SVC_ROUTE_RX.search(clean_line)
+                if not m:
+                    continue
+                window_text = _extract_non_py_route_window(clean_lines, lineno, back=3, forward=14)
+                if _NON_PY_OIDC_RX.search(window_text) and not _NON_PY_GUARD_RX.search(window_text):
+                    found.append(
+                        self._make_hypothesis(
+                            "MANTIS-AUTH-011",
+                            file_path,
+                            lineno,
+                            "<route>",
+                            f"oidc_service_route_auth({m.group(1)})",
+                            "oidc_token_without_service_guard",
+                            lines,
+                            0.85,
+                            pass_idx,
                         )
                     )
         return found
@@ -1653,6 +2002,25 @@ class MantisReproducer:
         the sink without any sanitization or OS side effect.
     """
 
+    def __init__(self) -> None:
+        self._ast_cache: Dict[
+            Tuple[str, int, str],
+            Optional[
+                Tuple[
+                    ast.Module,
+                    Dict[str, Any],
+                    Dict[str, List[str]],
+                    Dict[str, Set[str]],
+                    Dict[int, List[ast.Call]],
+                    Dict[str, List[ast.AST]],
+                ]
+            ],
+        ] = {}
+        self._taint_cache: Dict[
+            Tuple[str, int, str, str],
+            Tuple[Dict[str, Set[str]], Set[str], Set[str], List[str]],
+        ] = {}
+
     def reproduce(self, hypothesis: MantisHypothesis, enable_tier2: bool = True) -> ReproductionResult:
         src = _read_text_safe(hypothesis.file_path)
         if not src:
@@ -1660,11 +2028,21 @@ class MantisReproducer:
 
         if hypothesis.file_path.endswith(".py"):
             tier1 = self._tier1_ast_taint(src, hypothesis)
-            if enable_tier2 and tier1.reproduced:
+            if (
+                enable_tier2
+                and tier1.reproduced
+                and hypothesis.rule_id != "MANTIS-AUTH-011"
+                and not hypothesis.rule_id.startswith("MANTIS-0DAY")
+            ):
                 tier2 = self._tier2_isolated_canary(src, hypothesis, tier1.taint_path)
                 if tier2.canary_reached_sink:
                     return tier2
             return tier1
+
+        if hypothesis.rule_id == "MANTIS-AUTH-011" and hypothesis.file_path.lower().endswith(
+            (".go", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+        ):
+            return self._tier1_non_python_auth_boundary(src, hypothesis)
 
         return ReproductionResult(
             reproduced=False,
@@ -1672,145 +2050,237 @@ class MantisReproducer:
             details=f"Static pattern matched at {os.path.basename(hypothesis.file_path)}:{hypothesis.line_number}; dynamic Tier 2 applies to Python targets.",
         )
 
+    def _tier1_non_python_auth_boundary(self, src: str, hyp: MantisHypothesis) -> ReproductionResult:
+        clean_lines = _strip_non_py_comments(src).split("\n")
+        window_text = _extract_non_py_route_window(clean_lines, hyp.line_number, back=3, forward=14)
+        if _NON_PY_SVC_ROUTE_RX.search(window_text) and _NON_PY_OIDC_RX.search(window_text) and not _NON_PY_GUARD_RX.search(window_text):
+            return ReproductionResult(
+                reproduced=True,
+                tier="TIER_1_STATIC_TAINT",
+                details=f"Confirmed non-Python OIDC/end-user auth boundary confusion on service route via {hyp.sink}.",
+                taint_path=[hyp.source_hint, hyp.sink],
+            )
+        return ReproductionResult(
+            reproduced=False,
+            tier="UNVERIFIED",
+            details=f"Service-principal/audience guard or non-matching context at {os.path.basename(hyp.file_path)}:{hyp.line_number}.",
+        )
+
     def _tier1_ast_taint(self, src: str, hyp: MantisHypothesis) -> ReproductionResult:
-        try:
-            tree = ast.parse(src)
-        except SyntaxError as exc:
-            return ReproductionResult(False, "UNVERIFIED", f"AST parse failed: {exc}")
+        src_digest = hashlib.sha1(src.encode("utf-8", errors="replace")).hexdigest()
+        cache_key = (hyp.file_path, len(src), src_digest)
+        cached = self._ast_cache.get(cache_key)
+        if cache_key not in self._ast_cache:
+            try:
+                tree = ast.parse(src)
+            except SyntaxError as exc:
+                self._ast_cache[cache_key] = None
+                return ReproductionResult(False, "UNVERIFIED", f"AST parse failed: {exc}")
 
-        # 1. Discover all module-level and class-level functions and parameter signatures
-        func_nodes: Dict[str, Union[ast.FunctionDef, ast.AsyncFunctionDef]] = {}
-        func_params: Dict[str, List[str]] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                func_nodes[node.name] = node
-                func_params[node.name] = [a.arg for a in node.args.args if a.arg not in ("self", "cls")]
+            # 1. Discover all module-level and class-level functions and parameter signatures
+            func_nodes: Dict[str, Union[ast.FunctionDef, ast.AsyncFunctionDef]] = {}
+            func_params: Dict[str, List[str]] = {}
+            calls_by_lineno: Dict[int, List[ast.Call]] = {}
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    func_nodes[node.name] = node
+                    func_params[node.name] = [a.arg for a in node.args.args if a.arg not in ("self", "cls")]
+                elif isinstance(node, ast.Call):
+                    ln = getattr(node, "lineno", -1)
+                    if ln >= 0:
+                        calls_by_lineno.setdefault(ln, []).append(node)
 
-        # 2. Map return dependencies: which parameters flow into return expressions
-        returns_params: Dict[str, Set[str]] = {}
-        for fname, fnode in func_nodes.items():
-            ret_params: Set[str] = set()
-            for sub in ast.walk(fnode):
-                if isinstance(sub, ast.Return) and sub.value is not None:
-                    ref_names = _referenced_names(sub.value)
-                    matched = ref_names & set(func_params.get(fname, []))
-                    ret_params.update(matched)
-            if ret_params:
-                returns_params[fname] = ret_params
-
-        # 3. Initialize taint tracking state
-        target_func = func_nodes.get(hyp.function_name)
-        tainted_by_func: Dict[str, Set[str]] = {}
-        tainted_attrs: Set[str] = set()
-        tainted_module_vars: Set[str] = set()
-        sanitized_vars: Set[str] = set()
-        taint_path: List[str] = []
-
-        # Seed target function's parameters or any entry parameters
-        if target_func is not None:
-            init_args = [a.arg for a in target_func.args.args if a.arg not in ("self", "cls")]
-            tainted_by_func[hyp.function_name] = set(init_args)
-            taint_path.extend(init_args)
-
-        # 4. Multi-pass fixed-point inter-procedural taint propagation
-        for _ in range(4):
-            # Pass A: Module-level assignments
-            for stmt in tree.body:
-                if isinstance(stmt, ast.Assign):
-                    is_ext = _node_is_external_source(stmt.value)
-                    inherits = is_ext or _node_references_any_taint(stmt.value, tainted_module_vars | tainted_attrs)
-                    is_sanitized = _has_sanitizer_call(stmt.value)
-                    for tgt in stmt.targets:
-                        if isinstance(tgt, ast.Name):
-                            if is_sanitized:
-                                sanitized_vars.add(tgt.id)
-                                tainted_module_vars.discard(tgt.id)
-                            elif inherits and tgt.id not in sanitized_vars:
-                                tainted_module_vars.add(tgt.id)
-                                taint_path.append(f"{tgt.id}@{getattr(stmt, 'lineno', 0)}")
-
-            # Pass B: Function-level assignments, attribute tracking, and call propagation
+            # 2. Map return dependencies and pre-collect Assign/Call statements per function
+            returns_params: Dict[str, Set[str]] = {}
+            func_stmts: Dict[str, List[ast.AST]] = {}
             for fname, fnode in func_nodes.items():
-                cur_tainted = tainted_by_func.setdefault(fname, set())
-                for child in ast.walk(fnode):
-                    if isinstance(child, ast.Assign):
-                        is_ext = _node_is_external_source(child.value)
-                        has_var_taint = _node_references_any_taint(child.value, cur_tainted | tainted_module_vars)
-                        has_attr_taint = _node_references_any_taint(child.value, tainted_attrs)
+                ret_params: Set[str] = set()
+                stmts: List[ast.AST] = []
+                for sub in ast.walk(fnode):
+                    if isinstance(sub, (ast.Assign, ast.Call)):
+                        stmts.append(sub)
+                    elif isinstance(sub, ast.Return) and sub.value is not None:
+                        ref_names = _referenced_names(sub.value)
+                        matched = ref_names & set(func_params.get(fname, []))
+                        ret_params.update(matched)
+                func_stmts[fname] = stmts
+                if ret_params:
+                    returns_params[fname] = ret_params
 
-                        # Return value chaining from helper calls
-                        has_helper_taint = False
-                        if isinstance(child.value, ast.Call):
-                            cname = _call_full_name(child.value)
-                            c_short = cname.split(".")[-1]
-                            if c_short in returns_params:
-                                pnames = func_params.get(c_short, [])
-                                for idx, arg in enumerate(child.value.args):
-                                    if _node_references_any_taint(arg, cur_tainted | tainted_attrs | tainted_module_vars):
-                                        if idx < len(pnames) and pnames[idx] in returns_params[c_short]:
-                                            has_helper_taint = True
-                                            break
-                                if not has_helper_taint:
-                                    for kw in child.value.keywords:
-                                        if kw.arg and kw.arg in returns_params[c_short]:
-                                            if _node_references_any_taint(kw.value, cur_tainted | tainted_attrs | tainted_module_vars):
-                                                has_helper_taint = True
-                                                break
+            cached = (tree, func_nodes, func_params, returns_params, calls_by_lineno, func_stmts)
+            self._ast_cache[cache_key] = cached
+        elif cached is None:
+            return ReproductionResult(False, "UNVERIFIED", "AST parse failed (cached).")
 
-                        inherits = is_ext or has_var_taint or has_attr_taint or has_helper_taint
-                        is_sanitized = _has_sanitizer_call(child.value)
+        tree, func_nodes, func_params, returns_params, calls_by_lineno, func_stmts = cached
+        target_func = func_nodes.get(hyp.function_name)
 
-                        for tgt in child.targets:
+        if hyp.rule_id == "MANTIS-AUTH-011":
+            matched_fn = (
+                target_func
+                if target_func is not None and getattr(target_func, "lineno", None) == hyp.line_number
+                else None
+            )
+            if matched_fn is None:
+                for sub_n in ast.walk(tree):
+                    if (
+                        isinstance(sub_n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and sub_n.name == hyp.function_name
+                        and getattr(sub_n, "lineno", None) == hyp.line_number
+                    ):
+                        matched_fn = sub_n
+                        break
+            if matched_fn is not None and _has_py_aud_comparison_guard(matched_fn):
+                return ReproductionResult(
+                    reproduced=False,
+                    tier="UNVERIFIED",
+                    details=f"Python audience comparison guard verified in {hyp.function_name} at line {hyp.line_number}.",
+                )
+            return ReproductionResult(
+                reproduced=True,
+                tier="TIER_1_STATIC_TAINT",
+                details=f"Confirmed OIDC/end-user auth boundary confusion on service route via {hyp.sink}.",
+                taint_path=[hyp.source_hint, hyp.sink],
+            )
+
+        taint_key = (hyp.file_path, len(src), src_digest, hyp.function_name)
+        cached_taint = self._taint_cache.get(taint_key)
+        if cached_taint is not None:
+            tainted_by_func, tainted_module_vars, tainted_attrs, taint_path = cached_taint
+        else:
+            # 3. Initialize taint tracking state
+            tainted_by_func = {}
+            sanitized_by_func: Dict[str, Set[str]] = {}
+            tainted_attrs = set()
+            tainted_module_vars = set()
+            sanitized_module_vars: Set[str] = set()
+            taint_path = []
+
+            # Seed target function's parameters or any entry parameters
+            if target_func is not None:
+                init_args = [a.arg for a in target_func.args.args if a.arg not in ("self", "cls")]
+                tainted_by_func[hyp.function_name] = set(init_args)
+                taint_path.extend(init_args)
+
+            # 4. Multi-pass fixed-point inter-procedural taint propagation
+            for _ in range(4):
+                # Pass A: Module-level assignments
+                for stmt in tree.body:
+                    if isinstance(stmt, ast.Assign):
+                        is_ext = _node_is_external_source(stmt.value)
+                        inherits = is_ext or _node_references_any_taint(stmt.value, tainted_module_vars | tainted_attrs)
+                        is_sanitized = _has_sanitizer_call(stmt.value)
+                        for tgt in stmt.targets:
                             if isinstance(tgt, ast.Name):
                                 if is_sanitized:
-                                    sanitized_vars.add(tgt.id)
-                                    cur_tainted.discard(tgt.id)
-                                elif inherits and tgt.id not in sanitized_vars:
-                                    cur_tainted.add(tgt.id)
-                                    taint_path.append(f"{tgt.id}@{getattr(child, 'lineno', 0)}")
-                            elif isinstance(tgt, ast.Attribute):
-                                # Track instance attribute assignments: self.user_param = ...
-                                attr_name = tgt.attr
-                                if is_sanitized:
-                                    tainted_attrs.discard(attr_name)
-                                    tainted_attrs.discard(f"self.{attr_name}")
-                                elif inherits:
-                                    tainted_attrs.add(attr_name)
-                                    tainted_attrs.add(f"self.{attr_name}")
-                                    taint_path.append(f"self.{attr_name}@{getattr(child, 'lineno', 0)}")
+                                    sanitized_module_vars.add(tgt.id)
+                                    tainted_module_vars.discard(tgt.id)
+                                elif inherits and tgt.id not in sanitized_module_vars:
+                                    tainted_module_vars.add(tgt.id)
+                                    taint_path.append(f"{tgt.id}@{getattr(stmt, 'lineno', 0)}")
 
-                    # Caller -> callee call argument propagation (both positional and keyword arguments)
-                    elif isinstance(child, ast.Call):
-                        cname = _call_full_name(child)
-                        c_short = cname.split(".")[-1]
-                        if c_short in func_nodes:
-                            callee_tainted = tainted_by_func.setdefault(c_short, set())
-                            pnames = func_params.get(c_short, [])
-                            for idx, arg in enumerate(child.args):
-                                if _node_references_any_taint(arg, cur_tainted | tainted_attrs | tainted_module_vars):
-                                    if idx < len(pnames):
-                                        param = pnames[idx]
-                                        if param not in callee_tainted:
-                                            callee_tainted.add(param)
-                                            taint_path.append(f"{c_short}.{param}@{getattr(child, 'lineno', 0)}")
-                            for kw in child.keywords:
-                                if kw.arg and kw.arg in pnames:
-                                    if _node_references_any_taint(kw.value, cur_tainted | tainted_attrs | tainted_module_vars):
-                                        if kw.arg not in callee_tainted:
-                                            callee_tainted.add(kw.arg)
-                                            taint_path.append(f"{c_short}.{kw.arg}@{getattr(child, 'lineno', 0)}")
+                # Pass B: Function-level assignments, attribute tracking, and call propagation
+                for fname, stmts in func_stmts.items():
+                    cur_tainted = tainted_by_func.setdefault(fname, set())
+                    cur_sanitized = sanitized_by_func.setdefault(fname, set())
+                    for child in stmts:
+                        if isinstance(child, ast.Assign):
+                            is_ext = _node_is_external_source(child.value)
+                            has_var_taint = _node_references_any_taint(child.value, cur_tainted | tainted_module_vars)
+                            has_attr_taint = _node_references_any_taint(child.value, tainted_attrs)
 
-        # 5. Inspect call at target line across the entire AST module tree
+                            # Return value chaining from helper calls
+                            has_helper_taint = False
+                            if isinstance(child.value, ast.Call):
+                                cname = _call_full_name(child.value)
+                                c_short = cname.split(".")[-1]
+                                if c_short in returns_params:
+                                    pnames = func_params.get(c_short, [])
+                                    for idx, arg in enumerate(child.value.args):
+                                        if _node_references_any_taint(arg, cur_tainted | tainted_attrs | tainted_module_vars):
+                                            if idx < len(pnames) and pnames[idx] in returns_params[c_short]:
+                                                has_helper_taint = True
+                                                break
+                                    if not has_helper_taint:
+                                        for kw in child.value.keywords:
+                                            if kw.arg and kw.arg in returns_params[c_short]:
+                                                if _node_references_any_taint(kw.value, cur_tainted | tainted_attrs | tainted_module_vars):
+                                                    has_helper_taint = True
+                                                    break
+
+                            inherits = is_ext or has_var_taint or has_attr_taint or has_helper_taint
+                            is_sanitized = _has_sanitizer_call(child.value)
+
+                            for tgt in child.targets:
+                                if isinstance(tgt, ast.Name):
+                                    if is_sanitized:
+                                        cur_sanitized.add(tgt.id)
+                                        cur_tainted.discard(tgt.id)
+                                    elif inherits and tgt.id not in cur_sanitized:
+                                        cur_tainted.add(tgt.id)
+                                        taint_path.append(f"{tgt.id}@{getattr(child, 'lineno', 0)}")
+                                elif isinstance(tgt, ast.Attribute):
+                                    # Track instance attribute assignments: self.user_param = ...
+                                    attr_name = tgt.attr
+                                    if is_sanitized:
+                                        tainted_attrs.discard(attr_name)
+                                        tainted_attrs.discard(f"self.{attr_name}")
+                                    elif inherits:
+                                        tainted_attrs.add(attr_name)
+                                        tainted_attrs.add(f"self.{attr_name}")
+                                        taint_path.append(f"self.{attr_name}@{getattr(child, 'lineno', 0)}")
+
+                        # Caller -> callee call argument propagation (both positional and keyword arguments)
+                        elif isinstance(child, ast.Call):
+                            cname = _call_full_name(child)
+                            c_short = cname.split(".")[-1]
+                            if c_short in func_nodes:
+                                callee_tainted = tainted_by_func.setdefault(c_short, set())
+                                pnames = func_params.get(c_short, [])
+                                for idx, arg in enumerate(child.args):
+                                    if _node_references_any_taint(arg, cur_tainted | tainted_attrs | tainted_module_vars):
+                                        if idx < len(pnames):
+                                            param = pnames[idx]
+                                            if param not in callee_tainted:
+                                                callee_tainted.add(param)
+                                                taint_path.append(f"{c_short}.{param}@{getattr(child, 'lineno', 0)}")
+                                for kw in child.keywords:
+                                    if kw.arg and kw.arg in pnames:
+                                        if _node_references_any_taint(kw.value, cur_tainted | tainted_attrs | tainted_module_vars):
+                                            if kw.arg not in callee_tainted:
+                                                callee_tainted.add(kw.arg)
+                                                taint_path.append(f"{c_short}.{kw.arg}@{getattr(child, 'lineno', 0)}")
+
+            self._taint_cache[taint_key] = (
+                {k: set(v) for k, v in tainted_by_func.items()},
+                set(tainted_module_vars),
+                set(tainted_attrs),
+                list(taint_path),
+            )
+
+        # 5. Inspect call at target line scoped to the function actually enclosing hyp.line_number
+        sink_func_name: Optional[str] = None
+        best_span: Optional[int] = None
+        for fname, fnode in func_nodes.items():
+            f_start = getattr(fnode, "lineno", -1)
+            f_end = getattr(fnode, "end_lineno", None) or f_start
+            if f_start <= hyp.line_number <= f_end:
+                span = f_end - f_start
+                if best_span is None or span < best_span:
+                    best_span = span
+                    sink_func_name = fname
+
+        scoped_func_name = sink_func_name or hyp.function_name
         active_taint = (
-            set(tainted_by_func.get(hyp.function_name, set()))
+            set(tainted_by_func.get(scoped_func_name, set()))
             | tainted_module_vars
             | tainted_attrs
         )
-        for f_taints in tainted_by_func.values():
-            active_taint.update(f_taints)
+        if not scoped_func_name or scoped_func_name == "<module>":
+            for f_taints in tainted_by_func.values():
+                active_taint.update(f_taints)
 
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and getattr(node, "lineno", -1) == hyp.line_number:
+        for node in calls_by_lineno.get(hyp.line_number, ()):
                 if _has_sanitizer_call(node):
                     return ReproductionResult(
                         reproduced=False,
@@ -1822,7 +2292,12 @@ class MantisReproducer:
                 arg_references_taint = any(_node_references_any_taint(a, active_taint) for a in node.args) or any(
                     _node_references_any_taint(kw.value, active_taint) for kw in node.keywords
                 )
-                is_rule_with_implicit_taint = hyp.rule_id in ("MANTIS-DESER-004", "MANTIS-SECRET-007", "MANTIS-PROTO-010")
+                is_rule_with_implicit_taint = hyp.rule_id in (
+                    "MANTIS-DESER-004",
+                    "MANTIS-SECRET-007",
+                    "MANTIS-PROTO-010",
+                    "MANTIS-AUTH-011",
+                )
                 is_zero_day = hyp.rule_id.startswith("MANTIS-0DAY")
 
                 if arg_references_taint or is_rule_with_implicit_taint or is_zero_day:
@@ -1869,16 +2344,25 @@ class MantisReproducer:
         dangerous OS/SQL/eval sinks with safe interceptor stubs inside an AST-copied function
         and checks whether `'MANTIS_CANARY_TAINT'` reaches the vulnerable sink unescaped.
         """
-        try:
-            tree = ast.parse(src)
-        except SyntaxError:
-            return ReproductionResult(True, "TIER_1_STATIC_TAINT", "Fallback to Tier 1 AST taint proof.", taint_path=taint_path)
+        src_digest = hashlib.sha1(src.encode("utf-8", errors="replace")).hexdigest()
+        cached_entry = self._ast_cache.get((hyp.file_path, len(src), src_digest))
+        if cached_entry is not None:
+            tree, func_nodes, _, _, _, _ = cached_entry
+            cand_fn = func_nodes.get(hyp.function_name)
+            func_node: Optional[Union[ast.FunctionDef, ast.AsyncFunctionDef]] = (
+                cand_fn if isinstance(cand_fn, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
+            )
+        else:
+            try:
+                tree = ast.parse(src)
+            except SyntaxError:
+                return ReproductionResult(True, "TIER_1_STATIC_TAINT", "Fallback to Tier 1 AST taint proof.", taint_path=taint_path)
 
-        func_node: Optional[ast.FunctionDef] = None
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == hyp.function_name:
-                func_node = node
-                break
+            func_node = None
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == hyp.function_name:
+                    func_node = node
+                    break
 
         if func_node is None:
             return ReproductionResult(
@@ -1896,8 +2380,10 @@ class MantisReproducer:
         if not arg_names:
             return ReproductionResult(True, "TIER_1_STATIC_TAINT", "Tier 1 taint confirmed (zero-arg handler).", taint_path=taint_path)
 
+        is_async_fn = isinstance(func_node, ast.AsyncFunctionDef)
+        call_stmt = f"asyncio.run({func_node.name}(**kwargs_call))" if is_async_fn else f"{func_node.name}(**kwargs_call)"
         harness_code = f"""
-import ast, hashlib, json, os, shlex, sqlite3, sys
+import ast, asyncio, hashlib, json, os, shlex, sqlite3, sys
 
 CANARY = "MANTIS_CANARY_TAINT"
 INTERCEPTED = []
@@ -1978,7 +2464,7 @@ exec = _safe_exec
 
 kwargs_call = {{name: CANARY for name in {json.dumps(arg_names)}}}
 try:
-    {func_node.name}(**kwargs_call)
+    {call_stmt}
 except Exception:
     pass
 
@@ -2189,7 +2675,7 @@ class MantisPatchEngine:
                 return re.sub(r"\beval\s*\(", "ast.literal_eval(", line, count=1)
         elif rule_id == "MANTIS-DESER-004":
             if "yaml.load(" in line and "SafeLoader" not in line:
-                return re.sub(r"yaml\.load\(([^)]+)\)", r"yaml.safe_load(\1)", line, count=1)
+                return re.sub(r"yaml\.load\(\s*([^,)]+?)(?:\s*,\s*Loader\s*=\s*[^)]+)?\s*\)", r"yaml.safe_load(\1)", line, count=1)
             if "pickle.loads(" in line:
                 return line.replace("pickle.loads(", "json.loads(", 1)
         elif rule_id == "MANTIS-SQL-003":
@@ -2411,8 +2897,11 @@ class MantisIntegrator:
                 )
                 findings.append(finding)
 
-                if self.db is not None and hasattr(self.db, "save_mantis_finding"):
-                    self.db.save_mantis_finding(finding.to_dict())
+            if self.db is not None and hasattr(self.db, "save_mantis_finding") and findings:
+                _batch_ctx = self.db.batch_writes() if hasattr(self.db, "batch_writes") else contextlib.nullcontext()
+                with _batch_ctx:
+                    for finding in findings:
+                        self.db.save_mantis_finding(finding.to_dict())
 
         report_files = self._export_reports(resolved, effective_depth, mode, threat_model, findings)
         elapsed_sec = round(time.monotonic() - t_start, 3)
@@ -2547,16 +3036,20 @@ def build_sarif_document(
             }
 
         raw_fp = str(item.get("file_path") or item.get("file") or "repo").replace("\x00", "")
-        # Prevent path traversal in SARIF URI
-        parts = [p for p in raw_fp.replace("\\", "/").split("/") if p and p != ".."]
-        clean_fp = "/".join(parts) or "repo"
-        try:
-            rel_uri = os.path.relpath(clean_fp, target_root).replace("\\", "/") if os.path.isdir(target_root) and os.path.isabs(clean_fp) else clean_fp.replace("\\", "/")
-        except ValueError:
-            rel_uri = clean_fp.replace("\\", "/")
-
-        rel_uri = re.sub(r"^[a-zA-Z]:[/\\]*", "", rel_uri)
-        rel_uri = "/".join(p for p in rel_uri.split("/") if p != "..") or "target"
+        if raw_fp.lower().startswith(("http://", "https://")):
+            rel_uri = raw_fp
+        else:
+            cand_fp = raw_fp.split("::", 1)[0] if "::" in raw_fp else raw_fp
+            rel_candidate = cand_fp
+            if os.path.isdir(target_root) and os.path.isabs(cand_fp):
+                try:
+                    rel_try = os.path.relpath(cand_fp, target_root)
+                    if not rel_try.startswith(".."):
+                        rel_candidate = rel_try
+                except ValueError:
+                    rel_candidate = cand_fp
+            rel_uri = re.sub(r"^[a-zA-Z]:[/\\]*", "", rel_candidate.replace("\\", "/"))
+            rel_uri = "/".join(p for p in rel_uri.split("/") if p and p not in (".", "..")) or "target"
 
         raw_line = item.get("line_number") or item.get("line") or 1
         try:
@@ -2595,6 +3088,13 @@ def build_sarif_document(
                     "patch_verified": item.get("patch_verified", False),
                     "scanner": item.get("scanner", tool_name),
                     "is_zero_day": item.get("is_zero_day", False),
+                    **({
+                        "hop_count": item.get("hop_count"),
+                        "poe_level": item.get("poe_level"),
+                        "verification_status": item.get("verification_status"),
+                        "source_scanners": item.get("source_scanners"),
+                        "chain_steps": item.get("chain_steps"),
+                    } if item.get("chain_steps") or item.get("hop_count") else {}),
                 },
             }
         )
@@ -2914,7 +3414,7 @@ def run_unified_all_scans(
     repo: Optional[str] = None,
     path: Optional[str] = None,
     host: Optional[str] = None,
-    port: int = 443,
+    port: Optional[int] = None,
     use_tls: Optional[bool] = None,
     authorized: bool = False,
     allow_destructive: bool = False,
@@ -2928,6 +3428,44 @@ def run_unified_all_scans(
     on_trace: Optional[Callable[[str], None]] = None,
     arbiter: Optional[Any] = None,
     targets: Optional[Any] = None,
+    artex_url: Optional[str] = None,
+    artex_token: Optional[str] = None,
+    artex_proxy: Optional[str] = None,
+    artex_ca_cert: Optional[str] = None,
+    artex_noise_profile: Optional[str] = None,
+    artex_llm_profiles: Optional[List[str]] = None,
+    artex_llm_rotate: bool = False,
+    artex_wait_sse: bool = False,
+    artex_budget_turns: int = 0,
+    artex_retest: bool = False,
+    artex_workers: int = 3,
+    artex_live: Optional[bool] = None,
+    embedded_proxy: bool = False,
+    embedded_proxy_port: int = 0,
+    auth_profile: Optional[str] = None,
+    import_har: Optional[str] = None,
+    import_openapi: Optional[str] = None,
+    scope_file: Optional[str] = None,
+    approval_mode: str = "policy",
+    approval_rules: Optional[str] = None,
+    strict_poe: bool = False,
+    export_advisory: bool = False,
+    export_csv: bool = False,
+    quiet: bool = False,
+    enable_external_scanners: bool = False,
+    httpx_scan: Optional[bool] = None,
+    katana_scan: Optional[bool] = None,
+    nuclei_scan: Optional[bool] = None,
+    nuclei_tags: Optional[Any] = None,
+    scanner_isolation: str = "host",
+    artex_multiturn: bool = False,
+    artex_intent_turns: int = 0,
+    artex_intent_tokens: int = 0,
+    docker_image: Optional[str] = None,
+    docker_network: Optional[str] = None,
+    enable_rea: bool = True,
+    rea_target: Optional[str] = None,
+    rea_use_cli: bool = False,
 ) -> Dict[str, Any]:
     """
     Execute ALL integrated RFCHunt security scanners against `--repo`, `--path`, or remote `--host` in one pass,
@@ -2949,6 +3487,27 @@ def run_unified_all_scans(
       - MultiImplementationDifferentialOracle: Differential 4-parser evaluation
     """
     t0 = time.monotonic()
+    if isinstance(artex_intent_turns, bool):
+        raise ValueError("artex_intent_turns must be an integer, not bool.")
+    if isinstance(artex_intent_tokens, bool):
+        raise ValueError("artex_intent_tokens must be an integer, not bool.")
+    if isinstance(artex_budget_turns, bool):
+        raise ValueError("artex_budget_turns must be an integer, not bool.")
+    resolved_intent_turns = 0 if artex_intent_turns is None else int(artex_intent_turns)
+    resolved_intent_tokens = 0 if artex_intent_tokens is None else int(artex_intent_tokens)
+    resolved_budget_turns = 0 if artex_budget_turns is None else int(artex_budget_turns)
+    if resolved_intent_turns < 0:
+        raise ValueError(f"artex_intent_turns must be >= 0, got {resolved_intent_turns}")
+    if resolved_intent_tokens < 0:
+        raise ValueError(f"artex_intent_tokens must be >= 0, got {resolved_intent_tokens}")
+    if resolved_budget_turns < 0:
+        raise ValueError(f"artex_budget_turns must be >= 0, got {resolved_budget_turns}")
+
+    run_httpx = bool(httpx_scan) if httpx_scan is not None else bool(enable_external_scanners)
+    run_katana = bool(katana_scan) if katana_scan is not None else bool(enable_external_scanners)
+    run_nuclei = bool(nuclei_scan) if nuclei_scan is not None else bool(enable_external_scanners)
+    ext_scanners_active = bool(enable_external_scanners or run_httpx or run_katana or run_nuclei)
+
     base_dir = Path(__file__).resolve().parent.parent
     out_dir = Path(reports_dir) if reports_dir else (base_dir / "reports")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2958,17 +3517,37 @@ def run_unified_all_scans(
     enforced_fusion = True if use_fusion is None else bool(use_fusion)
     enforced_model = preferred_model or DEFAULT_ABLITERATED_MODEL
 
+    effective_trace = on_trace or ((lambda msg: print(msg, file=sys.stderr, flush=True)) if quiet else None)
+
     def _log(msg: str) -> None:
-        if on_trace:
-            on_trace(msg)
+        if effective_trace:
+            effective_trace(msg)
 
     # Shared FusionArbiter instance wired across all modules
     if arbiter is None:
         arbiter = (
-            FusionArbiter(db=db, preferred_model=enforced_model, sec_model=DEFAULT_SEC_MODEL)
+            FusionArbiter(db=db, preferred_model=enforced_model, sec_model=DEFAULT_SEC_MODEL, quiet=quiet)
             if FusionArbiter is not None
             else None
         )
+
+    _openapi_auto_host = False
+    if not host and not targets and import_openapi and Path(import_openapi).is_file():
+        try:
+            import yaml as _oa_yaml
+            from engine.safe_network_validator import is_explicit_loopback_host as _is_loop_oa
+            from urllib.parse import urlparse as _oa_urlparse
+            _oa_raw = Path(import_openapi).read_text(encoding="utf-8-sig")
+            _oa_doc = _oa_yaml.safe_load(_oa_raw) if str(import_openapi).lower().endswith((".yml", ".yaml")) else json.loads(_oa_raw)
+            if isinstance(_oa_doc, dict) and isinstance(_oa_doc.get("servers"), list) and _oa_doc["servers"]:
+                _srv_url = str((_oa_doc["servers"][0] or {}).get("url") or "").strip()
+                if _srv_url:
+                    _oa_parsed = _oa_urlparse(_srv_url if "://" in _srv_url else f"http://{_srv_url}")
+                    if _oa_parsed.hostname and _is_loop_oa(_oa_parsed.hostname):
+                        host = _srv_url
+                        _openapi_auto_host = True
+        except Exception:
+            pass
 
     clean_host: Optional[str] = None
     resolved_port: int = port or 443
@@ -2979,9 +3558,10 @@ def run_unified_all_scans(
     if host or targets:
         from engine.safe_network_validator import parse_host_and_port, validate_and_authorize_target
         if host:
+            host_has_scheme = "://" in str(host)
             clean_host, resolved_port, resolved_tls = parse_host_and_port(
                 host,
-                default_port=port or 443,
+                default_port=None if ((_openapi_auto_host and port in (None, 443)) or (port is None and host_has_scheme)) else (port or 443),
                 use_tls=use_tls,
             )
             ok, reason = validate_and_authorize_target(clean_host, authorized=authorized)
@@ -2992,9 +3572,10 @@ def run_unified_all_scans(
             resolved_targets.append(key)
 
         for raw_t in _parse_targets_arg(targets):
+            t_has_scheme = "://" in str(raw_t)
             t_host, t_port, t_tls = parse_host_and_port(
                 raw_t,
-                default_port=port or 443,
+                default_port=None if (port is None and t_has_scheme) else (port or 443),
                 use_tls=use_tls,
             )
             ok, reason = validate_and_authorize_target(t_host, authorized=authorized)
@@ -3007,6 +3588,32 @@ def run_unified_all_scans(
 
         if not clean_host and resolved_targets:
             clean_host, resolved_port, resolved_tls = resolved_targets[0]
+
+    loaded_scope_early: Dict[str, List[str]] = {"allow_hosts": [], "deny_hosts": [], "deny_routes": []}
+    if scope_file:
+        from engine.session_loader import load_scope_file as _early_load_scope
+
+        loaded_scope_early = _early_load_scope(scope_file)
+        if resolved_targets:
+            allow_s = {str(h).strip("[] ").rstrip(".").lower() for h in (loaded_scope_early.get("allow_hosts") or []) if str(h).strip()}
+            deny_s = {str(h).strip("[] ").rstrip(".").lower() for h in (loaded_scope_early.get("deny_hosts") or []) if str(h).strip()}
+            for t_h, _, _ in resolved_targets:
+                nh = str(t_h).strip("[] ").rstrip(".").lower()
+                if any(nh == d or nh.endswith(f".{d}") for d in deny_s):
+                    raise PermissionError(f"Target '{t_h}' is explicitly denied by scope_file '{scope_file}'.")
+                if allow_s and not any(nh == a or nh.endswith(f".{a}") for a in allow_s):
+                    raise PermissionError(f"Target '{t_h}' is outside allow_hosts in scope_file '{scope_file}'.")
+
+    ext_scanner_cfg = None
+    if ext_scanners_active:
+        from engine.external_scanners import DEFAULT_NUCLEI_TAGS, ExternalScannerConfig
+        ext_scanner_cfg = ExternalScannerConfig(
+            enabled=True,
+            execution_mode=scanner_isolation,
+            docker_image=docker_image,
+            docker_network=docker_network,
+            nuclei_tags=DEFAULT_NUCLEI_TAGS if nuclei_tags is None else nuclei_tags,
+        )
 
     has_local = bool(repo or path)
     has_remote = bool(clean_host)
@@ -3054,6 +3661,19 @@ def run_unified_all_scans(
         "total_findings": 0,
         "findings": [],
     }
+    rea_res: Dict[str, Any] = {
+        "status": "disabled" if not enable_rea else "pending",
+        "mode": "python_static",
+        "total_findings": 0,
+        "total_endpoints": 0,
+        "total_ai_sinks": 0,
+        "total_ipc_channels": 0,
+        "discovered_endpoints": [],
+        "ai_sinks": [],
+        "ipc_channels": [],
+        "findings": [],
+        "report_files": {},
+    }
     prober_res: Dict[str, Any] = {"total_findings": 0, "findings": []}
     ruler_res: Dict[str, Any] = {"total_findings": 0, "findings": []}
     harness_res: Dict[str, Any] = {"probes_generated": 0, "probes_evaluated": 0, "total_findings": 0, "findings": []}
@@ -3078,7 +3698,7 @@ def run_unified_all_scans(
             return fallback_res
         try:
             from engine.raptor_integrator import RaptorIntegrator
-            raptor = RaptorIntegrator(db=db, on_trace=on_trace)
+            raptor = RaptorIntegrator(db=db, on_trace=effective_trace)
             status = raptor.check_status()
             if status.get("docker_image_present") and status.get("raptor_repo_present") and os.name == "nt":
                 res = raptor.run_scan(target_path=scan_root, mode="all", model=enforced_model)
@@ -3092,14 +3712,21 @@ def run_unified_all_scans(
         return fallback_res
 
     from engine.safe_network_validator import is_explicit_loopback_host
-    allow_live_sockets = (not strict_offline) and (clean_host is not None) and (not in_test_env or is_explicit_loopback_host(clean_host))
+    allow_live_sockets = (
+        (not strict_offline)
+        and (clean_host is not None)
+        and (not in_test_env or is_explicit_loopback_host(clean_host))
+        and str(approval_mode or "policy").strip().lower() != "deny"
+    )
     net_timeout = 0.2 if offline_or_ci else 3.5
 
     def _run_raptor_remote_task() -> Dict[str, Any]:
         try:
             from engine.raptor_integrator import RaptorIntegrator
-            raptor = RaptorIntegrator(db=db, on_trace=on_trace)
+            raptor = RaptorIntegrator(db=db, on_trace=effective_trace)
             patched = _is_patched_call(raptor, "run_host_scan", "engine.raptor_integrator")
+            if not patched and str(approval_mode or "policy").strip().lower() == "deny":
+                return {"mode": "web", "total_findings": 0, "findings": [], "status": "skipped_approval_deny"}
             should_run = patched
             if not should_run and not offline_or_ci:
                 status = raptor.check_status()
@@ -3116,10 +3743,44 @@ def run_unified_all_scans(
         except Exception as exc:
             return {"mode": "web", "total_findings": 0, "findings": [], "error": str(exc)}
 
+    def _run_rea_local_task(scan_root: str) -> Dict[str, Any]:
+        try:
+            from engine.rea_integrator import ReaIntegrator
+            rea_scanner = ReaIntegrator(db=db, reports_dir=str(out_dir))
+            r_out = rea_scanner.analyze(
+                target_path=scan_root,
+                use_rea_cli=bool(rea_use_cli),
+                write_reports=True,
+            )
+            d = r_out.to_dict()
+            d["total_findings"] = len(d.get("findings") or [])
+            d["total_endpoints"] = len(d.get("discovered_endpoints") or [])
+            d["total_ai_sinks"] = len(d.get("ai_sinks") or [])
+            d["total_ipc_channels"] = len(d.get("ipc_channels") or [])
+            return d
+        except (PermissionError, ValueError):
+            raise
+        except Exception as exc:
+            return {
+                "target": scan_root,
+                "status": "error",
+                "mode": "python_static",
+                "total_findings": 0,
+                "total_endpoints": 0,
+                "total_ai_sinks": 0,
+                "total_ipc_channels": 0,
+                "discovered_endpoints": [],
+                "ai_sinks": [],
+                "ipc_channels": [],
+                "findings": [],
+                "report_files": {},
+                "error": str(exc),
+            }
+
     def _run_prober_task() -> Dict[str, Any]:
         try:
             from engine.active_flaw_prober import ActiveFlawProber
-            prober = ActiveFlawProber(host=clean_host or "", port=resolved_port, use_tls=resolved_tls, timeout=net_timeout)
+            prober = ActiveFlawProber(host=clean_host or "", port=resolved_port, use_tls=resolved_tls, timeout=net_timeout, on_trace=effective_trace)
             patched = _is_patched_call(prober, "run_active_audit", "engine.active_flaw_prober")
             if not (patched or allow_live_sockets):
                 return {"total_findings": 0, "findings": [], "status": "skipped_offline_or_ci"}
@@ -3132,7 +3793,7 @@ def run_unified_all_scans(
     def _run_ruler_task() -> Dict[str, Any]:
         try:
             from protocol_ruler import ProtocolRuler
-            ruler = ProtocolRuler(host=clean_host or "", port=resolved_port, use_tls=resolved_tls, timeout=net_timeout)
+            ruler = ProtocolRuler(host=clean_host or "", port=resolved_port, use_tls=resolved_tls, timeout=net_timeout, on_trace=effective_trace)
             patched = _is_patched_call(ruler, "run_comprehensive_audit", "protocol_ruler")
             if not (patched or allow_live_sockets):
                 return {"total_findings": 0, "findings": [], "status": "skipped_offline_or_ci"}
@@ -3294,13 +3955,16 @@ def run_unified_all_scans(
             }
 
     remote_probe_corpus: List[Dict[str, Any]] = _build_remote_probes() if has_remote else []
-    fut_mantis = fut_aiscan = fut_raptor_local = None
+    fut_mantis = fut_aiscan = fut_raptor_local = fut_rea = None
     fut_raptor_remote = fut_prober = fut_ruler = fut_harness = fut_oracle = None
+    rea_local_root = str(rea_target) if rea_target else (local_target_path if has_local else None)
     with ThreadPoolExecutor(max_workers=8) as pool:
         if has_local and local_target_path:
             fut_mantis = pool.submit(mantis_engine.run_scan, local_target_path, effective_depth, mantis_mode)
             fut_aiscan = pool.submit(_run_aiscan_task, local_target_path)
             fut_raptor_local = pool.submit(_run_raptor_local_task, local_target_path, candidate_files)
+        if enable_rea and rea_local_root:
+            fut_rea = pool.submit(_run_rea_local_task, rea_local_root)
         if has_remote and clean_host:
             fut_raptor_remote = pool.submit(_run_raptor_remote_task)
             fut_prober = pool.submit(_run_prober_task)
@@ -3315,6 +3979,8 @@ def run_unified_all_scans(
             aiscan_res = fut_aiscan.result()
         if fut_raptor_local is not None:
             raptor_res = fut_raptor_local.result()
+        if fut_rea is not None:
+            rea_res = fut_rea.result()
         if fut_raptor_remote is not None:
             remote_raptor_res = fut_raptor_remote.result()
             if has_local:
@@ -3333,100 +3999,7 @@ def run_unified_all_scans(
         if fut_oracle is not None:
             oracle_res = fut_oracle.result()
 
-    # 2. Seed ARTEX Dual-Graph Attack Chaining Engine (Module 17)
-    artex_res: Dict[str, Any] = {"chains_synthesized": 0, "chains": []}
-    try:
-        from engine.dual_graph_engine import DualGraphAttackEngine
-        artex = DualGraphAttackEngine(db=db, reports_dir=str(out_dir))
-        tm_dict = mantis_res.get("threat_model")
-        raw_eps = tm_dict.get("entry_points") if isinstance(tm_dict, dict) else []
-        discovered_eps = []
-        for ep in (raw_eps if isinstance(raw_eps, list) else []):
-            if isinstance(ep, dict):
-                discovered_eps.append(ep.get("function") or ep.get("route") or "/api")
-            else:
-                discovered_eps.append(str(ep))
-        raw_ai_eps = aiscan_res.get("endpoints")
-        for aep in (raw_ai_eps if isinstance(raw_ai_eps, list) else []):
-            if isinstance(aep, dict):
-                discovered_eps.append(aep.get("route_path") or aep.get("route") or "/api/ai")
-            elif hasattr(aep, "route_path"):
-                discovered_eps.append(str(aep.route_path))
-            else:
-                discovered_eps.append(str(aep))
-
-        raw_sinks = aiscan_res.get("findings")
-        ai_sinks = []
-        for f in (raw_sinks if isinstance(raw_sinks, list) else []):
-            if isinstance(f, dict):
-                ai_sinks.append(f.get("title") or f.get("name") or "ai_sink")
-            elif hasattr(f, "description"):
-                ai_sinks.append(str(f.description))
-            else:
-                ai_sinks.append(str(f))
-
-        artex.ingest_target_infrastructure(
-            host=clean_host or os.path.basename(target_path) or "repo-target",
-            port=resolved_port if has_remote else 443,
-            endpoints=discovered_eps or ["/api/chat"],
-            ai_sinks=ai_sinks or ["llm_prompt_sink"],
-        )
-        for idx, mfind in enumerate(mantis_res.get("findings") or [], start=1):
-            if isinstance(mfind, dict):
-                artex.register_wire_primitive(
-                    anomaly_id=mfind.get("finding_id", f"MANTIS-{idx}"),
-                    description=f"{mfind.get('rule_id')}: {mfind.get('title')} at {os.path.basename(mfind.get('file_path', ''))}:{mfind.get('line_number')}",
-                    anomaly_type=mfind.get("cwe", "MANTIS_TAINT"),
-                    raw_probe=str(mfind.get("sink", "")),
-                )
-            elif isinstance(mfind, str):
-                artex.register_wire_primitive(
-                    anomaly_id=f"MANTIS-{idx}",
-                    description=mfind,
-                    anomaly_type="MANTIS_TAINT",
-                    raw_probe=mfind,
-                )
-
-        # Ingest all findings from every scanner (Mantis, aiscan, RAPTOR, ActiveFlawProber, ProtocolRuler, Harness, Oracle) BEFORE chaining
-        ingester = getattr(artex, "ingest_finding", getattr(artex, "ingest_scanner_finding", None))
-        scanner_feeds = (
-            ("mantis", "MANTIS-FIND", mantis_res.get("findings") or []),
-            ("aiscan", "AISCAN-FIND", aiscan_res.get("findings") or []),
-            ("raptor", "RAPTOR-FIND", raptor_res.get("findings") or []),
-            ("ActiveFlawProber", "PROBER-FIND", prober_res.get("findings") or []),
-            ("ProtocolRuler", "RULER-FIND", ruler_res.get("findings") or []),
-            ("DeterministicHarness", "HARNESS-FIND", harness_res.get("findings") or []),
-            ("DifferentialOracle", "ORACLE-FIND", oracle_res.get("findings") or []),
-        )
-        for scanner_label, default_rule, items in scanner_feeds:
-            for item in items:
-                f_item = item if isinstance(item, dict) else {"title": str(item), "description": str(item), "rule_id": default_rule}
-                if ingester:
-                    ingester(f_item, scanner=scanner_label)
-                if scanner_label in ("ActiveFlawProber", "ProtocolRuler", "DeterministicHarness", "DifferentialOracle"):
-                    try:
-                        artex.register_wire_primitive(
-                            anomaly_id=str(f_item.get("vuln_id") or f_item.get("rule_id") or f_item.get("name") or default_rule),
-                            description=str(f_item.get("description") or f_item.get("verdict") or f_item.get("title") or scanner_label),
-                            anomaly_type=str(f_item.get("type") or f_item.get("classification") or "CL.TE"),
-                            raw_probe=str(f_item.get("raw_probe") or f_item.get("sequence_repr") or ""),
-                        )
-                    except Exception:
-                        pass
-
-        cycle_res = artex.run_attack_chain_cycle(round_num=max(1, int(artex_rounds)))
-        chains = artex.export_attack_chains_to_sarif_findings() if hasattr(artex, "export_attack_chains_to_sarif_findings") else []
-        artex_res = cycle_res if isinstance(cycle_res, dict) else {"result": str(cycle_res)}
-        artex_res["chains"] = chains
-        artex_res["chains_synthesized"] = len(chains) if chains else (
-            int(artex_res.get("candidates_planned", 0) or 0)
-            or int(artex_res.get("exploits_verified", 0) or 0)
-        )
-        artex_res["engine"] = "ARTEX Dual-Graph Attack Chaining"
-    except Exception as exc:
-        artex_res = {"error": str(exc), "chains_synthesized": 0, "chains": []}
-
-    # 3. Synthesize Cross-Layer Prompt Smuggling & RFC Desync Probes offline (Module 19)
+    # 2. Synthesize Cross-Layer Prompt Smuggling & RFC Desync Probes (Module 19) before ARTEX chaining
     smuggle_res: Dict[str, Any] = {"probes_generated": 0, "probes": []}
     all_smuggle_probes = []
     has_real_ai_endpoints = False
@@ -3442,6 +4015,11 @@ def run_unified_all_scans(
                 ai_endpoints.append(str(ep.route_path))
             elif ep:
                 ai_endpoints.append(str(ep))
+        for rea_sink in (rea_res.get("ai_sinks") or []):
+            if isinstance(rea_sink, dict) and rea_sink.get("route"):
+                r_str = str(rea_sink["route"])
+                if r_str not in ai_endpoints:
+                    ai_endpoints.append(r_str)
         has_real_ai_endpoints = len(ai_endpoints) > 0
         if not ai_endpoints:
             ai_endpoints = ["/api/chat"]
@@ -3462,6 +4040,545 @@ def run_unified_all_scans(
         }
     except Exception as exc:
         smuggle_res = {"error": str(exc), "probes_generated": 0}
+
+    # 3. Seed & Execute ARTEX Dual-Graph + Durable Attack Chaining Engine (Module 17)
+    ext_discovery_res: Dict[str, Any] = {
+        "status": "disabled",
+        "ok": False,
+        "execution_mode": str(scanner_isolation or "host"),
+        "endpoints": [],
+        "ai_sinks": [],
+        "js_endpoints": [],
+        "technologies": [],
+        "assets_added": 0,
+        "endpoints_added": 0,
+        "ai_sinks_added": 0,
+    }
+    ext_nuclei_res: Dict[str, Any] = {
+        "status": "disabled",
+        "ok": False,
+        "execution_mode": str(scanner_isolation or "host"),
+        "tags": [],
+        "findings": [],
+        "total_findings": 0,
+        "findings_ingested": 0,
+    }
+    artex_res: Dict[str, Any] = {"chains_synthesized": 0, "chains": []}
+    try:
+        from datetime import datetime, timezone
+        import secrets as _secrets
+        from engine.artex_bridge import ArtexProxyConfig, TrafficCaptureSession
+        from engine.dual_graph_engine import DualGraphAttackEngine, NoiseGovernor, derive_capability_class
+
+        shared_task_id = f"ARTEX-TASK-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{_secrets.token_hex(3)}"
+        shared_noise_governor = NoiseGovernor(profile=artex_noise_profile)
+
+        proxy_cfg = ArtexProxyConfig.from_env_or_args(
+            proxy_url=artex_proxy,
+            ca_cert_path=artex_ca_cert,
+            authorized=authorized,
+        )
+        traffic_session = TrafficCaptureSession(db=db, task_id=shared_task_id, proxy_config=proxy_cfg)
+
+        # Optional Pillar 3/4/2 integrations: ApprovalGate, Scope, Auth Profiles, Embedded MITM Proxy
+        from engine.approval_gate import ApprovalGate
+        from engine.session_loader import (
+            import_har_file,
+            import_openapi_spec,
+            load_auth_profiles,
+            load_scope_file,
+        )
+
+        approval_gate = (
+            ApprovalGate.from_rules_file(approval_rules, mode=approval_mode, db=db, task_id=shared_task_id)
+            if approval_rules
+            else ApprovalGate(mode=approval_mode, db=db, task_id=shared_task_id)
+        )
+        loaded_scope = loaded_scope_early if scope_file else {"allow_hosts": [], "deny_hosts": [], "deny_routes": []}
+        scope_hosts_set = set(loaded_scope.get("allow_hosts") or []) or None
+        loaded_auth_profiles = load_auth_profiles(auth_profile) if auth_profile else {}
+
+        embedded_mitm = None
+        try:
+            if embedded_proxy:
+                from engine.local_mitm_proxy import LocalRecordingMITMProxy
+                embedded_mitm = LocalRecordingMITMProxy(
+                    host="127.0.0.1",
+                    port=int(embedded_proxy_port or 0),
+                    db=db,
+                    task_id=shared_task_id,
+                    traffic_session=traffic_session,
+                    noise_governor=shared_noise_governor,
+                    authorized=authorized or bool(clean_host and is_explicit_loopback_host(clean_host)),
+                )
+                embedded_mitm.start()
+                proxy_cfg = ArtexProxyConfig(
+                    proxy_url=embedded_mitm.proxy_url,
+                    ca_cert_path=embedded_mitm.ca_cert_path,
+                    authorized=authorized or bool(clean_host and is_explicit_loopback_host(clean_host)),
+                    enabled=True,
+                )
+                traffic_session.proxy_config = proxy_cfg
+
+            resolved_llm_profiles = (
+                list(artex_llm_profiles)
+                if artex_llm_profiles
+                else list(getattr(mantis_engine, "fusion_models", []) or [])
+            )
+
+            # Pillar 1: Bind LiveWorkerExecutorRegistry for authorized/loopback remote hosts
+            live_executor_fn = None
+            live_registry = None
+            _is_loopback_target = bool(has_remote and clean_host and is_explicit_loopback_host(clean_host))
+            _enable_live = False
+            if artex_live is True and has_remote:
+                _enable_live = bool(authorized or _is_loopback_target)
+            elif artex_live is None and has_remote and not strict_offline and (authorized or _is_loopback_target):
+                # Auto-enable safe non-destructive live verification only when target port is reachable
+                import socket as _sock
+                try:
+                    with _sock.create_connection((clean_host, int(resolved_port)), timeout=1.0):
+                        _enable_live = True
+                except OSError:
+                    _enable_live = False
+
+            if _enable_live and has_remote:
+                from engine.live_executors import LiveWorkerExecutorRegistry
+                live_registry = LiveWorkerExecutorRegistry(
+                    host=clean_host,
+                    port=int(resolved_port),
+                    use_tls=bool(resolved_tls),
+                    authorized=bool(authorized or _is_loopback_target),
+                    traffic_session=traffic_session,
+                    approval_gate=approval_gate,
+                    noise_governor=shared_noise_governor,
+                    auth_profiles=loaded_auth_profiles,
+                    arbiter=None if strict_offline else arbiter,
+                )
+                live_executor_fn = live_registry.as_executor_fn()
+
+            artex = DualGraphAttackEngine(
+                db=db,
+                reports_dir=str(out_dir),
+                task_id=shared_task_id,
+                scope_hosts=scope_hosts_set,
+                noise_profile=artex_noise_profile,
+                max_task_turns=int(artex_budget_turns or 0),
+                max_intent_tokens=resolved_intent_tokens,
+                max_intent_turns=resolved_intent_turns,
+                llm_profile_ids=resolved_llm_profiles,
+                llm_rotate=bool(artex_llm_rotate),
+                proxy_config=proxy_cfg,
+                traffic_session=traffic_session,
+                workers=max(1, int(artex_workers or 3)),
+                arbiter=None if strict_offline else arbiter,
+                strict_poe=bool(strict_poe),
+                approval_gate=approval_gate,
+                default_executor_fn=live_executor_fn,
+            )
+            artex.noise_governor = shared_noise_governor
+            artex.worker.noise_governor = shared_noise_governor
+            if live_registry is not None:
+                live_registry.budget_ledger = artex.budget_ledger
+                live_registry.trace_store = artex.trace_store
+                live_registry.boundary = artex.boundary
+                live_registry.asset_graph = artex.asset_graph
+                if artex_multiturn:
+                    mt_turns = resolved_intent_turns if resolved_intent_turns > 0 else None
+                    live_executor_fn = live_registry.as_multiturn_executor_fn(
+                        max_turns=mt_turns,
+                        budget_ledger=artex.budget_ledger,
+                        trace_store=artex.trace_store,
+                        boundary=artex.boundary,
+                        asset_graph=artex.asset_graph,
+                    )
+                    artex.default_executor_fn = live_executor_fn
+            # Mark any explicit deny_hosts / deny_routes from scope_file out of scope on AssetGraph
+            for deny_h in loaded_scope.get("deny_hosts") or []:
+                artex.asset_graph.deny_hosts.add(str(deny_h).lower())
+            for deny_r in loaded_scope.get("deny_routes") or []:
+                artex.asset_graph.deny_routes.append(str(deny_r))
+
+            # Optional Pillar 2 surface imports (OpenAPI / HAR)
+            surface_imports: Dict[str, Any] = {}
+            if import_openapi:
+                surface_imports["openapi"] = import_openapi_spec(
+                    import_openapi,
+                    asset_graph=artex.asset_graph,
+                    default_host=clean_host or os.path.basename(target_path) or "repo-target",
+                    default_port=resolved_port if has_remote else 443,
+                    host=clean_host if has_remote else None,
+                    port=resolved_port if has_remote else None,
+                )
+            if import_har:
+                har_res = import_har_file(
+                    import_har,
+                    asset_graph=artex.asset_graph,
+                    traffic_session=traffic_session,
+                )
+                surface_imports["har"] = har_res
+                if not loaded_auth_profiles and har_res.get("extracted_auth_headers"):
+                    from engine.session_loader import AuthProfile as _AP
+                    loaded_auth_profiles["har_session"] = _AP(
+                        name="har_session",
+                        role="end_user",
+                        headers=dict(har_res["extracted_auth_headers"]),
+                    )
+                    if live_registry is not None:
+                        live_registry.auth_profiles.update(loaded_auth_profiles)
+
+            tm_dict = mantis_res.get("threat_model")
+            raw_eps = tm_dict.get("entry_points") if isinstance(tm_dict, dict) else []
+            discovered_eps = []
+            for ep in (raw_eps if isinstance(raw_eps, list) else []):
+                if isinstance(ep, dict):
+                    if ep.get("route"):
+                        discovered_eps.append({"route": ep["route"], "method": ep.get("method", "GET")})
+                    else:
+                        discovered_eps.append(ep.get("function") or "/api")
+                else:
+                    discovered_eps.append(str(ep))
+            raw_ai_eps = aiscan_res.get("endpoints")
+            for aep in (raw_ai_eps if isinstance(raw_ai_eps, list) else []):
+                if isinstance(aep, dict):
+                    discovered_eps.append(aep.get("route_path") or aep.get("route") or "/api/ai")
+                elif hasattr(aep, "route_path"):
+                    discovered_eps.append(str(aep.route_path))
+                else:
+                    discovered_eps.append(str(aep))
+
+            raw_sinks = aiscan_res.get("findings")
+            ai_sinks = []
+            for f in (raw_sinks if isinstance(raw_sinks, list) else []):
+                if isinstance(f, dict):
+                    ai_sinks.append(f.get("title") or f.get("name") or "ai_sink")
+                elif hasattr(f, "description"):
+                    ai_sinks.append(str(f.description))
+                else:
+                    ai_sinks.append(str(f))
+
+            # Optional Module 21 live same-origin JS bundle mining on authorized/loopback remote hosts
+            if enable_rea and has_remote and allow_live_sockets:
+                try:
+                    from engine.rea_integrator import ReaIntegrator
+                    live_rea_scanner = ReaIntegrator(
+                        db=db,
+                        reports_dir=str(out_dir),
+                        approval_gate=approval_gate,
+                        noise_governor=shared_noise_governor,
+                    )
+                    live_rea_out = live_rea_scanner.analyze(
+                        target_path=None,
+                        host=clean_host,
+                        port=int(resolved_port),
+                        use_tls=bool(resolved_tls),
+                        authorized=bool(authorized or _is_loopback_target),
+                        traffic_session=traffic_session,
+                        write_reports=True,
+                    ).to_dict()
+                    existing_rea_routes = {
+                        (str(e.get("method", "GET")).upper(), str(e.get("route", "")))
+                        for e in (rea_res.get("discovered_endpoints") or [])
+                        if isinstance(e, dict)
+                    }
+                    for ep_rec in live_rea_out.get("discovered_endpoints") or []:
+                        if isinstance(ep_rec, dict):
+                            rk = (str(ep_rec.get("method", "GET")).upper(), str(ep_rec.get("route", "")))
+                            if rk not in existing_rea_routes:
+                                existing_rea_routes.add(rk)
+                                rea_res.setdefault("discovered_endpoints", []).append(ep_rec)
+                    for sink_rec in live_rea_out.get("ai_sinks") or []:
+                        if sink_rec not in rea_res.setdefault("ai_sinks", []):
+                            rea_res["ai_sinks"].append(sink_rec)
+                    for ipc_rec in live_rea_out.get("ipc_channels") or []:
+                        rea_res.setdefault("ipc_channels", []).append(ipc_rec)
+                    existing_fids = {
+                        str(rf.get("finding_id", ""))
+                        for rf in (rea_res.get("findings") or [])
+                        if isinstance(rf, dict)
+                    }
+                    for lf in live_rea_out.get("findings") or []:
+                        if isinstance(lf, dict) and str(lf.get("finding_id", "")) not in existing_fids:
+                            existing_fids.add(str(lf.get("finding_id", "")))
+                            rea_res.setdefault("findings", []).append(lf)
+                    if rea_res.get("status") in ("pending", "skipped_no_js_artifacts"):
+                        rea_res["status"] = live_rea_out.get("status", "completed")
+                    rea_res["mode"] = (
+                        f"{rea_res.get('mode', 'python_static')}+live_same_origin"
+                        if fut_rea is not None and rea_res.get("status") == "completed"
+                        else "live_same_origin"
+                    )
+                    if live_rea_out.get("report_files") and not rea_res.get("report_files"):
+                        rea_res["report_files"] = live_rea_out["report_files"]
+                    rea_res["total_findings"] = len(rea_res.get("findings") or [])
+                    rea_res["total_endpoints"] = len(rea_res.get("discovered_endpoints") or [])
+                    rea_res["total_ai_sinks"] = len(rea_res.get("ai_sinks") or [])
+                    rea_res["total_ipc_channels"] = len(rea_res.get("ipc_channels") or [])
+                except Exception as live_rea_exc:
+                    rea_res.setdefault("limitations", []).append(f"Live REA JS bundle fetch skipped: {live_rea_exc}")
+
+            for rea_ep in (rea_res.get("discovered_endpoints") or []):
+                if isinstance(rea_ep, dict) and rea_ep.get("route"):
+                    discovered_eps.append({
+                        "route": str(rea_ep["route"]),
+                        "method": str(rea_ep.get("method") or "GET").upper(),
+                    })
+            for rea_ai in (rea_res.get("ai_sinks") or []):
+                if isinstance(rea_ai, dict) and rea_ai.get("route"):
+                    ai_sinks.append({"route": str(rea_ai["route"]), "method": str(rea_ai.get("method") or "POST").upper()})
+
+            ext_discovery_cfg = ext_scanner_cfg
+            ext_nuclei_cfg = ext_scanner_cfg
+            if ext_scanner_cfg is not None and resolved_targets and (run_httpx or run_katana or run_nuclei):
+                from engine.external_scanners import resolve_external_scanner_tool_configs
+                ext_discovery_cfg, ext_nuclei_cfg = resolve_external_scanner_tool_configs(
+                    ext_scanner_cfg,
+                    run_httpx=run_httpx,
+                    run_katana=run_katana,
+                    run_nuclei=run_nuclei,
+                )
+
+            if ext_scanner_cfg is not None and resolved_targets and (run_httpx or run_katana):
+                from engine.external_scanners import run_opt_in_external_discovery
+                for t_host, t_port, t_tls in resolved_targets:
+                    fmt_h = f"[{t_host}]" if ":" in t_host and not t_host.startswith("[") else t_host
+                    t_url = f"{'https' if t_tls else 'http'}://{fmt_h}:{t_port}"
+                    d_res = run_opt_in_external_discovery(
+                        t_url,
+                        config=ext_discovery_cfg,
+                        asset_graph=artex.asset_graph,
+                        authorized=bool(authorized or is_explicit_loopback_host(t_host)),
+                        approval_gate=approval_gate,
+                        noise_governor=shared_noise_governor,
+                        run_httpx=run_httpx,
+                        run_katana=run_katana,
+                    )
+                    ext_discovery_res["status"] = d_res.get("status", "completed")
+                    ext_discovery_res["ok"] = bool(ext_discovery_res["ok"] or d_res.get("ok"))
+                    ext_discovery_res["assets_added"] += int(d_res.get("assets_added", 0) or 0)
+                    for key_l in ("endpoints", "ai_sinks", "js_endpoints", "technologies"):
+                        for val in (d_res.get(key_l) or []):
+                            if val not in ext_discovery_res[key_l]:
+                                ext_discovery_res[key_l].append(val)
+                    ext_discovery_res["endpoints_added"] = len(ext_discovery_res["endpoints"])
+                    ext_discovery_res["ai_sinks_added"] = len(ext_discovery_res["ai_sinks"])
+                    if d_res.get("httpx") is not None:
+                        ext_discovery_res["httpx"] = d_res["httpx"]
+                    if d_res.get("katana") is not None:
+                        ext_discovery_res["katana"] = d_res["katana"]
+
+            primary_artex_host = clean_host or os.path.basename(target_path) or "repo-target"
+            primary_artex_port = resolved_port if has_remote else 443
+            existing_eps = artex.asset_graph.find_endpoints_by_type(
+                "ENDPOINT", host=primary_artex_host, port=primary_artex_port
+            )
+            existing_sinks = artex.asset_graph.find_endpoints_by_type(
+                "AI_SINK", host=primary_artex_host, port=primary_artex_port
+            )
+            eff_primary_eps = discovered_eps if discovered_eps else ([] if existing_eps else ["/api/chat"])
+            eff_primary_sinks = ai_sinks if ai_sinks else ([] if existing_sinks else ["llm_prompt_sink"])
+            artex.ingest_target_infrastructure(
+                host=primary_artex_host,
+                port=primary_artex_port,
+                endpoints=eff_primary_eps,
+                ai_sinks=eff_primary_sinks,
+            )
+            # Register any additional multi-target endpoints in AssetGraph
+            for extra_host, extra_port, _ in resolved_targets[1:]:
+                extra_existing_eps = artex.asset_graph.find_endpoints_by_type(
+                    "ENDPOINT", host=extra_host, port=extra_port
+                )
+                artex.ingest_target_infrastructure(
+                    host=extra_host,
+                    port=extra_port,
+                    endpoints=discovered_eps if discovered_eps else ([] if extra_existing_eps else ["/"]),
+                    ai_sinks=[],
+                )
+
+            if ext_scanner_cfg is not None and resolved_targets and run_nuclei:
+                from engine.external_scanners import run_opt_in_nuclei_scan
+                for t_host, t_port, t_tls in resolved_targets:
+                    fmt_h = f"[{t_host}]" if ":" in t_host and not t_host.startswith("[") else t_host
+                    t_url = f"{'https' if t_tls else 'http'}://{fmt_h}:{t_port}"
+                    n_res = run_opt_in_nuclei_scan(
+                        t_url,
+                        config=ext_nuclei_cfg,
+                        dual_graph_engine=artex,
+                        authorized=bool(authorized or is_explicit_loopback_host(t_host)),
+                        approval_gate=approval_gate,
+                        noise_governor=shared_noise_governor,
+                    )
+                    ext_nuclei_res["status"] = n_res.get("status", "completed")
+                    ext_nuclei_res["ok"] = bool(ext_nuclei_res["ok"] or n_res.get("ok"))
+                    if n_res.get("tags"):
+                        ext_nuclei_res["tags"] = list(n_res["tags"])
+                    ext_nuclei_res["findings"].extend(n_res.get("findings") or [])
+                    ext_nuclei_res["total_findings"] = len(ext_nuclei_res["findings"])
+                    ext_nuclei_res["findings_ingested"] += int(n_res.get("findings_ingested", 0) or 0)
+
+            _ingest_batch = db.batch_writes() if (db is not None and hasattr(db, "batch_writes")) else contextlib.nullcontext()
+            with _ingest_batch:
+                for idx, mfind in enumerate(mantis_res.get("findings") or [], start=1):
+                    if isinstance(mfind, dict):
+                        if derive_capability_class(mfind, scanner="mantis") == "DESYNC":
+                            artex.register_wire_primitive(
+                                anomaly_id=mfind.get("finding_id", f"MANTIS-{idx}"),
+                                description=f"{mfind.get('rule_id')}: {mfind.get('title')} at {os.path.basename(mfind.get('file_path', ''))}:{mfind.get('line_number')}",
+                                anomaly_type=mfind.get("cwe", "MANTIS_TAINT"),
+                                raw_probe=str(mfind.get("sink", "")),
+                                scanner="mantis",
+                            )
+                    elif isinstance(mfind, str):
+                        artex.register_wire_primitive(
+                            anomaly_id=f"MANTIS-{idx}",
+                            description=mfind,
+                            anomaly_type="MANTIS_TAINT",
+                            raw_probe=mfind,
+                            scanner="mantis",
+                        )
+
+                # Ingest all findings from EVERY scanner (Mantis, aiscan, RAPTOR, ActiveFlawProber,
+                # ProtocolRuler, DeterministicHarness, DifferentialOracle, PromptSmuggler) BEFORE chaining
+                ingester = getattr(artex, "ingest_finding", getattr(artex, "ingest_scanner_finding", None))
+                smuggle_findings_feed = (
+                    [
+                        {
+                            "rule_id": getattr(p, "probe_id", "PROMPT-SMUGGLE"),
+                            "title": f"Desynchronized Prompt Injection: {getattr(p, 'wire_anomaly_technique', 'CL.TE')}",
+                            "severity": "CRITICAL",
+                            "cwe": "CWE-444",
+                            "file_path": getattr(p, "target_ai_endpoint", "/api/chat"),
+                            "description": getattr(p, "rationale", ""),
+                            "raw_probe": getattr(p, "raw_smuggled_stream", ""),
+                        }
+                        for p in all_smuggle_probes
+                    ]
+                    if has_real_ai_endpoints
+                    else []
+                )
+                scanner_feeds = (
+                    ("mantis", "MANTIS-FIND", mantis_res.get("findings") or []),
+                    ("aiscan", "AISCAN-FIND", aiscan_res.get("findings") or []),
+                    ("raptor", "RAPTOR-FIND", raptor_res.get("findings") or []),
+                    ("Module-21-REA", "REA-FIND", rea_res.get("findings") or []),
+                    ("ActiveFlawProber", "PROBER-FIND", prober_res.get("findings") or []),
+                    ("ProtocolRuler", "RULER-FIND", ruler_res.get("findings") or []),
+                    ("DeterministicHarness", "HARNESS-FIND", harness_res.get("findings") or []),
+                    ("DifferentialOracle", "ORACLE-FIND", oracle_res.get("findings") or []),
+                    ("PromptSmuggler", "SMUGGLE-FIND", smuggle_findings_feed),
+                )
+                for scanner_label, default_rule, items in scanner_feeds:
+                    for item in items:
+                        f_item = item if isinstance(item, dict) else {"title": str(item), "description": str(item), "rule_id": default_rule}
+                        if ingester:
+                            ingester(f_item, scanner=scanner_label)
+                        if scanner_label in ("ActiveFlawProber", "ProtocolRuler", "DeterministicHarness", "DifferentialOracle"):
+                            try:
+                                artex.register_wire_primitive(
+                                    anomaly_id=str(f_item.get("vuln_id") or f_item.get("rule_id") or f_item.get("name") or default_rule),
+                                    description=str(f_item.get("description") or f_item.get("verdict") or f_item.get("title") or scanner_label),
+                                    anomaly_type=str(f_item.get("type") or f_item.get("classification") or "CL.TE"),
+                                    raw_probe=str(f_item.get("raw_probe") or f_item.get("sequence_repr") or ""),
+                                    scanner=scanner_label,
+                                )
+                            except Exception:
+                                pass
+                            # Record remote scanner probe/evidence into TrafficCaptureSession for ARTEX ingest
+                            if f_item.get("raw_probe") or f_item.get("description"):
+                                scheme = "https" if resolved_tls else "http"
+                                artex.bind_traffic_evidence(
+                                    method="POST" if "POST" in str(f_item.get("raw_probe", "")) else "GET",
+                                    url=f"{scheme}://{primary_artex_host}:{resolved_port if has_remote else 443}/",
+                                    host=primary_artex_host,
+                                    port=resolved_port if has_remote else 443,
+                                    status_code=200,
+                                    request_body=str(f_item.get("raw_probe") or "")[:1024],
+                                    response_body=str(f_item.get("description") or f_item.get("title") or ""),
+                                )
+
+            # Call with exact round_num keyword signature to preserve monkeypatch spy compatibility
+            cycle_res = artex.run_attack_chain_cycle(round_num=max(1, int(artex_rounds)))
+
+            # Optional retest loop after chaining
+            if artex_retest and hasattr(artex, "retester"):
+                stored_chains = db.get_attack_chains(limit=25, task_id=artex.task_id) if (db and hasattr(db, "get_attack_chains")) else []
+                retests = [
+                    artex.retester.retest_chain(
+                        ch,
+                        live=bool(_enable_live and has_remote),
+                        authorized=bool(authorized or _is_loopback_target),
+                    )
+                    for ch in stored_chains
+                ]
+                if isinstance(cycle_res, dict):
+                    cycle_res["retest_results"] = retests
+
+            # Optional Headless BaaRai/ARTEX REST+SSE sync when --artex-url or ARTEX_API_URL is configured
+            resolved_artex_url = artex_url or os.environ.get("ARTEX_API_URL")
+            remote_artex_summary: Dict[str, Any] = {"configured": bool(resolved_artex_url), "status": "not_configured"}
+            if resolved_artex_url:
+                from urllib.parse import urlparse as _urlparse
+                _artex_host = (_urlparse(resolved_artex_url if "://" in resolved_artex_url else f"http://{resolved_artex_url}").hostname or "").lower()
+                _is_local_artex = is_explicit_loopback_host(_artex_host)
+                if strict_offline and not _is_local_artex:
+                    remote_artex_summary = {
+                        "configured": True,
+                        "base_url": resolved_artex_url,
+                        "status": "skipped_offline",
+                    }
+                else:
+                    remote_artex_summary = artex.sync_with_headless_artex(
+                        artex_url=resolved_artex_url,
+                        token=artex_token or os.environ.get("ARTEX_API_TOKEN"),
+                        authorized=authorized,
+                        llm_profile_ids=resolved_llm_profiles or None,
+                        llm_rotate=bool(artex_llm_rotate) if resolved_llm_profiles else None,
+                        wait_sse=bool(artex_wait_sse),
+                    )
+                    # If remote ARTEX returned new findings, run a follow-up wake-up round locally
+                    if remote_artex_summary.get("remote_findings_ingested", 0) > 0:
+                        cycle_res = artex.run_attack_chain_cycle(round_num=max(1, int(artex_rounds)) + 1)
+
+            chains = artex.export_attack_chains_to_sarif_findings() if hasattr(artex, "export_attack_chains_to_sarif_findings") else []
+            artex_res = cycle_res if isinstance(cycle_res, dict) else {"result": str(cycle_res)}
+            artex_res["chains"] = chains
+            artex_res["chains_synthesized"] = len(chains) if chains else (
+                int(artex_res.get("candidates_planned", 0) or 0)
+                or int(artex_res.get("exploits_verified", 0) or 0)
+            )
+            artex_res["proxy"] = proxy_cfg.to_dict()
+            artex_res["embedded_proxy_active"] = bool(embedded_mitm is not None)
+            artex_res["live_execution_enabled"] = bool(_enable_live)
+            artex_res["multiturn_enabled"] = bool(artex_multiturn and live_registry is not None)
+            artex_res["strict_poe"] = bool(strict_poe)
+            artex_res["approval_mode"] = approval_mode
+            if surface_imports:
+                artex_res["surface_imports"] = {
+                    k: (
+                        {
+                            sk: sv
+                            for sk, sv in v.items()
+                            if sk not in ("extracted_auth_profiles", "extracted_auth_headers")
+                        }
+                        if isinstance(v, dict)
+                        else v
+                    )
+                    for k, v in surface_imports.items()
+                }
+            artex_res["remote_artex"] = remote_artex_summary
+            artex_res["engine"] = "ARTEX Dual-Graph & Durable Attack Chaining"
+        finally:
+            if embedded_mitm is not None:
+                try:
+                    embedded_mitm.stop()
+                except Exception:
+                    pass
+    except (PermissionError, ValueError) as exc:
+        if ext_scanners_active:
+            raise
+        artex_res = {"error": str(exc), "chains_synthesized": 0, "chains": []}
+    except Exception as exc:
+        artex_res = {"error": str(exc), "chains_synthesized": 0, "chains": []}
 
     # 4. Aggregate all findings into Unified SARIF 2.1.0 + JSON + TXT
     aggregated_findings: List[Dict[str, Any]] = []
@@ -3558,7 +4675,7 @@ def run_unified_all_scans(
                 "scanner": "Module-19-PromptSmuggler",
             })
 
-    # Append synthesized ARTEX attack chains
+    # Append synthesized ARTEX attack chains (with hop_count, POE level, verification status & steps)
     if artex_res.get("chains"):
         for ch in artex_res["chains"]:
             if isinstance(ch, dict):
@@ -3572,6 +4689,11 @@ def run_unified_all_scans(
                     "description": ch.get("description", "Compound vulnerability attack path synthesized by ARTEX."),
                     "remediation": ch.get("remediation", "Remediate initial framing primitive or auth secret exposure."),
                     "scanner": "Module-17-ARTEX",
+                    "hop_count": ch.get("hop_count", 1),
+                    "poe_level": ch.get("poe_level", 0),
+                    "verification_status": ch.get("verification_status", "UNVERIFIED"),
+                    "source_scanners": ch.get("source_scanners", []),
+                    "chain_steps": ch.get("chain_steps", []),
                 })
 
     for pf in prober_res.get("findings", []):
@@ -3631,6 +4753,34 @@ def run_unified_all_scans(
             "scanner": "MultiImplementationDifferentialOracle",
         })
 
+    for nf in (ext_nuclei_res.get("findings") or []):
+        if isinstance(nf, dict):
+            aggregated_findings.append({
+                "rule_id": nf.get("rule_id", "NUCLEI-001"),
+                "title": nf.get("title", nf.get("rule_id", "Nuclei Finding")),
+                "severity": str(nf.get("severity", "INFO")).upper(),
+                "cwe": nf.get("cwe", ""),
+                "file_path": nf.get("file_path", target_path),
+                "line_number": int(nf.get("line_number", 1) or 1),
+                "description": nf.get("description", ""),
+                "remediation": nf.get("remediation", ""),
+                "scanner": "external_nuclei",
+            })
+
+    for rf_rea in (rea_res.get("findings") or []):
+        if isinstance(rf_rea, dict):
+            aggregated_findings.append({
+                "rule_id": rf_rea.get("rule_id", "REA-ROUTE-001"),
+                "title": rf_rea.get("title", "REA Client Artifact Finding"),
+                "severity": str(rf_rea.get("severity", "MEDIUM")).upper(),
+                "cwe": rf_rea.get("cwe", "CWE-200"),
+                "file_path": rf_rea.get("file_path", target_path),
+                "line_number": int(rf_rea.get("line_number", 1) or 1),
+                "description": rf_rea.get("evidence") or rf_rea.get("title", ""),
+                "remediation": "Enforce server-side authorization, remove client-embedded secrets, and harden Electron webPreferences/IPC.",
+                "scanner": "Module-21-REA",
+            })
+
     # Final Fusion arbiter synthesis summary over combined scan surface
     fusion_summary = (
         f"Unified --all scan completed on {target_path}: "
@@ -3680,6 +4830,57 @@ def run_unified_all_scans(
         sev = str(item.get("severity", "INFO")).upper()
         sev_breakdown[sev] = sev_breakdown.get(sev, 0) + 1
 
+    extra_report_files: Dict[str, Any] = {}
+    if export_csv or export_advisory:
+        from engine.advisory_exporter import AdvisoryExporter, _safe_filename
+        exporter = AdvisoryExporter(reports_dir=out_dir)
+        if export_csv:
+            csv_path = out_dir / "findings_and_chains.csv"
+            non_chain_findings = [
+                f for f in aggregated_findings
+                if not (isinstance(f, dict) and f.get("scanner") == "Module-17-ARTEX")
+            ]
+            exporter.export_findings_csv(
+                non_chain_findings,
+                chains=artex_res.get("chains") or [],
+                output_path=csv_path,
+            )
+            extra_report_files["findings_and_chains_csv"] = str(csv_path)
+            extra_report_files["combined_csv"] = str(csv_path)
+        if export_advisory:
+            adv_paths: List[str] = []
+            seen_adv_paths: Set[str] = set()
+            task_id_val = artex_res.get("task_id")
+            stored_chains = (
+                db.get_attack_chains(limit=50, task_id=task_id_val)
+                if (db is not None and hasattr(db, "get_attack_chains") and task_id_val)
+                else []
+            )
+            export_targets = stored_chains or (artex_res.get("chains") or [])
+            for idx_ch, ch_item in enumerate(export_targets[:25], start=1):
+                if not isinstance(ch_item, dict):
+                    continue
+                cid = str(ch_item.get("chain_id") or ch_item.get("rule_id") or f"CHAIN-{idx_ch}")
+                tid = ch_item.get("traffic_id")
+                trec = (
+                    db.get_traffic_evidence(tid)
+                    if (tid and db is not None and hasattr(db, "get_traffic_evidence"))
+                    else None
+                )
+                rtests = (
+                    db.get_chain_retests(chain_id=cid)
+                    if (db is not None and hasattr(db, "get_chain_retests"))
+                    else []
+                )
+                base_stem = _safe_filename(cid)
+                out_md = out_dir / f"advisory_{base_stem}.md"
+                if str(out_md) in seen_adv_paths:
+                    out_md = out_dir / f"advisory_{base_stem}_{idx_ch}.md"
+                seen_adv_paths.add(str(out_md))
+                exporter.export_ghsa_markdown(ch_item, traffic_record=trec, retests=rtests, output_path=out_md)
+                adv_paths.append(str(out_md))
+            extra_report_files["advisories"] = adv_paths
+
     result_payload = {
         "target_path": target_path,
         "mode": scan_mode,
@@ -3710,17 +4911,45 @@ def run_unified_all_scans(
                 "mode": raptor_res.get("mode", "static"),
                 "total_findings": len(raptor_res.get("findings") or []),
             },
+            "rea_surface": {
+                "status": rea_res.get("status", "disabled"),
+                "mode": rea_res.get("mode", "python_static"),
+                "total_findings": int(rea_res.get("total_findings", len(rea_res.get("findings") or [])) or 0),
+                "total_endpoints": int(rea_res.get("total_endpoints", len(rea_res.get("discovered_endpoints") or [])) or 0),
+                "total_ai_sinks": int(rea_res.get("total_ai_sinks", len(rea_res.get("ai_sinks") or [])) or 0),
+                "total_ipc_channels": int(rea_res.get("total_ipc_channels", len(rea_res.get("ipc_channels") or [])) or 0),
+                "limitations": list(rea_res.get("limitations") or []),
+                "unknowns": list(rea_res.get("unknowns") or []),
+                "report_files": rea_res.get("report_files") or {},
+            },
             "artex_dual_graph": artex_res,
             "prompt_smuggling": smuggle_res,
+            "external_discovery": ext_discovery_res,
+            "external_nuclei": ext_nuclei_res,
         },
         "findings": aggregated_findings,
         "chains": artex_res.get("chains") or [],
         "chains_synthesized": artex_res.get("chains_synthesized", len(artex_res.get("chains") or [])),
+        "attack_chaining": {
+            "task_id": artex_res.get("task_id"),
+            "chains_synthesized": artex_res.get("chains_synthesized", len(artex_res.get("chains") or [])),
+            "exploits_verified": artex_res.get("exploits_verified", 0),
+            "max_hop_count": artex_res.get("max_hop_count", 0),
+            "goal_proven": artex_res.get("goal_proven", False),
+            "poe_breakdown": artex_res.get("poe_breakdown") or {},
+            "todolist_summary": artex_res.get("todolist_summary") or {},
+            "worker_traces_count": artex_res.get("worker_traces_count", 0),
+            "coverage": artex_res.get("coverage") or {},
+            "proxy": artex_res.get("proxy") or {},
+            "remote_artex": artex_res.get("remote_artex") or {},
+        },
         "report_files": {
             "combined_sarif": str(combined_sarif_path),
             "combined_json": str(combined_json_path),
             "combined_txt": str(combined_txt_path),
             "mantis_sarif": (mantis_res.get("report_files") or {}).get("sarif", "") if isinstance(mantis_res.get("report_files"), dict) else "",
+            "rea_sarif": (rea_res.get("report_files") or {}).get("sarif", "") if isinstance(rea_res.get("report_files"), dict) else "",
+            **extra_report_files,
         },
         "elapsed_sec": elapsed,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -3744,6 +4973,8 @@ def run_unified_all_scans(
         f"Mantis Findings: {mantis_res.get('total_findings', 0)} (Reproduced: {mantis_res.get('reproduced_count', 0)}, Patched Verified: {mantis_res.get('patched_verified_count', 0)})",
         f"aiscan AI Findings: {aiscan_res.get('total_findings', 0)}",
         f"RAPTOR SAST/PQC/SCA/Web Findings: {len(raptor_res.get('findings') or [])}",
+        f"Module 21 REA Surface/Bundle Findings: {rea_res.get('total_findings', 0)} (Routes: {rea_res.get('total_endpoints', 0)}, AI Sinks: {rea_res.get('total_ai_sinks', 0)}, IPC: {rea_res.get('total_ipc_channels', 0)})",
+        f"ARTEX Attack Chains: {artex_res.get('chains_synthesized', 0)} synthesized (Verified: {artex_res.get('exploits_verified', 0)}, Max Hops: {artex_res.get('max_hop_count', 0)}, Goal Proven: {artex_res.get('goal_proven', False)}, Traces: {artex_res.get('worker_traces_count', 0)})",
         f"Prompt Smuggling Probes Synthesized: {smuggle_res.get('probes_generated', 0)}",
     ]
     if has_remote:

@@ -290,9 +290,27 @@ class AiscanIntegrator:
                 logger.warning("aiscan binary execution failed, using Python fallback: %s", e)
 
         # Always run embedded scanner to discover web AI endpoints and AST sinks so endpoints are never dropped
-        f_ast, e_ast = self.python_scanner.scan_directory(tp)
-        findings.extend(f_ast)
-        endpoints.extend(e_ast)
+        if tp.is_file():
+            f_ast, e_ast = self.python_scanner.scan_file(tp)
+        else:
+            f_ast, e_ast = self.python_scanner.scan_directory(tp)
+
+        seen_f = {
+            (f.finding_type, str(Path(f.file_path).resolve()), int(f.line_number or 0))
+            for f in findings
+        }
+        for fa in f_ast:
+            fkey = (fa.finding_type, str(Path(fa.file_path).resolve()), int(fa.line_number or 0))
+            if fkey not in seen_f:
+                seen_f.add(fkey)
+                findings.append(fa)
+
+        seen_e = {(e.http_method.upper(), e.route_path) for e in endpoints}
+        for ea in e_ast:
+            ekey = (ea.http_method.upper(), ea.route_path)
+            if ekey not in seen_e:
+                seen_e.add(ekey)
+                endpoints.append(ea)
         if not findings and engine_used != "haasonsaas/aiscan":
             engine_used = "python_ast_fallback"
 

@@ -30,6 +30,7 @@ if sys.platform == "win32":
 
 import argparse
 import concurrent.futures
+import contextlib
 import os
 from pathlib import Path
 import operator
@@ -73,6 +74,26 @@ except ImportError:
                 else:
                     node_name = self._edges.get(node_name, END)
             return cur
+
+        def stream(self, state: dict, config: Optional[dict] = None):
+            cur = dict(state)
+            recursion_limit = (config or {}).get("recursion_limit", 150)
+            node_name = self._entry
+            steps = 0
+            while node_name and node_name != END and steps < recursion_limit:
+                steps += 1
+                fn = self._nodes[node_name]
+                updates = fn(cur) or {}
+                for k, v in updates.items():
+                    if k == "history" and isinstance(cur.get("history"), list) and isinstance(v, list):
+                        cur["history"] = cur["history"] + v
+                    else:
+                        cur[k] = v
+                yield {node_name: updates}
+                if node_name in self._cond_edges:
+                    node_name = self._cond_edges[node_name](cur)
+                else:
+                    node_name = self._edges.get(node_name, END)
 
     class StateGraph:  # type: ignore[no-redef]
         def __init__(self, state_schema=None):
@@ -1496,70 +1517,12 @@ def cmd_aiscan(args):
 def cmd_artex(args):
     """
     Executes BaaRai/ARTEX Dual-Graph (Asset Graph + Exploration Graph) Planner/Worker
-    autonomous attack chaining engine.
+    durable attack chaining engine with Pillar 1-5 CLI flags.
     """
-    from engine.dual_graph_engine import DualGraphAttackEngine
-    from database import Database
-
-    t_host = getattr(args, "host", "127.0.0.1")
-    from engine.safe_network_validator import validate_and_authorize_target
-    ok, reason = validate_and_authorize_target(t_host, authorized=getattr(args, "authorized", False))
-    if not ok:
-        print(f"[!] Target authorization error for {t_host}: {reason}")
-        sys.exit(1)
-
-    db = Database(getattr(args, "db", "terminator.db"))
-    engine = DualGraphAttackEngine(db=db)
-
-    print("\n" + "=" * 75)
-    print("  BAARAI/ARTEX: DUAL-GRAPH AUTONOMOUS ATTACK CHAINER (MODULE 17)")
-    print("  Credit: BaaRai & Autumn-27 (https://github.com/BaaRai/ARTEX)")
-    print("=" * 75 + "\n")
-
-    t_host = getattr(args, "host", "127.0.0.1")
-    t_port = getattr(args, "port", 8080)
-    rounds = getattr(args, "artex_rounds", 1)
-
-    print(f"[*] Target Host: {t_host}:{t_port}")
-    print(f"[*] Ingesting target topology and prior wire primitives from terminator.db...")
-
-    # Load known AI endpoints from aiscan table if present
-    ai_sinks = []
-    try:
-        cur = db.conn.cursor()
-        cur.execute("SELECT DISTINCT file_path, line_number, model_or_api, description FROM ai_security_findings WHERE finding_type = 'unmetered_ai_endpoint'")
-        for r in cur.fetchall():
-            ai_sinks.append({"route": "/api/chat", "method": "POST", "model_provider": r["model_or_api"], "file_path": r["file_path"]})
-    except Exception:
-        pass
-
-    if not ai_sinks:
-        ai_sinks = [{"route": "/api/chat", "method": "POST", "model_provider": "local_ai", "file_path": "server.py"}]
-
-    engine.ingest_target_infrastructure(host=t_host, port=t_port, ai_sinks=ai_sinks)
-
-    # Register baseline wire primitive if available
-    engine.register_wire_primitive(
-        anomaly_id="RFC9112-CHUNK-DESYNC",
-        description="HTTP/1.1 Framing Desync (Chunk Extension & Content-Length conflict)",
-        anomaly_type="CL.TE_DESYNC",
-    )
-
-    print(f"[*] Running {rounds} multi-round planning & exploitation cycle(s)...")
-    res = engine.run_attack_chain_cycle(round_num=rounds)
-
-    print(f"[*] Total Assets Mapped : {res['total_assets']}")
-    print(f"[*] Attack Candidates   : {res['candidates_planned']}")
-    print(f"[*] Exploits Verified   : {res['exploits_verified']}")
-
-    report_files = res.get("report_files", {})
-    if report_files:
-        print("\n[*] Reports saved to reports/ folder:")
-        for rtype, rpath in report_files.items():
-            print(f"    - {rtype.upper()}: {rpath}")
-
-    print("=" * 75 + "\n")
-    db.close()
+    import main as _main_cli
+    if not any(a == "--port" or a.startswith("--port=") for a in sys.argv[1:]) and getattr(args, "port", 5006) == 5006:
+        args.port = 8080
+    return _main_cli.cmd_artex(args)
 
 
 def cmd_prompt_smuggle(args):
@@ -1860,60 +1823,152 @@ def cmd_all(args):
     artex_rounds = int(getattr(args, "artex_rounds", 1) or 1)
     authorized = bool(getattr(args, "authorized", False))
     allow_destructive = bool(getattr(args, "allow_destructive", False))
+    as_json = bool(getattr(args, "as_json", False))
+
+    artex_intent_turns = int(getattr(args, "artex_intent_turns", 0) or 0)
+    artex_intent_tokens = int(getattr(args, "artex_intent_tokens", 0) or 0)
+    artex_budget_turns = int(getattr(args, "artex_budget_turns", 0) or 0)
+    if artex_intent_turns < 0 or artex_intent_tokens < 0 or artex_budget_turns < 0:
+        print(
+            "[!] ARTEX budget/turn parameters must be non-negative (>= 0).",
+            file=(sys.stderr if as_json else sys.stdout),
+        )
+        sys.exit(1)
 
     if host:
         from engine.safe_network_validator import validate_and_authorize_target
         ok, reason = validate_and_authorize_target(host, authorized=authorized)
         if not ok:
-            print(f"[!] Target authorization error for {host}: {reason}")
+            print(f"[!] Target authorization error for {host}: {reason}", file=(sys.stderr if as_json else sys.stdout))
             sys.exit(1)
 
     db = Database(args.db)
-    print(f"\n{'='*75}")
-    print(f"[*] UNIFIED --all SECURITY AUDIT (Fusion + Abliterated Models Enforced)")
-    target_disp = f"host={host or targets}" if (host or targets) and not repo and not path else os.path.abspath(str(repo or path))
-    print(f"[*] Target: {target_disp} | Depth: {depth} | Model: {preferred_model}")
-    print(f"{'='*75}")
-
-    port_arg = getattr(args, "port", 443)
-    from engine.safe_network_validator import is_explicit_loopback_host
-    if port_arg == 5006 and host and not is_explicit_loopback_host(str(host)):
-        port_arg = 443
-
     try:
-        res = run_unified_all_scans(
-            repo=repo,
-            path=path,
-            host=host,
-            targets=targets,
-            port=port_arg,
-            use_tls=getattr(args, "tls", None),
-            authorized=authorized,
-            allow_destructive=allow_destructive,
-            depth=depth,
-            mantis_mode=mantis_mode,
-            use_fusion=True,
-            preferred_model=preferred_model,
-            db=db,
-            reports_dir=reports_dir,
-            artex_rounds=artex_rounds,
-        )
-    except PermissionError as exc:
-        print(f"[!] Target authorization error for {host or targets or repo or path}: {exc}")
-        sys.exit(1)
+        if not as_json:
+            print(f"\n{'='*75}")
+            print(f"[*] UNIFIED --all SECURITY AUDIT (Fusion + Abliterated Models Enforced)")
+            target_disp = f"host={host or targets}" if (host or targets) and not repo and not path else os.path.abspath(str(repo or path))
+            print(f"[*] Target: {target_disp} | Depth: {depth} | Model: {preferred_model}")
+            print(f"{'='*75}")
 
-    eng = res.get("engines", {})
-    print(f"[+] Unified --all Completed in {res['elapsed_sec']}s")
-    print(f"    Fusion Enabled      : {res['fusion_enabled']} | Models: {', '.join(res.get('fusion_models', []))}")
-    print(f"    Aggregated Findings : {res['total_aggregated_findings']} {res.get('severity_counts', {})}")
-    print(f"    Module 20 Mantis    : {eng.get('mantis', {}).get('total_findings', 0)} (Reproduced: {eng.get('mantis', {}).get('reproduced_count', 0)})")
-    print(f"    Module 18 aiscan    : {eng.get('aiscan', {}).get('total_findings', 0)}")
-    print(f"    Module 15 RAPTOR    : {eng.get('raptor', {}).get('total_findings', 0)} ({eng.get('raptor', {}).get('mode', 'static')})")
-    print(f"    Module 19 Smuggling : {eng.get('prompt_smuggling', {}).get('probes_generated', 0)} probes synthesized")
-    print(f"    Combined SARIF      : {res['report_files'].get('combined_sarif')}")
-    print(f"    Combined JSON       : {res['report_files'].get('combined_json')}")
-    print(f"{'='*75}\n")
-    db.close()
+        raw_port = getattr(args, "port", 443)
+        port_arg = int(raw_port) if raw_port is not None else (None if host is None else 443)
+        from engine.safe_network_validator import is_explicit_loopback_host
+        if port_arg == 5006 and host and not is_explicit_loopback_host(str(host)):
+            port_arg = 443
+
+        raw_profiles = getattr(args, "artex_llm_profiles", None)
+        artex_llm_profiles = [p.strip() for p in str(raw_profiles).split(",") if p.strip()] if raw_profiles else None
+        artex_live_val = getattr(args, "artex_live", None)
+        if getattr(args, "no_artex_live", False):
+            artex_live_val = False
+
+        try:
+            _stdout_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+            with _stdout_ctx:
+                res = run_unified_all_scans(
+                    repo=repo,
+                    path=path,
+                    host=host,
+                    targets=targets,
+                    port=port_arg,
+                    use_tls=getattr(args, "tls", None),
+                    authorized=authorized,
+                    allow_destructive=allow_destructive,
+                    depth=depth,
+                    mantis_mode=mantis_mode,
+                    use_fusion=True,
+                    preferred_model=preferred_model,
+                    db=db,
+                    reports_dir=reports_dir,
+                    artex_rounds=artex_rounds,
+                    artex_url=getattr(args, "artex_url", None),
+                    artex_token=getattr(args, "artex_token", None),
+                    artex_proxy=getattr(args, "artex_proxy", None),
+                    artex_ca_cert=getattr(args, "artex_ca_cert", None),
+                    artex_noise_profile=getattr(args, "artex_noise_profile", None),
+                    artex_llm_profiles=artex_llm_profiles,
+                    artex_llm_rotate=bool(getattr(args, "artex_llm_rotate", False)),
+                    artex_wait_sse=bool(getattr(args, "artex_wait_sse", False)),
+                    artex_budget_turns=int(getattr(args, "artex_budget_turns", 0) or 0),
+                    artex_retest=bool(getattr(args, "artex_retest", False)),
+                    artex_workers=int(getattr(args, "artex_workers", 3) or 3),
+                    artex_live=artex_live_val,
+                    embedded_proxy=bool(getattr(args, "embedded_proxy", False)),
+                    embedded_proxy_port=int(getattr(args, "embedded_proxy_port", 0) or 0),
+                    auth_profile=getattr(args, "auth_profile", None),
+                    import_har=getattr(args, "import_har", None),
+                    import_openapi=getattr(args, "import_openapi", None),
+                    scope_file=getattr(args, "scope_file", None),
+                    approval_mode=getattr(args, "approval_mode", "policy") or "policy",
+                    approval_rules=getattr(args, "approval_rules", None),
+                    strict_poe=bool(getattr(args, "strict_poe", False)),
+                    export_advisory=bool(getattr(args, "export_advisory", False)),
+                    export_csv=bool(getattr(args, "export_csv", False)),
+                    quiet=as_json,
+                    enable_external_scanners=bool(getattr(args, "enable_external_scanners", False)),
+                    httpx_scan=getattr(args, "httpx_scan", None),
+                    katana_scan=getattr(args, "katana_scan", None),
+                    nuclei_scan=getattr(args, "nuclei_scan", None),
+                    nuclei_tags=getattr(args, "nuclei_tags", None),
+                    scanner_isolation=getattr(args, "scanner_isolation", "host") or "host",
+                    docker_image=getattr(args, "docker_image", None),
+                    docker_network=getattr(args, "docker_network", None),
+                    artex_multiturn=bool(getattr(args, "artex_multiturn", False)),
+                    artex_intent_turns=artex_intent_turns,
+                    artex_intent_tokens=artex_intent_tokens,
+                    enable_rea=not bool(getattr(args, "no_rea", False)),
+                    rea_target=getattr(args, "rea_target", None),
+                    rea_use_cli=bool(getattr(args, "rea_cli", False)),
+                )
+        except (PermissionError, ValueError) as exc:
+            print(f"[!] Target authorization or scanner configuration error for {host or targets or repo or path}: {exc}", file=(sys.stderr if as_json else sys.stdout))
+            sys.exit(1)
+
+        if getattr(args, "as_json", False):
+            from engine.cli_render import render_json
+            render_json(res)
+            return
+
+        from engine.cli_render import render_poe_summary
+        eng = res.get("engines", {})
+        chaining = res.get("attack_chaining") or eng.get("artex_dual_graph") or {}
+        cov = chaining.get("coverage") or {}
+        poe_bd = chaining.get("poe_breakdown") or {}
+        tid_val = chaining.get("task_id")
+        traces_for_render = db.list_worker_traces(task_id=tid_val, limit=25) if hasattr(db, "list_worker_traces") else []
+        chains_for_render = db.get_attack_chains(limit=25, task_id=tid_val) if hasattr(db, "get_attack_chains") else []
+
+        print(f"[+] Unified --all Completed in {res['elapsed_sec']}s")
+        print(f"    Fusion Enabled      : {res['fusion_enabled']} | Models: {', '.join(res.get('fusion_models', []))}")
+        print(f"    Aggregated Findings : {res['total_aggregated_findings']} {res.get('severity_counts', {})}")
+        print(f"    Module 20 Mantis    : {eng.get('mantis', {}).get('total_findings', 0)} (Reproduced: {eng.get('mantis', {}).get('reproduced_count', 0)})")
+        print(f"    Module 18 aiscan    : {eng.get('aiscan', {}).get('total_findings', 0)}")
+        print(f"    Module 15 RAPTOR    : {eng.get('raptor', {}).get('total_findings', 0)} ({eng.get('raptor', {}).get('mode', 'static')})")
+        print(f"    Module 21 REA       : {eng.get('rea_surface', {}).get('total_findings', 0)} ({eng.get('rea_surface', {}).get('status', 'disabled')}, routes={eng.get('rea_surface', {}).get('total_endpoints', 0)})")
+        print(
+            f"    Module 17 ARTEX     : {chaining.get('chains_synthesized', 0)} chains synthesized "
+            f"(Verified: {chaining.get('exploits_verified', 0)}, Max Hops: {chaining.get('max_hop_count', 0)}, "
+            f"Coverage: {cov.get('coverage_pct', 0.0)}%, Traces: {chaining.get('worker_traces_count', 0)}, Goal Proven: {chaining.get('goal_proven', False)})"
+        )
+        print(f"    POE Breakdown       : {poe_bd}")
+        print(f"    Module 19 Smuggling : {eng.get('prompt_smuggling', {}).get('probes_generated', 0)} probes synthesized")
+        print(f"    Combined SARIF      : {res['report_files'].get('combined_sarif')}")
+        print(f"    Combined JSON       : {res['report_files'].get('combined_json')}")
+        if res["report_files"].get("combined_csv"):
+            print(f"    Combined CSV        : {res['report_files'].get('combined_csv')}")
+        if res["report_files"].get("advisories"):
+            print(f"    GHSA Advisories     : {len(res['report_files']['advisories'])} written")
+        print(f"{'='*75}\n")
+        render_poe_summary(
+            poe_bd,
+            coverage=cov,
+            chains=chains_for_render or chaining.get("chains") or [],
+            traces=traces_for_render,
+            plain=bool(getattr(args, "plain", False)),
+        )
+    finally:
+        db.close()
 
 
 def cmd_harness2(args):
@@ -2081,8 +2136,9 @@ ALL_MODES = [
     "fetch", "chunk", "generate", "permute", "evaluate",
     "weaponize", "cascade", "dream", "caldera", "harness2",
     "dashboard", "export", "oracle", "differential", "h2", "http2", "audit", "merkle",
-    "ui", "vulns", "findings", "list", "raptor", "mantis", "clean", "clean-db",
-    "aiscan", "ai", "artex", "dual_graph", "dual-graph", "smuggle", "prompt_smuggle",
+    "ui", "vulns", "findings", "list", "raptor", "mantis", "rea", "clean", "clean-db",
+    "aiscan", "ai", "artex", "artex-loop", "chain", "dual_graph", "dual-graph", "smuggle", "prompt_smuggle",
+    "scanner", "proxy", "retest", "chains", "traces", "coverage", "export-advisory", "archive",
 ]
 
 
@@ -2450,9 +2506,67 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--aiscan-target", type=str, default=".", help="Target directory to audit for AI vulnerabilities, prompt injection sinks, and exposed model credentials (default: '.')")
     parser.add_argument("--aiscan-report", action="store_true", help="Print summary of recent AI security audit findings from terminator.db")
 
-    # BaaRai/ARTEX Dual-Graph Attack Chaining (Module 17)
+    # BaaRai/ARTEX Dual-Graph Attack Chaining (Module 17) & Headless REST/SSE/Proxy Bridge
     parser.add_argument("--artex", "--dual-graph", dest="enable_artex", action="store_true", help="Enable BaaRai/ARTEX Dual-Graph planner/worker attack chaining engine (Module 17)")
     parser.add_argument("--artex-rounds", type=int, default=1, help="Number of multi-round planning cycles to execute in ARTEX Dual-Graph (default: 1)")
+    parser.add_argument("--artex-url", dest="artex_url", type=str, default=None, help="Headless BaaRai/ARTEX REST+SSE server URL (e.g. http://127.0.0.1:8787)")
+    parser.add_argument("--artex-token", dest="artex_token", type=str, default=None, help="Bearer JWT token for headless ARTEX REST API")
+    parser.add_argument("--artex-proxy", dest="artex_proxy", type=str, default=None, help="ARTEX recording MITM proxy URL (e.g. http://127.0.0.1:8788)")
+    parser.add_argument("--artex-ca-cert", dest="artex_ca_cert", type=str, default=None, help="Optional CA certificate path for ARTEX MITM proxy")
+    parser.add_argument("--artex-noise-profile", dest="artex_noise_profile", choices=["off", "quiet", "balanced", "aggressive"], default=None, help="ARTEX target noise governor profile (off|quiet|balanced|aggressive)")
+    parser.add_argument("--artex-llm-profiles", dest="artex_llm_profiles", type=str, default=None, help="Comma-separated LLM profile IDs for ARTEX worker rotation")
+    parser.add_argument("--artex-llm-rotate", dest="artex_llm_rotate", action="store_true", default=False, help="Enable round-robin multi-LLM worker rotation (A, B, A, B)")
+    parser.add_argument("--artex-wait-sse", dest="artex_wait_sse", action="store_true", default=False, help="Stream headless ARTEX SSE events until terminal completion")
+    parser.add_argument("--artex-budget-turns", dest="artex_budget_turns", type=int, default=0, help="Optional max task turn budget for ARTEX attack chaining (0 = unlimited)")
+    parser.add_argument("--artex-retest", dest="artex_retest", action="store_true", default=False, help="Run ARTEX chain retest loop after attack chaining")
+    parser.add_argument("--artex-workers", dest="artex_workers", type=int, default=3, help="Concurrent ARTEX worker pool size (default: 3)")
+    parser.add_argument("--artex-live", dest="artex_live", action="store_true", default=None, help="Force live non-destructive ARTEX worker verification")
+    parser.add_argument("--no-artex-live", dest="no_artex_live", action="store_true", default=False, help="Disable auto-live ARTEX worker verification")
+    parser.add_argument("--embedded-proxy", dest="embedded_proxy", action="store_true", default=False, help="Start embedded pure-CLI recording MITM proxy during scan")
+    parser.add_argument("--embedded-proxy-port", dest="embedded_proxy_port", type=int, default=0, help="Port for embedded MITM proxy (0 = ephemeral)")
+    parser.add_argument("--auth-profile", dest="auth_profile", type=str, default=None, help="Path to JSON/YAML multi-role auth profiles")
+    parser.add_argument("--import-har", dest="import_har", type=str, default=None, help="Import HAR 1.2 recording into AssetGraph + traffic_evidence")
+    parser.add_argument("--import-openapi", dest="import_openapi", type=str, default=None, help="Import OpenAPI/Swagger spec into AssetGraph")
+    parser.add_argument("--scope-file", dest="scope_file", type=str, default=None, help="Path to YAML/JSON allow/deny scope rules")
+    parser.add_argument("--approval-mode", dest="approval_mode", choices=["policy", "prompt", "deny"], default="policy", help="Approval gate mode (policy|prompt|deny)")
+    parser.add_argument("--approval-rules", dest="approval_rules", type=str, default=None, help="Path to YAML/JSON approval rules file")
+    parser.add_argument("--strict-poe", dest="strict_poe", action="store_true", default=False, help="Require POE>=2 to mark chains VERIFIED")
+    parser.add_argument("--export-advisory", dest="export_advisory", action="store_true", default=False, help="Export GHSA-ready Markdown advisories")
+    parser.add_argument("--export-csv", dest="export_csv", action="store_true", default=False, help="Export formula-neutralized CSV of findings & chains")
+    parser.add_argument("--enable-external-scanners", dest="enable_external_scanners", action="store_true", default=False, help="Opt-in to external black-box scanners (httpx, katana, nuclei)")
+    parser.add_argument("--httpx-scan", dest="httpx_scan", action="store_true", default=None, help="Opt-in to ProjectDiscovery httpx discovery")
+    parser.add_argument("--katana-scan", dest="katana_scan", action="store_true", default=None, help="Opt-in to ProjectDiscovery katana crawling")
+    parser.add_argument("--nuclei-scan", dest="nuclei_scan", action="store_true", default=None, help="Opt-in to ProjectDiscovery nuclei non-destructive scanning")
+    parser.add_argument("--nuclei-tags", dest="nuclei_tags", type=str, default=None, help="Comma-separated non-destructive nuclei tags (e.g. tech,misconfig,exposure,headers)")
+    parser.add_argument("--scanner-isolation", dest="scanner_isolation", choices=["host", "docker"], default="host", help="External scanner execution isolation mode (host|docker)")
+    parser.add_argument("--docker-image", dest="docker_image", type=str, default=None, help="Optional explicit OCI image for docker isolation")
+    parser.add_argument("--docker-network", dest="docker_network", choices=["bridge", "none"], default=None, help="Docker network mode for external scanner isolation (bridge|none)")
+    parser.add_argument("--artex-multiturn", dest="artex_multiturn", action="store_true", default=False, help="Enable bounded multi-turn ArtexWorker adaptive tool loop")
+    parser.add_argument("--artex-intent-turns", dest="artex_intent_turns", type=int, default=0, help="Max turns per ARTEX intent (0 = default/unlimited)")
+    parser.add_argument("--artex-intent-tokens", dest="artex_intent_tokens", type=int, default=0, help="Max tokens per ARTEX intent (0 = unlimited)")
+    parser.add_argument("--json", dest="as_json", action="store_true", default=False, help="Emit machine-readable JSON output")
+    parser.add_argument("--plain", dest="plain", action="store_true", default=False, help="Force plain ASCII output")
+    parser.add_argument("--chain-id", dest="chain_id", type=str, default=None, help="Specific chain ID for retest or export-advisory")
+    parser.add_argument("--min-poe", dest="min_poe", type=int, default=0, help="Minimum POE level filter (0..3) for chains")
+    parser.add_argument("--verified-only", dest="verified_only", action="store_true", default=False, help="Filter chains to verified only")
+    parser.add_argument("--all-chains", dest="all_chains", action="store_true", default=False, help="Retest all persisted chains")
+    parser.add_argument("--live", dest="live", action="store_true", default=False, help="Enable live replay in retest mode")
+    parser.add_argument("--task-id", dest="task_id", type=str, default=None, help="Filter by ARTEX task ID")
+    parser.add_argument("--worker-id", dest="worker_id", type=str, default=None, help="Filter traces by worker ID")
+    parser.add_argument("--query", "-q", dest="query", type=str, default=None, help="Search query for worker traces")
+    parser.add_argument("--out", dest="out", type=str, default="reports", help="Output directory for export-advisory")
+    parser.add_argument("--csv", dest="csv", action="store_true", default=False, help="Export formula-safe CSV in export-advisory")
+    parser.add_argument("--export-archive", dest="export_path", type=str, default=None, help="Output encrypted .rfca archive file path")
+    parser.add_argument("--import", "--import-archive", dest="import_path", type=str, default=None, help="Input encrypted .rfca archive file path")
+    parser.add_argument("--key-file", dest="key_file", type=str, default=None, help="Optional encryption key file path for archive")
+    parser.add_argument("--ca-dir", dest="ca_dir", type=str, default="keys", help="CA directory for proxy mode")
+    parser.add_argument("--noise-profile", dest="noise_profile", choices=["off", "quiet", "balanced", "aggressive"], default=None, help="Noise governor profile for proxy mode")
+    parser.add_argument("--rewrite-rule", dest="rewrite_rule", action="append", default=[], help="Header rewrite rule for proxy mode (name:Header=Value)")
+    parser.add_argument("--duration", dest="duration", type=float, default=None, help="Optional run duration in seconds for proxy mode")
+    parser.add_argument("--mcp-transport", "--transport", dest="mcp_transport", choices=["stdio", "http", "sse", "both"], default="stdio", help="MCP transport for `mcp` mode: stdio, http (/http), sse (/sse), or both")
+    parser.add_argument("--mcp-host", dest="mcp_host", type=str, default="127.0.0.1", help="Bind address for remote HTTP/SSE MCP server (default: 127.0.0.1)")
+    parser.add_argument("--mcp-port", dest="mcp_port", type=int, default=8790, help="Port for remote HTTP/SSE MCP server (default: 8790)")
+    parser.add_argument("--mcp-token", dest="mcp_token", type=str, default=None, help="Optional Bearer token for remote HTTP/SSE MCP clients")
 
     # Novel Attack Synthesis: Desynchronized Prompt Injection (Module 19)
     parser.add_argument("--prompt-smuggle", dest="enable_prompt_smuggle", action="store_true", help="Synthesize and verify novel cross-layer Desynchronized Prompt Injection attack chains")
@@ -2468,6 +2582,10 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--mantis-target", type=str, default=None, help="Target repository or file path for Google Mantis scan")
     parser.add_argument("--mantis-model", type=str, default="hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M", help="Refusal-free abliterated ModelFusion model for Google Mantis")
     parser.add_argument("--mantis-report", action="store_true", help="Display stored Google Mantis findings from terminator.db")
+    parser.add_argument("--rea", dest="enable_rea_only", action="store_true", help="Run Module 21 (morluto/rea) JS/Electron/.asar/source-map & same-origin bundle surface analyzer")
+    parser.add_argument("--rea-target", dest="rea_target", type=str, default=None, help="Target JS/Electron/.asar/web bundle path for Module 21 REA")
+    parser.add_argument("--rea-cli", dest="rea_cli", action="store_true", default=False, help="Opt-in to locally installed rea-agents CLI (shell=False)")
+    parser.add_argument("--no-rea", dest="no_rea", action="store_true", default=False, help="Disable Module 21 REA during --all")
     parser.add_argument("--output-dir", type=str, default="reports", help="Output directory for SARIF, JSON, and text audit reports (default: reports)")
 
     return parser
@@ -2634,7 +2752,9 @@ def main_swarm(argv=None):
         elif args.kettle:
             active_mode = "corpus"
         elif args.all_active:
-            active_mode = "all"
+            active_mode = "all_active"
+        elif getattr(args, "enable_rea_only", False) and not getattr(args, "run_all_scans", False):
+            active_mode = "rea"
         else:
             active_mode = args.mode
     else:
@@ -2656,29 +2776,38 @@ def main_swarm(argv=None):
     if getattr(args, "clean_db", False) or active_mode == "clean_db":
         from database import Database
         db_inst = Database(args.db)
-        res = db_inst.clean_db(
-            keep_rfcs=getattr(args, "keep_rfcs_on_clean", False),
-            keep_findings=getattr(args, "keep_findings_on_clean", False),
-            vacuum=True,
-        )
-        print("\n" + "=" * 75)
-        print("  DATABASE CLEAN & VACUUM (HTTP TERMINATOR)")
-        print("=" * 75)
-        print(f"  [+] Target Database       : {args.db}")
-        print(f"  [+] Total Rows Cleared    : {res['total_rows_deleted']:,}")
-        print(f"  [+] Size Before Clean     : {res['size_before_bytes'] / (1024*1024):.2f} MB")
-        print(f"  [+] Size After Clean      : {res['size_after_bytes'] / (1024*1024):.2f} MB")
-        print(f"  [+] Space Reclaimed       : {res['reclaimed_mb']} MB")
-        if getattr(args, "keep_findings_on_clean", False):
-            print("  [*] Preserved Confirmed Vulnerabilities and Defensive Rules")
-        if getattr(args, "keep_rfcs_on_clean", False):
-            print("  [*] Preserved Cached RFC Specifications & Index")
-        print("=" * 75 + "\n")
+        try:
+            res = db_inst.clean_db(
+                keep_rfcs=getattr(args, "keep_rfcs_on_clean", False),
+                keep_findings=getattr(args, "keep_findings_on_clean", False),
+                vacuum=True,
+            )
+        finally:
+            db_inst.close()
+        _clean_ctx = contextlib.redirect_stdout(sys.stderr) if getattr(args, "as_json", False) else contextlib.nullcontext()
+        with _clean_ctx:
+            print("\n" + "=" * 75)
+            print("  DATABASE CLEAN & VACUUM (HTTP TERMINATOR)")
+            print("=" * 75)
+            print(f"  [+] Target Database       : {args.db}")
+            print(f"  [+] Total Rows Cleared    : {res['total_rows_deleted']:,}")
+            print(f"  [+] Size Before Clean     : {res['size_before_bytes'] / (1024*1024):.2f} MB")
+            print(f"  [+] Size After Clean      : {res['size_after_bytes'] / (1024*1024):.2f} MB")
+            print(f"  [+] Space Reclaimed       : {res['reclaimed_mb']} MB")
+            if getattr(args, "keep_findings_on_clean", False):
+                print("  [*] Preserved Confirmed Vulnerabilities and Defensive Rules")
+            if getattr(args, "keep_rfcs_on_clean", False):
+                print("  [*] Preserved Cached RFC Specifications & Index")
+            print("=" * 75 + "\n")
 
         # If --clean-db was called standalone or as primary command/mode, exit cleanly
-        standalone_clean = (active_mode == "clean_db") or (
+        standalone_clean = (active_mode == "clean_db" and not getattr(args, "run_all_scans", False)) or (
             not explicit_mode_given and not any(
-                getattr(args, flag, False) for flag in ("ui", "build", "mcp", "kettle", "all_active", "enable_raptor", "list_terminators")
+                getattr(args, flag, False) for flag in (
+                    "ui", "build", "mcp", "kettle", "all_active", "enable_raptor", "list_terminators",
+                    "run_all_scans", "enable_mantis", "enable_artex", "enable_aiscan", "enable_prompt_smuggle",
+                    "enable_rea_only",
+                )
             )
         )
         if standalone_clean:
@@ -2708,16 +2837,22 @@ def main_swarm(argv=None):
         return
 
     # Normalize default args.host (strip http://, https://, trailing slashes/paths, and inline :port)
+    inline_port_extracted = False
+    raw_host_scheme: Optional[str] = None
     if getattr(args, "host", None):
         raw_h = str(args.host).strip()
         if raw_h.lower().startswith("https://"):
+            raw_host_scheme = "https"
             args.tls = True
+        elif raw_h.lower().startswith("http://"):
+            raw_host_scheme = "http"
         clean_h = re.sub(r"^https?://", "", raw_h, flags=re.IGNORECASE).split("/")[0]
         if ":" in clean_h and not clean_h.startswith("["):
             parts = clean_h.split(":", 1)
             clean_h = parts[0]
             if len(parts) > 1 and parts[1].isdigit() and getattr(args, "port", 5006) == 5006:
                 args.port = int(parts[1])
+                inline_port_extracted = True
         args.host = clean_h
 
     # Configure ExecutionPolicy singleton with CLI flags and env opt-in
@@ -2731,9 +2866,82 @@ def main_swarm(argv=None):
         sys.exit(0 if ok else 1)
 
     if active_mode == "mcp":
-        from mcp_server import TerminatorMCPServer
-        print("[+] Launching Model Context Protocol (MCP) Server over JSON-RPC stdio...")
-        TerminatorMCPServer(db_path=args.db).run_stdio()
+        from mcp_server import MCPHttpServer, TerminatorMCPServer
+        transport = getattr(args, "mcp_transport", "stdio") or "stdio"
+        with TerminatorMCPServer(db_path=args.db) as srv:
+            if transport == "stdio":
+                print("[+] Launching Model Context Protocol (MCP) Server over JSON-RPC stdio...", file=sys.stderr)
+                srv.run_stdio()
+            else:
+                http_srv = MCPHttpServer(
+                    srv,
+                    host=getattr(args, "mcp_host", "127.0.0.1") or "127.0.0.1",
+                    port=int(getattr(args, "mcp_port", 8790) or 8790),
+                    bearer_token=getattr(args, "mcp_token", None),
+                )
+                http_srv.serve_forever()
+        return
+
+    if active_mode in ("scanner", "artex-loop", "proxy", "retest", "chains", "traces", "coverage", "export-advisory", "archive", "rea"):
+        import main as _main_cli
+        argv_flags = raw_argv
+        has_port_flag = any(a == "--port" or a.startswith("--port=") for a in argv_flags)
+        has_host_flag = any(a in ("--host", "--target") or a.startswith(("--host=", "--target=")) for a in argv_flags)
+        has_limit_flag = any(a == "--limit" or a.startswith("--limit=") for a in argv_flags)
+
+        if active_mode == "rea":
+            if not has_host_flag:
+                args.host = None
+            if not has_port_flag:
+                args.port = None
+            if not getattr(args, "path", None) and not getattr(args, "repo", None) and getattr(args, "target_arg", None):
+                args.path = args.target_arg
+            _main_cli.cmd_rea(args)
+        elif active_mode == "scanner":
+            if not has_port_flag and not inline_port_extracted:
+                if raw_host_scheme == "http":
+                    args.port = 80
+                    if not any(a == "--tls" for a in argv_flags):
+                        args.tls = False
+                else:
+                    args.port = 443
+            _main_cli.cmd_scanner(args)
+        elif active_mode == "artex-loop":
+            if not has_port_flag and not inline_port_extracted:
+                args.port = 8080
+            _main_cli.cmd_artex_loop(args)
+        elif active_mode == "proxy":
+            if not has_port_flag:
+                args.port = 8788
+            _main_cli.cmd_proxy(args)
+        elif active_mode == "chains":
+            if not has_limit_flag:
+                args.limit = 50
+            _main_cli.cmd_chains(args)
+        elif active_mode == "traces":
+            if not has_limit_flag:
+                args.limit = 100
+            _main_cli.cmd_traces(args)
+        elif active_mode == "coverage":
+            _main_cli.cmd_coverage(args)
+        elif active_mode == "retest":
+            if not has_host_flag:
+                args.host = None
+            if not has_port_flag:
+                args.port = None
+            if not has_limit_flag:
+                args.limit = 50
+            _main_cli.cmd_retest(args)
+        elif active_mode == "export-advisory":
+            if not has_limit_flag:
+                args.limit = 50
+            _main_cli.cmd_export_advisory(args)
+        elif active_mode == "archive":
+            if not getattr(args, "export_path", None) and any(
+                a == "--export" or a.startswith("--export=") for a in argv_flags
+            ):
+                args.export_path = getattr(args, "dream_export", None)
+            _main_cli.cmd_archive(args)
         return
 
     if active_mode == "dashboard":
@@ -2769,6 +2977,25 @@ def main_swarm(argv=None):
         return
 
     if getattr(args, "run_all_scans", False) or active_mode in ("all", "all_scans"):
+        argv_flags = raw_argv
+        has_host_flag = any(
+            a in ("--host", "--target") or a.startswith(("--host=", "--target="))
+            for a in argv_flags
+        )
+        has_port_flag = any(
+            a == "--port" or a.startswith("--port=")
+            for a in argv_flags
+        )
+        if not has_host_flag:
+            args.host = None
+        elif raw_host_scheme == "http" and not has_port_flag and not inline_port_extracted:
+            args.port = 80
+            if not any(a == "--tls" for a in argv_flags):
+                args.tls = False
+        elif raw_host_scheme == "https" and not has_port_flag and not inline_port_extracted:
+            args.port = 443
+        if not has_host_flag and not has_port_flag and getattr(args, "port", 5006) == 5006:
+            args.port = None
         cmd_all(args)
         return
 
@@ -2780,7 +3007,7 @@ def main_swarm(argv=None):
         cmd_aiscan(args)
         return
 
-    if active_mode in ("artex", "dual_graph", "dual-graph") or getattr(args, "enable_artex", False) and not explicit_mode_given:
+    if active_mode in ("artex", "chain", "dual_graph", "dual-graph") or getattr(args, "enable_artex", False) and not explicit_mode_given:
         cmd_artex(args)
         return
 
@@ -2892,7 +3119,12 @@ def main_swarm(argv=None):
         args.count = args.max_rfcs or 3
         args.fragments = args.limit
         args.rollouts = args.dream_rollouts
-        args.export = args.export_caldera if active_mode == "caldera" else args.dream_export
+        args.demo = getattr(args, "demo", False)
+        if active_mode == "caldera":
+            has_explicit_caldera_export = any(a == "--export-caldera" or a.startswith("--export-caldera=") for a in raw_argv)
+            args.export = args.export_caldera if (has_explicit_caldera_export or not args.caldera_url) else None
+        else:
+            args.export = args.dream_export
         args.push = args.caldera_url
         args.api_key = args.caldera_key
         dispatch_map = {
@@ -2960,8 +3192,8 @@ def main_swarm(argv=None):
                     fragments_per_rfc=args.limit,
                     permutations_per_probe=args.variants,
                     stop_on_first_flaw=not args.keep_going,
-                    all_active=(active_mode == "all"),
-                    kettle=(active_mode != "all"),
+                    all_active=(active_mode in ("all", "all_active")),
+                    kettle=(active_mode not in ("all", "all_active")),
                     keywords=kw_list,
                     target_rfc=args.rfc if active_mode == "single" else None,
                     comb_only=args.comb_only,
@@ -3006,7 +3238,7 @@ def main_swarm(argv=None):
         elif active_mode == "corpus":
             print("[*] Resolving James Kettle Research Corpus...")
             rfcs_to_scan = swarm.fetcher.get_kettle_corpus(max_rfcs=args.max_rfcs or 138)
-        elif active_mode == "all":
+        elif active_mode in ("all", "all_active"):
             if kw_list:
                 print(f"[*] Discovering active RFCs matching keywords: {kw_list}...")
                 rfcs_to_scan = swarm.fetcher.get_all_active_rfcs(keywords=kw_list, max_rfcs=args.max_rfcs, reverse=True)
@@ -3173,6 +3405,52 @@ def main_swarm(argv=None):
 
     print("[*] Swarm Execution Completed. All evidence saved to DB and Forensics Log.")
 
+    # BaaRai/ARTEX Dual-Graph Attack Chaining Synthesis Pass (Module 17)
+    try:
+        from database import Database
+        from engine.dual_graph_engine import DualGraphAttackEngine
+        chain_db = Database(args.db)
+        post_arbiter = None
+        try:
+            if getattr(args, "fusion", True) and os.environ.get("RFCHUNT_OFFLINE") != "1":
+                try:
+                    from fusion_engine import FusionArbiter
+                    post_arbiter = FusionArbiter(
+                        db=chain_db,
+                        preferred_model=getattr(args, "model", None),
+                        sec_model=getattr(args, "sec_model", None),
+                    )
+                except Exception:
+                    post_arbiter = None
+            artex_eng = DualGraphAttackEngine(
+                db=chain_db,
+                reports_dir=getattr(args, "output_dir", None) or "reports",
+                noise_profile=getattr(args, "artex_noise_profile", None),
+                arbiter=post_arbiter,
+            )
+            artex_eng.ingest_target_infrastructure(
+                host=args.host,
+                port=args.port,
+                endpoints=["/"],
+                ai_sinks=["/api/chat"],
+            )
+            hydrated_counts = artex_eng.ingest_from_database(chain_db)
+            if sum(hydrated_counts.values()) > 0 or getattr(args, "enable_artex", False):
+                c_res = artex_eng.run_attack_chain_cycle(round_num=max(1, int(getattr(args, "artex_rounds", 1) or 1)))
+                print(
+                    f"[+] [ARTEX Attack Chainer] Synthesized {c_res.get('candidates_planned', 0)} candidates | "
+                    f"Verified {c_res.get('exploits_verified', 0)} chains (Max Hops: {c_res.get('max_hop_count', 0)})"
+                )
+        finally:
+            if post_arbiter is not None and hasattr(post_arbiter, "close"):
+                try:
+                    post_arbiter.close()
+                except Exception:
+                    pass
+            chain_db.close()
+    except Exception as e:
+        print(f"[!] Warning: Post-swarm ARTEX attack chaining encountered error: {e}")
+
     # Caldera Auto-Sync: Runs by default on every run without requiring any flags
     if not args.no_caldera:
         from engine.caldera_bridge import CalderaBridge
@@ -3199,6 +3477,7 @@ def main_swarm(argv=None):
         dash_db = Database(args.db)
         try:
             findings = [dict(f) for f in dash_db.get_confirmed_findings()]
+            persisted_chains = dash_db.get_attack_chains(limit=50)
             stats = {
                 "total_evaluated": max(len(findings), 15),
                 "passed": 13,
@@ -3218,6 +3497,7 @@ def main_swarm(argv=None):
                 flaws=findings,
                 arm106_count=12,
                 arm107_count=12,
+                attack_chains=persisted_chains,
             )
             with open(out_file, "w", encoding="utf-8") as f:
                 f.write(html)

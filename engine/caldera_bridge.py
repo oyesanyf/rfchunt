@@ -5,6 +5,7 @@ into non-MITRE Caldera Abilities, Adversaries, and Operations for fleet-wide rep
 continuous validation, and defender measurement.
 """
 
+import base64
 import hashlib
 import json
 import os
@@ -12,6 +13,7 @@ import re
 import shutil
 import sqlite3
 import urllib.error
+from urllib.parse import urlparse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -92,7 +94,8 @@ class CalderaBridge:
         payload_hex = probe_bytes.hex()
         probe_hash = hashlib.sha256(probe_bytes).hexdigest()[:8]
 
-        ab_id = ability_id or f"terminator-{vuln_id.lower().replace('_', '-')}-{probe_hash}"
+        raw_ab_id = ability_id or f"terminator-{vuln_id.lower().replace('_', '-')}-{probe_hash}"
+        ab_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(raw_ab_id)).strip(".-") or f"terminator-{probe_hash}"
 
         impact = str(finding_data.get("impact") or finding_data.get("desync_class") or "DESYNCHRONIZATION").upper()
         tactic = TACTIC_MAP.get(impact, "protocol-framing")
@@ -180,7 +183,8 @@ class CalderaBridge:
         """
         Creates a Caldera Adversary profile that orders the protocol abilities.
         """
-        adv_id = adversary_id or f"adversary-terminator-rfc-audit-{uuid.uuid4().hex[:6]}"
+        raw_adv_id = adversary_id or f"adversary-terminator-rfc-audit-{uuid.uuid4().hex[:6]}"
+        adv_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(raw_adv_id)).strip(".-") or f"adversary-terminator-{uuid.uuid4().hex[:6]}"
         adv_name = name or "HTTP Terminator RFC Protocol Flaw Replay"
         adv_desc = description or "Orchestrates replay of novel RFC protocol anomalies and framing violations."
 
@@ -247,6 +251,91 @@ class CalderaBridge:
             conn.close()
 
         return findings
+
+    def fetch_attack_chains_from_db(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Queries terminator.db for synthesized BaaRai/ARTEX multi-step attack chains."""
+        if not self.db_path.exists():
+            return []
+        try:
+            from database import Database
+
+            db = Database(str(self.db_path))
+            try:
+                return db.get_attack_chains(limit=int(limit))
+            finally:
+                db.close()
+        except Exception:
+            pass
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        chains: List[Dict[str, Any]] = []
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='attack_chains'")
+            if cursor.fetchone():
+                cursor.execute(
+                    "SELECT * FROM attack_chains ORDER BY created_at DESC LIMIT ?",
+                    (int(limit),),
+                )
+                for r in cursor.fetchall():
+                    d = dict(r)
+                    try:
+                        d["steps"] = json.loads(d.get("steps_json") or "[]")
+                    except Exception:
+                        d["steps"] = []
+                    chains.append(d)
+        finally:
+            conn.close()
+        return chains
+
+    def export_attack_chains(
+        self,
+        output_dir: str = "caldera_export",
+        chains: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Exports persisted ARTEX multi-step attack chains as ordered Caldera abilities
+        and a chained adversary profile (`adversary-artex-attack-chains.yml`).
+        """
+        export_root = Path(output_dir)
+        plugin_root = export_root / "plugins" / "terminator"
+        abilities_dir = plugin_root / "data" / "abilities"
+        adversaries_dir = plugin_root / "data" / "adversaries"
+        abilities_dir.mkdir(parents=True, exist_ok=True)
+        adversaries_dir.mkdir(parents=True, exist_ok=True)
+
+        active_chains = chains if chains is not None else self.fetch_attack_chains_from_db()
+        chain_abilities: List[Dict[str, Any]] = []
+        for ch in active_chains:
+            finding_view = {
+                "vuln_id": str(ch.get("chain_id") or f"ARTEX-CHAIN-{uuid.uuid4().hex[:6]}"),
+                "impact": str(ch.get("attack_type") or "DESYNCHRONIZATION"),
+                "raw_request": str(ch.get("raw_payload") or "GET / HTTP/1.1\r\nHost: target.local\r\n\r\n"),
+                "rationale": f"{ch.get('title', 'ARTEX Attack Chain')} ({len(ch.get('steps') or [])} steps)",
+            }
+            ab = self.generate_ability(finding_view)
+            chain_abilities.append(ab)
+            tactic_dir = abilities_dir / ab["tactic"]
+            tactic_dir.mkdir(parents=True, exist_ok=True)
+            with open(tactic_dir / f"{ab['id']}.yml", "w", encoding="utf-8") as out_f:
+                yaml.dump([ab], out_f, sort_keys=False, default_flow_style=False)
+
+        adv_path = adversaries_dir / "adversary-artex-attack-chains.yml"
+        if chain_abilities:
+            adv = self.generate_adversary(
+                chain_abilities,
+                adversary_id="adversary-artex-attack-chains",
+                name="ARTEX Multi-Step Attack Chain Replay",
+                description="Ordered Caldera adversary generated from BaaRai/ARTEX Dual-Graph attack chains.",
+            )
+            with open(adv_path, "w", encoding="utf-8") as out_f:
+                yaml.dump(adv, out_f, sort_keys=False, default_flow_style=False)
+
+        return {
+            "status": "SUCCESS",
+            "chains_exported": len(chain_abilities),
+            "adversary_file": str(adv_path) if chain_abilities else "",
+        }
 
     def export_plugin(
         self,
@@ -371,7 +460,21 @@ class CalderaBridge:
         Pushes abilities and adversaries directly to a live Caldera server REST API (v2).
         """
         results: Dict[str, Any] = {"pushed_abilities": 0, "pushed_adversaries": 0, "errors": []}
-        clean_url = caldera_url.rstrip("/")
+        clean_url = str(caldera_url or "").strip().rstrip("/")
+        parsed_caldera = urlparse(clean_url)
+        if (parsed_caldera.scheme or "").lower() not in ("http", "https") or not parsed_caldera.hostname:
+            results["errors"].append(f"Invalid Caldera URL '{caldera_url}': only http/https schemes are permitted.")
+            return results
+        try:
+            from engine.safe_network_validator import validate_target_host
+
+            ok_host, reason = validate_target_host(parsed_caldera.hostname, allow_loopback=True)
+            if not ok_host:
+                results["errors"].append(f"Blocked Caldera destination '{parsed_caldera.hostname}': {reason}")
+                return results
+        except Exception as exc:
+            results["errors"].append(f"Caldera URL validation error: {exc}")
+            return results
 
         headers = {
             "KEY": api_key,
@@ -448,21 +551,38 @@ class CalderaBridge:
             "facts_ingested": 0,
         }
 
+        hosts_seen = set()
+        for hg in (operation_report.get("host_group") or []):
+            if isinstance(hg, dict) and hg.get("host"):
+                hosts_seen.add(str(hg["host"]))
+            elif isinstance(hg, str) and hg:
+                hosts_seen.add(hg)
+
         steps = operation_report.get("chain", []) or operation_report.get("steps", [])
         for step in steps:
+            if isinstance(step, dict) and step.get("host"):
+                hosts_seen.add(str(step["host"]))
             ability_id = step.get("ability", {}).get("ability_id") or step.get("ability_id", "")
             output_raw = step.get("output", "")
             status = step.get("status", 0)
 
-            # Try parsing JSON output from terminator_runner
-            parsed_output = {}
-            if isinstance(output_raw, str):
+            # Try parsing JSON output from terminator_runner (direct JSON or Caldera v2 base64)
+            parsed_output: Dict[str, Any] = {}
+            if isinstance(output_raw, str) and output_raw.strip():
                 try:
-                    parsed_output = json.loads(output_raw)
+                    cand = json.loads(output_raw)
+                    if isinstance(cand, dict):
+                        parsed_output = cand
                 except Exception:
-                    pass
+                    try:
+                        dec = base64.b64decode(output_raw).decode("utf-8", errors="replace")
+                        cand = json.loads(dec)
+                        if isinstance(cand, dict):
+                            parsed_output = cand
+                    except Exception:
+                        pass
 
-            is_vuln = parsed_output.get("desync_confirmed", False) or parsed_output.get("status") == "CONFIRMED_VULNERABILITY"
+            is_vuln = bool(parsed_output.get("desync_confirmed", False) or parsed_output.get("status") == "CONFIRMED_VULNERABILITY")
             if is_vuln:
                 summary["vulnerabilities_confirmed"] += 1
             else:
@@ -474,15 +594,24 @@ class CalderaBridge:
                 # Extract hex from command string if present
                 hex_match = re.search(r"--payload-hex\s+([0-9a-fA-F]+)", probe_hex)
                 probe_bytes = bytes.fromhex(hex_match.group(1)) if hex_match else b"PROBE"
+                try:
+                    base_status = int(parsed_output.get("baseline_status", 200))
+                except (TypeError, ValueError):
+                    base_status = 200
+                try:
+                    res_leak = float(parsed_output.get("residual_leak") or 0)
+                except (TypeError, ValueError):
+                    res_leak = 0.0
                 world_model.record_step(
                     probe_bytes=probe_bytes,
-                    status_code=parsed_output.get("baseline_status", 200) if isinstance(parsed_output.get("baseline_status"), int) else 200,
-                    is_anomaly=bool(parsed_output.get("residual_leak", 0) > 0),
+                    status_code=base_status,
+                    is_anomaly=bool(res_leak > 0),
                     is_vulnerability=is_vuln,
                     details=f"Caldera Operation {summary['operation_id']} feedback",
                 )
                 summary["facts_ingested"] += 1
 
+        summary["host_count"] = len(hosts_seen)
         return summary
 
     def _generate_hook_py_content(self) -> str:

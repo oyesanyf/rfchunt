@@ -25,6 +25,7 @@ from __future__ import annotations
 import atexit
 import ctypes
 from ctypes import wintypes
+import ipaddress
 import logging
 import os
 import socket
@@ -480,13 +481,21 @@ class LinuxNetlinkContainmentBackend(BaseContainmentBackend):
             self._rule_counter += 1
             rule_id = f"NETLINK-RULE-{self._rule_counter:04d}-{port}"
 
-            # Construct simulated/real nftables rule payload
-            attr_ip = self.pack_nlattr(1, socket.inet_aton(remote_ip))
-            attr_port = self.pack_nlattr(2, struct.pack("!H", port))
+            # Construct simulated/real nftables rule payload (supports both IPv4 and IPv6)
+            try:
+                ip_obj = ipaddress.ip_address(str(remote_ip).strip("[]"))
+                packed_ip = ip_obj.packed
+                nf_family = getattr(socket, "AF_INET6", 10) if ip_obj.version == 6 else (socket.AF_INET if hasattr(socket, "AF_INET") else 2)
+            except ValueError:
+                packed_ip = socket.inet_aton(remote_ip)
+                nf_family = socket.AF_INET if hasattr(socket, "AF_INET") else 2
+
+            attr_ip = self.pack_nlattr(1, packed_ip)
+            attr_port = self.pack_nlattr(2, struct.pack("!H", int(port)))
             rule_payload = attr_ip + attr_port
 
             msg_type = (NFNL_SUBSYS_NFTABLES << 8) | 2  # NFT_MSG_NEWRULE
-            genmsg = self.pack_nfgenmsg(socket.AF_INET if hasattr(socket, "AF_INET") else 2, 0, 0)
+            genmsg = self.pack_nfgenmsg(nf_family, 0, 0)
             inner_msg = self.pack_nlmsghdr(
                 NLMSG_HDRLEN + len(genmsg) + len(rule_payload),
                 msg_type,
@@ -772,11 +781,13 @@ class HostContainmentManager:
 
 # Global Singleton / Default Instance
 _global_containment: Optional[HostContainmentManager] = None
+_global_containment_lock = threading.Lock()
 
 
 def get_global_containment() -> HostContainmentManager:
     """Returns the process-wide host containment manager singleton."""
     global _global_containment
-    if _global_containment is None:
-        _global_containment = HostContainmentManager()
-    return _global_containment
+    with _global_containment_lock:
+        if _global_containment is None:
+            _global_containment = HostContainmentManager()
+        return _global_containment

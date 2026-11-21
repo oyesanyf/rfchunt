@@ -48,23 +48,46 @@ CLOUD_METADATA_IPS: Set[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]] = {
 
 
 def _clean_host(target: str) -> str:
-    cleaned = target.strip()
-    cleaned = re.sub(r"^https?://", "", cleaned, flags=re.IGNORECASE)
-    cleaned = cleaned.split("/")[0].strip()
+    cleaned = str(target or "").strip()
+    cleaned = re.sub(r"^(?:https?|wss?)://", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.split(r"[/?#]", cleaned, maxsplit=1)[0].strip()
+    if "@" in cleaned or "\\" in cleaned:
+        return ""
     if cleaned.startswith("[") and "]" in cleaned:
         cleaned = cleaned[1:cleaned.index("]")]
     elif cleaned.count(":") == 1:
         cleaned = cleaned.split(":", 1)[0]
-    return cleaned.strip().lower()
+    cleaned = cleaned.strip().lower()
+    if cleaned not in (".", ".."):
+        cleaned = cleaned.rstrip(".")
+    return cleaned
+
+
+def _unwrap_ipv4_compat(ip: ipaddress.IPv6Address) -> Optional[ipaddress.IPv4Address]:
+    """Unwrap IPv4-mapped (`::ffff:0:0/96`), deprecated IPv4-compatible IPv6 (`::/96`,
+    excluding `::` and `::1`), and RFC 6052 NAT64 (`64:ff9b::/96`)."""
+    ip = ipaddress.IPv6Address(int(ip))
+    if ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    if ip != ipaddress.IPv6Address("::1") and not ip.is_unspecified and ip in ipaddress.ip_network("::/96"):
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    if ip in ipaddress.ip_network("64:ff9b::/96"):
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return None
 
 
 def is_cloud_metadata(ip: Union[ipaddress.IPv4Address, ipaddress.IPv6Address]) -> bool:
     """Returns True if the address is a link-local or known cloud metadata endpoint."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        ip = ipaddress.IPv6Address(int(ip))
     if ip in CLOUD_METADATA_IPS:
         return True
     if isinstance(ip, ipaddress.IPv4Address):
         return ip in ipaddress.ip_network("169.254.0.0/16") or ip.is_link_local
     elif isinstance(ip, ipaddress.IPv6Address):
+        v4_embedded = _unwrap_ipv4_compat(ip)
+        if v4_embedded is not None and is_cloud_metadata(v4_embedded):
+            return True
         return ip in ipaddress.ip_network("fe80::/10") or ip.is_link_local
     return False
 
@@ -91,6 +114,11 @@ def is_safe_target_ip(ip_str: str, allow_private: bool = False) -> bool:
     if isinstance(ip, ipaddress.IPv6Address):
         if ip.ipv4_mapped is not None or ip in ipaddress.ip_network("::ffff:0:0/96"):
             return False
+        if not allow_private and ip in ipaddress.ip_network("64:ff9b::/96"):
+            return False
+        v4_compat = _unwrap_ipv4_compat(ip)
+        if v4_compat is not None:
+            return is_safe_target_ip(str(v4_compat), allow_private=allow_private)
 
     if allow_private:
         # Loopback is explicitly permitted for local testing
@@ -143,9 +171,10 @@ def validate_target_host(target: str, allow_private: bool = False) -> Tuple[bool
         if isinstance(ip, ipaddress.IPv6Address) and (ip.ipv4_mapped is not None or ip in ipaddress.ip_network("::ffff:0:0/96")):
             return False, f"Target IP {host} is an IPv4-mapped IPv6 address, strictly blocked."
 
-        if not allow_private:
-            if not is_safe_target_ip(host, allow_private=False):
-                return False, f"Target IP {host} is in private, loopback, or reserved range, blocked without explicit private authorization."
+        if not is_safe_target_ip(host, allow_private=allow_private):
+            if allow_private:
+                return False, f"Target IP {host} is in restricted (metadata, multicast, reserved, or mapped) range, strictly blocked."
+            return False, f"Target IP {host} is in private, loopback, or reserved range, blocked without explicit private authorization."
         return True, f"Target IP {host} is safe."
 
     # Hostname: Check localhost
@@ -178,9 +207,10 @@ def validate_target_host(target: str, allow_private: bool = False) -> Tuple[bool
         if isinstance(resolved_ip, ipaddress.IPv6Address) and (resolved_ip.ipv4_mapped is not None or resolved_ip in ipaddress.ip_network("::ffff:0:0/96")):
             return False, f"Host '{host}' resolved to IPv4-mapped IPv6 address {ip_addr_str}, strictly blocked."
 
-        if not allow_private:
-            if not is_safe_target_ip(ip_addr_str, allow_private=False):
-                return False, f"Host '{host}' resolved to private/reserved IP {ip_addr_str} (DNS rebinding / SSRF violation)."
+        if not is_safe_target_ip(ip_addr_str, allow_private=allow_private):
+            if allow_private:
+                return False, f"Host '{host}' resolved to restricted IP {ip_addr_str} (DNS rebinding / SSRF violation)."
+            return False, f"Host '{host}' resolved to private/reserved IP {ip_addr_str} (DNS rebinding / SSRF violation)."
 
     return True, f"Target hostname '{host}' successfully verified against SSRF invariants."
 
@@ -212,14 +242,23 @@ def parse_host_and_port(
     """
     text = str(raw_target or "").strip()
     scheme: Optional[str] = None
-    if text.lower().startswith("https://"):
+    low_text = text.lower()
+    if low_text.startswith("https://"):
         scheme = "https"
         text = text[8:]
-    elif text.lower().startswith("http://"):
+    elif low_text.startswith("wss://"):
+        scheme = "https"
+        text = text[6:]
+    elif low_text.startswith("http://"):
         scheme = "http"
         text = text[7:]
+    elif low_text.startswith("ws://"):
+        scheme = "http"
+        text = text[5:]
 
     authority = text.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].strip()
+    if "@" in authority:
+        authority = authority.rsplit("@", 1)[-1].strip()
     parsed_port: Optional[int] = None
     host_only = authority
 

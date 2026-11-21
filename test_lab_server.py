@@ -15,10 +15,17 @@ from typing import Optional
 class TestLabServer:
     __test__ = False
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 8080, max_header_limit: int = 64040):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8080,
+        max_header_limit: int = 64040,
+        auth_boundary_patched: bool = False,
+    ):
         self.host = host
         self.port = port
         self.max_header_limit = max_header_limit
+        self.auth_boundary_patched = bool(auth_boundary_patched)
         self.server_sock: Optional[socket.socket] = None
         self.is_running = False
         self.thread: Optional[threading.Thread] = None
@@ -77,6 +84,25 @@ class TestLabServer:
                 t.start()
             except Exception:
                 break
+
+    @staticmethod
+    def _read_content_length_body(client_sock: socket.socket, header_bytes: bytes, rest: bytes) -> bytes:
+        cl_m = re.search(rb"(?im)^Content-Length:\s*(\d+)\r?$", header_bytes)
+        if not cl_m:
+            return rest
+        expected_len = int(cl_m.group(1))
+        if expected_len <= len(rest):
+            return rest
+        buf = bytearray(rest)
+        while len(buf) < expected_len:
+            try:
+                more = client_sock.recv(min(4096, expected_len - len(buf)))
+            except socket.timeout:
+                break
+            if not more:
+                break
+            buf.extend(more)
+        return bytes(buf)
 
     def _handle_client(self, client_sock: socket.socket) -> None:
         client_sock.settimeout(3.0)
@@ -160,11 +186,96 @@ class TestLabServer:
                             break
 
                     # Handle Dangling-Byte simulation:
-                    # If request is POST with Content-Length: 1 but 0 body bytes present
-                    if b"Content-Length: 1" in header_bytes and len(rest) == 0:
+                    # If request is POST with exact Content-Length: 1 but 0 body bytes present
+                    if "/__lab/patch" not in request_line and re.search(rb"(?im)^Content-Length:\s*1\r?$", header_bytes) and len(rest) == 0:
                         with self.lock:
                             self.dangling_byte_pending = True
                         # Do not send response yet - wait for next request to complete the byte!
+                        break
+
+                    # Runtime patch toggle for E2E auth-boundary retest verification
+                    if "/__lab/patch" in request_line:
+                        import json as _json
+                        rest = self._read_content_length_body(client_sock, header_bytes, rest)
+                        with self.lock:
+                            if "patched=1" in request_line or "enabled=1" in request_line:
+                                self.auth_boundary_patched = True
+                            elif "patched=0" in request_line or "enabled=0" in request_line:
+                                self.auth_boundary_patched = False
+                            elif rest:
+                                try:
+                                    payload_obj = _json.loads(rest.decode("utf-8", errors="ignore"))
+                                    if "patched" in payload_obj:
+                                        self.auth_boundary_patched = bool(payload_obj["patched"])
+                                    else:
+                                        self.auth_boundary_patched = not self.auth_boundary_patched
+                                except Exception:
+                                    self.auth_boundary_patched = not self.auth_boundary_patched
+                            else:
+                                self.auth_boundary_patched = not self.auth_boundary_patched
+                            patched_state = self.auth_boundary_patched
+                        body = _json.dumps({"auth_boundary_patched": patched_state}).encode("utf-8")
+                        resp = (
+                            b"HTTP/1.1 200 OK\r\n"
+                            b"Content-Type: application/json\r\n"
+                            b"Connection: close\r\n"
+                            + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+                            + body
+                        )
+                        client_sock.sendall(resp)
+                        break
+
+                    # Auth-Boundary simulation (/internal/service):
+                    # Anonymous -> 401; Bearer token unpatched -> 200 (governance-admin); patched -> 403
+                    if "/internal/service" in request_line:
+                        import json as _json
+                        auth_m = re.search(rb"(?im)^Authorization:\s*([^\r\n]+)", header_bytes)
+                        auth_val = auth_m.group(1).decode("latin-1", errors="ignore").strip() if auth_m else ""
+                        if not auth_val:
+                            status_line = b"HTTP/1.1 401 Unauthorized\r\n"
+                            body = _json.dumps({"error": "missing_credentials"}).encode("utf-8")
+                        else:
+                            with self.lock:
+                                is_patched = self.auth_boundary_patched
+                            if is_patched:
+                                status_line = b"HTTP/1.1 403 Forbidden\r\n"
+                                body = _json.dumps({"error": "service_principal_required"}).encode("utf-8")
+                            else:
+                                status_line = b"HTTP/1.1 200 OK\r\n"
+                                body = _json.dumps({
+                                    "status": "granted",
+                                    "route": "/internal/service",
+                                    "scope": "governance-admin",
+                                }).encode("utf-8")
+                        resp = (
+                            status_line
+                            + b"Content-Type: application/json\r\n"
+                            + b"Connection: close\r\n"
+                            + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+                            + body
+                        )
+                        client_sock.sendall(resp)
+                        break
+
+                    # AI Chat sink simulation (/api/chat)
+                    if "/api/chat" in request_line:
+                        import json as _json
+                        rest = self._read_content_length_body(client_sock, header_bytes, rest)
+                        req_body_txt = rest.decode("utf-8", errors="ignore")
+                        canary_hit = "RFCHUNT_CANARY_PROBE" in req_body_txt
+                        body = _json.dumps({
+                            "reply": "ok",
+                            "model": "lab-mock",
+                            "canary_echo": "RFCHUNT_CANARY_PROBE" if canary_hit else "",
+                        }).encode("utf-8")
+                        resp = (
+                            b"HTTP/1.1 200 OK\r\n"
+                            b"Content-Type: application/json\r\n"
+                            b"Connection: close\r\n"
+                            + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+                            + body
+                        )
+                        client_sock.sendall(resp)
                         break
 
                     # Handle Memory Leak simulation

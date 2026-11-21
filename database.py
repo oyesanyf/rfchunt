@@ -4,25 +4,149 @@ Uses SQLite to store RFCs, micro-fragments, generated probes,
 evaluations, anomalies, and discovery cascade hypotheses.
 """
 
+import contextlib
 import json
+import os
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 class Database:
-    def __init__(self, db_path: str = "terminator.db", timeout: float = 30.0):
-        self.db_path = Path(db_path)
+    def __init__(
+        self,
+        db_path: str = "terminator.db",
+        timeout: float = 30.0,
+        secret_box: Optional[Any] = None,
+        encrypt_at_rest: Optional[bool] = None,
+        secret_key_path: Optional[Union[str, Path]] = None,
+    ):
+        self._raw_db_path = str(db_path)
+        self.db_path = Path(db_path) if self._raw_db_path else Path(":memory:")
         self._lock = threading.RLock()
+        self._batch_depth = 0
+        use_uri = self._raw_db_path.startswith("file:")
+        connect_target = self._raw_db_path if (self._raw_db_path in ("", ":memory:") or use_uri) else str(self.db_path)
         self.conn = sqlite3.connect(
-            str(self.db_path),
+            connect_target,
             timeout=timeout,
-            check_same_thread=False
+            check_same_thread=False,
+            uri=use_uri,
         )
         self.conn.row_factory = sqlite3.Row
         self._configure_pragmas()
         self._init_schema()
+        self.secret_box = self._init_secret_box(
+            secret_box=secret_box,
+            encrypt_at_rest=encrypt_at_rest,
+            secret_key_path=secret_key_path,
+        )
+
+    def _is_memory_db(self) -> bool:
+        raw = getattr(self, "_raw_db_path", str(self.db_path))
+        return raw in (":memory:", "") or "mode=memory" in raw
+
+    def _sample_encrypted_value(self) -> Optional[str]:
+        """Returns a sample `enc:v1:` ciphertext if any encrypted row exists in SQLite."""
+        with self._lock:
+            cur = self.conn.cursor()
+            for sql in (
+                "SELECT request_headers_json FROM traffic_evidence WHERE request_headers_json LIKE 'enc:v1:%' LIMIT 1",
+                "SELECT request_body FROM traffic_evidence WHERE request_body LIKE 'enc:v1:%' LIMIT 1",
+                "SELECT response_headers_json FROM traffic_evidence WHERE response_headers_json LIKE 'enc:v1:%' LIMIT 1",
+                "SELECT response_body_b64 FROM traffic_evidence WHERE response_body_b64 LIKE 'enc:v1:%' LIMIT 1",
+                "SELECT raw_payload FROM attack_chains WHERE raw_payload LIKE 'enc:v1:%' LIMIT 1",
+            ):
+                try:
+                    cur.execute(sql)
+                    row = cur.fetchone()
+                    if row is not None and row[0]:
+                        return str(row[0])
+                except sqlite3.OperationalError:
+                    continue
+        return None
+
+    def _has_encrypted_rows(self) -> bool:
+        """Checks whether any stored traffic_evidence or attack_chains rows contain `enc:v1:` envelopes."""
+        return self._sample_encrypted_value() is not None
+
+    def _init_secret_box(
+        self,
+        *,
+        secret_box: Optional[Any],
+        encrypt_at_rest: Optional[bool],
+        secret_key_path: Optional[Union[str, Path]],
+    ) -> Optional[Any]:
+        """
+        Initializes AES-256-GCM encryption at rest with fail-closed verification:
+        - Refuses to start if encrypted rows exist in SQLite and encryption is disabled,
+          no key is available, or the supplied key fails to authenticate a sample ciphertext.
+        - On-disk DBs auto-initialize `keys/secret.key` (mode 0600) by default unless disabled.
+        - `:memory:` DBs remain unencrypted unless `secret_box` or `encrypt_at_rest=True` is supplied.
+        """
+        from engine.secret_store import SecretBox
+
+        sample_ct = self._sample_encrypted_value()
+        has_encrypted = sample_ct is not None
+
+        def _verify_box_can_decrypt(candidate_box: Any) -> Any:
+            if sample_ct is not None:
+                try:
+                    candidate_box.decrypt_str(sample_ct)
+                except Exception as exc:
+                    self.close()
+                    raise RuntimeError(
+                        "Database contains AES-256-GCM encrypted rows that cannot be decrypted with the provided key."
+                    ) from exc
+            return candidate_box
+
+        if secret_box is not None:
+            return _verify_box_can_decrypt(secret_box)
+
+        disable_env = os.environ.get("RFCHUNT_DISABLE_AT_REST_ENCRYPTION", "").strip().lower() in ("1", "true", "yes")
+        if has_encrypted:
+            if encrypt_at_rest is False or disable_env:
+                self.close()
+                raise RuntimeError(
+                    "Database contains AES-256-GCM encrypted evidence/secrets; cannot open with encryption disabled."
+                )
+            # Fail-closed: NEVER fabricate a fresh replacement key when encrypted rows already exist!
+            box = SecretBox.from_env_or_keyfile(secret_key_path, create_if_missing=False)
+            if box is None:
+                self.close()
+                raise RuntimeError(
+                    "Database contains AES-256-GCM encrypted evidence/secrets, but no usable key was found "
+                    "(set ARTEX_SECRET_KEY or restore keys/secret.key)."
+                )
+            return _verify_box_can_decrypt(box)
+
+        if encrypt_at_rest is False or disable_env:
+            return None
+
+        if encrypt_at_rest is True:
+            return SecretBox.from_env_or_keyfile(secret_key_path, create_if_missing=True)
+
+        # Default (encrypt_at_rest is None): enable for real on-disk DBs; skip for :memory: unless env key set
+        if self._is_memory_db():
+            return SecretBox.from_env_or_keyfile(secret_key_path, create_if_missing=False) if os.environ.get("ARTEX_SECRET_KEY") else None
+        return SecretBox.from_env_or_keyfile(secret_key_path, create_if_missing=True)
+
+    def _enc(self, value: Optional[str]) -> str:
+        text = "" if value is None else str(value)
+        if not text or self.secret_box is None:
+            return text
+        return self.secret_box.encrypt_str(text)
+
+    def _dec(self, value: Optional[str]) -> str:
+        text = "" if value is None else str(value)
+        if not text:
+            return ""
+        if self.secret_box is None:
+            if text.startswith("enc:v1:"):
+                raise RuntimeError("Encrypted field encountered without an active SecretBox key.")
+            return text
+        return self.secret_box.decrypt_str(text)
 
     def _configure_pragmas(self) -> None:
         """Configures production WAL mode, 30s busy timeout, and NORMAL synchrony."""
@@ -30,7 +154,7 @@ class Database:
             cur = self.conn.cursor()
             try:
                 # In-memory databases do not support WAL mode
-                is_mem = str(self.db_path) in (":memory:", "") or "mode=memory" in str(self.db_path)
+                is_mem = self._is_memory_db()
                 if not is_mem:
                     cur.execute("PRAGMA journal_mode = WAL;")
                 cur.execute("PRAGMA busy_timeout = 30000;")
@@ -57,6 +181,48 @@ class Database:
     @property
     def is_closed(self) -> bool:
         return self.conn is None
+
+    @contextlib.contextmanager
+    def batch_writes(self):
+        """Groups multiple DB writes into a single SQLite transaction under self._lock."""
+        self._lock.acquire()
+        try:
+            next_depth = self._batch_depth + 1
+            sp_name: Optional[str] = None
+            started_outer_tx = False
+            if next_depth == 1 and not self.conn.in_transaction:
+                self.conn.execute("BEGIN")
+                started_outer_tx = True
+            else:
+                sp_name = f"sp_batch_{next_depth}"
+                self.conn.execute(f"SAVEPOINT {sp_name}")
+            self._batch_depth = next_depth
+            try:
+                yield
+            except Exception:
+                if sp_name is not None and self.conn.in_transaction:
+                    self.conn.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                    self.conn.execute(f"RELEASE SAVEPOINT {sp_name}")
+                elif started_outer_tx and self.conn.in_transaction:
+                    self.conn.rollback()
+                raise
+            else:
+                if sp_name is not None and self.conn.in_transaction:
+                    self.conn.execute(f"RELEASE SAVEPOINT {sp_name}")
+                elif started_outer_tx and self.conn.in_transaction:
+                    self.conn.commit()
+            finally:
+                self._batch_depth = max(0, self._batch_depth - 1)
+        finally:
+            self._lock.release()
+
+    @contextlib.contextmanager
+    def _tx(self):
+        if self._batch_depth > 0:
+            yield
+        else:
+            with self.conn:
+                yield
 
     def __enter__(self) -> "Database":
         return self
@@ -287,7 +453,119 @@ class Database:
                     raw_payload TEXT,
                     is_verified BOOLEAN DEFAULT 0,
                     severity TEXT DEFAULT 'HIGH',
+                    task_id TEXT DEFAULT 'default',
+                    poe_level INTEGER DEFAULT 0,
+                    verification_status TEXT DEFAULT 'UNVERIFIED',
+                    evidence_quote TEXT DEFAULT '',
+                    traffic_id TEXT DEFAULT '',
+                    hop_count INTEGER DEFAULT 1,
+                    source_scanners_json TEXT DEFAULT '[]',
+                    remote_artex_task_id TEXT DEFAULT '',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS exploration_anchors (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL DEFAULT 'default',
+                    node_id TEXT NOT NULL,
+                    asset_id TEXT NOT NULL,
+                    anchor_kind TEXT DEFAULT 'TOUCHES',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(task_id, node_id, asset_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS planner_todolist (
+                    step_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    chain_id TEXT NOT NULL,
+                    step_order INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    capability_class TEXT,
+                    prerequisite_facts_json TEXT NOT NULL DEFAULT '[]',
+                    requires_step_ids_json TEXT NOT NULL DEFAULT '[]',
+                    target_asset_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    dispatched_intent_id TEXT,
+                    yielded_fact_id TEXT,
+                    metadata_json TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS worker_execution_traces (
+                    trace_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    worker_id TEXT NOT NULL,
+                    intent_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    target_asset_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'COMPLETED',
+                    summary TEXT,
+                    raw_observation TEXT,
+                    extracted_facts_json TEXT DEFAULT '[]',
+                    traffic_id TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS traffic_evidence (
+                    traffic_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL DEFAULT 'default',
+                    method TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    host TEXT NOT NULL,
+                    port INTEGER DEFAULT 80,
+                    request_headers_json TEXT DEFAULT '{}',
+                    request_body TEXT DEFAULT '',
+                    status_code INTEGER DEFAULT 0,
+                    response_headers_json TEXT DEFAULT '{}',
+                    response_body_b64 TEXT DEFAULT '',
+                    content_encoding TEXT DEFAULT '',
+                    is_preview_only BOOLEAN DEFAULT 0,
+                    source TEXT DEFAULT 'local',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS chain_retests (
+                    retest_id TEXT PRIMARY KEY,
+                    chain_id TEXT NOT NULL,
+                    verdict TEXT NOT NULL,
+                    conditions TEXT DEFAULT '',
+                    evidence TEXT DEFAULT '',
+                    traffic_id TEXT DEFAULT '',
+                    original_traffic_id TEXT DEFAULT '',
+                    tested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS llm_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL DEFAULT 'default',
+                    session_id TEXT DEFAULT '',
+                    role TEXT NOT NULL DEFAULT 'worker',
+                    model TEXT DEFAULT '',
+                    prompt_tokens INTEGER DEFAULT 0,
+                    completion_tokens INTEGER DEFAULT 0,
+                    total_tokens INTEGER DEFAULT 0,
+                    turns INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS approval_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL DEFAULT 'default',
+                    action_type TEXT NOT NULL,
+                    target TEXT DEFAULT '',
+                    method TEXT DEFAULT '',
+                    decision TEXT NOT NULL,
+                    decided_by TEXT NOT NULL,
+                    rule_id TEXT DEFAULT '',
+                    rationale TEXT DEFAULT '',
+                    action_summary TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
 
                 CREATE TABLE IF NOT EXISTS mantis_threat_models (
@@ -337,11 +615,83 @@ class Database:
                     snippet TEXT,
                     discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS rea_findings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    finding_id TEXT UNIQUE NOT NULL,
+                    target_path TEXT DEFAULT '',
+                    rule_id TEXT NOT NULL,
+                    capability_class TEXT DEFAULT '',
+                    severity TEXT NOT NULL,
+                    cwe TEXT DEFAULT '',
+                    file_path TEXT NOT NULL,
+                    line_number INTEGER DEFAULT 0,
+                    title TEXT NOT NULL,
+                    evidence TEXT DEFAULT '',
+                    limitations TEXT DEFAULT '[]',
+                    unknowns TEXT DEFAULT '[]',
+                    source_mode TEXT DEFAULT 'python_static',
+                    discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             """)
+            self._run_migrations()
+
+    def _run_migrations(self) -> None:
+        """Ordered transactional schema migrations recorded in `schema_migrations`."""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT version FROM schema_migrations")
+            applied = {str(r[0]) for r in cur.fetchall()}
+
+            def _table_cols(table: str) -> set:
+                cur.execute(f"PRAGMA table_info({table})")
+                return {str(r[1]) for r in cur.fetchall()}
+
+            with self.conn:
+                if "001_attack_chains_artex_cols" not in applied:
+                    existing = _table_cols("attack_chains")
+                    for col_name, col_def in (
+                        ("task_id", "TEXT DEFAULT 'default'"),
+                        ("poe_level", "INTEGER DEFAULT 0"),
+                        ("verification_status", "TEXT DEFAULT 'UNVERIFIED'"),
+                        ("evidence_quote", "TEXT DEFAULT ''"),
+                        ("traffic_id", "TEXT DEFAULT ''"),
+                        ("hop_count", "INTEGER DEFAULT 1"),
+                        ("source_scanners_json", "TEXT DEFAULT '[]'"),
+                        ("remote_artex_task_id", "TEXT DEFAULT ''"),
+                    ):
+                        if col_name not in existing:
+                            self.conn.execute(f"ALTER TABLE attack_chains ADD COLUMN {col_name} {col_def}")
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)",
+                        ("001_attack_chains_artex_cols",),
+                    )
+
+                if "002_chain_retests_original_traffic_id" not in applied:
+                    existing = _table_cols("chain_retests")
+                    if "original_traffic_id" not in existing:
+                        self.conn.execute("ALTER TABLE chain_retests ADD COLUMN original_traffic_id TEXT DEFAULT ''")
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)",
+                        ("002_chain_retests_original_traffic_id",),
+                    )
+
+                if "003_approval_decisions_action_summary" not in applied:
+                    existing = _table_cols("approval_decisions")
+                    if "action_summary" not in existing:
+                        self.conn.execute("ALTER TABLE approval_decisions ADD COLUMN action_summary TEXT DEFAULT ''")
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)",
+                        ("003_approval_decisions_action_summary",),
+                    )
+
+    def _migrate_attack_chains_columns(self) -> None:
+        """Backward-compatible wrapper invoking ordered transactional migrations."""
+        self._run_migrations()
 
     def save_rfc(self, rfc_id: str, title: str, source_url: str, doc_path: str) -> None:
         with self._lock:
-            with self.conn:
+            with self._tx():
                 self.conn.execute(
                     """
                     INSERT OR REPLACE INTO rfcs (rfc_id, title, source_url, doc_path)
@@ -353,7 +703,7 @@ class Database:
     def save_fragments(self, rfc_id: str, fragments: List[Any]) -> int:
         count = 0
         with self._lock:
-            with self.conn:
+            with self._tx():
                 if rfc_id:
                     self.conn.execute(
                         "INSERT OR IGNORE INTO rfcs (rfc_id, title) VALUES (?, ?)",
@@ -423,7 +773,7 @@ class Database:
         parent_probe_id: Optional[int] = None,
     ) -> int:
         with self._lock:
-            with self.conn:
+            with self._tx():
                 existing = self.conn.execute(
                     "SELECT probe_id FROM probes WHERE raw_request = ? LIMIT 1",
                     (raw_request,),
@@ -465,7 +815,7 @@ class Database:
         raw_evidence: str,
     ) -> int:
         with self._lock:
-            with self.conn:
+            with self._tx():
                 cursor = self.conn.execute(
                     """
                     INSERT INTO evaluations (probe_id, target_host, target_port, is_vulnerable, desync_class, details, raw_evidence)
@@ -483,7 +833,7 @@ class Database:
         raw_response: bytes,
     ) -> int:
         with self._lock:
-            with self.conn:
+            with self._tx():
                 cursor = self.conn.execute(
                     """
                     INSERT INTO anomalies (eval_id, anomaly_type, description, raw_response)
@@ -501,7 +851,7 @@ class Database:
         suggested_probes: List[Dict[str, Any]],
     ) -> int:
         with self._lock:
-            with self.conn:
+            with self._tx():
                 cursor = self.conn.execute(
                     """
                     INSERT INTO cascade_hypotheses (trigger_eval_id, category, hypothesis_text, suggested_probes_json)
@@ -539,7 +889,7 @@ class Database:
         superseded_by: Optional[str] = None,
     ) -> None:
         with self._lock:
-            with self.conn:
+            with self._tx():
                 self.conn.execute(
                     """
                     INSERT OR REPLACE INTO rfc_requirements
@@ -563,7 +913,7 @@ class Database:
         is_environmental_noise: bool = False,
     ) -> None:
         with self._lock:
-            with self.conn:
+            with self._tx():
                 self.conn.execute(
                     """
                     INSERT OR REPLACE INTO implementation_anomalies
@@ -597,7 +947,7 @@ class Database:
         provenance_chain: List[str],
     ) -> None:
         with self._lock:
-            with self.conn:
+            with self._tx():
                 self.conn.execute(
                     """
                     INSERT OR REPLACE INTO reproducible_vulnerabilities
@@ -628,7 +978,7 @@ class Database:
         recommended_mitigation: str,
     ) -> None:
         with self._lock:
-            with self.conn:
+            with self._tx():
                 self.conn.execute(
                     """
                     INSERT OR REPLACE INTO novel_techniques
@@ -657,7 +1007,7 @@ class Database:
         severity: str,
     ) -> None:
         with self._lock:
-            with self.conn:
+            with self._tx():
                 self.conn.execute(
                     """
                     INSERT OR REPLACE INTO arm106_defensive_rules
@@ -677,7 +1027,7 @@ class Database:
         validation_logic: str,
     ) -> None:
         with self._lock:
-            with self.conn:
+            with self._tx():
                 self.conn.execute(
                     """
                     INSERT OR REPLACE INTO arm107_regression_tests
@@ -711,7 +1061,7 @@ class Database:
         description: str = "",
     ) -> int:
         with self._lock:
-            with self.conn:
+            with self._tx():
                 cursor = self.conn.execute(
                     """
                     INSERT OR REPLACE INTO anomaly_fingerprints
@@ -738,7 +1088,7 @@ class Database:
         is_clean: bool = False,
     ) -> int:
         with self._lock:
-            with self.conn:
+            with self._tx():
                 cursor = self.conn.execute(
                     """
                     INSERT OR REPLACE INTO dynamic_permutations
@@ -800,10 +1150,18 @@ class Database:
                 "rfc_requirements",
                 "mantis_findings",
                 "mantis_threat_models",
+                "rea_findings",
                 "ai_security_findings",
                 "dual_graph_nodes",
                 "dual_graph_edges",
                 "attack_chains",
+                "exploration_anchors",
+                "planner_todolist",
+                "worker_execution_traces",
+                "traffic_evidence",
+                "chain_retests",
+                "llm_usage",
+                "approval_decisions",
             ])
         if not keep_rfcs:
             tables_to_clear.append("rfcs")
@@ -868,7 +1226,10 @@ class Database:
             "arm106_defensive_rules", "arm107_regression_tests",
             "anomaly_fingerprints", "dynamic_permutations", "harness2_runs",
             "ai_security_findings", "dual_graph_nodes", "dual_graph_edges",
-            "attack_chains", "mantis_findings", "mantis_threat_models",
+            "attack_chains", "exploration_anchors", "planner_todolist",
+            "worker_execution_traces", "traffic_evidence", "chain_retests",
+            "llm_usage", "approval_decisions",
+            "mantis_findings", "mantis_threat_models", "rea_findings",
         ]
         counts = {}
         with self._lock:
@@ -897,7 +1258,7 @@ class Database:
         score = float(best_view.get("behavioral_score", 0.0))
 
         with self._lock:
-            with self.conn:
+            with self._tx():
                 cur = self.conn.execute(
                     """
                     INSERT INTO harness2_runs
@@ -934,7 +1295,7 @@ class Database:
     def _seed_baseline_defensive_intelligence(self) -> None:
         """Populates verified baseline defensive intelligence records if empty."""
         with self._lock:
-            with self.conn:
+            with self._tx():
                 vulns_cnt = self.conn.execute("SELECT COUNT(*) FROM reproducible_vulnerabilities").fetchone()[0]
                 if vulns_cnt == 0:
                     self.conn.execute("""
@@ -944,7 +1305,7 @@ class Database:
                         ('VULN-REPRO-1792275840052', 'ANOM-ACTIVE-1792275839890', 'QUEUE_POISONING', 'GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\n0\r\n\r\n', 1.0, 3, 3, 2),
                         ('VULN-REPRO-1792275840722', 'ANOM-ACTIVE-1792275840498', 'QUEUE_POISONING', 'HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\n0\r\n\r\n', 1.0, 3, 3, 2)
                     """)
-                
+
                 cur_vulns = self.conn.execute("SELECT vuln_id, impact FROM reproducible_vulnerabilities").fetchall()
                 for idx, v in enumerate(cur_vulns, 1):
                     v_id = str(v["vuln_id"])
@@ -964,6 +1325,12 @@ class Database:
 
                 evals_cnt = self.conn.execute("SELECT COUNT(*) FROM evaluations").fetchone()[0]
                 if evals_cnt == 0:
+                    self.conn.execute("""
+                        INSERT OR IGNORE INTO probes
+                        (probe_id, rationale, raw_request, is_clean, source_type)
+                        VALUES
+                        (1, 'Baseline queue poisoning verification probe', 'GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\n0\r\n\r\n', 0, 'baseline')
+                    """)
                     self.conn.execute("""
                         INSERT OR IGNORE INTO evaluations
                         (eval_id, probe_id, target_host, target_port, is_vulnerable, desync_class, details)
@@ -986,7 +1353,7 @@ class Database:
     ) -> int:
         """Persists an AI security/risk finding discovered by aiscan or AST audit."""
         with self._lock:
-            with self.conn:
+            with self._tx():
                 cur = self.conn.execute(
                     """
                     INSERT INTO ai_security_findings
@@ -1024,7 +1391,7 @@ class Database:
         """Saves or updates an ARTEX Dual-Graph node (Asset or Exploration)."""
         attrs_json = json.dumps(attributes or {})
         with self._lock:
-            with self.conn:
+            with self._tx():
                 self.conn.execute(
                     """
                     INSERT OR REPLACE INTO dual_graph_nodes (node_id, graph_type, node_type, label, attributes_json)
@@ -1043,7 +1410,7 @@ class Database:
         """Saves a directed edge in the ARTEX Dual-Graph."""
         attrs_json = json.dumps(attributes or {})
         with self._lock:
-            with self.conn:
+            with self._tx():
                 self.conn.execute(
                     """
                     INSERT INTO dual_graph_edges (source_id, target_id, relationship, attributes_json)
@@ -1092,31 +1459,607 @@ class Database:
         raw_payload: str = "",
         is_verified: bool = False,
         severity: str = "HIGH",
+        task_id: str = "default",
+        poe_level: int = 0,
+        verification_status: Optional[str] = None,
+        evidence_quote: str = "",
+        traffic_id: str = "",
+        hop_count: Optional[int] = None,
+        source_scanners: Optional[List[str]] = None,
+        remote_artex_task_id: str = "",
     ) -> None:
         """Records a synthesized multi-step attack chain (e.g. Desynchronized Prompt Injection)."""
         steps_json = json.dumps(steps)
+        scanners_json = json.dumps(source_scanners or [])
+        resolved_status = verification_status or ("VERIFIED" if is_verified else "UNVERIFIED")
+        resolved_hops = int(hop_count) if hop_count is not None else max(1, len(steps))
         with self._lock:
-            with self.conn:
+            with self._tx():
                 self.conn.execute(
                     """
                     INSERT OR REPLACE INTO attack_chains
-                    (chain_id, title, attack_type, target_host, target_endpoint, framing_anomaly_id, ai_sink_id, steps_json, raw_payload, is_verified, severity)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (chain_id, title, attack_type, target_host, target_endpoint, framing_anomaly_id,
+                     ai_sink_id, steps_json, raw_payload, is_verified, severity,
+                     task_id, poe_level, verification_status, evidence_quote, traffic_id,
+                     hop_count, source_scanners_json, remote_artex_task_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (chain_id, title, attack_type, target_host, target_endpoint, framing_anomaly_id, ai_sink_id, steps_json, raw_payload, 1 if is_verified else 0, severity),
+                    (
+                        chain_id, title, attack_type, target_host, target_endpoint, framing_anomaly_id,
+                        ai_sink_id, steps_json, self._enc(raw_payload), 1 if is_verified else 0, severity,
+                        task_id, int(poe_level), resolved_status, evidence_quote or "", traffic_id or "",
+                        resolved_hops, scanners_json, remote_artex_task_id or "",
+                    ),
                 )
 
-    def get_attack_chains(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """Retrieves recorded attack chains."""
+    def get_attack_chain(self, chain_id: str, task_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Retrieves a single attack chain by chain_id (optionally scoped by task_id) without LIMIT truncation."""
         with self._lock:
             cur = self.conn.cursor()
-            cur.execute("SELECT * FROM attack_chains ORDER BY created_at DESC LIMIT ?", (limit,))
+            if task_id:
+                cur.execute(
+                    "SELECT * FROM attack_chains WHERE chain_id = ? AND task_id = ? LIMIT 1",
+                    (str(chain_id), task_id),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM attack_chains WHERE chain_id = ? LIMIT 1",
+                    (str(chain_id),),
+                )
+            row = cur.fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            d["steps"] = json.loads(d.get("steps_json") or "[]")
+            d["source_scanners"] = json.loads(d.get("source_scanners_json") or "[]")
+            d["raw_payload"] = self._dec(d.get("raw_payload") or "")
+            return d
+
+    def get_attack_chains(
+        self,
+        limit: Optional[int] = 50,
+        task_id: Optional[str] = None,
+        chain_id: Optional[str] = None,
+        min_poe: Optional[int] = None,
+        verified_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Retrieves recorded attack chains with SQL-side filtering before LIMIT."""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if chain_id:
+            clauses.append("chain_id = ?")
+            params.append(str(chain_id))
+        if min_poe is not None and int(min_poe) > 0:
+            clauses.append("COALESCE(poe_level, 0) >= ?")
+            params.append(int(min_poe))
+        if verified_only:
+            clauses.append("is_verified = 1")
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_sql = ""
+        if limit is not None and int(limit) > 0:
+            limit_sql = " LIMIT ?"
+            params.append(int(limit))
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                f"SELECT * FROM attack_chains {where_sql} ORDER BY created_at DESC{limit_sql}",
+                tuple(params),
+            )
             res = []
             for r in cur.fetchall():
                 d = dict(r)
                 d["steps"] = json.loads(d.get("steps_json") or "[]")
+                d["source_scanners"] = json.loads(d.get("source_scanners_json") or "[]")
+                d["raw_payload"] = self._dec(d.get("raw_payload") or "")
                 res.append(d)
             return res
+
+    def update_attack_chain_status(
+        self,
+        chain_id: str,
+        verification_status: str,
+        is_verified: Optional[bool] = None,
+        poe_level: Optional[int] = None,
+    ) -> None:
+        """Updates a chain's verification status (e.g. FIXED after retest) while preserving original evidence."""
+        with self._lock:
+            with self._tx():
+                if is_verified is not None and poe_level is not None:
+                    self.conn.execute(
+                        "UPDATE attack_chains SET verification_status = ?, is_verified = ?, poe_level = ? WHERE chain_id = ?",
+                        (verification_status, 1 if is_verified else 0, int(poe_level), chain_id),
+                    )
+                elif is_verified is not None:
+                    self.conn.execute(
+                        "UPDATE attack_chains SET verification_status = ?, is_verified = ? WHERE chain_id = ?",
+                        (verification_status, 1 if is_verified else 0, chain_id),
+                    )
+                else:
+                    self.conn.execute(
+                        "UPDATE attack_chains SET verification_status = ? WHERE chain_id = ?",
+                        (verification_status, chain_id),
+                    )
+
+    def save_exploration_anchor(
+        self,
+        node_id: str,
+        asset_id: str,
+        task_id: str = "default",
+        anchor_kind: str = "TOUCHES",
+    ) -> None:
+        """Links an Exploration Graph node to a concrete Asset Graph node (exploration_anchors)."""
+        with self._lock:
+            with self._tx():
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO exploration_anchors (task_id, node_id, asset_id, anchor_kind)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (task_id, node_id, asset_id, anchor_kind),
+                )
+
+    def get_exploration_anchors(
+        self,
+        task_id: Optional[str] = None,
+        asset_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieves exploration_anchors linking exploration nodes and target assets."""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if asset_id:
+            clauses.append("asset_id = ?")
+            params.append(asset_id)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(f"SELECT * FROM exploration_anchors {where_sql} ORDER BY id ASC", tuple(params))
+            return [dict(r) for r in cur.fetchall()]
+
+    def save_todolist_item(
+        self,
+        step_id: str,
+        task_id: str,
+        chain_id: str,
+        step_order: int,
+        title: str,
+        capability_class: str = "",
+        prerequisite_facts: Optional[List[str]] = None,
+        requires_step_ids: Optional[List[str]] = None,
+        target_asset_id: Optional[str] = None,
+        status: str = "PENDING",
+        dispatched_intent_id: Optional[str] = None,
+        yielded_fact_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persists a Planner Todolist attack-chain step across planner wake-ups."""
+        with self._lock:
+            with self._tx():
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO planner_todolist
+                    (step_id, task_id, chain_id, step_order, title, capability_class,
+                     prerequisite_facts_json, requires_step_ids_json, target_asset_id,
+                     status, dispatched_intent_id, yielded_fact_id, metadata_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        step_id, task_id, chain_id, int(step_order), title, capability_class or "",
+                        json.dumps(prerequisite_facts or []),
+                        json.dumps(requires_step_ids or []),
+                        target_asset_id,
+                        status,
+                        dispatched_intent_id,
+                        yielded_fact_id,
+                        json.dumps(metadata or {}),
+                    ),
+                )
+
+    def get_todolist_items(
+        self,
+        task_id: Optional[str] = None,
+        chain_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieves persisted Planner Todolist items ordered by chain and step_order."""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if chain_id:
+            clauses.append("chain_id = ?")
+            params.append(chain_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                f"SELECT * FROM planner_todolist {where_sql} ORDER BY chain_id ASC, step_order ASC",
+                tuple(params),
+            )
+            res = []
+            for r in cur.fetchall():
+                d = dict(r)
+                d["prerequisite_facts"] = json.loads(d.get("prerequisite_facts_json") or "[]")
+                d["requires_step_ids"] = json.loads(d.get("requires_step_ids_json") or "[]")
+                d["metadata"] = json.loads(d.get("metadata_json") or "{}")
+                res.append(d)
+            return res
+
+    def update_todolist_status(
+        self,
+        step_id: str,
+        status: str,
+        dispatched_intent_id: Optional[str] = None,
+        yielded_fact_id: Optional[str] = None,
+    ) -> None:
+        """Updates a todolist step's lifecycle status."""
+        with self._lock:
+            with self._tx():
+                self.conn.execute(
+                    """
+                    UPDATE planner_todolist
+                    SET status = ?,
+                        dispatched_intent_id = COALESCE(?, dispatched_intent_id),
+                        yielded_fact_id = COALESCE(?, yielded_fact_id),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE step_id = ?
+                    """,
+                    (status, dispatched_intent_id, yielded_fact_id, step_id),
+                )
+
+    def save_worker_trace(
+        self,
+        trace_id: str,
+        task_id: str,
+        worker_id: str,
+        intent_id: str,
+        tool_name: str,
+        summary: str = "",
+        raw_observation: str = "",
+        target_asset_id: Optional[str] = None,
+        status: str = "COMPLETED",
+        extracted_facts: Optional[List[str]] = None,
+        traffic_id: Optional[str] = None,
+    ) -> None:
+        """Persists a worker execution trace for cross-worker trace search and reuse."""
+        with self._lock:
+            with self._tx():
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO worker_execution_traces
+                    (trace_id, task_id, worker_id, intent_id, tool_name, target_asset_id,
+                     status, summary, raw_observation, extracted_facts_json, traffic_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trace_id, task_id, worker_id, intent_id, tool_name, target_asset_id,
+                        status, summary or "", raw_observation or "",
+                        json.dumps(extracted_facts or []), traffic_id,
+                    ),
+                )
+
+    def list_worker_traces(
+        self,
+        task_id: Optional[str] = None,
+        worker_id: Optional[str] = None,
+        intent_id: Optional[str] = None,
+        query: Optional[str] = None,
+        limit: Optional[int] = 100,
+    ) -> List[Dict[str, Any]]:
+        """Lists recorded worker execution traces (ARTEX list_worker_traces) with SQL-side query filtering."""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if worker_id:
+            clauses.append("worker_id = ?")
+            params.append(worker_id)
+        if intent_id:
+            clauses.append("intent_id = ?")
+            params.append(intent_id)
+        q_norm = str(query or "").strip().lower()
+        if q_norm:
+            clauses.append(
+                "("
+                "INSTR(LOWER(COALESCE(trace_id, '')), ?) > 0 OR "
+                "INSTR(LOWER(COALESCE(worker_id, '')), ?) > 0 OR "
+                "INSTR(LOWER(COALESCE(tool_name, '')), ?) > 0 OR "
+                "INSTR(LOWER(COALESCE(target_asset_id, '')), ?) > 0 OR "
+                "INSTR(LOWER(COALESCE(status, '')), ?) > 0 OR "
+                "INSTR(LOWER(COALESCE(summary, '')), ?) > 0 OR "
+                "INSTR(LOWER(COALESCE(raw_observation, '')), ?) > 0 OR "
+                "INSTR(LOWER(COALESCE(extracted_facts_json, '')), ?) > 0"
+                ")"
+            )
+            params.extend([q_norm] * 8)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_sql = ""
+        if limit is not None and int(limit) > 0:
+            limit_sql = " LIMIT ?"
+            params.append(int(limit))
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                f"SELECT * FROM worker_execution_traces {where_sql} ORDER BY created_at DESC{limit_sql}",
+                tuple(params),
+            )
+            res = []
+            for r in cur.fetchall():
+                d = dict(r)
+                d["extracted_facts"] = json.loads(d.get("extracted_facts_json") or "[]")
+                res.append(d)
+            return res
+
+    def get_worker_trace(self, trace_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieves a single worker execution trace by trace_id (ARTEX get_worker_trace)."""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT * FROM worker_execution_traces WHERE trace_id = ?", (trace_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            d["extracted_facts"] = json.loads(d.get("extracted_facts_json") or "[]")
+            return d
+
+    def search_all_worker_traces(
+        self,
+        query: str,
+        task_id: Optional[str] = None,
+        limit: int = 25,
+    ) -> List[Dict[str, Any]]:
+        """Searches across all workers' raw observations and summaries (ARTEX search_all_worker_traces)."""
+        tokens = [t.strip() for t in str(query or "").split() if t.strip()]
+        if not tokens:
+            return self.list_worker_traces(task_id=task_id, limit=limit)
+
+        clauses: List[str] = []
+        params: List[Any] = []
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+
+        token_clauses: List[str] = []
+        for tok in tokens:
+            token_clauses.append(
+                "(INSTR(LOWER(COALESCE(summary, '')), LOWER(?)) > 0 "
+                "OR INSTR(LOWER(COALESCE(raw_observation, '')), LOWER(?)) > 0 "
+                "OR INSTR(LOWER(COALESCE(tool_name, '')), LOWER(?)) > 0 "
+                "OR INSTR(LOWER(COALESCE(target_asset_id, '')), LOWER(?)) > 0 "
+                "OR INSTR(LOWER(COALESCE(extracted_facts_json, '')), LOWER(?)) > 0)"
+            )
+            params.extend([tok, tok, tok, tok, tok])
+        clauses.append("(" + " OR ".join(token_clauses) + ")")
+        where_sql = "WHERE " + " AND ".join(clauses)
+        params.append(int(limit))
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                f"SELECT * FROM worker_execution_traces {where_sql} ORDER BY created_at DESC LIMIT ?",
+                tuple(params),
+            )
+            res = []
+            for r in cur.fetchall():
+                d = dict(r)
+                d["extracted_facts"] = json.loads(d.get("extracted_facts_json") or "[]")
+                res.append(d)
+            return res
+
+    def save_traffic_evidence(
+        self,
+        traffic_id: str,
+        method: str,
+        url: str,
+        host: str,
+        port: int = 80,
+        request_headers: Optional[Dict[str, Any]] = None,
+        request_body: str = "",
+        status_code: int = 0,
+        response_headers: Optional[Dict[str, Any]] = None,
+        response_body_b64: str = "",
+        content_encoding: str = "",
+        is_preview_only: bool = False,
+        source: str = "local",
+        task_id: str = "default",
+    ) -> None:
+        """Persists a captured HTTP request/response exchange for POE verification and replay."""
+        with self._lock:
+            with self._tx():
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO traffic_evidence
+                    (traffic_id, task_id, method, url, host, port, request_headers_json,
+                     request_body, status_code, response_headers_json, response_body_b64,
+                     content_encoding, is_preview_only, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        traffic_id, task_id, method.upper(), url, host, int(port),
+                        self._enc(json.dumps(request_headers or {})), self._enc(request_body or ""),
+                        int(status_code), self._enc(json.dumps(response_headers or {})),
+                        self._enc(response_body_b64 or ""), content_encoding or "",
+                        1 if is_preview_only else 0, source or "local",
+                    ),
+                )
+
+    def get_traffic_evidence(self, traffic_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieves a captured HTTP traffic record by traffic_id."""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT * FROM traffic_evidence WHERE traffic_id = ?", (traffic_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            d["request_headers"] = json.loads(self._dec(d.get("request_headers_json") or "{}") or "{}")
+            d["request_body"] = self._dec(d.get("request_body") or "")
+            d["response_headers"] = json.loads(self._dec(d.get("response_headers_json") or "{}") or "{}")
+            d["response_body_b64"] = self._dec(d.get("response_body_b64") or "")
+            return d
+
+    def list_traffic_evidence(
+        self,
+        task_id: Optional[str] = None,
+        host: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Lists captured HTTP traffic records."""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if host:
+            clauses.append("host = ?")
+            params.append(host)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(int(limit))
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                f"SELECT * FROM traffic_evidence {where_sql} ORDER BY created_at DESC LIMIT ?",
+                tuple(params),
+            )
+            res = []
+            for r in cur.fetchall():
+                d = dict(r)
+                d["request_headers"] = json.loads(self._dec(d.get("request_headers_json") or "{}") or "{}")
+                d["request_body"] = self._dec(d.get("request_body") or "")
+                d["response_headers"] = json.loads(self._dec(d.get("response_headers_json") or "{}") or "{}")
+                d["response_body_b64"] = self._dec(d.get("response_body_b64") or "")
+                res.append(d)
+            return res
+
+    def record_llm_usage(
+        self,
+        task_id: str,
+        role: str = "worker",
+        model: str = "",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: Optional[int] = None,
+        turns: int = 1,
+        session_id: str = "",
+    ) -> None:
+        """Persists token and turn spend so RunBudgetLedger restores accurately across restarts."""
+        tot = int(total_tokens) if total_tokens is not None else int(prompt_tokens) + int(completion_tokens)
+        with self._lock:
+            with self._tx():
+                self.conn.execute(
+                    """
+                    INSERT INTO llm_usage
+                    (task_id, session_id, role, model, prompt_tokens, completion_tokens, total_tokens, turns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (task_id, session_id, role, model, int(prompt_tokens), int(completion_tokens), tot, int(turns)),
+                )
+
+    def get_task_llm_usage(self, task_id: str) -> Dict[str, Any]:
+        """Aggregates persisted LLM token/turn spend for planner/worker/judge/compactor roles."""
+        countable = ("planner", "worker", "judge", "compactor")
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(total_tokens), 0) AS tokens,
+                       COALESCE(SUM(turns), 0) AS turns,
+                       COUNT(*) AS calls
+                FROM llm_usage
+                WHERE task_id = ? AND LOWER(role) IN ('planner', 'worker', 'judge', 'compactor')
+                """,
+                (task_id,),
+            )
+            row = cur.fetchone()
+            return {
+                "task_id": task_id,
+                "total_tokens": int(row["tokens"] or 0) if row else 0,
+                "total_turns": int(row["turns"] or 0) if row else 0,
+                "calls": int(row["calls"] or 0) if row else 0,
+                "countable_roles": list(countable),
+            }
+
+    def save_approval_decision(
+        self,
+        action_type: str,
+        decision: str,
+        decided_by: str,
+        task_id: str = "default",
+        target: str = "",
+        method: str = "",
+        rule_id: str = "",
+        rationale: str = "",
+        action_summary: str = "",
+    ) -> None:
+        """Records an interception/approval gate decision with full attribution."""
+        summary_val = action_summary or rationale or f"{action_type} {method} {target}".strip()
+        with self._lock:
+            with self._tx():
+                self.conn.execute(
+                    """
+                    INSERT INTO approval_decisions
+                    (task_id, action_type, target, method, decision, decided_by, rule_id, rationale, action_summary)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (task_id, action_type, target, method, decision, decided_by, rule_id, rationale, summary_val),
+                )
+
+    def get_approval_decisions(self, task_id: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """Retrieves approval gate decision history."""
+        with self._lock:
+            cur = self.conn.cursor()
+            if task_id:
+                cur.execute(
+                    "SELECT * FROM approval_decisions WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+                    (task_id, int(limit)),
+                )
+            else:
+                cur.execute("SELECT * FROM approval_decisions ORDER BY id DESC LIMIT ?", (int(limit),))
+            return [dict(r) for r in cur.fetchall()]
+
+    def save_chain_retest(
+        self,
+        retest_id: str,
+        chain_id: str,
+        verdict: str,
+        conditions: str = "",
+        evidence: str = "",
+        traffic_id: str = "",
+        original_traffic_id: str = "",
+    ) -> None:
+        """Records a retest evaluation for a confirmed attack chain."""
+        with self._lock:
+            with self._tx():
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO chain_retests
+                    (retest_id, chain_id, verdict, conditions, evidence, traffic_id, original_traffic_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (retest_id, chain_id, verdict, conditions or "", evidence or "", traffic_id or "", original_traffic_id or ""),
+                )
+
+    def get_chain_retests(self, chain_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """Retrieves retest history for attack chains."""
+        with self._lock:
+            cur = self.conn.cursor()
+            if chain_id:
+                cur.execute(
+                    "SELECT * FROM chain_retests WHERE chain_id = ? ORDER BY tested_at DESC LIMIT ?",
+                    (chain_id, limit),
+                )
+            else:
+                cur.execute("SELECT * FROM chain_retests ORDER BY tested_at DESC LIMIT ?", (limit,))
+            return [dict(r) for r in cur.fetchall()]
 
     def save_mantis_threat_model(
         self,
@@ -1134,7 +2077,7 @@ class Database:
     ) -> int:
         """Persists a Google Mantis automated repository threat model."""
         with self._lock:
-            with self.conn:
+            with self._tx():
                 cur = self.conn.execute(
                     """
                     INSERT OR REPLACE INTO mantis_threat_models
@@ -1229,7 +2172,7 @@ class Database:
             fusion_val = ", ".join(str(m) for m in fusion_val)
 
         with self._lock:
-            with self.conn:
+            with self._tx():
                 cur = self.conn.execute(
                     """
                     INSERT OR REPLACE INTO mantis_findings
@@ -1297,3 +2240,73 @@ class Database:
             cur = self.conn.cursor()
             cur.execute(sql, tuple(params))
             return [dict(r) for r in cur.fetchall()]
+
+    def save_rea_finding(self, payload: Dict[str, Any]) -> int:
+        """Persists a Module 21 (`morluto/rea`) surface/bundle security finding."""
+        finding_id = str(payload.get("finding_id") or payload.get("id") or "")
+        if not finding_id:
+            return 0
+        lims = payload.get("limitations")
+        unks = payload.get("unknowns")
+        lims_json = json.dumps(lims) if isinstance(lims, (list, dict)) else str(lims or "[]")
+        unks_json = json.dumps(unks) if isinstance(unks, (list, dict)) else str(unks or "[]")
+        with self._lock:
+            with self._tx():
+                cur = self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO rea_findings
+                    (finding_id, target_path, rule_id, capability_class, severity, cwe,
+                     file_path, line_number, title, evidence, limitations, unknowns, source_mode)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        finding_id,
+                        str(payload.get("target_path", "")),
+                        str(payload.get("rule_id", "REA-ROUTE-001")),
+                        str(payload.get("capability_class", "")),
+                        str(payload.get("severity", "MEDIUM")).upper(),
+                        str(payload.get("cwe", "")),
+                        str(payload.get("file_path", "")),
+                        int(payload.get("line_number", 0) or 0),
+                        str(payload.get("title", "REA Surface Finding")),
+                        str(payload.get("evidence", "")),
+                        lims_json,
+                        unks_json,
+                        str(payload.get("source_mode") or payload.get("mode") or "python_static"),
+                    ),
+                )
+                return int(cur.lastrowid or 0)
+
+    def get_rea_findings(
+        self,
+        target_path: Optional[str] = None,
+        severity: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Retrieves persisted Module 21 (`morluto/rea`) findings."""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if target_path:
+            clauses.append("target_path = ?")
+            params.append(str(target_path))
+        if severity:
+            clauses.append("severity = ?")
+            params.append(str(severity).upper())
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"SELECT * FROM rea_findings {where_sql} ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(sql, tuple(params))
+            rows = []
+            for r in cur.fetchall():
+                d = dict(r)
+                for k in ("limitations", "unknowns"):
+                    raw_k = d.get(k)
+                    if isinstance(raw_k, str):
+                        try:
+                            d[k] = json.loads(raw_k)
+                        except Exception:
+                            d[k] = [raw_k] if raw_k else []
+                rows.append(d)
+            return rows

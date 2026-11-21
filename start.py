@@ -115,45 +115,7 @@ def main():
         sys.exit(1)
     is_local_target = args.host in ("127.0.0.1", "localhost", "::1", "[::1]")
 
-    if getattr(args, "clean_db", False):
-        from database import Database
-        db_inst = Database("terminator.db")
-        res = db_inst.clean_db(
-            keep_rfcs=getattr(args, "keep_rfcs_on_clean", False),
-            keep_findings=getattr(args, "keep_findings_on_clean", False),
-            vacuum=True,
-        )
-        print(f"[+] Database cleaned and VACUUMed: {res['total_rows_deleted']:,} rows removed, {res['reclaimed_mb']} MB reclaimed.")
-
-    print("=" * 70)
-    print("  HTTP TERMINATOR: AUTONOMOUS RESEARCH FACTORY")
-    print("  Architecture: PortSwigger DEF CON 34 / Black Hat USA 2026")
-    print("  Engine: Google Gemma 2 + ModelFusion via Ollama (Zero Cost 24/7)")
-    print("  Starting Spec: RFC 9112 (HTTP/1.1 Message Syntax & Framing - Primary Terminator Spec)")
-    print("=" * 70)
-
-    # Parse multiple target terminators if provided
-    target_list = []
-    if args.targets:
-        for t_str in args.targets.split(","):
-            t_str = t_str.strip()
-            if not t_str:
-                continue
-            if "://" in t_str:
-                t_proto, t_rest = t_str.split("://", 1)
-                t_tls = t_proto.lower() == "https"
-            else:
-                t_rest = t_str
-                t_tls = args.tls or (":443" in t_rest)
-            if ":" in t_rest:
-                h, p = t_rest.split(":", 1)
-                target_list.append((h.strip(), int(p.strip()), t_tls))
-            else:
-                target_list.append((t_rest.strip(), 443 if t_tls else 80, t_tls))
-    else:
-        target_list = [(args.host, args.port, use_tls)]
-
-    # Handle mode overrides
+    # Handle mode overrides early so --mcp routes banners cleanly to stderr
     if args.mode:
         m = args.mode.lower().strip()
         if m == "mcp":
@@ -161,15 +123,62 @@ def main():
         elif m in ("offline", "comb-only"):
             args.comb_only = True
 
+    banner_stream = sys.stderr if args.mcp else sys.stdout
+
+    if getattr(args, "clean_db", False):
+        from database import Database
+        db_inst = Database("terminator.db")
+        try:
+            res = db_inst.clean_db(
+                keep_rfcs=getattr(args, "keep_rfcs_on_clean", False),
+                keep_findings=getattr(args, "keep_findings_on_clean", False),
+                vacuum=True,
+            )
+        finally:
+            db_inst.close()
+        print(
+            f"[+] Database cleaned and VACUUMed: {res['total_rows_deleted']:,} rows removed, {res['reclaimed_mb']} MB reclaimed.",
+            file=banner_stream,
+        )
+
+    print("=" * 70, file=banner_stream)
+    print("  HTTP TERMINATOR: AUTONOMOUS RESEARCH FACTORY", file=banner_stream)
+    print("  Architecture: PortSwigger DEF CON 34 / Black Hat USA 2026", file=banner_stream)
+    print("  Engine: Google Gemma + ModelFusion via Ollama (Zero Cost 24/7)", file=banner_stream)
+    print("  Starting Spec: RFC 9112 (HTTP/1.1 Message Syntax & Framing - Primary Terminator Spec)", file=banner_stream)
+    print("=" * 70, file=banner_stream)
+
+    # Parse multiple target terminators if provided (args.targets may already be normalized to a list)
+    from engine.safe_network_validator import parse_host_and_port
+
+    target_list = []
+    if args.targets:
+        raw_targets = args.targets.split(",") if isinstance(args.targets, str) else list(args.targets)
+        for t_str in raw_targets:
+            t_str = str(t_str).strip()
+            if not t_str:
+                continue
+            h, p, t_tls = parse_host_and_port(t_str, use_tls=True if args.tls else None)
+            target_list.append((h, p, t_tls))
+    else:
+        target_list = [(args.host, args.port, use_tls)]
+
     # 1. Start Local Protocol Test Lab Server (if first target is local 8080 and not disabled, or if --random-port is given)
     lab_server = None
     first_host, first_port, first_tls = target_list[0]
     is_first_local = first_host in ("127.0.0.1", "localhost", "::1", "[::1]")
-    should_spawn_lab = is_first_local and (first_port == 8080 or args.random_port) and not args.no_lab and not args.comb_only and not (args.ui or args.mode == "ui")
+    should_spawn_lab = (
+        is_first_local
+        and (first_port == 8080 or args.random_port)
+        and not args.no_lab
+        and not args.comb_only
+        and not args.mcp
+        and not (args.ui or args.mode == "ui")
+    )
 
     if args.comb_only:
-        print("\n[+] Step 1: Mode: Offline RFC Ingestion & Discovery")
-        print("    (Host evaluation bypassed - generating and banking probes into database only)")
+        print("\n[+] Step 1: Mode: Offline RFC Ingestion & Discovery", file=banner_stream)
+        print("    (Host evaluation bypassed - generating and banking probes into database only)", file=banner_stream)
     elif should_spawn_lab:
         bind_port = 0 if args.random_port else first_port
         lab_server = TestLabServer(host=first_host, port=bind_port)
@@ -178,22 +187,22 @@ def main():
             first_port = lab_server.port
             target_list[0] = (first_host, first_port, first_tls)
             time.sleep(0.4)
-            print(f"\n[+] Step 1: Initializing local Protocol Test Lab on http://{first_host}:{first_port}...")
+            print(f"\n[+] Step 1: Initializing local Protocol Test Lab on http://{first_host}:{first_port}...", file=banner_stream)
         except Exception as e:
-            print(f"[!] Failed to bind lab server: {e}")
+            print(f"[!] Failed to bind lab server: {e}", file=sys.stderr)
             sys.exit(1)
     else:
-        print(f"\n[+] Step 1: Configured {len(target_list)} Target Terminator(s):")
+        print(f"\n[+] Step 1: Configured {len(target_list)} Target Terminator(s):", file=banner_stream)
         for idx, (h, p, tls_f) in enumerate(target_list, 1):
             proto = "https" if tls_f else "http"
-            print(f"    [{idx}] {proto}://{h}:{p}")
+            print(f"    [{idx}] {proto}://{h}:{p}", file=banner_stream)
 
     # Graceful shutdown handler
     def shutdown(sig=None, frame=None):
-        print("\n\n[*] Shutting down HTTP Terminator...")
+        print("\n\n[*] Shutting down HTTP Terminator...", file=banner_stream)
         if lab_server:
             lab_server.stop()
-        print("[+] All services halted safely.")
+        print("[+] All services halted safely.", file=banner_stream)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
@@ -202,7 +211,7 @@ def main():
     # 2. Launch Hunter or MCP Server
     try:
         if args.mcp:
-            print(f"\n[+] Step 2: Launching Model Context Protocol (MCP) Server over stdio...")
+            print("\n[+] Step 2: Launching Model Context Protocol (MCP) Server over stdio...", file=sys.stderr)
             mcp_server = TerminatorMCPServer()
             mcp_server.run_stdio()
         elif args.ui or args.mode == "ui":

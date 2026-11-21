@@ -85,7 +85,22 @@
 | `--raptor-target` | string | `None` | Path to repository/codebase for RAPTOR audit | `--raptor-target D:\harfile\my_project` |
 | `--repo` | string | `None` | Repository directory path for `--all`, `--mantis`, or `--raptor` scans | `--all --repo .` |
 | `--path` | string | `None` | Specific file or directory path for `--all`, `--mantis`, or `--raptor` scans | `--all --path engine/mantis_integrator.py` |
-| `--all`, `--run-all`, `--all-scans` | flag | `False` | Run ALL integrated scanners (Google Mantis, aiscan, ARTEX, RAPTOR, Prompt Smuggling) with ModelFusion + Abliterated models | `--all --repo .` |
+| `--all`, `--run-all`, `--all-scans` | flag | `False` | Run ALL integrated scanners (Google Mantis, aiscan, ARTEX Dual-Graph & Attack Chaining, RAPTOR, Prompt Smuggling) with ModelFusion + Abliterated models | `--all --repo .` |
+| `--artex`, `--dual-graph` | flag | `False` | Run BaaRai/ARTEX Dual-Graph durable attack chaining engine (Module 17) | `artex --host 127.0.0.1 --port 8080` |
+| `--artex-rounds` | int | `1` | Number of multi-round durable planning & verification cycles | `--all --repo . --artex-rounds 2` |
+| `--artex-url` | string | `None` | Headless BaaRai/ARTEX REST+SSE backend URL (e.g. `http://127.0.0.1:8787`, or `ARTEX_API_URL`) | `--all --repo . --artex-url http://127.0.0.1:8787` |
+| `--artex-token` | string | `None` | Bearer JWT token for headless ARTEX REST API (or `ARTEX_API_TOKEN`) | `--artex-token <jwt>` |
+| `--artex-proxy` | string | `None` | ARTEX recording MITM proxy URL (`http://127.0.0.1:8788`, or `ARTEX_PROXY_URL`) | `--all --repo . --artex-proxy http://127.0.0.1:8788` |
+| `--artex-ca-cert` | string | `None` | Optional CA certificate path for ARTEX MITM proxy TLS verification | `--artex-ca-cert ./artex-ca.pem` |
+| `--artex-noise-profile` | string | `off` | Target traffic noise governor profile (`off`, `quiet`, `balanced`, `aggressive`) | `--artex-noise-profile quiet` |
+| `--artex-llm-profiles` | string | `None` | Comma-separated LLM profile IDs for ARTEX worker rotation (`PUT /api/tasks/{id}/llm`) | `--artex-llm-profiles profA,profB` |
+| `--artex-llm-rotate` | flag | `False` | Enable round-robin multi-LLM worker rotation (`A, B, A, B`) | `--artex-llm-rotate` |
+| `--artex-wait-sse` | flag | `False` | Stream ARTEX SSE activity events on `:8787` until terminal task completion | `--artex-wait-sse` |
+| `--artex-budget-turns` | int | `0` | Optional max task turn budget for ARTEX attack chaining (`0` = unlimited) | `--artex-budget-turns 25` |
+| `--artex-retest` | flag | `False` | Run ARTEX chain retest loop (`STILL_REPRODUCIBLE` / `FIXED` / `CANNOT_CONFIRM`) | `--artex-retest` |
+| `--mcp-transport` | string | `stdio` | Remote MCP server transport: `stdio`, `http` (`/http`), `sse` (`/sse`), or `both` | `mcp --mcp-transport both --mcp-port 8790` |
+| `--mcp-host` / `--mcp-port` | str/int | `127.0.0.1:8790` | Bind host and port for remote Streamable HTTP / Legacy SSE MCP server | `--mcp-host 127.0.0.1 --mcp-port 8790` |
+| `--mcp-token` | string | `None` | Optional Bearer token for remote HTTP/SSE MCP clients (`RFCHUNT_MCP_TOKEN`) | `--mcp-token <secret>` |
 | `--mantis`, `--enable-mantis` | flag | `False` | Enable Google Mantis Security Toolkit (Module 20) with ModelFusion + Abliterated models | `--mantis --repo .` |
 | `--mantis-mode` | string | `full` | Google Mantis mode (`full`, `fast`, `threat-model`, `scan`, `reproduce`, `patch`) | `--mantis-mode patch` |
 | `--depth`, `--mantis-depth` | int | `30` | Google Mantis audit depth `1..100` (scales coverage, passes, and rule tiers) | `--depth 100` |
@@ -390,6 +405,40 @@ py -3.12 -u rfc_hunt_swarm.py build
 # --skip-tests (Run Build All without executing pytest)
 py -3.12 -u rfc_hunt_swarm.py build --skip-tests
 
-# --mcp (Run Model Context Protocol JSON-RPC stdio server)
+# --mcp (Run Model Context Protocol server over stdio, Streamable HTTP /http, or Legacy SSE /sse for ARTEX)
 py -3.12 -u rfc_hunt_swarm.py mcp
+py -3.12 -u rfc_hunt_swarm.py mcp --mcp-transport both --mcp-host 127.0.0.1 --mcp-port 8790 --mcp-token secret-token
+py -3.12 -u main.py mcp --transport both --mcp-port 8790 --mcp-token secret-token
+
+# BaaRai/ARTEX Durable Attack Chaining & Headless REST+SSE / MITM Proxy Integration (Standalone & --all)
+py -3.12 -u main.py artex --host 127.0.0.1 --port 8080 --artex-rounds 2 --artex-noise-profile balanced
+py -3.12 -u rfc_hunt_swarm.py --all --repo . --artex-rounds 2 --artex-url http://127.0.0.1:8787 --artex-proxy http://127.0.0.1:8788 --artex-llm-rotate --artex-wait-sse --artex-retest
+```
+
+### 10. Pure-CLI ARTEX Parity & Advisory Subcommands (Zero-GUI)
+```powershell
+# Start embedded pure-CLI recording HTTP/HTTPS MITM proxy (auto-generates keys/rfchunt_ca.crt)
+python main.py proxy --port 8788 --noise-profile balanced --rewrite-rule "trace:X-RFCHunt=1"
+
+# Unified --all with embedded MITM proxy, OpenAPI/HAR surface import, multi-role auth profiles, live workers & exports
+python main.py --all --repo . --host 127.0.0.1 --port 8080 --authorized --embedded-proxy \
+  --import-openapi spec.yaml --import-har session.har --auth-profile auth.yaml --scope-file scope.yaml \
+  --artex-workers 4 --approval-mode policy --approval-rules rules.yaml --strict-poe \
+  --export-advisory --export-csv
+
+# Query persisted attack chains, shared worker traces, and asset coverage ledger (TTY Rich tables, --plain, or --json)
+python main.py chains --min-poe 2 --verified-only
+python main.py chains --json
+python main.py traces --query "AUTH_BOUNDARY" --limit 50
+python main.py coverage --json
+
+# Replay persisted chains (offline receipt check or live HTTP replay)
+python main.py retest --all-chains --live --authorized
+
+# Export GHSA-ready Markdown advisories (redacted receipts) and formula-neutralized CSV
+python main.py export-advisory --out reports/advisories --csv
+
+# Export / decrypt & verify AES-256-GCM encrypted task archives (.rfca) with SHA-256 checksums
+python main.py archive --export reports/task_backup.rfca
+python main.py archive --import reports/task_backup.rfca
 ```

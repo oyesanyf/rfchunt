@@ -962,6 +962,80 @@ def test_unified_all_scans_string_entry_points_and_sinks_no_slicing(monkeypatch:
         assert "chains_synthesized" in artex_engine
 
 
+def test_mantis_auth_011_two_line_brace_free_express_and_python_aud_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("RFCHUNT_OFFLINE", "1")
+
+    # 1. 2-line brace-free Express route above unguarded /admin/users must NOT bleed requireService downward
+    ts_dir = tmp_path / "ts_2line"
+    ts_dir.mkdir()
+    (ts_dir / "routes.ts").write_text(
+        """export function mount(router: any) {
+  router.get("/public/ping",
+    requireService, pingHandler);
+  router.get("/admin/users",
+    verifyIdToken, adminHandler);
+}
+""",
+        encoding="utf-8",
+    )
+    db_ts = Database(":memory:")
+    try:
+        res_ts = MantisIntegrator(db=db_ts, reports_dir=str(ts_dir / "reports"), use_fusion=True).run_scan(
+            target_path=str(ts_dir), depth=100, mode="scan"
+        )
+        auth_ts = [f for f in res_ts["findings"] if f["rule_id"] == "MANTIS-AUTH-011"]
+        assert len(auth_ts) == 1, f"Expected 1 MANTIS-AUTH-011 for unguarded 2-line neighbor, got: {auth_ts}"
+    finally:
+        db_ts.close()
+
+    # 2. Python claims.get("aud") != "..." guard -> 0; aud = claims.get("aud") return trap -> 1
+    py_guard_dir = tmp_path / "py_aud_guard"
+    py_guard_dir.mkdir()
+    (py_guard_dir / "guarded.py").write_text(
+        """from fastapi import FastAPI, HTTPException, Depends
+app = FastAPI()
+
+@app.post("/internal/worker/run")
+def run_worker(claims=Depends(verify_oidc)):
+    if claims.get("aud") != "internal-svc":
+        raise HTTPException(status_code=403)
+    return {"ok": True}
+""",
+        encoding="utf-8",
+    )
+    db_g = Database(":memory:")
+    try:
+        res_g = MantisIntegrator(db=db_g, reports_dir=str(py_guard_dir / "reports"), use_fusion=True).run_scan(
+            target_path=str(py_guard_dir), depth=100, mode="scan"
+        )
+        assert [f for f in res_g["findings"] if f["rule_id"] == "MANTIS-AUTH-011"] == []
+    finally:
+        db_g.close()
+
+    py_trap_dir = tmp_path / "py_aud_trap"
+    py_trap_dir.mkdir()
+    (py_trap_dir / "trap.py").write_text(
+        """from fastapi import FastAPI, Depends
+app = FastAPI()
+
+@app.post("/internal/worker/run")
+def run_worker(claims=Depends(verify_oidc)):
+    aud = claims.get("aud")
+    return {"ok": True, "aud": aud}
+""",
+        encoding="utf-8",
+    )
+    db_t = Database(":memory:")
+    try:
+        res_t = MantisIntegrator(db=db_t, reports_dir=str(py_trap_dir / "reports"), use_fusion=True).run_scan(
+            target_path=str(py_trap_dir), depth=100, mode="scan"
+        )
+        auth_t = [f for f in res_t["findings"] if f["rule_id"] == "MANTIS-AUTH-011"]
+        assert len(auth_t) == 1, f"Expected 1 MANTIS-AUTH-011 for py_aud_trap, got: {auth_t}"
+    finally:
+        db_t.close()
+
+
 
 
 

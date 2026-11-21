@@ -85,6 +85,11 @@ class ProtocolResearchOrchestrator:
         self.boundary = CrossProtocolBoundaryAnalyzer()                 # Mod 10
         self.knowledge_graph = ResearchKnowledgeGraph()                 # Mod 11
         self.publisher = DefensiveIntelligencePublisher(db=db)          # Mod 12
+        self.attack_chainer: Optional[Any] = None                       # Mod 17 (optional ARTEX link)
+
+    def attach_attack_chainer(self, chainer: Any) -> None:
+        """Attaches an ARTEX DualGraphAttackEngine to receive confirmed protocol findings."""
+        self.attack_chainer = chainer
 
     def ingest_rfc_specification(self, rfc_id: str, rfc_text: str) -> Dict[str, int]:
         """
@@ -194,6 +199,21 @@ class ProtocolResearchOrchestrator:
                 arm106_rule, arm107_test = self.publisher.publish_finding(vuln, rfc_anchor="RFC9112")
                 cycle_result["arm106_rule_published"] = arm106_rule.rule_id
                 cycle_result["arm107_test_published"] = arm107_test.test_id
+
+                # Step 11: Mod 17 Feed confirmed vulnerability into attached ARTEX Attack Chainer
+                if self.attack_chainer is not None:
+                    try:
+                        self.attack_chainer.register_wire_primitive(
+                            anomaly_id=vuln.vuln_id,
+                            description=f"{vuln.impact.value}: {anomaly.observed_behavior[:120]}",
+                            anomaly_type=vuln.impact.value,
+                            raw_probe=vuln.minimized_probe.decode("latin-1", errors="replace"),
+                            scanner="ProtocolResearchOrchestrator",
+                        )
+                        chain_res = self.attack_chainer.run_attack_chain_cycle(round_num=1)
+                        cycle_result["artex_chains_verified"] = chain_res.get("exploits_verified", 0)
+                    except Exception:
+                        pass
 
         # Update bandit feedback loop
         self.bandit.record_feedback(

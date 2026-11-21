@@ -17,6 +17,7 @@ plugins/
 runs/
 reports/
 !reports/.gitkeep
+keys/
 .agents/
 
 # Compressed Archives
