@@ -615,3 +615,47 @@ def test_hybrid_repo_and_host_runs_local_and_remote_and_feeds_artex_before_chain
     assert "DeterministicHarness+AnomalyDetector" in scanners_in_findings
     assert "MultiImplementationDifferentialOracle" in scanners_in_findings
 
+
+def test_unified_swarm_cli_consolidation_and_main_shim(tmp_path):
+    """
+    Verifies rfc_hunt_swarm.py natively defines all unified flags (--demo, --patched,
+    --rounds, --retest, --domain, --runs-dir, --report, harness2 --mode both) without
+    importing `main`, while main.py acts as a thin forwarding shim.
+    """
+    import main as main_cli
+    import rfc_hunt_swarm as swarm_cli
+
+    assert getattr(main_cli, "_IS_SWARM_SHIM", False) is True
+    swarm_src = (Path(__file__).resolve().parent.parent / "rfc_hunt_swarm.py").read_text(encoding="utf-8")
+    assert "import main" not in swarm_src
+
+    args_all = swarm_cli.parse_swarm_arguments([
+        "cascade", "--demo", "--patched", "--rounds", "3", "--retest",
+        "--domain", "h2_translation", "--runs-dir", str(tmp_path / "h2"), "--report",
+    ])
+    assert args_all.demo is True
+    assert args_all.patched is True
+    assert args_all.artex_rounds == 3
+    assert args_all.artex_retest is True
+    assert args_all.harness2_domain == "h2_translation"
+    assert args_all.harness2_runs_dir == str(tmp_path / "h2")
+    assert args_all.harness2_report is True
+
+    args_h2 = swarm_cli.parse_swarm_arguments([
+        "harness2", "--rfc", "9112", "--k", "2", "--mode", "both",
+    ])
+    assert args_h2.command == "harness2"
+    assert args_h2.harness2_k == 2
+    assert args_h2.harness2_mode == "both"
+
+    for sym in (
+        "cmd_all", "cmd_artex", "cmd_artex_loop", "cmd_scanner", "cmd_proxy",
+        "cmd_chains", "cmd_traces", "cmd_coverage", "cmd_retest", "cmd_export_advisory",
+        "cmd_archive", "cmd_rea", "cmd_fetch", "cmd_chunk", "cmd_generate", "cmd_permute",
+        "cmd_evaluate", "cmd_weaponize", "cmd_cascade", "cmd_lab", "cmd_auto", "cmd_hunt",
+        "cmd_mcp", "cmd_ruler", "cmd_dream", "cmd_caldera", "cmd_build", "cmd_harness2",
+    ):
+        assert hasattr(swarm_cli, sym) and callable(getattr(swarm_cli, sym))
+        assert hasattr(main_cli, sym) and getattr(main_cli, sym) is getattr(swarm_cli, sym)
+
+

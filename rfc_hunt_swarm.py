@@ -39,88 +39,175 @@ import threading
 import time
 from typing import Annotated, Any, Dict, List, Optional, Tuple, TypedDict
 
-try:
-    from langgraph.graph import END, StateGraph
-except ImportError:
-    END = "__end__"
+END = "__end__"
+StateGraph = None  # Resolved lazily by _resolve_langgraph() to keep CLI startup fast
 
-    class _CompiledFallbackGraph:
-        def __init__(self, entry_point, nodes, edges, cond_edges):
-            self._entry = entry_point
-            self._nodes = nodes
-            self._edges = edges
-            self._cond_edges = cond_edges
 
-        @property
-        def nodes(self):
-            return self._nodes
+def _resolve_langgraph():
+    """Loads `langgraph.graph` lazily when `ProtocolResearchSwarm` builds its graph."""
+    try:
+        from langgraph.graph import END as _lg_end, StateGraph as _lg_state_graph
+        return _lg_end, _lg_state_graph
+    except ImportError:
+        _fallback_end = "__end__"
 
-        def invoke(self, state: dict, config: Optional[dict] = None) -> dict:
-            cur = dict(state)
-            recursion_limit = (config or {}).get("recursion_limit", 150)
-            node_name = self._entry
-            steps = 0
-            while node_name and node_name != END and steps < recursion_limit:
-                steps += 1
-                fn = self._nodes[node_name]
-                updates = fn(cur) or {}
-                for k, v in updates.items():
-                    if k == "history" and isinstance(cur.get("history"), list) and isinstance(v, list):
-                        cur["history"] = cur["history"] + v
+        class _CompiledFallbackGraph:
+            def __init__(self, entry_point, nodes, edges, cond_edges):
+                self._entry = entry_point
+                self._nodes = nodes
+                self._edges = edges
+                self._cond_edges = cond_edges
+
+            @property
+            def nodes(self):
+                return self._nodes
+
+            def invoke(self, state: dict, config: Optional[dict] = None) -> dict:
+                cur = dict(state)
+                recursion_limit = (config or {}).get("recursion_limit", 150)
+                node_name = self._entry
+                steps = 0
+                while node_name and node_name != _fallback_end and steps < recursion_limit:
+                    steps += 1
+                    fn = self._nodes[node_name]
+                    updates = fn(cur) or {}
+                    for k, v in updates.items():
+                        if k == "history" and isinstance(cur.get("history"), list) and isinstance(v, list):
+                            cur["history"] = cur["history"] + v
+                        else:
+                            cur[k] = v
+                    if node_name in self._cond_edges:
+                        node_name = self._cond_edges[node_name](cur)
                     else:
-                        cur[k] = v
-                if node_name in self._cond_edges:
-                    node_name = self._cond_edges[node_name](cur)
-                else:
-                    node_name = self._edges.get(node_name, END)
-            return cur
+                        node_name = self._edges.get(node_name, _fallback_end)
+                return cur
 
-        def stream(self, state: dict, config: Optional[dict] = None):
-            cur = dict(state)
-            recursion_limit = (config or {}).get("recursion_limit", 150)
-            node_name = self._entry
-            steps = 0
-            while node_name and node_name != END and steps < recursion_limit:
-                steps += 1
-                fn = self._nodes[node_name]
-                updates = fn(cur) or {}
-                for k, v in updates.items():
-                    if k == "history" and isinstance(cur.get("history"), list) and isinstance(v, list):
-                        cur["history"] = cur["history"] + v
+            def stream(self, state: dict, config: Optional[dict] = None):
+                cur = dict(state)
+                recursion_limit = (config or {}).get("recursion_limit", 150)
+                node_name = self._entry
+                steps = 0
+                while node_name and node_name != _fallback_end and steps < recursion_limit:
+                    steps += 1
+                    fn = self._nodes[node_name]
+                    updates = fn(cur) or {}
+                    for k, v in updates.items():
+                        if k == "history" and isinstance(cur.get("history"), list) and isinstance(v, list):
+                            cur["history"] = cur["history"] + v
+                        else:
+                            cur[k] = v
+                    yield {node_name: updates}
+                    if node_name in self._cond_edges:
+                        node_name = self._cond_edges[node_name](cur)
                     else:
-                        cur[k] = v
-                yield {node_name: updates}
-                if node_name in self._cond_edges:
-                    node_name = self._cond_edges[node_name](cur)
-                else:
-                    node_name = self._edges.get(node_name, END)
+                        node_name = self._edges.get(node_name, _fallback_end)
 
-    class StateGraph:  # type: ignore[no-redef]
-        def __init__(self, state_schema=None):
-            self._entry = None
-            self._nodes = {}
-            self._edges = {}
-            self._cond_edges = {}
+        class _FallbackStateGraph:
+            def __init__(self, state_schema=None):
+                self._entry = None
+                self._nodes = {}
+                self._edges = {}
+                self._cond_edges = {}
 
-        def add_node(self, name: str, fn):
-            self._nodes[name] = fn
+            def add_node(self, name: str, fn):
+                self._nodes[name] = fn
 
-        def set_entry_point(self, name: str):
-            self._entry = name
+            def set_entry_point(self, name: str):
+                self._entry = name
 
-        def add_edge(self, src: str, dst: str):
-            self._edges[src] = dst
+            def add_edge(self, src: str, dst: str):
+                self._edges[src] = dst
 
-        def add_conditional_edges(self, src: str, router_fn):
-            self._cond_edges[src] = router_fn
+            def add_conditional_edges(self, src: str, router_fn):
+                self._cond_edges[src] = router_fn
 
-        def compile(self):
-            return _CompiledFallbackGraph(self._entry, self._nodes, self._edges, self._cond_edges)
+            def compile(self):
+                return _CompiledFallbackGraph(self._entry, self._nodes, self._edges, self._cond_edges)
+
+        return _fallback_end, _FallbackStateGraph
 
 # External/Core components from original continuous_scanner
 from anomaly_detector import AnomalyDetector
 from database import Database
 from forensics import ForensicLogger
+
+_ORIGINAL_SWARM_DATABASE = Database
+
+
+def _resolve_db_cls():
+    """Resolves Database class, honoring monkeypatches on main shim, rfc_hunt_swarm, or database."""
+    main_mod = sys.modules.get("main")
+    if main_mod is not None and main_mod.__dict__.get("_IS_SWARM_SHIM", False):
+        orig_main_db = main_mod.__dict__.get("_ORIGINAL_DATABASE")
+        cur_main_db = getattr(main_mod, "Database", None)
+        if cur_main_db is not None and orig_main_db is not None and cur_main_db is not orig_main_db:
+            return cur_main_db
+    cur_swarm_db = globals().get("Database")
+    orig_swarm_db = globals().get("_ORIGINAL_SWARM_DATABASE")
+    if cur_swarm_db is not None and cur_swarm_db is not orig_swarm_db:
+        return cur_swarm_db
+    from database import Database as _DB
+    return _DB
+
+
+def _dispatch_cmd(name: str, args: Any, check_main_shim: bool = True) -> Any:
+    """Invokes CLI command handler `name`, honoring monkeypatches on the thin `main` shim when appropriate."""
+    if check_main_shim:
+        main_mod = sys.modules.get("main")
+        if main_mod is not None and main_mod.__dict__.get("_IS_SWARM_SHIM", False):
+            orig_bind = main_mod.__dict__.get("_ORIGINAL_SWARM_BINDS", {}).get(name)
+            cur_bind = getattr(main_mod, name, None)
+            if cur_bind is not None and orig_bind is not None and cur_bind is not orig_bind:
+                return cur_bind(args)
+    return globals()[name](args)
+
+
+def _parse_csv_list(raw: Optional[str]) -> Optional[List[str]]:
+    if not raw:
+        return None
+    items = [p.strip() for p in str(raw).split(",") if p.strip()]
+    return items or None
+
+
+def _sync_modular_args(args: Any, active_mode: str, raw_argv: List[str]) -> None:
+    """Maps unified swarm CLI options to modular pipeline attributes."""
+    if getattr(args, "target", None) is None:
+        args.target = getattr(args, "host", "127.0.0.1")
+    if getattr(args, "count", None) is None:
+        args.count = getattr(args, "max_rfcs", None) or 3
+    if getattr(args, "fragments", None) is None:
+        args.fragments = getattr(args, "limit", 5)
+    if getattr(args, "rollouts", None) is None:
+        args.rollouts = getattr(args, "dream_rollouts", 300)
+    args.demo = bool(getattr(args, "demo", False))
+    if active_mode == "caldera":
+        has_explicit_export = any(
+            a in ("--export-caldera", "--export") or a.startswith(("--export-caldera=", "--export="))
+            for a in raw_argv
+        )
+        args.export = (
+            getattr(args, "export_caldera", "caldera_export")
+            if (has_explicit_export or not getattr(args, "caldera_url", None))
+            else None
+        )
+    elif getattr(args, "export", None) is None:
+        args.export = getattr(args, "dream_export", "data/dream_policies.json")
+    if getattr(args, "push", None) is None:
+        args.push = getattr(args, "caldera_url", None)
+    if getattr(args, "api_key", None) is None:
+        args.api_key = getattr(args, "caldera_key", "ADMIN123")
+
+
+class _TrackExplicitStore(argparse.Action):
+    """Argparse action that records explicitly supplied CLI option destinations."""
+
+    def __call__(self, parser_obj, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        explicit_set = getattr(namespace, "_explicit_cli_dests", None)
+        if explicit_set is None:
+            explicit_set = set()
+            setattr(namespace, "_explicit_cli_dests", explicit_set)
+        explicit_set.add(self.dest)
 from permutator import VectorPermutator
 from probe_generator import ProbeGenerator
 from rfc_chunker import RFCChunker
@@ -979,7 +1066,9 @@ class ProtocolResearchSwarm:
         return "llm_generator_agent"
 
 
-    def build_graph(self) -> StateGraph:
+    def build_graph(self):
+        global END, StateGraph
+        END, StateGraph = _resolve_langgraph()
         builder = StateGraph(ResearchState)
 
         # Add Nodes
@@ -1102,6 +1191,38 @@ class ProtocolResearchSwarm:
         print(summary_text)
         return summary_text
 
+def _extract_cli_host_port(raw_val: str) -> Tuple[Optional[str], str, Optional[int]]:
+    """Extracts optional URL scheme, host (preserving unbracketed IPv6), and inline numeric port."""
+    raw_s = str(raw_val or "").strip()
+    scheme: Optional[str] = None
+    low = raw_s.lower()
+    if low.startswith("https://"):
+        scheme = "https"
+    elif low.startswith("http://"):
+        scheme = "http"
+    elif low.startswith("wss://"):
+        scheme = "https"
+    elif low.startswith("ws://"):
+        scheme = "http"
+    clean_h = re.sub(r"^(?:https?|wss?)://", "", raw_s, flags=re.IGNORECASE).split("/")[0]
+    if "@" in clean_h or "\\" in clean_h:
+        return scheme, clean_h, None
+    inline_port: Optional[int] = None
+    if clean_h.startswith("[") and "]" in clean_h:
+        end_idx = clean_h.index("]")
+        host_part = clean_h[1:end_idx]
+        rest = clean_h[end_idx + 1:]
+        if rest.startswith(":") and rest[1:].isdigit():
+            inline_port = int(rest[1:])
+        clean_h = host_part
+    elif clean_h.count(":") == 1:
+        host_part, port_part = clean_h.split(":", 1)
+        if port_part.isdigit():
+            clean_h = host_part
+            inline_port = int(port_part)
+    return scheme, clean_h, inline_port
+
+
 def parse_targets(raw_targets: Any, default_host: str, default_port: int, default_tls: bool) -> List[tuple]:
     """Parses comma-separated target terminators into a list of (host, port, tls) tuples."""
     if not raw_targets:
@@ -1115,19 +1236,13 @@ def parse_targets(raw_targets: Any, default_host: str, default_port: int, defaul
         t_str = t_str.strip()
         if not t_str:
             continue
-        if "://" in t_str:
-            proto, rest = t_str.split("://", 1)
-            t_tls = proto.lower() == "https"
+        scheme, h_val, p_val = _extract_cli_host_port(t_str)
+        if scheme is not None:
+            t_tls = scheme == "https"
         else:
-            rest = t_str
-            t_tls = default_tls or (":443" in rest)
-        rest = rest.split("/")[0]
-        if ":" in rest and not rest.startswith("["):
-            h, p = rest.split(":", 1)
-            p_int = int(p) if p.isdigit() else (443 if t_tls else 80)
-            target_list.append((h.strip(), p_int, t_tls))
-        else:
-            target_list.append((rest.strip(), 443 if t_tls else 80, t_tls))
+            t_tls = default_tls or (p_val == 443)
+        p_int = p_val if p_val is not None else (443 if t_tls else 80)
+        target_list.append((h_val.strip(), p_int, t_tls))
     return target_list or [(default_host, default_port, default_tls)]
 
 
@@ -1469,60 +1584,377 @@ def cmd_aiscan(args):
     using haasonsaas/aiscan and Python AST fallback scanner.
     """
     from engine.aiscan_integrator import AiscanIntegrator
-    from database import Database
 
-    db = Database(getattr(args, "db", "terminator.db"))
-    scanner = AiscanIntegrator(db=db)
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        scanner = AiscanIntegrator(db=db)
 
-    print("\n" + "=" * 75)
-    print("  HAASONSAAS/AISCAN: AI & PROMPT SECURITY AUDITOR (MODULE 18)")
-    print("  Credit: Jonathan Haas (https://github.com/haasonsaas/aiscan)")
-    print("=" * 75 + "\n")
+        print("\n" + "=" * 75)
+        print("  HAASONSAAS/AISCAN: AI & PROMPT SECURITY AUDITOR (MODULE 18)")
+        print("  Credit: Jonathan Haas (https://github.com/haasonsaas/aiscan)")
+        print("=" * 75 + "\n")
 
-    target_path = getattr(args, "aiscan_target", ".") or "."
-    print(f"[*] Initiating AI security scan on: {target_path}")
-    res = scanner.scan_target(target_path)
+        target_path = getattr(args, "aiscan_target", ".") or "."
+        print(f"[*] Initiating AI security scan on: {target_path}")
+        res = scanner.scan_target(target_path)
 
-    print(f"[*] Engine Used      : {res.get('engine', 'unknown')}")
-    print(f"[*] Total Findings   : {res.get('total_findings', 0)}")
-    print(f"[*] Total AI Sinks   : {res.get('total_endpoints', 0)}")
-    print("-" * 75)
+        print(f"[*] Engine Used      : {res.get('engine', 'unknown')}")
+        print(f"[*] Total Findings   : {res.get('total_findings', 0)}")
+        print(f"[*] Total AI Sinks   : {res.get('total_endpoints', 0)}")
+        print("-" * 75)
 
-    findings = res.get("findings", [])
-    if not findings:
-        print("[+] Zero AI vulnerabilities or prompt injection sinks detected.")
-    else:
-        print(f"{'SEVERITY':<10} {'TYPE':<28} {'LOCATION':<30} {'DESCRIPTION'}")
-        print(f"{'-'*10} {'-'*28} {'-'*30} {'-'*30}")
-        for f in findings[:25]:
-            loc = f"{Path(f['file_path']).name}:{f['line_number']}"
-            print(f"{f['severity']:<10} {f['finding_type']:<28} {loc:<30} {f['description'][:40]}")
+        findings = res.get("findings", [])
+        if not findings:
+            print("[+] Zero AI vulnerabilities or prompt injection sinks detected.")
+        else:
+            print(f"{'SEVERITY':<10} {'TYPE':<28} {'LOCATION':<30} {'DESCRIPTION'}")
+            print(f"{'-'*10} {'-'*28} {'-'*30} {'-'*30}")
+            for f in findings[:25]:
+                loc = f"{Path(f['file_path']).name}:{f['line_number']}"
+                print(f"{f['severity']:<10} {f['finding_type']:<28} {loc:<30} {f['description'][:40]}")
 
-    endpoints = res.get("endpoints", [])
-    if endpoints:
-        print("\n[*] DISCOVERED AI ENDPOINTS (PROMPT SMUGGLING TARGETS):")
-        for e in endpoints:
-            print(f"    -> {e['http_method']} {e['route_path']} ({Path(e['file_path']).name}:{e['line_number']})")
+        endpoints = res.get("endpoints", [])
+        if endpoints:
+            print("\n[*] DISCOVERED AI ENDPOINTS (PROMPT SMUGGLING TARGETS):")
+            for e in endpoints:
+                print(f"    -> {e['http_method']} {e['route_path']} ({Path(e['file_path']).name}:{e['line_number']})")
 
-    report_files = res.get("report_files", {})
-    if report_files:
-        print("\n[*] Reports saved to reports/ folder:")
-        for rtype, rpath in report_files.items():
-            print(f"    - {rtype.upper()}: {rpath}")
+        report_files = res.get("report_files", {})
+        if report_files:
+            print("\n[*] Reports saved to reports/ folder:")
+            for rtype, rpath in report_files.items():
+                print(f"    - {rtype.upper()}: {rpath}")
 
-    print("=" * 75 + "\n")
-    db.close()
+        print("=" * 75 + "\n")
+    finally:
+        db.close()
 
 
 def cmd_artex(args):
-    """
-    Executes BaaRai/ARTEX Dual-Graph (Asset Graph + Exploration Graph) Planner/Worker
-    durable attack chaining engine with Pillar 1-5 CLI flags.
-    """
-    import main as _main_cli
-    if not any(a == "--port" or a.startswith("--port=") for a in sys.argv[1:]) and getattr(args, "port", 5006) == 5006:
-        args.port = 8080
-    return _main_cli.cmd_artex(args)
+    """Execute BaaRai/ARTEX Dual-Graph & Durable Attack Chaining Engine (Module 17)."""
+    from datetime import datetime, timezone
+    from pathlib import Path as _Path
+    import secrets as _secrets
+    from engine.approval_gate import ApprovalGate
+    from engine.artex_bridge import ArtexProxyConfig, TrafficCaptureSession
+    from engine.cli_render import render_json, render_poe_summary
+    from engine.dual_graph_engine import DualGraphAttackEngine, NoiseGovernor
+    from engine.safe_network_validator import (
+        is_explicit_loopback_host,
+        parse_host_and_port,
+        validate_and_authorize_target,
+    )
+    from engine.session_loader import (
+        import_har_file,
+        import_openapi_spec,
+        load_auth_profiles,
+        load_scope_file,
+    )
+
+    raw_host = getattr(args, "host", None) or getattr(args, "target", None) or "127.0.0.1"
+    raw_port = int(getattr(args, "port", 8080) or 8080)
+    raw_tls = getattr(args, "tls", None)
+    as_json = bool(getattr(args, "as_json", False))
+    authorized = bool(getattr(args, "authorized", False))
+    t_host, t_port, inferred_tls = parse_host_and_port(
+        raw_host,
+        default_port=raw_port,
+        use_tls=bool(raw_tls) if raw_tls is not None else None,
+    )
+    use_tls = bool(raw_tls) or ("://" in str(raw_host) and inferred_tls)
+    ok, reason = validate_and_authorize_target(t_host, authorized=authorized)
+    if not ok:
+        print(f"[!] Target authorization error for {raw_host}: {reason}", file=(sys.stderr if as_json else sys.stdout))
+        sys.exit(1)
+
+    artex_multiturn = bool(getattr(args, "artex_multiturn", False))
+    artex_intent_turns = int(getattr(args, "artex_intent_turns", 0) or 0)
+    artex_intent_tokens = int(getattr(args, "artex_intent_tokens", 0) or 0)
+    artex_budget_turns = int(getattr(args, "artex_budget_turns", 0) or 0)
+    if artex_intent_turns < 0 or artex_intent_tokens < 0 or artex_budget_turns < 0:
+        print(
+            "[!] ARTEX budget/turn parameters must be non-negative (>= 0).",
+            file=(sys.stderr if as_json else sys.stdout),
+        )
+        sys.exit(1)
+
+    reports_dir = getattr(args, "output_dir", None) or "reports"
+    rounds = max(1, int(getattr(args, "artex_rounds", 1) or 1))
+    workers = max(1, int(getattr(args, "artex_workers", 3) or 3))
+    strict_poe = bool(getattr(args, "strict_poe", False))
+    approval_mode = getattr(args, "approval_mode", "policy") or "policy"
+    approval_rules = getattr(args, "approval_rules", None)
+    scope_file = getattr(args, "scope_file", None)
+    auth_profile = getattr(args, "auth_profile", None)
+    import_har = getattr(args, "import_har", None)
+    import_openapi = getattr(args, "import_openapi", None)
+    embedded_proxy = bool(getattr(args, "embedded_proxy", False))
+    embedded_proxy_port = int(getattr(args, "embedded_proxy_port", 0) or 0)
+    export_advisory = bool(getattr(args, "export_advisory", False))
+    export_csv = bool(getattr(args, "export_csv", False))
+    noise_profile = getattr(args, "artex_noise_profile", None)
+    llm_profiles = _parse_csv_list(getattr(args, "artex_llm_profiles", None))
+
+    shared_task_id = f"ARTEX-TASK-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{_secrets.token_hex(3)}"
+    shared_noise = NoiseGovernor(profile=noise_profile)
+
+    proxy_cfg = ArtexProxyConfig.from_env_or_args(
+        proxy_url=getattr(args, "artex_proxy", None),
+        ca_cert_path=getattr(args, "artex_ca_cert", None),
+        authorized=authorized,
+    )
+
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    embedded_mitm = None
+    arbiter = None
+    try:
+        if getattr(args, "fusion", True) and os.environ.get("RFCHUNT_OFFLINE") != "1":
+            try:
+                from fusion_engine import FusionArbiter
+                arbiter = FusionArbiter(
+                    db=db,
+                    preferred_model=getattr(args, "model", None),
+                    sec_model=getattr(args, "sec_model", None),
+                    quiet=as_json,
+                )
+            except Exception:
+                arbiter = None
+        traffic_session = TrafficCaptureSession(db=db, task_id=shared_task_id, proxy_config=proxy_cfg)
+        approval_gate = (
+            ApprovalGate.from_rules_file(approval_rules, mode=approval_mode, db=db, task_id=shared_task_id)
+            if approval_rules
+            else ApprovalGate(mode=approval_mode, db=db, task_id=shared_task_id)
+        )
+        loaded_scope = load_scope_file(scope_file) if scope_file else {"allow_hosts": [], "deny_hosts": [], "deny_routes": []}
+        scope_hosts_set = set(loaded_scope.get("allow_hosts") or []) or None
+        loaded_auth_profiles = load_auth_profiles(auth_profile) if auth_profile else {}
+
+        if embedded_proxy:
+            from engine.local_mitm_proxy import LocalRecordingMITMProxy
+            embedded_mitm = LocalRecordingMITMProxy(
+                host="127.0.0.1",
+                port=embedded_proxy_port,
+                db=db,
+                task_id=shared_task_id,
+                traffic_session=traffic_session,
+                noise_governor=shared_noise,
+                authorized=authorized or is_explicit_loopback_host(t_host),
+            )
+            embedded_mitm.start()
+            proxy_cfg = ArtexProxyConfig(
+                proxy_url=embedded_mitm.proxy_url,
+                ca_cert_path=embedded_mitm.ca_cert_path,
+                enabled=True,
+            )
+            traffic_session.proxy_config = proxy_cfg
+
+        artex_live_val = getattr(args, "artex_live", None)
+        if getattr(args, "no_artex_live", False):
+            artex_live_val = False
+        _is_loopback = is_explicit_loopback_host(t_host)
+        _enable_live = False
+        if artex_live_val is True:
+            _enable_live = bool(authorized or _is_loopback)
+        elif artex_live_val is None and (authorized or _is_loopback):
+            import socket as _sock
+            try:
+                with _sock.create_connection((t_host, t_port), timeout=1.0):
+                    _enable_live = True
+            except OSError:
+                _enable_live = False
+
+        live_executor_fn = None
+        live_registry = None
+        if _enable_live:
+            from engine.live_executors import LiveWorkerExecutorRegistry
+            live_registry = LiveWorkerExecutorRegistry(
+                host=t_host,
+                port=t_port,
+                use_tls=use_tls,
+                authorized=bool(authorized or _is_loopback),
+                traffic_session=traffic_session,
+                approval_gate=approval_gate,
+                noise_governor=shared_noise,
+                auth_profiles=loaded_auth_profiles,
+                arbiter=arbiter,
+            )
+            live_executor_fn = live_registry.as_executor_fn()
+
+        engine = DualGraphAttackEngine(
+            db=db,
+            reports_dir=reports_dir,
+            task_id=shared_task_id,
+            scope_hosts=scope_hosts_set,
+            noise_profile=noise_profile,
+            max_task_turns=artex_budget_turns,
+            max_intent_tokens=artex_intent_tokens,
+            max_intent_turns=artex_intent_turns,
+            llm_profile_ids=llm_profiles,
+            llm_rotate=bool(getattr(args, "artex_llm_rotate", False)),
+            proxy_config=proxy_cfg,
+            traffic_session=traffic_session,
+            workers=workers,
+            arbiter=arbiter,
+            strict_poe=strict_poe,
+            approval_gate=approval_gate,
+            default_executor_fn=live_executor_fn,
+        )
+        engine.noise_governor = shared_noise
+        engine.worker.noise_governor = shared_noise
+        if live_registry is not None:
+            live_registry.budget_ledger = engine.budget_ledger
+            live_registry.trace_store = engine.trace_store
+            live_registry.boundary = engine.boundary
+            live_registry.asset_graph = engine.asset_graph
+            if artex_multiturn:
+                mt_turns = artex_intent_turns if artex_intent_turns > 0 else None
+                engine.default_executor_fn = live_registry.as_multiturn_executor_fn(
+                    max_turns=mt_turns,
+                    budget_ledger=engine.budget_ledger,
+                    trace_store=engine.trace_store,
+                    boundary=engine.boundary,
+                    asset_graph=engine.asset_graph,
+                )
+        for deny_h in loaded_scope.get("deny_hosts") or []:
+            engine.asset_graph.deny_hosts.add(str(deny_h).lower())
+        for deny_r in loaded_scope.get("deny_routes") or []:
+            engine.asset_graph.deny_routes.append(str(deny_r))
+
+        if import_openapi:
+            import_openapi_spec(
+                import_openapi,
+                asset_graph=engine.asset_graph,
+                default_host=t_host,
+                default_port=t_port,
+                host=t_host,
+                port=t_port,
+            )
+        if import_har:
+            har_res = import_har_file(import_har, asset_graph=engine.asset_graph, traffic_session=traffic_session)
+            if not loaded_auth_profiles and har_res.get("extracted_auth_headers"):
+                from engine.session_loader import AuthProfile as _AP
+                loaded_auth_profiles["har_session"] = _AP(
+                    name="har_session",
+                    role="end_user",
+                    headers=dict(har_res["extracted_auth_headers"]),
+                )
+                if live_registry is not None:
+                    live_registry.auth_profiles.update(loaded_auth_profiles)
+
+        ai_sinks = []
+        try:
+            cur = db.conn.cursor()
+            cur.execute("SELECT DISTINCT file_path, model_or_api FROM ai_security_findings WHERE finding_type = 'unmetered_ai_endpoint'")
+            for r in cur.fetchall():
+                ai_sinks.append({"route": "/api/chat", "method": "POST", "model_provider": r["model_or_api"], "file_path": r["file_path"]})
+        except Exception:
+            pass
+        if not ai_sinks:
+            ai_sinks = [{"route": "/api/chat", "method": "POST", "model_provider": "local_ai", "file_path": "server.py"}]
+
+        engine.ingest_target_infrastructure(host=t_host, port=t_port, endpoints=["/api/v1"], ai_sinks=ai_sinks)
+        hydrated = engine.ingest_from_database(db)
+        if sum(hydrated.values()) == 0:
+            engine.register_wire_primitive(
+                anomaly_id="RFC9112-CHUNK-DESYNC",
+                description="HTTP/1.1 Framing Desync (Chunk Extension & Content-Length conflict)",
+                anomaly_type="CL.TE_DESYNC",
+            )
+
+        _stdout_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+        with _stdout_ctx:
+            res = engine.run_attack_chain_cycle(
+                round_num=rounds,
+                retest_existing=bool(getattr(args, "artex_retest", False)),
+            )
+
+            artex_url = getattr(args, "artex_url", None) or os.environ.get("ARTEX_API_URL")
+            remote_res = None
+            if artex_url:
+                remote_res = engine.sync_with_headless_artex(
+                    artex_url=artex_url,
+                    token=getattr(args, "artex_token", None),
+                    authorized=authorized,
+                    llm_profile_ids=llm_profiles,
+                    llm_rotate=bool(getattr(args, "artex_llm_rotate", False)) if llm_profiles else None,
+                    wait_sse=bool(getattr(args, "artex_wait_sse", False)),
+                )
+
+        stored_chains = db.get_attack_chains(limit=50, task_id=shared_task_id) if hasattr(db, "get_attack_chains") else []
+        traces_list = db.list_worker_traces(task_id=shared_task_id, limit=25) if hasattr(db, "list_worker_traces") else []
+
+        extra_exports: Dict[str, Any] = {}
+        if export_advisory or export_csv:
+            from engine.advisory_exporter import AdvisoryExporter, _safe_filename
+            out_dir = _Path(reports_dir)
+            exporter = AdvisoryExporter(reports_dir=out_dir)
+            if export_csv:
+                csv_path = out_dir / "findings_and_chains.csv"
+                exporter.export_findings_csv([], chains=stored_chains, output_path=csv_path)
+                extra_exports["csv"] = str(csv_path)
+            if export_advisory:
+                adv_paths: List[str] = []
+                for ch in stored_chains[:25]:
+                    cid = str(ch.get("chain_id") or "CHAIN")
+                    tid = ch.get("traffic_id")
+                    trec = db.get_traffic_evidence(tid) if tid else None
+                    rtests = db.get_chain_retests(chain_id=cid)
+                    out_md = out_dir / f"advisory_{_safe_filename(cid)}.md"
+                    exporter.export_ghsa_markdown(ch, traffic_record=trec, retests=rtests, output_path=out_md)
+                    adv_paths.append(str(out_md))
+                extra_exports["advisories"] = adv_paths
+
+        if getattr(args, "as_json", False):
+            render_json({"result": res, "hydrated": hydrated, "remote_artex": remote_res, "exports": extra_exports})
+            return
+
+        cov = res.get("coverage") or {}
+        todo = res.get("todolist_summary") or {}
+        print(f"\n[+] ARTEX Dual-Graph Attack Chaining Complete: target={t_host}:{t_port} rounds={rounds} workers={workers}")
+        print(f"    DB Hydrated        : {hydrated}")
+        print(f"    Assets / Coverage  : {res['total_assets']} assets ({cov.get('tested_assets', 0)}/{cov.get('total_in_scope_assets', 0)} = {cov.get('coverage_pct', 0.0)}%)")
+        print(f"    Attack Chains      : {res['candidates_planned']} planned | {res['exploits_verified']} verified | Max Hops: {res.get('max_hop_count', 0)}")
+        print(f"    Todolist / Traces  : {todo.get('completed_chains', 0)}/{todo.get('total_chains', 0)} chains complete | {res.get('worker_traces_count', 0)} worker traces | Goal Proven: {res.get('goal_proven', False)}")
+        if proxy_cfg.enabled:
+            print(f"    MITM Proxy         : {proxy_cfg.proxy_url}")
+        if remote_res is not None:
+            print(f"    Headless ARTEX API : {remote_res.get('status')} (task_id={remote_res.get('task_id')}, traffic_ingested={remote_res.get('traffic_ingested', 0)})")
+        for rtype, rpath in (res.get("report_files") or {}).items():
+            print(f"    Report ({rtype.upper():<7}) : {rpath}")
+        if extra_exports.get("csv"):
+            print(f"    CSV Export         : {extra_exports['csv']}")
+        if extra_exports.get("advisories"):
+            print(f"    GHSA Advisories    : {len(extra_exports['advisories'])} written")
+        render_poe_summary(
+            res.get("poe_breakdown") or {},
+            coverage=cov,
+            chains=stored_chains,
+            traces=traces_list,
+            plain=bool(getattr(args, "plain", False)),
+        )
+    except (PermissionError, ValueError) as exc:
+        print(f"[!] ARTEX execution rejected: {exc}", file=(sys.stderr if as_json else sys.stdout))
+        sys.exit(1)
+    finally:
+        if embedded_mitm is not None:
+            try:
+                embedded_mitm.stop()
+            except Exception:
+                pass
+        if arbiter is not None and hasattr(arbiter, "close"):
+            try:
+                arbiter.close()
+            except Exception:
+                pass
+        db.close()
+
+
+def cmd_artex_loop(args):
+    """Execute bounded multi-turn ArtexWorker tool loop via CLI."""
+    args.artex_multiturn = True
+    if getattr(args, "artex_live", None) is None and not bool(getattr(args, "no_artex_live", False)):
+        args.artex_live = True
+    return _dispatch_cmd("cmd_artex", args)
 
 
 def cmd_prompt_smuggle(args):
@@ -1539,40 +1971,41 @@ def cmd_prompt_smuggle(args):
         print(f"[!] Target authorization error for {t_host}: {reason}")
         sys.exit(1)
 
-    db = Database(getattr(args, "db", "terminator.db"))
-    synthesizer = PromptSmugglingSynthesizer(db=db)
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        synthesizer = PromptSmugglingSynthesizer(db=db)
 
-    print("\n" + "=" * 75)
-    print("  NOVEL ATTACK SYNTHESIZER: DESYNCHRONIZED PROMPT INJECTION (MODULE 19)")
-    print("  Couples HTTP Framing Desynchronization with Backend AI Sinks")
-    print("=" * 75 + "\n")
+        print("\n" + "=" * 75)
+        print("  NOVEL ATTACK SYNTHESIZER: DESYNCHRONIZED PROMPT INJECTION (MODULE 19)")
+        print("  Couples HTTP Framing Desynchronization with Backend AI Sinks")
+        print("=" * 75 + "\n")
 
-    t_host = getattr(args, "host", "127.0.0.1")
-    t_port = getattr(args, "port", 8080)
-    ai_route = getattr(args, "ai_route", "/api/chat") or "/api/chat"
+        t_port = getattr(args, "port", 8080)
+        ai_route = getattr(args, "ai_route", "/api/chat") or "/api/chat"
 
-    print(f"[*] Target Host        : {t_host}:{t_port}")
-    print(f"[*] Target AI Endpoint : {ai_route}")
-    print(f"[*] Synthesizing cross-layer attack streams (CL.TE, TE.CL, Chunk-Ext)...")
+        print(f"[*] Target Host        : {t_host}:{t_port}")
+        print(f"[*] Target AI Endpoint : {ai_route}")
+        print(f"[*] Synthesizing cross-layer attack streams (CL.TE, TE.CL, Chunk-Ext)...")
 
-    probes = synthesizer.synthesize_probes_for_endpoint(
-        target_host=t_host,
-        target_port=t_port,
-        ai_endpoint=ai_route,
-        http_method="POST",
-    )
+        probes = synthesizer.synthesize_probes_for_endpoint(
+            target_host=t_host,
+            target_port=t_port,
+            ai_endpoint=ai_route,
+            http_method="POST",
+        )
 
-    print(f"[+] Synthesized {len(probes)} novel Desynchronized Prompt Injection probe(s):\n")
-    for p in probes:
-        print(f"  -> [{p.attack_class}] ID: {p.probe_id}")
-        print(f"     Canary Token : {p.canary_token}")
-        print(f"     Target Sink  : {p.target_ai_endpoint}")
-        print(f"     Rationale    : {p.rationale[:90]}...")
-        print()
+        print(f"[+] Synthesized {len(probes)} novel Desynchronized Prompt Injection probe(s):\n")
+        for p in probes:
+            print(f"  -> [{p.attack_class}] ID: {p.probe_id}")
+            print(f"     Canary Token : {p.canary_token}")
+            print(f"     Target Sink  : {p.target_ai_endpoint}")
+            print(f"     Rationale    : {p.rationale[:90]}...")
+            print()
 
-    print(f"[*] Reports successfully generated in reports/ folder.")
-    print("=" * 75 + "\n")
-    db.close()
+        print(f"[*] Reports successfully generated in reports/ folder.")
+        print("=" * 75 + "\n")
+    finally:
+        db.close()
 
 
 def cmd_raptor(args):
@@ -1587,145 +2020,138 @@ def cmd_raptor(args):
         RAPTOR_REPO_URL,
         RAPTOR_DOCKER_IMAGE,
     )
-    from database import Database
 
-    db = Database(getattr(args, "db", "terminator.db"))
-    raptor = RaptorIntegrator(db=db)
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        raptor = RaptorIntegrator(db=db)
 
-    print(f"\n{'='*75}")
-    print(RaptorIntegrator.get_attribution_banner())
-    print(f"{'='*75}\n")
-
-    # 1. Setup / Bootstrap RAPTOR if requested
-    if getattr(args, "raptor_setup", False):
-        print("[*] Bootstrapping & configuring RAPTOR Security Framework...")
-        setup_res = raptor.ensure_installed()
-        if setup_res.get("stdout"):
-            print(setup_res["stdout"])
-        if setup_res.get("stderr"):
-            print(setup_res["stderr"])
-        db.close()
-        return
-
-    # 2. Status Check
-    if getattr(args, "raptor_status", False) or (hasattr(args, "status") and args.status):
-        st = raptor.check_status()
-        print(f"[*] RAPTOR SYSTEM STATUS:")
-        img_id = str(st.get("image_id") or "")[:12]
-        print(f"    Docker Image Ready     : {'YES (' + img_id + ')' if st['docker_ready'] else 'NO'}")
-        print(f"    Framework Installed    : {'YES (' + st['raptor_root'] + ')' if st['raptor_available'] else 'NO'}")
-        print(f"    Ollama Daemon Ready    : {'YES' if st['ollama_ready'] else 'NO'}")
-        print(f"    Preferred Model Ready  : {'YES (fenkohq/foundation-sec-8b:latest)' if st['preferred_model_installed'] else 'NO'}")
-        print(f"    Installed Models       : {', '.join(st['ollama_models'][:6]) or 'None detected'}")
+        print(f"\n{'='*75}")
+        print(RaptorIntegrator.get_attribution_banner())
         print(f"{'='*75}\n")
-        db.close()
-        return
 
-    # 2. Findings Summary
-    if getattr(args, "raptor_findings", False):
-        findings = raptor.list_all_findings(max_items=getattr(args, "limit", 50))
-        print(f"[*] RECENT RAPTOR VULNERABILITY FINDINGS (Total: {len(findings)}):")
-        if not findings:
-            print("    No previous findings discovered in out/ directory.")
+        # 1. Setup / Bootstrap RAPTOR if requested
+        if getattr(args, "raptor_setup", False):
+            print("[*] Bootstrapping & configuring RAPTOR Security Framework...")
+            setup_res = raptor.ensure_installed()
+            if setup_res.get("stdout"):
+                print(setup_res["stdout"])
+            if setup_res.get("stderr"):
+                print(setup_res["stderr"])
+            return
+
+        # 2. Status Check
+        if getattr(args, "raptor_status", False) or (hasattr(args, "status") and args.status):
+            st = raptor.check_status()
+            print(f"[*] RAPTOR SYSTEM STATUS:")
+            img_id = str(st.get("image_id") or "")[:12]
+            print(f"    Docker Image Ready     : {'YES (' + img_id + ')' if st['docker_ready'] else 'NO'}")
+            print(f"    Framework Installed    : {'YES (' + st['raptor_root'] + ')' if st['raptor_available'] else 'NO'}")
+            print(f"    Ollama Daemon Ready    : {'YES' if st['ollama_ready'] else 'NO'}")
+            print(f"    Preferred Model Ready  : {'YES (fenkohq/foundation-sec-8b:latest)' if st['preferred_model_installed'] else 'NO'}")
+            print(f"    Installed Models       : {', '.join(st['ollama_models'][:6]) or 'None detected'}")
+            print(f"{'='*75}\n")
+            return
+
+        # 2. Findings Summary
+        if getattr(args, "raptor_findings", False):
+            findings = raptor.list_all_findings(max_items=getattr(args, "limit", 50))
+            print(f"[*] RECENT RAPTOR VULNERABILITY FINDINGS (Total: {len(findings)}):")
+            if not findings:
+                print("    No previous findings discovered in out/ directory.")
+            else:
+                print(f"{'SEVERITY':<10} {'RULE ID':<30} {'LOCATION':<32} {'MESSAGE'}")
+                print(f"{'-'*10} {'-'*30} {'-'*32} {'-'*30}")
+                for f in findings:
+                    loc = f"{f['file']}:{f['line']}"
+                    print(f"{f['severity']:<10} {f['rule_id']:<30} {loc[:32]:<32} {f['message'][:50]}")
+            print(f"{'='*75}\n")
+            return
+
+        # 3. Determine Scan Target: Live Host vs Any Local Folder
+        target_repo = getattr(args, "raptor_target", None) or getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "target_arg", None)
+        host = getattr(args, "host", None)
+        raptor_mode = getattr(args, "raptor_mode", None)
+
+        if not target_repo and host and os.path.isdir(str(host)):
+            target_repo = str(host)
+        elif not target_repo and not host and raptor_mode in ("all", "full", "scan", "agentic", "crypto", "sca", "describe"):
+            target_repo = os.getcwd()
+
+        if target_repo and os.path.exists(str(target_repo)):
+            mode = raptor_mode or "all"
+            model = getattr(args, "raptor_model", "fenkohq/foundation-sec-8b:latest")
+            pg = getattr(args, "policy_groups", "") or ""
+            codeql = bool(getattr(args, "include_codeql", False))
+            if mode == "full":
+                mode = "all"
+            if mode == "describe":
+                desc_res = raptor.describe_target(target_repo)
+                if desc_res.get("stdout"):
+                    print(desc_res["stdout"])
+                res = {
+                    "target": str(target_repo),
+                    "mode": "describe",
+                    "duration_sec": 0.0,
+                    "total_findings": 0,
+                    "ingested_to_db": 0,
+                    "findings": [],
+                }
+            else:
+                res = raptor.run_scan(
+                    target_path=target_repo,
+                    mode=mode,
+                    model=model,
+                    policy_groups=pg,
+                    include_codeql=codeql,
+                    timeout_sec=3600 if mode == "all" else 1800,
+                )
         else:
-            print(f"{'SEVERITY':<10} {'RULE ID':<30} {'LOCATION':<32} {'MESSAGE'}")
-            print(f"{'-'*10} {'-'*30} {'-'*32} {'-'*30}")
-            for f in findings:
-                loc = f"{f['file']}:{f['line']}"
-                print(f"{f['severity']:<10} {f['rule_id']:<30} {loc[:32]:<32} {f['message'][:50]}")
+            if not host or host in ("127.0.0.1", "localhost") and getattr(args, "target", None):
+                host = getattr(args, "target", host)
+
+            port = getattr(args, "port", 443)
+            from engine.safe_network_validator import is_explicit_loopback_host
+            if port == 5006 and host and not is_explicit_loopback_host(str(host)):
+                port = 443
+            use_tls = bool(getattr(args, "tls", False) or port == 443)
+            authorized = bool(getattr(args, "authorized", False))
+
+            from engine.safe_network_validator import validate_and_authorize_target
+            ok, reason = validate_and_authorize_target(host, authorized=authorized)
+            if not ok:
+                print(f"[!] Target authorization error for {host}: {reason}")
+                sys.exit(1)
+
+            try:
+                res = raptor.run_host_scan(
+                    host=host,
+                    port=port,
+                    use_tls=use_tls,
+                    authorized=authorized,
+                )
+            except PermissionError as exc:
+                print(f"[!] Target authorization error for {host}: {exc}")
+                sys.exit(1)
+
+        if "error" in res:
+            print(f"[-] RAPTOR Execution Notice: {res['error']}")
+        else:
+            print(f"[+] RAPTOR Execution Completed Successfully!")
+            print(f"    Target             : {res.get('target_url') or res.get('target')}")
+            print(f"    Mode               : {res.get('mode')}")
+            print(f"    Duration           : {res.get('duration_sec')}s")
+            print(f"    Total Findings     : {res.get('total_findings')}")
+            print(f"    Ingested to DB     : {res.get('ingested_to_db')}")
+            if res.get("findings"):
+                print(f"\n[*] TOP DISCOVERED FINDINGS:")
+                print(f"{'SEVERITY':<10} {'RULE ID':<30} {'LOCATION':<32} {'MESSAGE'}")
+                print(f"{'-'*10} {'-'*30} {'-'*32} {'-'*30}")
+                for f in res["findings"][:15]:
+                    loc = f"{f['file']}:{f['line']}"
+                    print(f"{f['severity']:<10} {f['rule_id']:<30} {loc[:32]:<32} {f['message'][:50]}")
         print(f"{'='*75}\n")
+    finally:
         db.close()
-        return
-
-    # 3. Determine Scan Target: Live Host vs Any Local Folder
-    target_repo = getattr(args, "raptor_target", None) or getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "target_arg", None)
-    host = getattr(args, "host", None)
-    raptor_mode = getattr(args, "raptor_mode", None)
-
-    # Also support passing a folder path via --host / --target, or defaulting to current directory for repo scan modes
-    if not target_repo and host and os.path.isdir(str(host)):
-        target_repo = str(host)
-    elif not target_repo and not host and raptor_mode in ("all", "full", "scan", "agentic", "crypto", "sca", "describe"):
-        target_repo = os.getcwd()
-
-    # Check if target_repo points to an existing directory
-    if target_repo and os.path.exists(str(target_repo)):
-        mode = raptor_mode or "all"
-        model = getattr(args, "raptor_model", "fenkohq/foundation-sec-8b:latest")
-        pg = getattr(args, "policy_groups", "") or ""
-        codeql = bool(getattr(args, "include_codeql", False))
-        if mode == "full":
-            mode = "all"
-        if mode == "describe":
-            desc_res = raptor.describe_target(target_repo)
-            if desc_res.get("stdout"):
-                print(desc_res["stdout"])
-            res = {
-                "target": str(target_repo),
-                "mode": "describe",
-                "duration_sec": 0.0,
-                "total_findings": 0,
-                "ingested_to_db": 0,
-                "findings": [],
-            }
-        else:
-            res = raptor.run_scan(
-                target_path=target_repo,
-                mode=mode,
-                model=model,
-                policy_groups=pg,
-                include_codeql=codeql,
-                timeout_sec=3600 if mode == "all" else 1800,
-            )
-    else:
-        # Live Host Web Scan!
-        # Fall back to host argument or target URL
-        if not host or host in ("127.0.0.1", "localhost") and getattr(args, "target", None):
-            host = getattr(args, "target", host)
-
-        port = getattr(args, "port", 443)
-        from engine.safe_network_validator import is_explicit_loopback_host
-        if port == 5006 and host and not is_explicit_loopback_host(str(host)):
-            port = 443
-        use_tls = bool(getattr(args, "tls", False) or port == 443)
-        authorized = bool(getattr(args, "authorized", False))
-
-        from engine.safe_network_validator import validate_and_authorize_target
-        ok, reason = validate_and_authorize_target(host, authorized=authorized)
-        if not ok:
-            print(f"[!] Target authorization error for {host}: {reason}")
-            sys.exit(1)
-
-        try:
-            res = raptor.run_host_scan(
-                host=host,
-                port=port,
-                use_tls=use_tls,
-                authorized=authorized,
-            )
-        except PermissionError as exc:
-            print(f"[!] Target authorization error for {host}: {exc}")
-            sys.exit(1)
-
-    # 4. Display Results Summary
-    if "error" in res:
-        print(f"[-] RAPTOR Execution Notice: {res['error']}")
-    else:
-        print(f"[+] RAPTOR Execution Completed Successfully!")
-        print(f"    Target             : {res.get('target_url') or res.get('target')}")
-        print(f"    Mode               : {res.get('mode')}")
-        print(f"    Duration           : {res.get('duration_sec')}s")
-        print(f"    Total Findings     : {res.get('total_findings')}")
-        print(f"    Ingested to DB     : {res.get('ingested_to_db')}")
-        if res.get("findings"):
-            print(f"\n[*] TOP DISCOVERED FINDINGS:")
-            print(f"{'SEVERITY':<10} {'RULE ID':<30} {'LOCATION':<32} {'MESSAGE'}")
-            print(f"{'-'*10} {'-'*30} {'-'*32} {'-'*30}")
-            for f in res["findings"][:15]:
-                loc = f"{f['file']}:{f['line']}"
-                print(f"{f['severity']:<10} {f['rule_id']:<30} {loc[:32]:<32} {f['message'][:50]}")
-    print(f"{'='*75}\n")
-    db.close()
 
 
 def cmd_mantis(args):
@@ -1734,7 +2160,6 @@ def cmd_mantis(args):
     Tier 1/2 Reproduction, Calibrated CVSS Scoring, and Adversarial Patching with
     mandatory ModelFusion and refusal-free Abliterated models.
     """
-    from database import Database
     from engine.mantis_integrator import DEFAULT_ABLITERATED_MODEL, MantisIntegrator
 
     args.fusion = True
@@ -1751,46 +2176,50 @@ def cmd_mantis(args):
     depth = 30 if raw_depth is None else int(raw_depth)
     mode = getattr(args, "mantis_mode", "full") or "full"
     preferred_model = getattr(args, "mantis_model", None) or DEFAULT_ABLITERATED_MODEL
+    if getattr(args, "model", None) and "obliterated" in str(args.model).lower() and not getattr(args, "mantis_model", None):
+        preferred_model = args.model
     reports_dir = getattr(args, "output_dir", None) or "reports"
 
-    db = Database(args.db)
-    if getattr(args, "mantis_report", False):
-        findings = db.get_mantis_findings(limit=50)
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        if getattr(args, "mantis_report", False):
+            findings = db.get_mantis_findings(limit=50)
+            print(f"\n{'='*75}")
+            print(f"[*] GOOGLE MANTIS STORED FINDINGS ({len(findings)} rows)")
+            print(f"{'='*75}")
+            for f in findings[:20]:
+                print(
+                    f"  [{f.get('severity', 'INFO'):<8} CVSS {f.get('cvss_score', 0.0):<4}] "
+                    f"{f.get('rule_id', '')} ({f.get('cwe', '')}) "
+                    f"{os.path.basename(str(f.get('file_path', '')))}:{f.get('line_number', 0)} - {f.get('title', '')}"
+                )
+            print(f"{'='*75}\n")
+            return
+
         print(f"\n{'='*75}")
-        print(f"[*] GOOGLE MANTIS STORED FINDINGS ({len(findings)} rows)")
+        print(f"[*] MODULE 20: GOOGLE MANTIS SECURITY PIPELINE (Fusion + Abliterated Enforced)")
+        print(f"[*] Target: {os.path.abspath(str(target))} | Mode: {mode} | Depth: {depth}")
+        print(f"[*] Abliterated Model: {preferred_model}")
         print(f"{'='*75}")
-        for f in findings[:20]:
-            print(
-                f"  [{f.get('severity', 'INFO'):<8} CVSS {f.get('cvss_score', 0.0):<4}] "
-                f"{f.get('rule_id', '')} ({f.get('cwe', '')}) "
-                f"{os.path.basename(str(f.get('file_path', '')))}:{f.get('line_number', 0)} - {f.get('title', '')}"
-            )
+
+        integrator = MantisIntegrator(
+            db=db,
+            reports_dir=reports_dir,
+            use_fusion=True,
+            preferred_model=preferred_model,
+            sec_model=getattr(args, "sec_model", None),
+        )
+        res = integrator.run_scan(target_path=str(target), depth=depth, mode=mode)
+
+        print(f"[+] Mantis Completed in {res['elapsed_sec']}s | Profile: {res['depth_profile']}")
+        print(f"    Threat Model ID  : {res['threat_model_id']}")
+        print(f"    Files Discovered : {res['files_discovered']}")
+        print(f"    Total Findings   : {res['total_findings']} (Reproduced: {res['reproduced_count']}, Patched Verified: {res['patched_verified_count']})")
+        print(f"    SARIF Report     : {res['report_files'].get('sarif')}")
+        print(f"    JSON Summary     : {res['report_files'].get('summary_json')}")
         print(f"{'='*75}\n")
+    finally:
         db.close()
-        return
-
-    print(f"\n{'='*75}")
-    print(f"[*] MODULE 20: GOOGLE MANTIS SECURITY PIPELINE (Fusion + Abliterated Enforced)")
-    print(f"[*] Target: {os.path.abspath(str(target))} | Mode: {mode} | Depth: {depth}")
-    print(f"[*] Abliterated Model: {preferred_model}")
-    print(f"{'='*75}")
-
-    integrator = MantisIntegrator(
-        db=db,
-        reports_dir=reports_dir,
-        use_fusion=True,
-        preferred_model=preferred_model,
-    )
-    res = integrator.run_scan(target_path=str(target), depth=depth, mode=mode)
-
-    print(f"[+] Mantis Completed in {res['elapsed_sec']}s | Profile: {res['depth_profile']}")
-    print(f"    Threat Model ID  : {res['threat_model_id']}")
-    print(f"    Files Discovered : {res['files_discovered']}")
-    print(f"    Total Findings   : {res['total_findings']} (Reproduced: {res['reproduced_count']}, Patched Verified: {res['patched_verified_count']})")
-    print(f"    SARIF Report     : {res['report_files'].get('sarif')}")
-    print(f"    JSON Summary     : {res['report_files'].get('summary_json')}")
-    print(f"{'='*75}\n")
-    db.close()
 
 
 def cmd_all(args):
@@ -1799,12 +2228,12 @@ def cmd_all(args):
     RAPTOR (Docker or cross-platform SAST/PQC/SCA), and Prompt Smuggling / RFC framing analyzers
     against --repo or --path or remote --host with mandatory ModelFusion and Abliterated model enforcement.
     """
-    from database import Database
     from engine.mantis_integrator import DEFAULT_ABLITERATED_MODEL, run_unified_all_scans
+    from engine.safe_network_validator import is_explicit_loopback_host, validate_and_authorize_target
 
     args.fusion = True
     args.abliteration = True
-    host = getattr(args, "host", None)
+    host = getattr(args, "host", None) or getattr(args, "target", None)
     targets = getattr(args, "targets", None)
     repo = getattr(args, "repo", None) or getattr(args, "raptor_target", None)
     path = getattr(args, "path", None)
@@ -1819,8 +2248,10 @@ def cmd_all(args):
     depth = 100 if raw_depth is None else int(raw_depth)
     mantis_mode = getattr(args, "mantis_mode", "full") or "full"
     preferred_model = getattr(args, "mantis_model", None) or DEFAULT_ABLITERATED_MODEL
+    if getattr(args, "model", None) and "obliterated" in str(args.model).lower() and not getattr(args, "mantis_model", None):
+        preferred_model = args.model
     reports_dir = getattr(args, "output_dir", None) or "reports"
-    artex_rounds = int(getattr(args, "artex_rounds", 1) or 1)
+    artex_rounds = max(1, int(getattr(args, "artex_rounds", 1) or 1))
     authorized = bool(getattr(args, "authorized", False))
     allow_destructive = bool(getattr(args, "allow_destructive", False))
     as_json = bool(getattr(args, "as_json", False))
@@ -1836,13 +2267,12 @@ def cmd_all(args):
         sys.exit(1)
 
     if host:
-        from engine.safe_network_validator import validate_and_authorize_target
         ok, reason = validate_and_authorize_target(host, authorized=authorized)
         if not ok:
             print(f"[!] Target authorization error for {host}: {reason}", file=(sys.stderr if as_json else sys.stdout))
             sys.exit(1)
 
-    db = Database(args.db)
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
     try:
         if not as_json:
             print(f"\n{'='*75}")
@@ -1851,14 +2281,23 @@ def cmd_all(args):
             print(f"[*] Target: {target_disp} | Depth: {depth} | Model: {preferred_model}")
             print(f"{'='*75}")
 
-        raw_port = getattr(args, "port", 443)
-        port_arg = int(raw_port) if raw_port is not None else (None if host is None else 443)
-        from engine.safe_network_validator import is_explicit_loopback_host
-        if port_arg == 5006 and host and not is_explicit_loopback_host(str(host)):
-            port_arg = 443
+        raw_port = getattr(args, "port", None)
+        explicit_dests = getattr(args, "_explicit_cli_dests", set())
+        if "port" in explicit_dests and raw_port is not None:
+            port_arg = int(raw_port)
+        elif host and str(host).strip().lower().startswith("http://"):
+            port_arg = 80 if (hasattr(args, "_explicit_cli_dests") or raw_port in (None, 443, 5006)) else int(raw_port)
+        elif not host and "port" not in explicit_dests and (
+            raw_port is None or (hasattr(args, "_explicit_cli_dests") and raw_port in (443, 5006))
+        ):
+            port_arg = None
+        else:
+            port_arg = int(raw_port) if raw_port is not None else (None if not host else 443)
+            if port_arg == 5006 and host and not is_explicit_loopback_host(str(host)):
+                port_arg = 443
 
         raw_profiles = getattr(args, "artex_llm_profiles", None)
-        artex_llm_profiles = [p.strip() for p in str(raw_profiles).split(",") if p.strip()] if raw_profiles else None
+        artex_llm_profiles = _parse_csv_list(raw_profiles) if not isinstance(raw_profiles, list) else raw_profiles
         artex_live_val = getattr(args, "artex_live", None)
         if getattr(args, "no_artex_live", False):
             artex_live_val = False
@@ -1976,98 +2415,1318 @@ def cmd_harness2(args):
     Executes Google Research Harness² Recursive Agent Harnessing (arXiv:2610.14224)
     in standalone or report mode.
     """
-    from database import Database
     from engine.harness2_engine import Harness2ProtocolEngine, RFCHUNT_SURFACE
-
-    t_host = getattr(args, "host", "127.0.0.1")
     from engine.safe_network_validator import validate_and_authorize_target
+
+    t_host = getattr(args, "host", None) or getattr(args, "target", None) or "127.0.0.1"
     ok, reason = validate_and_authorize_target(t_host, authorized=getattr(args, "authorized", False))
     if not ok:
         print(f"[!] Target authorization error for {t_host}: {reason}")
         sys.exit(1)
 
-    db = Database(args.db)
-    h2_engine = Harness2ProtocolEngine(
-        runs_root=getattr(args, "harness2_runs_dir", "runs/harness2") or "runs/harness2",
-        target_host=args.host,
-        target_port=args.port,
-        db_path=args.db,
+    runs_root = getattr(args, "harness2_runs_dir", None) or getattr(args, "runs_dir", None) or "runs/harness2"
+    t_port = getattr(args, "port", 8080) or 8080
+    show_report = bool(getattr(args, "harness2_report", False) or getattr(args, "report", False))
+
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        h2_engine = Harness2ProtocolEngine(
+            runs_root=runs_root,
+            target_host=t_host,
+            target_port=t_port,
+            db_path=getattr(args, "db", "terminator.db"),
+        )
+
+        print(f"\n{'='*78}")
+        print("  GOOGLE RESEARCH HARNESS²: RECURSIVE AGENT HARNESSING FOR AN OPEN WORLD")
+        print("  Citation : Xu et al., Google Research (arXiv:2610.14224, 2026)")
+        print("  Repo     : https://github.com/google-research/harness2")
+        print(f"{'='*78}")
+
+        if show_report:
+            runs = db.get_harness2_runs(limit=getattr(args, "limit", None) or 25)
+            print(f"\n[*] HISTORICAL HARNESS² RECURSION RUNS ({len(runs)} recorded in {args.db}):")
+            if not runs:
+                print("    [~] No Harness² runs recorded yet. Executing a live k=1 run first...")
+            else:
+                print(f"  {'ID':<4} {'TASK':<10} {'DOMAIN':<28} {'MODE':<6} {'K':<3} {'R/P':<7} {'ADOPTED':<8} {'SCORE':<7}")
+                print(f"  {'-'*4} {'-'*10} {'-'*28} {'-'*6} {'-'*3} {'-'*7} {'-'*8} {'-'*7}")
+                for r in runs:
+                    rp = f"{r['rollouts_count']}/{r['sessions_count']}"
+                    print(
+                        f"  {r['run_id']:<4} {r['task_id']:<10} {r['domain'][:28]:<28} "
+                        f"{r['mode']:<6} {r['k_budget']:<3} {rp:<7} {r['adopted_label']:<8} {r['contrast_score']:<7.1f}"
+                    )
+                    print(f"       Lesson: {r['lesson']}")
+                print(f"{'='*78}\n")
+                return
+
+        rfc_items = [
+            r.strip().replace("RFC-", "").replace("RFC", "")
+            for r in str(getattr(args, "rfc", None) or "9112").split(",")
+            if r.strip()
+        ]
+        k = max(1, int(getattr(args, "harness2_k", None) or getattr(args, "k", None) or 1))
+        raw_h2_mode = getattr(args, "harness2_mode", None) or getattr(args, "mode", None) or "parallel"
+        req_mode = raw_h2_mode if raw_h2_mode in ("parallel", "sequential", "agg", "seq", "both") else "parallel"
+        modes_to_run = ["parallel", "sequential"] if req_mode == "both" else [req_mode]
+        domain = getattr(args, "harness2_domain", None) or getattr(args, "domain", None) or "auto"
+
+        for rfc_clean in rfc_items:
+            task_id = f"RFC{rfc_clean}"
+            for mode in modes_to_run:
+                print(f"  [+] Task ID                  : {task_id}")
+                print(f"  [+] Recursion Mode           : {mode} ({'WIDTH: 2k INV+DOM -> k AGG' if mode in ('parallel', 'agg') else 'DEPTH: k sequential Propose-Probe-Compose rounds'})")
+                print(f"  [+] Task Recursion Budget (k): {k} (Expected Rollouts R={4*k}, Improvement Stages P={3*k})")
+                print(f"  [+] Editable Surface (c1..c8): {', '.join(RFCHUNT_SURFACE.always_on)} + skills/ + sub_agents/ + scripts/ + plugin/")
+                print(f"  [+] Runs & Experience Dir    : {h2_engine.runs_root}")
+                print(f"{'-'*78}")
+
+                res = h2_engine.run_mode(mode=mode, task_id=task_id, k=k, domain=domain)
+                res_dict = res.to_dict()
+                db.save_harness2_run(res_dict)
+
+                print("\n  [*] TASK-LEVEL PROPOSE-PROBE-COMPOSE STAGES:")
+                for st in res.stages:
+                    view = res.rollouts.get(st.label)
+                    score_str = f"{view.behavioral_score:.1f}" if view else "N/A"
+                    div_str = f"{view.parser_divergences}" if view else "0"
+                    print(f"      - [{st.dim:<7}] Stage `{st.label:<10}` | Score: {score_str:<6} | Divergences: {div_str} | {st.notes}")
+
+                print("\n  [*] BUDGET IDENTITY VERIFICATION (Ledger):")
+                if res.ledger:
+                    l_dict = res.ledger.to_dict()
+                    print(
+                        f"      - Rollouts (R = 4k) : {l_dict['actual_rollouts']}/{l_dict['expected_rollouts']} "
+                        f"| Stages (P = 3k) : {l_dict['actual_sessions']}/{l_dict['expected_sessions']} "
+                        f"| Verified: {l_dict['budget_verified']}"
+                    )
+
+                print("\n  [*] HARNESSING-LEVEL RECURSION (Adopted Harness & Experience Library):")
+                print(f"      - Adopted Candidate : `{res.adopted_label}` (Domain: `{res.domain}`)")
+                if res.similarity:
+                    print(f"      - Candidate Diversity: Mean Jaccard={res.similarity['mean_jaccard_similarity']} (Diversity Index={res.similarity.get('diversity_index', 0.0)})")
+                print(f"      - Cue               : {res.experience.get('cue')}")
+                print(f"      - Lesson            : {res.experience.get('lesson')}")
+                print(f"      - Evidence          : {res.experience.get('evidence')}")
+                print(f"{'='*78}\n")
+    finally:
+        db.close()
+
+
+def cmd_scanner(args):
+    """Execute opt-in external scanners (`httpx`, `katana`, `nuclei`) into AssetGraph & DualGraph."""
+    from datetime import datetime, timezone
+    import secrets as _secrets
+    from engine.approval_gate import ApprovalGate
+    from engine.cli_render import render_json, render_kv_panel, render_table
+    from engine.dual_graph_engine import DualGraphAttackEngine, NoiseGovernor
+    from engine.external_scanners import (
+        DEFAULT_NUCLEI_TAGS,
+        ExternalScannerConfig,
+        _normalize_nuclei_tags,
+        run_opt_in_external_discovery,
+        run_opt_in_nuclei_scan,
+    )
+    from engine.safe_network_validator import (
+        is_explicit_loopback_host,
+        parse_host_and_port,
+        validate_and_authorize_target,
+    )
+    from engine.session_loader import load_scope_file
+
+    raw_host = getattr(args, "host", None) or getattr(args, "target", None) or "127.0.0.1"
+    raw_port = getattr(args, "port", None)
+    explicit_dests = getattr(args, "_explicit_cli_dests", set())
+    if "port" in explicit_dests and raw_port is not None:
+        eff_default_port = int(raw_port)
+    elif str(raw_host).strip().lower().startswith("http://"):
+        eff_default_port = 80
+    elif raw_port is not None:
+        eff_default_port = int(raw_port)
+    else:
+        eff_default_port = 443
+    raw_tls = getattr(args, "tls", None)
+    authorized = bool(getattr(args, "authorized", False))
+    as_json = bool(getattr(args, "as_json", False))
+    plain = bool(getattr(args, "plain", False))
+    err_stream = sys.stderr if as_json else sys.stdout
+
+    try:
+        clean_host, resolved_port, resolved_tls = parse_host_and_port(
+            raw_host,
+            default_port=eff_default_port,
+            use_tls=bool(raw_tls) if raw_tls is not None else None,
+        )
+        ok, reason = validate_and_authorize_target(clean_host, authorized=authorized)
+        if not ok:
+            raise PermissionError(reason)
+    except (PermissionError, ValueError) as exc:
+        print(f"[!] Target authorization error for {raw_host}: {exc}", file=err_stream)
+        sys.exit(1)
+
+    scanner_isolation = getattr(args, "scanner_isolation", "host") or "host"
+    if scanner_isolation not in ("host", "docker"):
+        print(
+            f"[!] Unsupported --scanner-isolation value: {scanner_isolation!r}. Expected 'host' or 'docker'.",
+            file=err_stream,
+        )
+        sys.exit(1)
+
+    raw_tags = getattr(args, "nuclei_tags", None)
+    try:
+        norm_tags = _normalize_nuclei_tags(raw_tags) if raw_tags is not None else DEFAULT_NUCLEI_TAGS
+    except (ValueError, PermissionError) as exc:
+        print(f"[!] Invalid --nuclei-tags: {exc}", file=err_stream)
+        sys.exit(1)
+
+    enable_all = bool(getattr(args, "enable_external_scanners", False))
+    hx = getattr(args, "httpx_scan", None)
+    kt = getattr(args, "katana_scan", None)
+    nc = getattr(args, "nuclei_scan", None)
+    any_enabled = enable_all or bool(hx) or bool(kt) or bool(nc)
+
+    fmt_host = f"[{clean_host}]" if ":" in clean_host and not clean_host.startswith("[") else clean_host
+    target_url = f"{'https' if resolved_tls else 'http'}://{fmt_host}:{resolved_port}"
+
+    if not any_enabled:
+        disabled_payload = {
+            "status": "disabled",
+            "ok": False,
+            "scans_run": 0,
+            "target": target_url,
+            "execution_mode": scanner_isolation,
+            "discovery": {"status": "disabled", "ok": False, "endpoints": [], "ai_sinks": []},
+            "nuclei": {"status": "disabled", "ok": False, "findings": [], "total_findings": 0},
+        }
+        if as_json:
+            render_json(disabled_payload)
+        else:
+            render_kv_panel(
+                "External Scanners (Opt-In Disabled)",
+                {
+                    "Status": "disabled (pass --enable-external-scanners or --httpx-scan/--katana-scan/--nuclei-scan)",
+                    "Target": target_url,
+                    "Isolation": scanner_isolation,
+                    "Scans Run": 0,
+                },
+                plain=plain,
+            )
+        return
+
+    if hx is None and kt is None and nc is None:
+        run_httpx = run_katana = run_nuclei = True
+    else:
+        run_httpx = bool(hx) if hx is not None else enable_all
+        run_katana = bool(kt) if kt is not None else enable_all
+        run_nuclei = bool(nc) if nc is not None else enable_all
+
+    try:
+        cfg = ExternalScannerConfig(
+            enabled=True,
+            execution_mode=scanner_isolation,
+            docker_image=getattr(args, "docker_image", None),
+            docker_network=getattr(args, "docker_network", None),
+            nuclei_tags=norm_tags,
+        )
+    except (ValueError, PermissionError) as exc:
+        print(f"[!] Invalid external scanner configuration: {exc}", file=err_stream)
+        sys.exit(1)
+
+    reports_dir = getattr(args, "output_dir", None) or "reports"
+    noise_profile = getattr(args, "artex_noise_profile", None)
+    approval_mode = getattr(args, "approval_mode", "policy") or "policy"
+    approval_rules = getattr(args, "approval_rules", None)
+    scope_file = getattr(args, "scope_file", None)
+    shared_task_id = f"SCAN-TASK-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{_secrets.token_hex(3)}"
+    eff_auth = bool(authorized or is_explicit_loopback_host(clean_host))
+
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        gate = (
+            ApprovalGate.from_rules_file(approval_rules, mode=approval_mode, db=db, task_id=shared_task_id)
+            if approval_rules
+            else ApprovalGate(mode=approval_mode, db=db, task_id=shared_task_id)
+        )
+        noise_gov = NoiseGovernor(profile=noise_profile)
+        loaded_scope = load_scope_file(scope_file) if scope_file else {"allow_hosts": [], "deny_hosts": [], "deny_routes": []}
+        scope_hosts_set = set(loaded_scope.get("allow_hosts") or []) or None
+
+        engine = DualGraphAttackEngine(
+            db=db,
+            reports_dir=reports_dir,
+            task_id=shared_task_id,
+            scope_hosts=scope_hosts_set,
+            noise_profile=noise_profile,
+            approval_gate=gate,
+        )
+        for deny_h in loaded_scope.get("deny_hosts") or []:
+            engine.asset_graph.deny_hosts.add(str(deny_h).lower())
+        for deny_r in loaded_scope.get("deny_routes") or []:
+            engine.asset_graph.deny_routes.append(str(deny_r))
+
+        discovery_res: Dict[str, Any] = {
+            "status": "disabled",
+            "ok": False,
+            "endpoints": [],
+            "ai_sinks": [],
+            "js_endpoints": [],
+            "technologies": [],
+            "assets_added": 0,
+        }
+        nuclei_res: Dict[str, Any] = {
+            "status": "disabled",
+            "ok": False,
+            "tags": list(norm_tags),
+            "findings": [],
+            "total_findings": 0,
+            "findings_ingested": 0,
+        }
+
+        _stdout_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+        with _stdout_ctx:
+            from engine.external_scanners import resolve_external_scanner_tool_configs
+            discovery_cfg, nuclei_cfg = resolve_external_scanner_tool_configs(
+                cfg,
+                run_httpx=run_httpx,
+                run_katana=run_katana,
+                run_nuclei=run_nuclei,
+            )
+            if run_httpx or run_katana:
+                discovery_res = run_opt_in_external_discovery(
+                    target_url,
+                    config=discovery_cfg,
+                    asset_graph=engine.asset_graph,
+                    authorized=eff_auth,
+                    approval_gate=gate,
+                    noise_governor=noise_gov,
+                    run_httpx=run_httpx,
+                    run_katana=run_katana,
+                )
+            if run_nuclei:
+                nuclei_res = run_opt_in_nuclei_scan(
+                    target_url,
+                    config=nuclei_cfg,
+                    dual_graph_engine=engine,
+                    authorized=eff_auth,
+                    approval_gate=gate,
+                    noise_governor=noise_gov,
+                )
+
+        scans_run = int(bool(run_httpx)) + int(bool(run_katana)) + int(bool(run_nuclei))
+        payload = {
+            "status": "completed",
+            "ok": bool(discovery_res.get("ok") or nuclei_res.get("ok")),
+            "scans_run": scans_run,
+            "task_id": shared_task_id,
+            "target": target_url,
+            "execution_mode": scanner_isolation,
+            "discovery": discovery_res,
+            "nuclei": nuclei_res,
+            "endpoints": list(discovery_res.get("endpoints") or []),
+            "ai_sinks": list(discovery_res.get("ai_sinks") or []),
+            "findings": list(nuclei_res.get("findings") or []),
+        }
+    except (PermissionError, ValueError) as exc:
+        print(f"[!] External scanner execution rejected: {exc}", file=err_stream)
+        sys.exit(1)
+    finally:
+        db.close()
+
+    if as_json:
+        render_json(payload)
+        return
+
+    render_kv_panel(
+        "External Scanners Summary",
+        {
+            "Task ID": shared_task_id,
+            "Target": target_url,
+            "Isolation": scanner_isolation,
+            "Scans Run": scans_run,
+            "Endpoints": len(payload["endpoints"]),
+            "AI Sinks": len(payload["ai_sinks"]),
+            "Nuclei Findings": len(payload["findings"]),
+        },
+        plain=plain,
+    )
+    rows: List[List[Any]] = []
+    for ep in payload["endpoints"]:
+        rows.append(["endpoint", ep, "AssetGraph"])
+    for nf in payload["findings"]:
+        if isinstance(nf, dict):
+            rows.append([nf.get("severity", "INFO"), nf.get("rule_id", ""), nf.get("file_path", "")])
+    render_table("Discovered Surface & Findings", ["Kind/Severity", "Item", "Target"], rows, plain=plain)
+
+
+def cmd_proxy(args):
+    """Start the embedded pure-CLI recording HTTP/HTTPS MITM proxy (Pillar 2)."""
+    import time as _time
+    from engine.artex_bridge import TrafficCaptureSession
+    from engine.cli_render import render_kv_panel
+    from engine.dual_graph_engine import NoiseGovernor
+    from engine.local_mitm_proxy import LocalRecordingMITMProxy, RewriteRule
+
+    rewrite_rules = []
+    for raw_rule in (getattr(args, "rewrite_rule", None) or []):
+        if ":" in raw_rule and "=" in raw_rule:
+            rname, rest = raw_rule.split(":", 1)
+            hname, hval = rest.split("=", 1)
+            rewrite_rules.append(
+                RewriteRule(rule_id=rname.strip(), phase="request", header_name=hname.strip(), header_value=hval.strip())
+            )
+        elif "=" in raw_rule:
+            hname, hval = raw_rule.split("=", 1)
+            rewrite_rules.append(
+                RewriteRule(rule_id=f"set_{hname.strip()}", phase="request", header_name=hname.strip(), header_value=hval.strip())
+            )
+
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        session = TrafficCaptureSession(db=db, task_id=getattr(args, "task_id", None) or "PROXY-SESSION")
+        governor = NoiseGovernor(profile=getattr(args, "noise_profile", None))
+        raw_port = getattr(args, "port", None)
+        bind_port = 8788 if raw_port is None else int(raw_port)
+        proxy = LocalRecordingMITMProxy(
+            host=getattr(args, "host", "127.0.0.1") or "127.0.0.1",
+            port=bind_port,
+            keys_dir=getattr(args, "ca_dir", "keys") or "keys",
+            traffic_session=session,
+            noise_governor=governor,
+            rewrite_rules=rewrite_rules,
+            authorized=bool(getattr(args, "authorized", False)),
+        )
+        proxy.start()
+        try:
+            info = {
+                "Proxy URL": proxy.proxy_url,
+                "CA Cert": proxy.ca_cert_path,
+                "DB": args.db,
+                "Noise Profile": governor.profile,
+                "Authorized Remote": bool(getattr(args, "authorized", False)),
+                "Rewrite Rules": len(rewrite_rules),
+            }
+            render_kv_panel(
+                "RFCHunt Embedded Recording MITM Proxy",
+                info,
+                as_json=bool(getattr(args, "as_json", False)),
+                plain=bool(getattr(args, "plain", False)),
+            )
+            duration = getattr(args, "duration", None)
+            if duration is not None and float(duration) >= 0:
+                _time.sleep(float(duration))
+            else:
+                try:
+                    while True:
+                        _time.sleep(0.5)
+                except KeyboardInterrupt:
+                    pass
+        finally:
+            proxy.stop()
+    finally:
+        db.close()
+
+
+def cmd_chains(args):
+    """Query and display persisted ARTEX attack chains from the SQLite database."""
+    from engine.cli_render import render_chains
+
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        min_poe = int(getattr(args, "min_poe", 0) or 0)
+        verified_only = bool(getattr(args, "verified_only", False))
+        chains = db.get_attack_chains(
+            limit=int(getattr(args, "limit", 50) or 50),
+            task_id=getattr(args, "task_id", None),
+            min_poe=min_poe if min_poe > 0 else None,
+            verified_only=verified_only,
+        )
+        render_chains(
+            chains,
+            as_json=bool(getattr(args, "as_json", False)),
+            plain=bool(getattr(args, "plain", False)),
+        )
+    finally:
+        db.close()
+
+
+def cmd_traces(args):
+    """Search and inspect persisted ARTEX shared worker traces."""
+    from engine.cli_render import render_traces
+
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        traces = db.list_worker_traces(
+            task_id=getattr(args, "task_id", None),
+            worker_id=getattr(args, "worker_id", None),
+            query=getattr(args, "query", None),
+            limit=int(getattr(args, "limit", 100) or 100),
+        )
+        render_traces(
+            traces,
+            as_json=bool(getattr(args, "as_json", False)),
+            plain=bool(getattr(args, "plain", False)),
+        )
+    finally:
+        db.close()
+
+
+def cmd_coverage(args):
+    """Compute and print the ARTEX Asset Coverage Ledger from persisted graphs."""
+    from engine.cli_render import render_coverage
+    from engine.dual_graph_engine import DualGraphAttackEngine
+
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        target_task_id = getattr(args, "task_id", None)
+        engine = DualGraphAttackEngine(db=None, task_id=target_task_id)
+        for n in db.get_dual_graph_nodes():
+            gtype = n.get("graph_type")
+            nid = n.get("node_id")
+            attrs = n.get("attributes") or {}
+            if gtype == "ASSET":
+                engine.asset_graph.add_asset(nid, n.get("node_type", "ENDPOINT"), n.get("label", nid), attrs)
+            elif gtype == "EXPLORATION":
+                node_task_id = attrs.get("task_id")
+                if target_task_id and node_task_id is not None and node_task_id != target_task_id:
+                    continue
+                engine.exploration_graph.add_intent(
+                    nid,
+                    n.get("node_type", "FACT"),
+                    n.get("label", nid),
+                    anchored_asset_id=attrs.get("anchored_asset"),
+                    attributes=attrs,
+                    status=attrs.get("status", "PENDING"),
+                )
+        for anc in db.get_exploration_anchors(task_id=target_task_id):
+            engine.exploration_graph.anchor_asset(anc["node_id"], anc["asset_id"])
+        cov = engine.compute_coverage_ledger()
+        render_coverage(
+            cov,
+            as_json=bool(getattr(args, "as_json", False)),
+            plain=bool(getattr(args, "plain", False)),
+        )
+    finally:
+        db.close()
+
+
+def cmd_retest(args):
+    """Replay persisted attack chains and record FIXED / STILL_REPRODUCIBLE / CANNOT_CONFIRM verdicts."""
+    from engine.artex_bridge import TrafficCaptureSession
+    from engine.cli_render import render_retest_results
+    from engine.dual_graph_engine import ArtexRetester
+    from engine.safe_network_validator import is_explicit_loopback_host, validate_and_authorize_target
+
+    target_host = getattr(args, "host", None)
+    target_port = getattr(args, "port", None)
+    use_tls = getattr(args, "tls", None)
+    authorized = bool(getattr(args, "authorized", False))
+    live = bool(getattr(args, "live", False))
+
+    if target_host:
+        ok, reason = validate_and_authorize_target(target_host, authorized=authorized)
+        if not ok:
+            print(f"[!] Target authorization error for {target_host}: {reason}")
+            sys.exit(1)
+        live = True
+        if is_explicit_loopback_host(target_host):
+            authorized = True
+
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        session = TrafficCaptureSession(db=db, task_id=getattr(args, "task_id", None) or "RETEST")
+        retester = ArtexRetester(db=db, traffic_session=session)
+        chain_id = getattr(args, "chain_id", None)
+        task_id_filter = getattr(args, "task_id", None)
+        if chain_id:
+            found = db.get_attack_chain(str(chain_id), task_id=task_id_filter)
+            if found is None:
+                print(f"[!] Attack chain '{chain_id}' not found.", file=sys.stderr)
+                sys.exit(1)
+            chains = [found]
+        else:
+            chains = db.get_attack_chains(
+                limit=int(getattr(args, "limit", 50) or 50),
+                task_id=task_id_filter,
+            )
+            if not getattr(args, "all_chains", False):
+                chains = chains[:10]
+
+        results = []
+        for ch in chains:
+            verifier_fn = None
+            if live and not ch.get("traffic_id") and target_host:
+                from engine.live_executors import LiveWorkerExecutorRegistry
+                reg = LiveWorkerExecutorRegistry(
+                    host=target_host,
+                    port=int(target_port or 80),
+                    use_tls=bool(use_tls),
+                    authorized=authorized,
+                    traffic_session=session,
+                )
+
+                def _live_fallback_verifier(chain_obj, _reg=reg):
+                    ok_v, ev, _, meta = _reg.execute_candidate_live({
+                        "attack_type": chain_obj.get("attack_type", ""),
+                        "target_route": chain_obj.get("target_endpoint") or "/",
+                        "raw_probe": chain_obj.get("raw_payload") or "",
+                    })
+                    if ok_v:
+                        return True, ev
+                    tid = meta.get("traffic_id")
+                    ex = session.get_exchange(tid) if tid else None
+                    if ex is not None and ex.status_code >= 500:
+                        return None, ev
+                    if ex is not None and ex.status_code in (400, 401, 403, 404, 405, 422):
+                        return False, ev
+                    return None, ev
+
+                verifier_fn = _live_fallback_verifier
+
+            results.append(
+                retester.retest_chain(
+                    ch,
+                    verifier_fn=verifier_fn,
+                    live=live,
+                    authorized=authorized,
+                    target_host=target_host,
+                    target_port=int(target_port) if target_port is not None else None,
+                    use_tls=use_tls,
+                )
+            )
+        render_retest_results(
+            results,
+            as_json=bool(getattr(args, "as_json", False)),
+            plain=bool(getattr(args, "plain", False)),
+        )
+    finally:
+        db.close()
+
+
+def cmd_export_advisory(args):
+    """Export GHSA-ready Markdown advisories and/or formula-safe CSV from persisted findings."""
+    from pathlib import Path as _Path
+    from engine.advisory_exporter import AdvisoryExporter, _safe_filename
+    from engine.cli_render import render_kv_panel
+
+    out_dir = _Path(getattr(args, "out", None) or "reports")
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        exporter = AdvisoryExporter(reports_dir=out_dir)
+        chain_id = getattr(args, "chain_id", None)
+        task_id_filter = getattr(args, "task_id", None)
+        if chain_id:
+            found = db.get_attack_chain(str(chain_id), task_id=task_id_filter)
+            if found is None:
+                print(f"[!] Attack chain '{chain_id}' not found.", file=sys.stderr)
+                sys.exit(1)
+            chains = [found]
+        else:
+            chains = db.get_attack_chains(
+                limit=int(getattr(args, "limit", 50) or 50),
+                task_id=task_id_filter,
+            )
+
+        written_md: List[str] = []
+        for ch in chains:
+            cid = str(ch.get("chain_id") or "CHAIN")
+            tid = ch.get("traffic_id")
+            trec = db.get_traffic_evidence(tid) if tid else None
+            rtests = db.get_chain_retests(chain_id=cid)
+            out_md = out_dir / f"advisory_{_safe_filename(cid)}.md"
+            exporter.export_ghsa_markdown(ch, traffic_record=trec, retests=rtests, output_path=out_md)
+            written_md.append(str(out_md))
+
+        csv_out = None
+        if getattr(args, "csv", False):
+            findings = db.get_mantis_findings(limit=500) if hasattr(db, "get_mantis_findings") else []
+            csv_path = out_dir / "findings_and_chains.csv"
+            exporter.export_findings_csv(findings, chains=chains, output_path=csv_path)
+            csv_out = str(csv_path)
+
+        summary = {
+            "Output Directory": str(out_dir),
+            "Advisories Exported": len(written_md),
+            "Files": written_md,
+            "CSV Exported": csv_out or "disabled",
+        }
+        render_kv_panel(
+            "RFCHunt Advisory Export",
+            summary,
+            as_json=bool(getattr(args, "as_json", False)),
+            plain=bool(getattr(args, "plain", False)),
+        )
+    finally:
+        db.close()
+
+
+def cmd_archive(args):
+    """Export or import AES-256-GCM encrypted task archives (*.rfca) with SHA-256 verification."""
+    from engine.advisory_exporter import AdvisoryExporter
+    from engine.cli_render import render_kv_panel
+    from engine.secret_store import SecretBox
+
+    key_file = getattr(args, "key_file", None)
+    export_path = getattr(args, "export_path", None)
+    import_path = getattr(args, "import_path", None)
+    if not export_path and not import_path:
+        print("[!] Specify either --export <file.rfca> or --import <file.rfca>.")
+        sys.exit(1)
+
+    if export_path:
+        db = _resolve_db_cls()(getattr(args, "db", "terminator.db"), secret_key_path=key_file)
+        try:
+            box = db.secret_box or SecretBox.from_env_or_keyfile(key_path=key_file, create_if_missing=True)
+            res = AdvisoryExporter().export_task_archive(
+                db,
+                export_path,
+                task_id=getattr(args, "task_id", None),
+                secret_box=box,
+            )
+            render_kv_panel(
+                "RFCHunt Encrypted Archive Export",
+                res,
+                as_json=bool(getattr(args, "as_json", False)),
+                plain=bool(getattr(args, "plain", False)),
+            )
+        finally:
+            db.close()
+    else:
+        box = SecretBox.from_env_or_keyfile(key_path=key_file, create_if_missing=False)
+        res = AdvisoryExporter.import_task_archive(import_path, secret_box=box)
+        summary = {
+            "Archive": import_path,
+            "Schema": res["schema"],
+            "Task ID": res["task_id"],
+            "Exported At": res["exported_at"],
+            "SHA-256": res["sha256"],
+            "Verified": res["verified"],
+            "Chains": len((res.get("payload") or {}).get("attack_chains") or []),
+            "Traffic Records": len((res.get("payload") or {}).get("traffic_evidence") or []),
+        }
+        render_kv_panel(
+            "RFCHunt Encrypted Archive Verification",
+            summary,
+            as_json=bool(getattr(args, "as_json", False)),
+            plain=bool(getattr(args, "plain", False)),
+        )
+
+
+def cmd_rea(args):
+    """Execute Module 21 (`morluto/rea`) client bundle, Electron `.asar`, source-map & live JS surface analyzer."""
+    from engine.approval_gate import ApprovalGate
+    from engine.cli_render import render_json, render_kv_panel, render_table
+    from engine.dual_graph_engine import NoiseGovernor
+    from engine.rea_integrator import ReaIntegrator
+    from engine.safe_network_validator import (
+        is_explicit_loopback_host,
+        parse_host_and_port,
+        validate_and_authorize_target,
     )
 
-    print(f"\n{'='*78}")
-    print("  GOOGLE RESEARCH HARNESS²: RECURSIVE AGENT HARNESSING FOR AN OPEN WORLD")
-    print("  Citation : Xu et al., Google Research (arXiv:2610.14224, 2026)")
-    print("  Repo     : https://github.com/google-research/harness2")
-    print(f"{'='*78}")
+    as_json = bool(getattr(args, "as_json", False))
+    plain = bool(getattr(args, "plain", False))
+    err_stream = sys.stderr if as_json else sys.stdout
+    target_path = getattr(args, "rea_target", None) or getattr(args, "path", None) or getattr(args, "repo", None)
+    raw_host = getattr(args, "host", None)
+    if not target_path and not raw_host:
+        target_path = "."
 
-    if getattr(args, "harness2_report", False):
-        runs = db.get_harness2_runs(limit=args.limit or 25)
-        print(f"\n[*] HISTORICAL HARNESS² RECURSION RUNS ({len(runs)} recorded in {args.db}):")
-        if not runs:
-            print("    [~] No Harness² runs recorded yet. Executing a live k=1 run first...")
+    clean_host = None
+    resolved_port = None
+    resolved_tls = bool(getattr(args, "tls", False))
+    authorized = bool(getattr(args, "authorized", False))
+
+    if raw_host:
+        raw_port = getattr(args, "port", None)
+        explicit_dests = getattr(args, "_explicit_cli_dests", set())
+        if "port" in explicit_dests and raw_port is not None:
+            eff_port = int(raw_port)
+        elif str(raw_host).strip().lower().startswith("http://"):
+            eff_port = 80
+        elif str(raw_host).strip().lower().startswith("https://"):
+            eff_port = 443
         else:
-            print(f"  {'ID':<4} {'TASK':<10} {'DOMAIN':<28} {'MODE':<6} {'K':<3} {'R/P':<7} {'ADOPTED':<8} {'SCORE':<7}")
-            print(f"  {'-'*4} {'-'*10} {'-'*28} {'-'*6} {'-'*3} {'-'*7} {'-'*8} {'-'*7}")
-            for r in runs:
-                rp = f"{r['rollouts_count']}/{r['sessions_count']}"
-                print(
-                    f"  {r['run_id']:<4} {r['task_id']:<10} {r['domain'][:28]:<28} "
-                    f"{r['mode']:<6} {r['k_budget']:<3} {rp:<7} {r['adopted_label']:<8} {r['contrast_score']:<7.1f}"
-                )
-                print(f"       Lesson: {r['lesson']}")
-            print(f"{'='*78}\n")
-            db.close()
+            eff_port = int(raw_port) if raw_port is not None else 443
+        try:
+            clean_host, resolved_port, resolved_tls = parse_host_and_port(
+                raw_host,
+                default_port=eff_port,
+                use_tls=True if getattr(args, "tls", False) else None,
+            )
+            ok, reason = validate_and_authorize_target(clean_host, authorized=authorized)
+            if not ok:
+                raise PermissionError(reason)
+        except (PermissionError, ValueError) as exc:
+            print(f"[!] REA target authorization error for {raw_host}: {exc}", file=err_stream)
+            sys.exit(1)
+
+    reports_dir = getattr(args, "output_dir", None) or "reports"
+    approval_mode = getattr(args, "approval_mode", "policy") or "policy"
+    approval_rules = getattr(args, "approval_rules", None)
+    noise_profile = getattr(args, "artex_noise_profile", None)
+
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        gate = (
+            ApprovalGate.from_rules_file(approval_rules, mode=approval_mode, db=db, task_id="REA-CLI")
+            if approval_rules
+            else ApprovalGate(mode=approval_mode, db=db, task_id="REA-CLI")
+        )
+        noise_gov = NoiseGovernor(profile=noise_profile)
+        integrator = ReaIntegrator(
+            db=db,
+            reports_dir=reports_dir,
+            approval_gate=gate,
+            noise_governor=noise_gov,
+        )
+        _stdout_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+        with _stdout_ctx:
+            result = integrator.analyze(
+                target_path=target_path,
+                host=clean_host,
+                port=resolved_port,
+                use_tls=resolved_tls,
+                authorized=bool(authorized or (clean_host and is_explicit_loopback_host(clean_host))),
+                use_rea_cli=bool(getattr(args, "rea_cli", False)),
+                write_reports=True,
+            )
+            payload = result.to_dict()
+    except (PermissionError, ValueError) as exc:
+        print(f"[!] REA execution rejected: {exc}", file=err_stream)
+        sys.exit(1)
+    finally:
+        db.close()
+
+    if as_json:
+        render_json(payload)
+        return
+
+    render_kv_panel(
+        "Module 21: REA Client Surface & Artifact Audit",
+        {
+            "Target": payload.get("target", ""),
+            "Status": payload.get("status", ""),
+            "Mode": payload.get("mode", ""),
+            "Findings": len(payload.get("findings") or []),
+            "Endpoints Mined": len(payload.get("discovered_endpoints") or []),
+            "AI Sinks Mined": len(payload.get("ai_sinks") or []),
+            "Electron IPC Channels": len(payload.get("ipc_channels") or []),
+            "SARIF Report": (payload.get("report_files") or {}).get("sarif", "-"),
+        },
+        plain=plain,
+    )
+    rows = [
+        [
+            f.get("severity", "MEDIUM"),
+            f.get("rule_id", ""),
+            f.get("title", ""),
+            f"{f.get('file_path', '')}:{f.get('line_number', 1)}",
+        ]
+        for f in (payload.get("findings") or [])
+    ]
+    render_table("REA Surface & Bundle Findings", ["Severity", "Rule ID", "Title", "Location"], rows, plain=plain)
+
+
+def cmd_fetch(args):
+    """Downloads core and recent normative RFC documents into local cache and DB."""
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    cache_dir = getattr(args, "cache_dir", "rfcs") or "rfcs"
+    count = int(getattr(args, "count", None) or getattr(args, "max_rfcs", None) or 3)
+    discover_recent = int(getattr(args, "discover_recent", 0) or 0)
+    fetcher = RFCFetcher(cache_dir=cache_dir, db=db)
+    try:
+        print(f"[+] Fetching core RFC documents (limit={count})...")
+        core_docs = fetcher.fetch_core_rfcs(limit=count)
+        print(f"[*] Fetched {len(core_docs)} core RFCs.")
+
+        if discover_recent:
+            print("[+] Scanning RFC index for newly published protocol specifications...")
+            recent_nums = fetcher.discover_recent_rfcs(max_discover=discover_recent)
+            for num in recent_nums:
+                fetcher.fetch_rfc_by_number(num)
+    finally:
+        if hasattr(fetcher, "client") and hasattr(fetcher.client, "close"):
+            fetcher.client.close()
+        db.close()
+
+
+def cmd_chunk(args):
+    """Chunks cached RFCs into terminator-weighted micro-inspiration fragments."""
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    sentences = int(getattr(args, "sentences", 2) or 2)
+    try:
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT rfc_id, doc_path FROM rfcs")
+        rows = cursor.fetchall()
+
+        if not rows:
+            print("[-] No RFCs found in database. Run 'fetch' first.")
             return
 
-    rfc_items = [
-        r.strip().replace("RFC-", "").replace("RFC", "")
-        for r in str(args.rfc or "9112").split(",")
-        if r.strip()
-    ]
-    k = max(1, int(getattr(args, "harness2_k", 1) or 1))
-    req_mode = getattr(args, "harness2_mode", "parallel") or "parallel"
-    modes_to_run = ["parallel", "sequential"] if req_mode == "both" else [req_mode]
-    domain = getattr(args, "harness2_domain", "auto") or "auto"
-
-    for rfc_clean in rfc_items:
-        task_id = f"RFC{rfc_clean}"
-        for mode in modes_to_run:
-            print(f"  [+] Task ID                  : {task_id}")
-            print(f"  [+] Recursion Mode           : {mode} ({'WIDTH: 2k INV+DOM -> k AGG' if mode in ('parallel', 'agg') else 'DEPTH: k sequential Propose-Probe-Compose rounds'})")
-            print(f"  [+] Task Recursion Budget (k): {k} (Expected Rollouts R={4*k}, Improvement Stages P={3*k})")
-            print(f"  [+] Editable Surface (c1..c8): {', '.join(RFCHUNT_SURFACE.always_on)} + skills/ + sub_agents/ + scripts/ + plugin/")
-            print(f"  [+] Runs & Experience Dir    : {h2_engine.runs_root}")
-            print(f"{'-'*78}")
-
-            res = h2_engine.run_mode(mode=mode, task_id=task_id, k=k, domain=domain)
-            res_dict = res.to_dict()
-            db.save_harness2_run(res_dict)
-
-            print("\n  [*] TASK-LEVEL PROPOSE-PROBE-COMPOSE STAGES:")
-            for st in res.stages:
-                view = res.rollouts.get(st.label)
-                score_str = f"{view.behavioral_score:.1f}" if view else "N/A"
-                div_str = f"{view.parser_divergences}" if view else "0"
-                print(f"      - [{st.dim:<7}] Stage `{st.label:<10}` | Score: {score_str:<6} | Divergences: {div_str} | {st.notes}")
-
-            print("\n  [*] BUDGET IDENTITY VERIFICATION (Ledger):")
-            if res.ledger:
-                l_dict = res.ledger.to_dict()
-                print(
-                    f"      - Rollouts (R = 4k) : {l_dict['actual_rollouts']}/{l_dict['expected_rollouts']} "
-                    f"| Stages (P = 3k) : {l_dict['actual_sessions']}/{l_dict['expected_sessions']} "
-                    f"| Verified: {l_dict['budget_verified']}"
+        total_chunks = 0
+        for row in rows:
+            rfc_id = row["rfc_id"]
+            doc_path = row["doc_path"]
+            try:
+                with open(doc_path, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read()
+                num_str = "".join(ch for ch in str(rfc_id) if ch.isdigit())
+                rfc_num = int(num_str) if num_str else None
+                fragments = RFCChunker.chunk_document_for_terminator(
+                    text, sentences_per_chunk=sentences, rfc_num=rfc_num
                 )
+                saved = db.save_fragments(rfc_id, fragments)
+                total_chunks += saved
+                print(f"[+] {rfc_id}: Generated and saved {saved} micro-inspiration fragments.")
+            except Exception as e:
+                print(f"[!] Error chunking {rfc_id}: {e}")
 
-            print("\n  [*] HARNESSING-LEVEL RECURSION (Adopted Harness & Experience Library):")
-            print(f"      - Adopted Candidate : `{res.adopted_label}` (Domain: `{res.domain}`)")
-            if res.similarity:
-                print(f"      - Candidate Diversity: Mean Jaccard={res.similarity['mean_jaccard_similarity']} (Diversity Index={res.similarity.get('diversity_index', 0.0)})")
-            print(f"      - Cue               : {res.experience.get('cue')}")
-            print(f"      - Lesson            : {res.experience.get('lesson')}")
-            print(f"      - Evidence          : {res.experience.get('evidence')}")
-            print(f"{'='*78}\n")
-    db.close()
+        print(f"[*] Successfully saved {total_chunks} total micro-inspiration fragments.")
+    finally:
+        db.close()
+
+
+def cmd_generate(args):
+    """Synthesizes candidate HTTP probes from unprocessed RFC fragments."""
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    limit = int(getattr(args, "limit", None) or getattr(args, "fragments", None) or 5)
+    try:
+        unprocessed = db.get_unprocessed_fragments(limit=limit)
+
+        if not unprocessed:
+            print("[-] No unprocessed fragments. Run 'chunk' first.")
+            return
+
+        print(f"[+] Generating novel candidate probes from {len(unprocessed)} fragments using {args.model} (fusion={args.fusion})...")
+        generator = ProbeGenerator(preferred_model=args.model, use_fusion=args.fusion, db=db)
+
+        total_probes = 0
+        for frag in unprocessed:
+            frag_id = frag["fragment_id"]
+            rfc_id = frag["rfc_id"]
+            content = frag["content"]
+
+            print(f"\n[*] Fragment [{rfc_id} #{frag_id}]: {content[:80]}...")
+            probes = generator.generate_candidate_probes(content, fragment_id=frag_id)
+            for p in probes:
+                print(f"    -> [Probe #{p.get('probe_id')}] (Clean: {p['is_clean']}) {p['rationale']}")
+                total_probes += 1
+
+        print(f"\n[+] Generated and saved {total_probes} candidate probes.")
+    finally:
+        db.close()
+
+
+def cmd_permute(args):
+    """Applies protocol vector permutations to stored LLM/fusion base probes."""
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    limit = int(getattr(args, "limit", None) or 10)
+    variants_cnt = int(getattr(args, "variants", 3) or 3)
+    try:
+        cursor = db.conn.cursor()
+        cursor.execute(
+            "SELECT probe_id, fragment_id, rationale, raw_request, is_clean FROM probes WHERE source_type IN ('llm', 'fusion') LIMIT ?",
+            (limit,),
+        )
+        rows = [dict(r) for r in cursor.fetchall()]
+
+        if not rows:
+            print("[-] No base probes to permute. Run 'generate' first.")
+            return
+
+        permutator = VectorPermutator(db=db)
+        total_permuted = 0
+        for row in rows:
+            variants = permutator.permute_probe(row, max_variants=variants_cnt)
+            for v in variants:
+                print(f"[+] Permutation #{v.get('probe_id')}: {v['rationale']}")
+                total_permuted += 1
+
+        print(f"[*] Generated {total_permuted} permuted probe variants.")
+    finally:
+        db.close()
+
+
+def cmd_evaluate(args):
+    """Evaluates pending probes with active host network containment."""
+    with HostContainmentManager():
+        return _cmd_evaluate_impl(args)
+
+
+def _cmd_evaluate_impl(args):
+    from deterministic_harness import DeterministicHarness
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    target_host = getattr(args, "target", None) or getattr(args, "host", "127.0.0.1")
+    target_port = int(getattr(args, "port", 8080) or 8080)
+    use_tls = bool(getattr(args, "tls", False))
+    timeout = float(getattr(args, "timeout", 3.0) or 3.0)
+    limit = int(getattr(args, "limit", 20) or 20)
+    try:
+        pending = db.get_pending_probes(target_host=target_host, limit=limit)
+
+        if not pending:
+            print(f"[-] No pending probes for target {target_host}. Generate probes first or check test history.")
+            return
+
+        harness = DeterministicHarness(
+            host=target_host,
+            port=target_port,
+            use_tls=use_tls,
+            timeout=timeout,
+            db=db,
+        )
+
+        print(f"[+] Starting deterministic evaluation of {len(pending)} probes against {target_host}:{target_port} (TLS={use_tls})...")
+
+        vulnerable_count = 0
+        concurrency = getattr(args, "concurrency", 4)
+        if concurrency > 1 and len(pending) > 1:
+            print(f"[*] Multithreaded evaluation active: {concurrency} threads (bounded by semaphore)")
+            probes_list = [dict(r) for r in pending]
+            results = harness.evaluate_batch_concurrent(probes_list, max_concurrency=concurrency)
+            for (is_vuln, desync_class, details, meta) in results:
+                if is_vuln:
+                    vulnerable_count += 1
+                    print(f"    [!] BREAKTHROUGH FINDING: {details} ({desync_class})")
+                else:
+                    if meta.get("anomalies"):
+                        for anom in meta["anomalies"]:
+                            print(f"    [~] ANOMALY DETECTED: {anom['type']} - {anom['description']}")
+        else:
+            for row in pending:
+                probe_dict = dict(row)
+                p_id = probe_dict["probe_id"]
+                print(f"\n[*] Evaluating Probe #{p_id}: {probe_dict['rationale'][:70]}...")
+
+                is_vuln, desync_class, details, meta = harness.run_evaluation(probe_dict)
+                if is_vuln:
+                    print(f"    [!] BREAKTHROUGH FINDING: {details}")
+                    print(f"    [!] Attack Class: {desync_class}")
+                    vulnerable_count += 1
+                else:
+                    print(f"    [-] Result: {details}")
+
+                if meta.get("anomalies"):
+                    for anom in meta["anomalies"]:
+                        print(f"    [~] ANOMALY DETECTED: {anom['type']} - {anom['description']}")
+
+        print(f"\n[*] Evaluation complete: {vulnerable_count} breakthroughs out of {len(pending)} evaluated.")
+    finally:
+        db.close()
+
+
+def cmd_weaponize(args):
+    """Tests Dangling-Byte Request Queue Poisoning against the target host."""
+    from weaponizer import RQPWeaponizer
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    target_host = getattr(args, "target", None) or getattr(args, "host", "127.0.0.1")
+    target_port = int(getattr(args, "port", 8080) or 8080)
+    use_tls = bool(getattr(args, "tls", False))
+    try:
+        weaponizer = RQPWeaponizer(
+            host=target_host,
+            port=target_port,
+            use_tls=use_tls,
+            db=db,
+        )
+
+        sample_trigger = (
+            "POST / HTTP/1.1\r\n"
+            "Host: target.local\r\n"
+            "Content-Type: multipart/byteranges; boundary=BOUND\r\n"
+            "Content-Length: 120\r\n\r\n"
+            "$PAYLOAD"
+        )
+
+        print(f"[+] Launching Autonomous RQP with Dangling-Byte Technique on {target_host}:{target_port}...")
+        is_stolen, reason, evidence = weaponizer.test_dangling_byte_rqp(sample_trigger)
+        if is_stolen:
+            print(f"\n[!] WEAPONIZATION SUCCESS: {reason}")
+        else:
+            print(f"\n[-] Weaponization outcome: {reason}")
+    finally:
+        db.close()
+
+
+def cmd_cascade(args):
+    """Formulates second-order shared-parser confusion hypotheses from confirmed findings."""
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        confirmed = db.get_confirmed_findings()
+
+        if not confirmed:
+            print("[-] No confirmed vulnerable findings yet. Run 'evaluate' to surface discoveries first.")
+            if getattr(args, "demo", False):
+                print("[*] Running Cascade Extrapolation demo on Kettle's RFC 2616 multipart/byteranges finding...")
+                confirmed = [{
+                    "eval_id": 1,
+                    "rationale": "RFC 2616 §19.2 response rule applied in request",
+                    "rfc_fragment": "The one exception is the 'multipart/byteranges' type when it appears in a 206 response.",
+                    "details": "Status shift 200 -> 405. Marker reflected in victim stream.",
+                    "raw_evidence": "HTTP/1.1 200 OK\r\n\r\nTrigger Accepted\n--- POLLUTED ---\nHTTP/1.1 405 Method Not Allowed",
+                }]
+            else:
+                return
+
+        cascade_engine = DiscoveryCascade(preferred_model=args.model, use_fusion=args.fusion, db=db)
+        for finding in confirmed:
+            f_dict = dict(finding)
+            print(f"\n[+] Extrapolating finding #{f_dict.get('eval_id')}: {f_dict.get('details')}")
+            result = cascade_engine.cascade_from_finding(f_dict, eval_id=f_dict.get("eval_id"))
+            if result:
+                print(f"    [Cascade Category]: {result['category']}")
+                print(f"    [Hypothesis]: {result['hypothesis']}")
+                print(f"    [New Probes Synthesized]: {len(result['suggested_probes'])}")
+    finally:
+        db.close()
+
+
+def cmd_lab(args):
+    """Starts standalone Test Lab Server with optional random high port and `--patched` toggle."""
+    from test_lab_server import TestLabServer
+    lab_host = getattr(args, "host", "127.0.0.1") or "127.0.0.1"
+    lab_port = int(getattr(args, "port", 8080) or 0)
+    if getattr(args, "random_port", False) or lab_port == 0:
+        lab_port = TestLabServer.get_high_random_port(min_port=10000, max_port=65000, host=lab_host)
+    server = TestLabServer(
+        host=lab_host,
+        port=lab_port,
+        auth_boundary_patched=bool(getattr(args, "patched", False)),
+    )
+    server.start()
+    try:
+        print(f"[*] Test Lab Server is active on http://{lab_host}:{lab_port}. Press Ctrl+C to stop.")
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        server.stop()
+
+
+def cmd_auto(args):
+    """Continuous research loop: Ingest -> Chunk -> Generate -> Permute -> Evaluate -> Cascade."""
+    from test_lab_server import TestLabServer
+    print("=" * 70)
+    print("  HTTP TERMINATOR: AUTONOMOUS PROTOCOL RESEARCH CASCADE ENGINE")
+    print("  Model: Google Gemma 2 / Local ModelFusion (Zero-Cost 24/7 Mode)")
+    print("=" * 70)
+
+    _dispatch_cmd("cmd_fetch", args)
+    _dispatch_cmd("cmd_chunk", args)
+    _dispatch_cmd("cmd_generate", args)
+    _dispatch_cmd("cmd_permute", args)
+
+    lab_server = None
+    target_host = getattr(args, "target", None) or getattr(args, "host", "127.0.0.1")
+    target_port = int(getattr(args, "port", 8080) or 8080)
+    if target_host == "127.0.0.1" and target_port == 8080:
+        lab_server = TestLabServer(host="127.0.0.1", port=8080)
+        lab_server.start()
+        time.sleep(0.5)
+
+    with HostContainmentManager():
+        try:
+            _dispatch_cmd("cmd_evaluate", args)
+            _dispatch_cmd("cmd_weaponize", args)
+            _dispatch_cmd("cmd_cascade", args)
+
+            try:
+                from engine.caldera_bridge import CalderaBridge
+                bridge = CalderaBridge(db_path=args.db)
+                c_res = bridge.export_plugin(output_dir="caldera_export")
+                bridge.export_plugin(output_dir=".")
+                print(f"\n[+] Caldera Auto-Sync [Default]: {c_res['abilities_count']} abilities and {c_res['adversaries_count']} adversaries updated.")
+            except Exception as e:
+                print(f"[-] Caldera Auto-Sync notice: {e}")
+
+            if not getattr(args, "no_dream_rsi", False):
+                try:
+                    print(f"\n[*] Dream-RSI Auto-Optimization [Default]: Evolving off-policy exploration trajectories...")
+                    _dispatch_cmd("cmd_dream", args)
+                except Exception as e:
+                    print(f"[-] Dream-RSI Auto-Optimization notice: {e}")
+        finally:
+            if lab_server:
+                lab_server.stop()
+
+
+def cmd_hunt(args):
+    """Continuously fetches RFCs and evaluates until flaws are discovered."""
+    from continuous_scanner import ContinuousFlawHunter
+
+    target_host = getattr(args, "target", None) or getattr(args, "host", "127.0.0.1")
+    target_port = int(getattr(args, "port", 8080) or 8080)
+    max_rfcs = int(getattr(args, "max_rfcs", None) or 15)
+    fragments = int(getattr(args, "fragments", None) or getattr(args, "limit", None) or 3)
+    variants = int(getattr(args, "variants", None) or 2)
+
+    hunter = ContinuousFlawHunter(
+        target_host=target_host,
+        target_port=target_port,
+        use_tls=bool(getattr(args, "tls", False)),
+        preferred_model=args.model,
+        use_fusion=args.fusion,
+        db_path=args.db,
+    )
+    flaws = hunter.run_until_flaw(
+        max_rfcs=max_rfcs,
+        fragments_per_rfc=fragments,
+        permutations_per_probe=variants,
+        stop_on_first_flaw=not bool(getattr(args, "keep_going", False)),
+    )
+    print(f"\n[*] Hunt complete. Total flaws/anomalies found: {len(flaws)}")
+
+    try:
+        from engine.caldera_bridge import CalderaBridge
+        bridge = CalderaBridge(db_path=args.db)
+        c_res = bridge.export_plugin(output_dir="caldera_export")
+        bridge.export_plugin(output_dir=".")
+        print(f"[+] Caldera Auto-Sync [Default]: {c_res['abilities_count']} abilities and {c_res['adversaries_count']} adversaries updated.")
+    except Exception:
+        pass
+
+    if not getattr(args, "no_dream_rsi", False):
+        try:
+            print(f"\n[*] Dream-RSI Auto-Optimization [Default]: Evolving off-policy exploration trajectories...")
+            _dispatch_cmd("cmd_dream", args)
+        except Exception:
+            pass
+
+
+def cmd_mcp(args):
+    """Runs the HTTP Terminator MCP Server over stdio, Streamable HTTP (/http), or Legacy SSE (/sse)."""
+    from mcp_server import MCPHttpServer, TerminatorMCPServer
+    transport = getattr(args, "mcp_transport", None) or getattr(args, "transport", None) or "stdio"
+    with TerminatorMCPServer(db_path=args.db) as server:
+        if transport == "stdio":
+            print("[+] Launching Model Context Protocol (MCP) Server over JSON-RPC stdio...", file=sys.stderr)
+            server.run_stdio()
+        else:
+            http_srv = MCPHttpServer(
+                server,
+                host=getattr(args, "mcp_host", "127.0.0.1") or "127.0.0.1",
+                port=int(getattr(args, "mcp_port", 8790) or 8790),
+                bearer_token=getattr(args, "mcp_token", None),
+            )
+            http_srv.serve_forever()
+
+
+def cmd_ruler(args):
+    """Measures front-end transformations using backend header length limits (James Kettle technique)."""
+    from protocol_ruler import ProtocolRuler
+    raw_host = getattr(args, "target", None) or getattr(args, "host", "127.0.0.1")
+    port = int(getattr(args, "port", 8080) or 8080)
+    use_tls = bool(getattr(args, "tls", False) or (port == 443))
+    targets_arg = getattr(args, "targets", None)
+    if targets_arg:
+        target_tuples = parse_targets(targets_arg, raw_host, port, use_tls)
+    else:
+        target_tuples = [(raw_host, port, use_tls)]
+
+    custom = None
+    if getattr(args, "sequence", None):
+        seq_str = args.sequence
+        if seq_str.startswith("\\x"):
+            seq_bytes = bytes.fromhex(seq_str.replace("\\x", ""))
+        else:
+            try:
+                seq_bytes = bytes.fromhex(seq_str)
+            except ValueError:
+                seq_bytes = seq_str.encode("latin-1")
+        custom = [(getattr(args, "name", "Custom Probe"), seq_bytes, f"Custom sequence: {seq_str}")]
+
+    raw_timeout = float(getattr(args, "timeout", 3.5) or 3.5)
+    ruler_timeout = raw_timeout if (0 < raw_timeout <= 30.0) else 3.5
+    max_size = int(getattr(args, "max_size", 131072) or 131072)
+
+    for t_host, t_port, t_tls in target_tuples:
+        proto_str = "https" if t_tls else "http"
+        print(f"\n{'='*75}")
+        print("[*] LAUNCHING PROTOCOL RULER ENGINE (James Kettle Benchmark Technique)")
+        print(f"[*] Target: {proto_str}://{t_host}:{t_port}")
+        print(f"{'='*75}")
+        ruler = ProtocolRuler(
+            host=t_host,
+            port=t_port,
+            use_tls=t_tls,
+            timeout=ruler_timeout,
+            verbose=bool(getattr(args, "verbose", False)),
+            debug=bool(getattr(args, "debug", False)),
+        )
+        ruler.run_comprehensive_audit(custom_sequences=custom, max_size=max_size)
+        print("\n[*] Protocol Ruler Audit Completed.")
+
+
+def cmd_dream(args):
+    """Executes offline Dream-RSI policy evolution over accumulated database trajectories."""
+    db_path = getattr(args, "db", "terminator.db")
+    target_host = getattr(args, "target", None) or getattr(args, "host", "127.0.0.1")
+    target_port = int(getattr(args, "port", 5006) or 5006)
+    export_path = getattr(args, "export", None) or getattr(args, "dream_export", "data/dream_policies.json")
+    generations = int(getattr(args, "generations", 2) or 2)
+    rollouts = int(getattr(args, "rollouts", None) or getattr(args, "dream_rollouts", 200) or 200)
+
+    print(f"[*] Initializing Dream-RSI World Model from {db_path}...")
+    model = ProtocolWorldModel(target_host=target_host, target_port=target_port)
+    loaded = model.ingest_history_from_db(db_path)
+    print(f"[+] Loaded {loaded} execution trajectories into offline World Model.")
+
+    optimizer = DreamRSIOptimizer(model)
+    store = DreamPolicyStore(storage_path=export_path)
+
+    print(f"[*] Executing {generations} generations of off-policy dreaming ({rollouts} rollouts each)...")
+    for _ in range(generations):
+        evolved = optimizer.evolve_policy_generation(rollouts_per_candidate=rollouts)
+        store.save_policy(evolved)
+        gain_str = f"+{evolved.rsi_gain * 100:.1f}%" if evolved.rsi_gain > 0 else "0.0%"
+        print(f"  [Gen {evolved.generation}] Fitness: {evolved.fitness_score:.2f} | RSI Gain: {gain_str} | Yield: {evolved.simulated_yield:.1%}")
+
+    summary = store.export_summary()
+    print(f"\n[+] Dream-RSI Optimization Complete. Policies saved to {export_path}.")
+    print(f"    Total Cumulative Gain: {summary.get('cumulative_rsi_gain_pct', 0.0)}%")
+    print(f"    Dominant Mutators: {summary.get('dominant_mutators', [])}")
+
+
+def cmd_caldera(args):
+    """Exports or pushes findings to Caldera adversary emulation platform."""
+    from engine.caldera_bridge import CalderaBridge
+
+    export_dir = getattr(args, "export", None) or getattr(args, "export_caldera", None)
+    push_url = getattr(args, "push", None) or getattr(args, "caldera_url", None)
+    api_key = getattr(args, "api_key", None) or getattr(args, "caldera_key", None)
+
+    bridge = CalderaBridge(db_path=args.db)
+    if export_dir and not push_url:
+        print(f"[*] Exporting Caldera plugin to {export_dir}...")
+        res = bridge.export_plugin(output_dir=export_dir)
+        print(f"[+] Caldera plugin successfully exported to {res['plugin_path']}:")
+        print(f"    Abilities generated: {res['abilities_count']}")
+        print(f"    Adversaries generated: {res['adversaries_count']}")
+        print(f"    Custom non-MITRE tactics: {', '.join(res['tactics'])}")
+    elif push_url:
+        if not api_key:
+            print("[!] Error: --api-key is required when using --push")
+            sys.exit(1)
+        print(f"[*] Pushing abilities to Caldera at {push_url}...")
+        findings = bridge.fetch_confirmed_findings_from_db()
+        abilities = [bridge.generate_ability(f) for f in findings]
+        adversary = bridge.generate_adversary(abilities) if abilities else None
+        res = bridge.push_to_caldera(push_url, api_key, abilities=abilities, adversary=adversary)
+        print(f"[+] Caldera API Push Result: {res['pushed_abilities']} abilities, {res['pushed_adversaries']} adversaries pushed.")
+        if res["errors"]:
+            print(f"[!] Warnings/Errors encountered during API push: {res['errors']}")
+    else:
+        print("[*] No action specified. Exporting to default directory: ./caldera_export...")
+        res = bridge.export_plugin(output_dir="caldera_export")
+        print(f"[+] Caldera plugin successfully exported to {res['plugin_path']} ({res['abilities_count']} abilities).")
+
+
+def cmd_build(args):
+    """Executes the unified 'Build All' pipeline."""
+    from build_all import run_full_build
+    success = run_full_build(skip_tests=bool(getattr(args, "skip_tests", False)))
+    if not success:
+        sys.exit(1)
 
 
 def print_harness2_help():
@@ -2408,8 +4067,8 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
         help="Execution mode (default: single)",
     )
     parser.add_argument("--list-terminators", action="store_true", help="Print the complete catalog of 25 Terminator RFC specifications and 36 wire/chunk/cross-protocol terminator mutators and exit")
-    parser.add_argument("--host", "--target", dest="host", type=str, default="127.0.0.1", help="Target host (domain or IP, default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=5006, help="Target port (default: 5006)")
+    parser.add_argument("--host", "--target", dest="host", type=str, default="127.0.0.1", action=_TrackExplicitStore, help="Target host (domain or IP, default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=5006, action=_TrackExplicitStore, help="Target port (default: 5006)")
     parser.add_argument("--tls", action="store_true", help="Enable TLS/HTTPS for remote host (auto-enabled if port is 443)")
     parser.add_argument("--targets", type=str, default=None, help="Comma-separated target terminators (e.g. '127.0.0.1:8080,https://target.local:8443')")
     parser.add_argument("--terminators", type=str, default="all", help="Comma-separated terminator categories: 'line,chunk,framing,cross_protocol,crlf_rhi,h2_gateway' or 'all' (default: all)")
@@ -2437,6 +4096,8 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--keywords", type=str, default=None, help="Comma-separated keywords to filter active RFCs (e.g. 'chunked,trailer,websocket')")
     parser.add_argument("--comb-only", "--offline", dest="comb_only", action="store_true", help="Offline RFC ingestion & probe generation into database without sending packets to any host")
     parser.add_argument("--no-lab", action="store_true", help="Do not auto-spawn the built-in local TestLabServer when targeting localhost/127.0.0.1")
+    parser.add_argument("--patched", action="store_true", default=False, help="Start TestLabServer with /internal/service auth-boundary patched (returns 403)")
+    parser.add_argument("--demo", action="store_true", default=False, help="Run cascade extrapolation demonstration when no confirmed findings exist")
     parser.add_argument("--mcp", action="store_true", help="Shortcut to launch the Model Context Protocol (MCP) JSON-RPC server over stdio")
     parser.add_argument("--build", action="store_true", help="Shortcut to run the unified 'Build All' verification pipeline")
     parser.add_argument("--skip-tests", action="store_true", help="Skip running pytest when executing --mode build / --build")
@@ -2485,9 +4146,9 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--no-harness2", dest="enable_harness2", action="store_false", help="Disable Google Research Harness² recursive agent harnessing")
     parser.add_argument("--harness2-k", "--k", dest="harness2_k", type=int, default=1, help="Harness² task-level recursion budget k (R=4k rollouts, P=3k improvement stages; default: 1)")
     parser.add_argument("--harness2-mode", type=str, choices=["parallel", "sequential", "agg", "seq", "both"], default="parallel", help="Harness² recursion mode: 'parallel' ('agg' width exploration), 'sequential' ('seq' depth refinement), or 'both'")
-    parser.add_argument("--harness2-domain", type=str, default="auto", help="Protocol domain for Harness² experience library (e.g. http11_framing, h2_translation, tls13_pqc, auto)")
-    parser.add_argument("--harness2-runs-dir", type=str, default="runs/harness2", help="Output directory for persisted Harness² domain libraries, INDEX.md, and EXPERIENCE.md (default: runs/harness2)")
-    parser.add_argument("--harness2-report", action="store_true", help="Display historical Harness² recursion runs, R=4k/P=3k ledger verification, and learned domain lessons")
+    parser.add_argument("--harness2-domain", "--domain", dest="harness2_domain", type=str, default="auto", help="Protocol domain for Harness² experience library (e.g. http11_framing, h2_translation, tls13_pqc, auto)")
+    parser.add_argument("--harness2-runs-dir", "--runs-dir", dest="harness2_runs_dir", type=str, default="runs/harness2", help="Output directory for persisted Harness² domain libraries, INDEX.md, and EXPERIENCE.md (default: runs/harness2)")
+    parser.add_argument("--harness2-report", "--report", dest="harness2_report", action="store_true", help="Display historical Harness² recursion runs, R=4k/P=3k ledger verification, and learned domain lessons")
 
     # RAPTOR Autonomous Offensive/Defensive Research Framework Integration
     # Credit: Gadi Evron, Daniel Cuthbert, Thomas Dullien (Halvar Flake)
@@ -2508,7 +4169,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
 
     # BaaRai/ARTEX Dual-Graph Attack Chaining (Module 17) & Headless REST/SSE/Proxy Bridge
     parser.add_argument("--artex", "--dual-graph", dest="enable_artex", action="store_true", help="Enable BaaRai/ARTEX Dual-Graph planner/worker attack chaining engine (Module 17)")
-    parser.add_argument("--artex-rounds", type=int, default=1, help="Number of multi-round planning cycles to execute in ARTEX Dual-Graph (default: 1)")
+    parser.add_argument("--artex-rounds", "--rounds", dest="artex_rounds", type=int, default=1, action=_TrackExplicitStore, help="Number of multi-round planning cycles to execute in ARTEX Dual-Graph (default: 1)")
     parser.add_argument("--artex-url", dest="artex_url", type=str, default=None, help="Headless BaaRai/ARTEX REST+SSE server URL (e.g. http://127.0.0.1:8787)")
     parser.add_argument("--artex-token", dest="artex_token", type=str, default=None, help="Bearer JWT token for headless ARTEX REST API")
     parser.add_argument("--artex-proxy", dest="artex_proxy", type=str, default=None, help="ARTEX recording MITM proxy URL (e.g. http://127.0.0.1:8788)")
@@ -2518,7 +4179,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--artex-llm-rotate", dest="artex_llm_rotate", action="store_true", default=False, help="Enable round-robin multi-LLM worker rotation (A, B, A, B)")
     parser.add_argument("--artex-wait-sse", dest="artex_wait_sse", action="store_true", default=False, help="Stream headless ARTEX SSE events until terminal completion")
     parser.add_argument("--artex-budget-turns", dest="artex_budget_turns", type=int, default=0, help="Optional max task turn budget for ARTEX attack chaining (0 = unlimited)")
-    parser.add_argument("--artex-retest", dest="artex_retest", action="store_true", default=False, help="Run ARTEX chain retest loop after attack chaining")
+    parser.add_argument("--artex-retest", "--retest", dest="artex_retest", action="store_true", default=False, help="Run ARTEX chain retest loop after attack chaining")
     parser.add_argument("--artex-workers", dest="artex_workers", type=int, default=3, help="Concurrent ARTEX worker pool size (default: 3)")
     parser.add_argument("--artex-live", dest="artex_live", action="store_true", default=None, help="Force live non-destructive ARTEX worker verification")
     parser.add_argument("--no-artex-live", dest="no_artex_live", action="store_true", default=False, help="Disable auto-live ARTEX worker verification")
@@ -2704,6 +4365,29 @@ CLI FLAGS FOR RAPTOR:
     print(help_text)
 
 
+def _normalize_harness2_argv(raw_args: List[str]) -> List[str]:
+    """Translates `harness2 --mode <parallel|sequential|agg|seq|both>` to `--harness2-mode` cleanly."""
+    h2_modes = {"parallel", "sequential", "agg", "seq", "both"}
+    pos_tokens = [tok for tok in raw_args if not tok.startswith("-")]
+    if "harness2" not in pos_tokens:
+        return list(raw_args)
+    out: List[str] = []
+    i = 0
+    while i < len(raw_args):
+        tok = raw_args[i]
+        if tok == "--mode" and i + 1 < len(raw_args) and raw_args[i + 1] in h2_modes:
+            out.extend(["--harness2-mode", raw_args[i + 1]])
+            i += 2
+            continue
+        if tok.startswith("--mode=") and tok.split("=", 1)[1] in h2_modes:
+            out.append("--harness2-mode=" + tok.split("=", 1)[1])
+            i += 1
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
 def parse_swarm_arguments(argv=None):
     """Parses arguments using build_swarm_parser."""
     raw_args = sys.argv[1:] if argv is None else list(argv)
@@ -2716,7 +4400,10 @@ def parse_swarm_arguments(argv=None):
             sys.exit(0)
 
     parser = build_swarm_parser()
-    args = parser.parse_args(argv)
+    norm_args = _normalize_harness2_argv(raw_args)
+    args = parser.parse_args(norm_args)
+    if not hasattr(args, "_explicit_cli_dests"):
+        args._explicit_cli_dests = set()
     if isinstance(args.targets, str):
         args.targets = [t.strip() for t in args.targets.split(",") if t.strip()]
     if isinstance(args.terminators, str):
@@ -2732,14 +4419,26 @@ def parse_swarm_arguments(argv=None):
 
 
 
-def main_swarm(argv=None):
-    """Primary execution entrypoint for rfc_hunt_swarm."""
+def main_swarm(argv=None, caller_profile: str = "swarm"):
+    """Primary unified CLI execution entrypoint for rfc_hunt_swarm (and thin compatibility callers)."""
     args = parse_swarm_arguments(argv)
 
     raw_argv = sys.argv[1:] if argv is None else list(argv)
+    explicit_dests = getattr(args, "_explicit_cli_dests", set())
     explicit_mode_given = bool(args.command) or any(
-        arg == "--mode" or arg.startswith("--mode=") for arg in raw_argv
+        arg == "--mode" or arg.startswith("--mode=") for arg in _normalize_harness2_argv(raw_argv)
     )
+
+    if caller_profile == "main" and not explicit_mode_given and not any(
+        getattr(args, flag, False) for flag in (
+            "ui", "build", "mcp", "kettle", "all_active", "enable_raptor", "list_terminators",
+            "run_all_scans", "enable_mantis", "enable_artex", "enable_aiscan", "enable_prompt_smuggle",
+            "enable_rea_only", "clean_db", "raptor_status", "raptor_findings", "raptor_setup",
+            "harness2_report", "mantis_report", "aiscan_report",
+        )
+    ):
+        build_swarm_parser().print_help()
+        sys.exit(0)
 
     # Resolve positional command / shortcut flags into active_mode
     if not explicit_mode_given:
@@ -2774,8 +4473,7 @@ def main_swarm(argv=None):
 
     # Handle Database Clean & Vacuum
     if getattr(args, "clean_db", False) or active_mode == "clean_db":
-        from database import Database
-        db_inst = Database(args.db)
+        db_inst = _resolve_db_cls()(args.db)
         try:
             res = db_inst.clean_db(
                 keep_rfcs=getattr(args, "keep_rfcs_on_clean", False),
@@ -2836,23 +4534,16 @@ def main_swarm(argv=None):
         print("=" * 78 + "\n")
         return
 
-    # Normalize default args.host (strip http://, https://, trailing slashes/paths, and inline :port)
+    # Normalize default args.host (strip scheme, trailing paths, and inline :port without corrupting IPv6)
     inline_port_extracted = False
     raw_host_scheme: Optional[str] = None
     if getattr(args, "host", None):
-        raw_h = str(args.host).strip()
-        if raw_h.lower().startswith("https://"):
-            raw_host_scheme = "https"
+        raw_host_scheme, clean_h, inline_port_val = _extract_cli_host_port(str(args.host))
+        if raw_host_scheme == "https":
             args.tls = True
-        elif raw_h.lower().startswith("http://"):
-            raw_host_scheme = "http"
-        clean_h = re.sub(r"^https?://", "", raw_h, flags=re.IGNORECASE).split("/")[0]
-        if ":" in clean_h and not clean_h.startswith("["):
-            parts = clean_h.split(":", 1)
-            clean_h = parts[0]
-            if len(parts) > 1 and parts[1].isdigit() and getattr(args, "port", 5006) == 5006:
-                args.port = int(parts[1])
-                inline_port_extracted = True
+        if inline_port_val is not None and getattr(args, "port", 5006) == 5006:
+            args.port = inline_port_val
+            inline_port_extracted = True
         args.host = clean_h
 
     # Configure ExecutionPolicy singleton with CLI flags and env opt-in
@@ -2861,34 +4552,24 @@ def main_swarm(argv=None):
 
     # Handle standalone modes that do not require remote target authorization first
     if active_mode == "build":
-        from build_all import run_full_build
-        ok = run_full_build(skip_tests=args.skip_tests)
-        sys.exit(0 if ok else 1)
-
-    if active_mode == "mcp":
-        from mcp_server import MCPHttpServer, TerminatorMCPServer
-        transport = getattr(args, "mcp_transport", "stdio") or "stdio"
-        with TerminatorMCPServer(db_path=args.db) as srv:
-            if transport == "stdio":
-                print("[+] Launching Model Context Protocol (MCP) Server over JSON-RPC stdio...", file=sys.stderr)
-                srv.run_stdio()
-            else:
-                http_srv = MCPHttpServer(
-                    srv,
-                    host=getattr(args, "mcp_host", "127.0.0.1") or "127.0.0.1",
-                    port=int(getattr(args, "mcp_port", 8790) or 8790),
-                    bearer_token=getattr(args, "mcp_token", None),
-                )
-                http_srv.serve_forever()
+        _dispatch_cmd("cmd_build", args)
         return
 
-    if active_mode in ("scanner", "artex-loop", "proxy", "retest", "chains", "traces", "coverage", "export-advisory", "archive", "rea"):
-        import main as _main_cli
-        argv_flags = raw_argv
-        has_port_flag = any(a == "--port" or a.startswith("--port=") for a in argv_flags)
-        has_host_flag = any(a in ("--host", "--target") or a.startswith(("--host=", "--target=")) for a in argv_flags)
-        has_limit_flag = any(a == "--limit" or a.startswith("--limit=") for a in argv_flags)
+    if active_mode == "mcp":
+        _dispatch_cmd("cmd_mcp", args)
+        return
 
+    has_port_flag = "port" in explicit_dests or any(a == "--port" or a.startswith("--port=") for a in raw_argv)
+    has_host_flag = "host" in explicit_dests or any(
+        a in ("--host", "--target") or a.startswith(("--host=", "--target=")) for a in raw_argv
+    )
+    has_limit_flag = any(a == "--limit" or a.startswith("--limit=") for a in raw_argv)
+    has_rounds_flag = "artex_rounds" in explicit_dests or any(
+        a in ("--artex-rounds", "--rounds") or a.startswith(("--artex-rounds=", "--rounds="))
+        for a in raw_argv
+    )
+
+    if active_mode in ("scanner", "artex-loop", "proxy", "retest", "chains", "traces", "coverage", "export-advisory", "archive", "rea"):
         if active_mode == "rea":
             if not has_host_flag:
                 args.host = None
@@ -2896,34 +4577,36 @@ def main_swarm(argv=None):
                 args.port = None
             if not getattr(args, "path", None) and not getattr(args, "repo", None) and getattr(args, "target_arg", None):
                 args.path = args.target_arg
-            _main_cli.cmd_rea(args)
+            _dispatch_cmd("cmd_rea", args)
         elif active_mode == "scanner":
             if not has_port_flag and not inline_port_extracted:
                 if raw_host_scheme == "http":
                     args.port = 80
-                    if not any(a == "--tls" for a in argv_flags):
+                    if not any(a == "--tls" for a in raw_argv):
                         args.tls = False
                 else:
                     args.port = 443
-            _main_cli.cmd_scanner(args)
+            _dispatch_cmd("cmd_scanner", args)
         elif active_mode == "artex-loop":
             if not has_port_flag and not inline_port_extracted:
                 args.port = 8080
-            _main_cli.cmd_artex_loop(args)
+            if not has_rounds_flag:
+                args.artex_rounds = 1
+            _dispatch_cmd("cmd_artex_loop", args)
         elif active_mode == "proxy":
             if not has_port_flag:
                 args.port = 8788
-            _main_cli.cmd_proxy(args)
+            _dispatch_cmd("cmd_proxy", args)
         elif active_mode == "chains":
             if not has_limit_flag:
                 args.limit = 50
-            _main_cli.cmd_chains(args)
+            _dispatch_cmd("cmd_chains", args)
         elif active_mode == "traces":
             if not has_limit_flag:
                 args.limit = 100
-            _main_cli.cmd_traces(args)
+            _dispatch_cmd("cmd_traces", args)
         elif active_mode == "coverage":
-            _main_cli.cmd_coverage(args)
+            _dispatch_cmd("cmd_coverage", args)
         elif active_mode == "retest":
             if not has_host_flag:
                 args.host = None
@@ -2931,110 +4614,105 @@ def main_swarm(argv=None):
                 args.port = None
             if not has_limit_flag:
                 args.limit = 50
-            _main_cli.cmd_retest(args)
+            _dispatch_cmd("cmd_retest", args)
         elif active_mode == "export-advisory":
             if not has_limit_flag:
                 args.limit = 50
-            _main_cli.cmd_export_advisory(args)
+            _dispatch_cmd("cmd_export_advisory", args)
         elif active_mode == "archive":
             if not getattr(args, "export_path", None) and any(
-                a == "--export" or a.startswith("--export=") for a in argv_flags
+                a == "--export" or a.startswith("--export=") for a in raw_argv
             ):
                 args.export_path = getattr(args, "dream_export", None)
-            _main_cli.cmd_archive(args)
+            _dispatch_cmd("cmd_archive", args)
         return
 
     if active_mode == "dashboard":
-        cmd_dashboard(args)
+        _dispatch_cmd("cmd_dashboard", args)
         return
 
     if active_mode == "export":
-        cmd_export(args)
+        _dispatch_cmd("cmd_export", args)
         return
 
     if active_mode == "oracle":
-        cmd_oracle(args)
+        _dispatch_cmd("cmd_oracle", args)
         return
 
     if active_mode == "h2":
-        cmd_h2(args)
+        _dispatch_cmd("cmd_h2", args)
         return
 
     if active_mode == "audit":
-        cmd_audit(args)
+        _dispatch_cmd("cmd_audit", args)
         return
 
     if active_mode == "start":
-        cmd_start(args)
+        _dispatch_cmd("cmd_start", args)
         return
 
     if active_mode == "ui":
-        cmd_ui(args)
+        _dispatch_cmd("cmd_ui", args)
         return
 
     if active_mode in ("vulns", "findings", "list"):
-        cmd_vulns(args)
+        _dispatch_cmd("cmd_vulns", args)
         return
 
     if getattr(args, "run_all_scans", False) or active_mode in ("all", "all_scans"):
-        argv_flags = raw_argv
-        has_host_flag = any(
-            a in ("--host", "--target") or a.startswith(("--host=", "--target="))
-            for a in argv_flags
-        )
-        has_port_flag = any(
-            a == "--port" or a.startswith("--port=")
-            for a in argv_flags
-        )
         if not has_host_flag:
             args.host = None
         elif raw_host_scheme == "http" and not has_port_flag and not inline_port_extracted:
             args.port = 80
-            if not any(a == "--tls" for a in argv_flags):
+            if not any(a == "--tls" for a in raw_argv):
                 args.tls = False
         elif raw_host_scheme == "https" and not has_port_flag and not inline_port_extracted:
             args.port = 443
-        if not has_host_flag and not has_port_flag and getattr(args, "port", 5006) == 5006:
+        elif caller_profile == "main" and has_host_flag and not has_port_flag and not inline_port_extracted:
+            args.port = 443
+        if not has_host_flag and not has_port_flag and getattr(args, "port", 5006) in (443, 5006):
             args.port = None
-        cmd_all(args)
+        _dispatch_cmd("cmd_all", args, check_main_shim=(caller_profile == "main"))
         return
 
     if active_mode == "mantis" or getattr(args, "enable_mantis", False) or getattr(args, "mantis_report", False):
-        cmd_mantis(args)
+        _dispatch_cmd("cmd_mantis", args, check_main_shim=(caller_profile == "main"))
         return
 
     if active_mode in ("aiscan", "ai") or getattr(args, "enable_aiscan", False) and not explicit_mode_given:
-        cmd_aiscan(args)
+        _dispatch_cmd("cmd_aiscan", args, check_main_shim=(caller_profile == "main"))
         return
 
     if active_mode in ("artex", "chain", "dual_graph", "dual-graph") or getattr(args, "enable_artex", False) and not explicit_mode_given:
-        cmd_artex(args)
+        if not has_port_flag and not inline_port_extracted and getattr(args, "port", 5006) == 5006:
+            args.port = 8080
+        if caller_profile == "main" and not has_rounds_flag:
+            args.artex_rounds = 2
+        _dispatch_cmd("cmd_artex", args, check_main_shim=True)
         return
 
     if active_mode in ("prompt_smuggle", "smuggle") or getattr(args, "enable_prompt_smuggle", False) and not explicit_mode_given:
-        cmd_prompt_smuggle(args)
+        _dispatch_cmd("cmd_prompt_smuggle", args, check_main_shim=(caller_profile == "main"))
         return
 
     if active_mode == "raptor" or getattr(args, "raptor_status", False) or getattr(args, "raptor_findings", False) or getattr(args, "raptor_setup", False):
-        cmd_raptor(args)
+        _dispatch_cmd("cmd_raptor", args, check_main_shim=(caller_profile == "main"))
         return
 
     if active_mode == "harness2" or getattr(args, "harness2_report", False):
-        cmd_harness2(args)
+        if caller_profile == "main" and not has_port_flag and not inline_port_extracted:
+            args.port = 8080
+        _dispatch_cmd("cmd_harness2", args, check_main_shim=(caller_profile == "main"))
         return
 
 
-    # Normalize default args.host (strip http://, https://, trailing slashes/paths, and inline :port)
+    # Normalize args.host cleanly if still unstripped
     if args.host:
-        raw_h = str(args.host).strip()
-        if raw_h.lower().startswith("https://"):
+        rem_scheme, clean_h, rem_port = _extract_cli_host_port(str(args.host))
+        if rem_scheme == "https":
             args.tls = True
-        clean_h = re.sub(r"^https?://", "", raw_h, flags=re.IGNORECASE).split("/")[0]
-        if ":" in clean_h and not clean_h.startswith("["):
-            parts = clean_h.split(":", 1)
-            clean_h = parts[0]
-            if len(parts) > 1 and parts[1].isdigit() and args.port == 5006:
-                args.port = int(parts[1])
+        if rem_port is not None and args.port == 5006:
+            args.port = rem_port
         args.host = clean_h
 
     use_tls = bool(args.tls or (args.port == 443))
@@ -3066,80 +4744,42 @@ def main_swarm(argv=None):
                 print(f"[!] Warning: Could not start background UI server: {e}")
 
     if active_mode == "lab":
-        from test_lab_server import TestLabServer
-        lab_port = args.port
-        if getattr(args, "random_port", False) or lab_port == 0:
-            lab_port = TestLabServer.get_high_random_port(min_port=10000, max_port=65000, host=args.host)
-        server = TestLabServer(host=args.host, port=lab_port)
-        server.start()
-        print(f"[*] Standalone Test Lab Server running on http://{args.host}:{lab_port}. Press Ctrl+C to stop.")
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            server.stop()
+        if caller_profile == "main" and not has_port_flag and not inline_port_extracted:
+            args.port = 8080
+        _dispatch_cmd("cmd_lab", args)
         return
 
     if active_mode == "ruler":
-        from protocol_ruler import ProtocolRuler
-        for t_host, t_port, t_tls in target_list:
-            proto_str = "https" if t_tls else "http"
-            print(f"\n{'='*75}")
-            print(f"[*] LAUNCHING PROTOCOL RULER ENGINE (James Kettle Benchmark Technique)")
-            print(f"[*] Target: {proto_str}://{t_host}:{t_port}")
-            print(f"{'='*75}")
-            ruler = ProtocolRuler(
-                host=t_host,
-                port=t_port,
-                use_tls=t_tls,
-                timeout=args.timeout if (0 < args.timeout <= 30.0) else 3.5,
-                verbose=args.verbose,
-                debug=args.debug,
-            )
-            custom_seqs = None
-            if args.sequence:
-                seq_str = args.sequence
-                if seq_str.startswith("\\x"):
-                    seq_bytes = bytes.fromhex(seq_str.replace("\\x", ""))
-                else:
-                    try:
-                        seq_bytes = bytes.fromhex(seq_str)
-                    except ValueError:
-                        seq_bytes = seq_str.encode("latin-1")
-                custom_seqs = [(args.name, seq_bytes, f"Custom sequence: {seq_str}")]
-            ruler.run_comprehensive_audit(custom_sequences=custom_seqs, max_size=args.max_size)
-            print("\n[*] Protocol Ruler Audit Completed.")
+        if caller_profile == "main" and not has_port_flag and not inline_port_extracted:
+            args.port = 443 if getattr(args, "tls", False) else 8080
+        _dispatch_cmd("cmd_ruler", args)
         return
 
-    # Delegate modular pipeline subcommands from main.py if selected
+    if caller_profile == "main" and active_mode == "hunt":
+        if not has_port_flag and not inline_port_extracted:
+            args.port = 8080
+        _sync_modular_args(args, active_mode, raw_argv)
+        _dispatch_cmd("cmd_hunt", args)
+        return
+
+    # Execute modular pipeline subcommands natively within rfc_hunt_swarm.py
     if active_mode in ("fetch", "chunk", "generate", "permute", "evaluate", "weaponize", "cascade", "dream", "caldera", "auto"):
-        import main as _main_cli
-        # Map unified args to main.py namespace expectations
-        args.target = args.host
-        args.count = args.max_rfcs or 3
-        args.fragments = args.limit
-        args.rollouts = args.dream_rollouts
-        args.demo = getattr(args, "demo", False)
-        if active_mode == "caldera":
-            has_explicit_caldera_export = any(a == "--export-caldera" or a.startswith("--export-caldera=") for a in raw_argv)
-            args.export = args.export_caldera if (has_explicit_caldera_export or not args.caldera_url) else None
-        else:
-            args.export = args.dream_export
-        args.push = args.caldera_url
-        args.api_key = args.caldera_key
+        if caller_profile == "main" and active_mode in ("evaluate", "weaponize", "auto", "hunt") and not has_port_flag and not inline_port_extracted:
+            args.port = 8080
+        _sync_modular_args(args, active_mode, raw_argv)
         dispatch_map = {
-            "fetch": _main_cli.cmd_fetch,
-            "chunk": _main_cli.cmd_chunk,
-            "generate": _main_cli.cmd_generate,
-            "permute": _main_cli.cmd_permute,
-            "evaluate": _main_cli.cmd_evaluate,
-            "weaponize": _main_cli.cmd_weaponize,
-            "cascade": _main_cli.cmd_cascade,
-            "dream": _main_cli.cmd_dream,
-            "caldera": _main_cli.cmd_caldera,
-            "auto": _main_cli.cmd_auto,
+            "fetch": "cmd_fetch",
+            "chunk": "cmd_chunk",
+            "generate": "cmd_generate",
+            "permute": "cmd_permute",
+            "evaluate": "cmd_evaluate",
+            "weaponize": "cmd_weaponize",
+            "cascade": "cmd_cascade",
+            "dream": "cmd_dream",
+            "caldera": "cmd_caldera",
+            "auto": "cmd_auto",
         }
-        dispatch_map[active_mode](args)
+        _dispatch_cmd(dispatch_map[active_mode], args)
         return
 
     # Iterate through target list for Hunt or Swarm
