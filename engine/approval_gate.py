@@ -391,8 +391,10 @@ def _is_safe_raptor_ps1(tokens: List[str]) -> bool:
             ):
                 return False
         else:
+            # Normalize separators cleanly so Windows-style relative paths like
+            # `scripts\Invoke-RaptorScan.ps1` resolve identically on POSIX/CI runners.
             # Check CWD hijack/symlink first if present in current working directory
-            cwd_cand = Path.cwd() / script_s
+            cwd_cand = Path.cwd() / script_norm
             if cwd_cand.exists() or cwd_cand.is_symlink():
                 resolved_cwd = cwd_cand.resolve()
                 resolved_cwd_s = str(resolved_cwd)
@@ -404,7 +406,7 @@ def _is_safe_raptor_ps1(tokens: List[str]) -> bool:
                 ):
                     return False
             # Also anchor relative path to repo_root so legitimate "scripts/Invoke-RaptorScan.ps1" works from any CWD
-            repo_cand = (repo_root / script_s).resolve()
+            repo_cand = (repo_root / script_norm).resolve()
             repo_cand_s = str(repo_cand)
             if _validate_canonical_path_syntax(repo_cand_s) is not None:
                 return False
