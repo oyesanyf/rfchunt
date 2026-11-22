@@ -9,7 +9,7 @@ Implements the 4 core anomaly detectors from the HTTP Terminator research:
 
 import logging
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("terminator.anomaly")
 
@@ -28,6 +28,7 @@ class AnomalyDetector:
         is_clean_probe: bool = False,
         separate_responses_count: int = 1,
         db: Optional[object] = None,
+        jepa_verdict: Optional[Any] = None,
     ) -> List[Dict[str, str]]:
         # Exact baseline subtraction (only suppress when response bytes are identical to baseline)
         if baseline_response and raw_response == baseline_response:
@@ -35,93 +36,121 @@ class AnomalyDetector:
 
         anomalies: List[Dict[str, str]] = []
 
-        if not raw_response:
-            return anomalies
+        if raw_response:
+            # 1. Check for Text / Binary Blend (Memory Leak or unhandled compression)
+            is_blend, blend_details = cls._check_text_binary_blend(raw_response)
+            if is_blend:
+                anomalies.append({
+                    "type": "text_binary_blend",
+                    "description": f"Text/Binary Blend detected: {blend_details}",
+                })
 
-        # 1. Check for Text / Binary Blend (Memory Leak or unhandled compression)
-        is_blend, blend_details = cls._check_text_binary_blend(raw_response)
-        if is_blend:
-            anomalies.append({
-                "type": "text_binary_blend",
-                "description": f"Text/Binary Blend detected: {blend_details}",
-            })
+            # 2. Check for Double HTML (Response Forking)
+            is_fork, fork_details = cls._check_double_html(raw_response)
+            if is_fork:
+                anomalies.append({
+                    "type": "double_html",
+                    "description": f"Response Forking / Double HTML: {fork_details}",
+                })
 
-        # 2. Check for Double HTML (Response Forking)
-        is_fork, fork_details = cls._check_double_html(raw_response)
-        if is_fork:
-            anomalies.append({
-                "type": "double_html",
-                "description": f"Response Forking / Double HTML: {fork_details}",
-            })
+            # 3. Check for Inline HTTP Headers (CVE-2026-63078 pattern)
+            is_inline, inline_details = cls._check_inline_headers(raw_response)
+            if is_inline:
+                anomalies.append({
+                    "type": "inline_headers",
+                    "description": f"Inline HTTP Response Headers in body: {inline_details}",
+                })
 
-        # 3. Check for Inline HTTP Headers (CVE-2026-63078 pattern)
-        is_inline, inline_details = cls._check_inline_headers(raw_response)
-        if is_inline:
-            anomalies.append({
-                "type": "inline_headers",
-                "description": f"Inline HTTP Response Headers in body: {inline_details}",
-            })
+            # 4. Check for Clean Probe Dual-Response
+            if is_clean_probe and (separate_responses_count >= 2 or cls._count_http_status_lines(raw_response) >= 2):
+                anomalies.append({
+                    "type": "clean_dual_response",
+                    "description": "Clean (RFC-compliant) request triggered multiple HTTP responses on one connection!",
+                })
 
-        # 4. Check for Clean Probe Dual-Response
-        if is_clean_probe and (separate_responses_count >= 2 or cls._count_http_status_lines(raw_response) >= 2):
-            anomalies.append({
-                "type": "clean_dual_response",
-                "description": "Clean (RFC-compliant) request triggered multiple HTTP responses on one connection!",
-            })
+            # 5. Check for Status-Line Reflection / HTTP/0.9 downgrade
+            is_status_refl, status_refl_details = cls._check_status_line_reflection(raw_response)
+            if is_status_refl:
+                anomalies.append({
+                    "type": "status_line_reflection",
+                    "description": f"Status-Line Reflection / Downgrade detected: {status_refl_details}",
+                })
 
-        # 5. Check for Status-Line Reflection / HTTP/0.9 downgrade
-        is_status_refl, status_refl_details = cls._check_status_line_reflection(raw_response)
-        if is_status_refl:
-            anomalies.append({
-                "type": "status_line_reflection",
-                "description": f"Status-Line Reflection / Downgrade detected: {status_refl_details}",
-            })
+            # 6. Check for Range Cache Mismatch (200 OK with Content-Range or multipart/byteranges)
+            is_range_mismatch, range_details = cls._check_range_cache_mismatch(raw_response)
+            if is_range_mismatch:
+                anomalies.append({
+                    "type": "range_cache_mismatch",
+                    "description": f"Range Cache Mismatch detected: {range_details}",
+                })
 
-        # 6. Check for Range Cache Mismatch (200 OK with Content-Range or multipart/byteranges)
-        is_range_mismatch, range_details = cls._check_range_cache_mismatch(raw_response)
-        if is_range_mismatch:
-            anomalies.append({
-                "type": "range_cache_mismatch",
-                "description": f"Range Cache Mismatch detected: {range_details}",
-            })
+            # 7. Check for CRLF Request Header Injection Discovery Signatures (417, 501, 505)
+            is_rhi, rhi_details = cls._check_rhi_discovery_probes(raw_response)
+            if is_rhi:
+                anomalies.append({
+                    "type": "crlf_rhi_discovery",
+                    "description": f"CRLF Request Header Injection confirmed: {rhi_details}",
+                })
 
-        # 7. Check for CRLF Request Header Injection Discovery Signatures (417, 501, 505)
-        is_rhi, rhi_details = cls._check_rhi_discovery_probes(raw_response)
-        if is_rhi:
-            anomalies.append({
-                "type": "crlf_rhi_discovery",
-                "description": f"CRLF Request Header Injection confirmed: {rhi_details}",
-            })
+            # 8. Check for Expect: 100-continue Tunneling Leak
+            is_tunnel, tunnel_details = cls._check_expect_100_tunnel_leak(raw_response)
+            if is_tunnel:
+                anomalies.append({
+                    "type": "expect_100_tunnel_leak",
+                    "description": f"Expect: 100-continue Tunneling Leak detected: {tunnel_details}",
+                })
 
-        # 8. Check for Expect: 100-continue Tunneling Leak
-        is_tunnel, tunnel_details = cls._check_expect_100_tunnel_leak(raw_response)
-        if is_tunnel:
-            anomalies.append({
-                "type": "expect_100_tunnel_leak",
-                "description": f"Expect: 100-continue Tunneling Leak detected: {tunnel_details}",
-            })
+            # 9. Check for HEAD + Range Body Over-Read
+            is_overread, overread_details = cls._check_head_range_overread(raw_response)
+            if is_overread:
+                anomalies.append({
+                    "type": "head_range_overread",
+                    "description": f"HEAD + Range Response Over-Read detected: {overread_details}",
+                })
 
-        # 9. Check for HEAD + Range Body Over-Read
-        is_overread, overread_details = cls._check_head_range_overread(raw_response)
-        if is_overread:
-            anomalies.append({
-                "type": "head_range_overread",
-                "description": f"HEAD + Range Response Over-Read detected: {overread_details}",
-            })
+            # 10. Check database-registered custom anomaly fingerprints if db is provided
+            if db is not None and hasattr(db, "get_anomaly_fingerprints"):
+                try:
+                    text_resp = raw_response.decode("latin-1", errors="ignore")
+                    for fp in db.get_anomaly_fingerprints():
+                        pat = fp.get("pattern", "")
+                        if pat and re.search(pat, text_resp, re.IGNORECASE):
+                            anomalies.append({
+                                "type": fp.get("name", "custom_fingerprint"),
+                                "description": fp.get("description", f"Matched custom fingerprint: {pat}"),
+                            })
+                except Exception as e:
+                    logger.warning("Error evaluating database anomaly fingerprints: %s", e)
 
-        # 10. Check database-registered custom anomaly fingerprints if db is provided
-        if db is not None and hasattr(db, "get_anomaly_fingerprints"):
+        # 11. Optional calibrated JEPA latent transition surprise sensor
+        if jepa_verdict is not None:
             try:
-                text_resp = raw_response.decode("latin-1", errors="ignore")
-                for fp in db.get_anomaly_fingerprints():
-                    pat = fp.get("pattern", "")
-                    if pat and re.search(pat, text_resp, re.IGNORECASE):
-                        anomalies.append({
-                            "type": fp.get("name", "custom_fingerprint"),
-                            "description": fp.get("description", f"Matched custom fingerprint: {pat}"),
-                        })
+                if isinstance(jepa_verdict, dict):
+                    v_calibrated = bool(jepa_verdict.get("calibrated", False))
+                    v_anomalous = bool(jepa_verdict.get("is_anomalous", False))
+                    v_score = float(jepa_verdict.get("surprise_score", 0.0))
+                    v_thresh = float(jepa_verdict.get("threshold", 0.0))
+                    v_profile = str(jepa_verdict.get("stack_profile", "generic"))
+                    v_reason = str(jepa_verdict.get("reason", ""))
+                else:
+                    v_calibrated = bool(getattr(jepa_verdict, "calibrated", False))
+                    v_anomalous = bool(getattr(jepa_verdict, "is_anomalous", False))
+                    v_score = float(getattr(jepa_verdict, "surprise_score", 0.0))
+                    v_thresh = float(getattr(jepa_verdict, "threshold", 0.0))
+                    v_profile = str(getattr(jepa_verdict, "stack_profile", "generic"))
+                    v_reason = str(getattr(jepa_verdict, "reason", ""))
+                if v_calibrated and v_anomalous and (baseline_response is None or raw_response != baseline_response):
+                    reason_suffix = f", reason={v_reason}" if v_reason else ""
+                    anomalies.append({
+                        "type": "latent_transition_surprise",
+                        "description": (
+                            f"Calibrated JEPA latent transition surprise detected "
+                            f"(score={v_score:.6f} > threshold={v_thresh:.6f}, "
+                            f"stack={v_profile}{reason_suffix})"
+                        ),
+                    })
             except Exception as e:
-                logger.warning("Error evaluating database anomaly fingerprints: %s", e)
+                logger.warning("Error evaluating JEPA surprise verdict: %s", e)
 
         return anomalies
 

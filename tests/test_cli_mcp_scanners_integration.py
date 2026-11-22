@@ -1592,3 +1592,136 @@ def test_dual_graph_ingest_from_database_idempotent_across_same_and_fresh_engine
             sc = str((r.get("attributes") or {}).get("scanner") or "")
             by_scanner[sc] = by_scanner.get(sc, 0) + 1
         assert by_scanner == {"nuclei": 1, "mantis": 1, "aiscan": 1}
+
+
+def test_run_unified_all_scans_remote_runs_external_scanners_by_default_and_toggles_off(
+    isolated_db: Database,
+    subprocess_recorder: SimpleNamespace,
+    loopback_server: SimpleNamespace,
+    tmp_path: Path,
+) -> None:
+    from engine.external_scanners import DEFAULT_NUCLEI_TAGS
+
+    subprocess_recorder.set_response(
+        "httpx",
+        stdout=json.dumps({"url": f"{loopback_server.url}/api/public", "status_code": 200, "tech": ["FastAPI"]}) + "\n",
+    )
+    subprocess_recorder.set_response(
+        "katana",
+        stdout=json.dumps({"request": {"method": "POST", "endpoint": f"{loopback_server.url}/api/ai/chat"}}) + "\n",
+    )
+    subprocess_recorder.set_response(
+        "nuclei",
+        stdout=json.dumps(
+            {
+                "template-id": "exposed-admin-default",
+                "info": {"name": "Exposed Admin Default", "severity": "medium", "tags": ["exposure"]},
+                "matched-at": f"{loopback_server.url}/api/admin",
+                "host": loopback_server.host,
+            }
+        )
+        + "\n",
+    )
+
+    # 1. Default-ON for remote target WITHOUT passing enable_external_scanners=True
+    res = run_unified_all_scans(
+        host=loopback_server.host,
+        port=loopback_server.port,
+        use_tls=False,
+        authorized=True,
+        db=isolated_db,
+        reports_dir=str(tmp_path / "rep_def_on"),
+        quiet=True,
+    )
+    assert res["engines"]["external_discovery"]["status"] == "completed"
+    assert res["engines"]["external_nuclei"]["status"] == "completed"
+    assert res["engines"]["external_nuclei"]["total_findings"] == 1
+    assert set(res["engines"]["external_nuclei"]["tags"]) == set(DEFAULT_NUCLEI_TAGS)
+    invoked = [Path(c["argv"][0]).name.lower() for c in subprocess_recorder.calls]
+    assert any(b.startswith("httpx") for b in invoked)
+    assert any(b.startswith("katana") for b in invoked)
+    assert any(b.startswith("nuclei") for b in invoked)
+    assert all(c["shell"] is False and "-rl" in c["argv"] for c in subprocess_recorder.calls)
+
+    # 2. Explicit enable_external_scanners=False cleanly disables all 3 external scanners
+    subprocess_recorder.calls.clear()
+    res_off = run_unified_all_scans(
+        host=loopback_server.host,
+        port=loopback_server.port,
+        use_tls=False,
+        authorized=True,
+        enable_external_scanners=False,
+        db=isolated_db,
+        reports_dir=str(tmp_path / "rep_def_off"),
+        quiet=True,
+    )
+    assert res_off["engines"]["external_discovery"]["status"] == "disabled"
+    assert res_off["engines"]["external_nuclei"]["status"] == "disabled"
+    assert len(subprocess_recorder.calls) == 0
+
+    # 3. Per-tool False cleanly disables individual scanners while leaving defaults active
+    subprocess_recorder.calls.clear()
+    res_per_tool = run_unified_all_scans(
+        host=loopback_server.host,
+        port=loopback_server.port,
+        use_tls=False,
+        authorized=True,
+        katana_scan=False,
+        nuclei_scan=False,
+        db=isolated_db,
+        reports_dir=str(tmp_path / "rep_per_tool"),
+        quiet=True,
+    )
+    invoked_pt = [Path(c["argv"][0]).name.lower() for c in subprocess_recorder.calls]
+    assert any(b.startswith("httpx") for b in invoked_pt)
+    assert not any(b.startswith(("katana", "nuclei")) for b in invoked_pt)
+    assert res_per_tool["engines"]["external_nuclei"]["status"] == "disabled"
+
+    # 3b. Explicit single-tool opt-in (httpx_scan=True without enable_external_scanners) runs ONLY that tool
+    subprocess_recorder.calls.clear()
+    res_single_opt = run_unified_all_scans(
+        host=loopback_server.host,
+        port=loopback_server.port,
+        use_tls=False,
+        authorized=True,
+        httpx_scan=True,
+        db=isolated_db,
+        reports_dir=str(tmp_path / "rep_single_opt"),
+        quiet=True,
+    )
+    invoked_so = [Path(c["argv"][0]).name.lower() for c in subprocess_recorder.calls]
+    assert len(invoked_so) == 1 and invoked_so[0].startswith("httpx")
+    assert res_single_opt["engines"]["external_nuclei"]["status"] == "disabled"
+
+    # 4. approval_mode="deny" with implicit default (enable_external_scanners=None) skips cleanly (0 calls, no PermissionError)
+    subprocess_recorder.calls.clear()
+    loopback_server.reset()
+    res_deny_default = run_unified_all_scans(
+        host=loopback_server.host,
+        port=loopback_server.port,
+        use_tls=False,
+        authorized=True,
+        approval_mode="deny",
+        db=isolated_db,
+        reports_dir=str(tmp_path / "rep_deny_def"),
+        quiet=True,
+    )
+    assert res_deny_default["engines"]["external_discovery"]["status"] == "disabled"
+    assert res_deny_default["engines"]["external_nuclei"]["status"] == "disabled"
+    assert len(subprocess_recorder.calls) == 0
+    assert len(loopback_server.requests) == 0
+
+    # 5. Local repo with JS artifact in offline/test mode spawns 0 aiscan/rea-agents/external subprocesses
+    js_repo = tmp_path / "js_repo"
+    js_repo.mkdir()
+    (js_repo / "app.js").write_text('fetch("/api/internal/status");\n', encoding="utf-8")
+    subprocess_recorder.calls.clear()
+    res_js_local = run_unified_all_scans(
+        repo=str(js_repo),
+        db=isolated_db,
+        reports_dir=str(tmp_path / "rep_js_local"),
+        quiet=True,
+    )
+    assert res_js_local["engines"]["external_discovery"]["status"] == "disabled"
+    assert res_js_local["engines"]["external_nuclei"]["status"] == "disabled"
+    assert len(subprocess_recorder.calls) == 0

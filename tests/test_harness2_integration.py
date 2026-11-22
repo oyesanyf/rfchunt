@@ -3,7 +3,10 @@ Unit and Integration Tests for Module 16: Google Research Harness² Engine
 (Recursive Agent Harnessing for an Open World, arXiv:2610.14224, Google LLC 2026).
 """
 
+import os
 import shutil
+import stat
+import sys
 from pathlib import Path
 import pytest
 
@@ -352,4 +355,55 @@ def test_normalize_rel_windows_device_names_and_base_dir(tmp_path: Path):
     resolved = normalize_rel("scripts/helper.py", base_dir=tmp_path)
     assert isinstance(resolved, Path)
     assert resolved == (tmp_path / "scripts" / "helper.py").resolve()
+
+
+def test_write_tree_replaces_existing_readonly_files_and_subdirs(tmp_path: Path):
+    """Verifies write_tree cleanly replaces an existing tree with ReadOnly files and subdirectories."""
+    dest = tmp_path / "readonly_harness"
+    initial_tree = {
+        "systemprompt.md": "# initial systemprompt\n",
+        "guardrails.md": "# initial guardrails\n",
+        "LongTermMEMORY.md": "# initial memory\n",
+        "tool_descriptions/tool_guidance.md": "Initial guidance\n",
+        "skills/old_skill/SKILL.md": (
+            "---\nname: old_skill\ndescription: Old skill\n---\n\nInitial body.\n"
+        ),
+        "scripts/old_helper.py": "print('old')\n",
+        "sub_agents/old_sub.md": "# Old subagent\n",
+        "plugin/old_guard.ts": "export const guard = true;\n",
+    }
+    write_tree(RFCHUNT_SURFACE, initial_tree, dest, stubs=True)
+
+    # Mark all files and directories (bottom-up including dest) read-only
+    for root, dirs, files in os.walk(dest, topdown=False):
+        root_path = Path(root)
+        for fname in files:
+            os.chmod(root_path / fname, stat.S_IREAD)
+        for dname in dirs:
+            os.chmod(root_path / dname, stat.S_IREAD)
+    os.chmod(dest, stat.S_IREAD)
+
+    if sys.platform == "win32":
+        assert (dest.stat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY) != 0
+
+    replacement_tree = {
+        "systemprompt.md": "# replacement systemprompt\n",
+        "guardrails.md": "# replacement guardrails\n",
+        "LongTermMEMORY.md": "# replacement memory\n",
+        "tool_descriptions/tool_guidance.md": "Updated guidance\n",
+        "skills/new_skill/SKILL.md": (
+            "---\nname: new_skill\ndescription: New skill\n---\n\nReplacement body.\n"
+        ),
+        "scripts/new_helper.py": "print('new')\n",
+    }
+    write_tree(RFCHUNT_SURFACE, replacement_tree, dest, stubs=True)
+
+    loaded = read_tree(RFCHUNT_SURFACE, dest)
+    assert loaded == replacement_tree
+    assert not (dest / "skills" / "old_skill").exists()
+    assert not (dest / "scripts" / "old_helper.py").exists()
+    assert not (dest / "sub_agents" / "old_sub.md").exists()
+    assert not (dest / "plugin" / "old_guard.ts").exists()
+    assert (dest / "sub_agents" / "README.md").exists()
+    assert (dest / "plugin" / "README.md").exists()
 

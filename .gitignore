@@ -25,6 +25,10 @@ keys/
 *.tar.gz
 *.tgz
 
+# Dynamically Provisioned Local Tool Binaries & Cloned Runtimes
+bin/
+tools/
+
 # Environment & Virtual Environments
 .env
 .venv/

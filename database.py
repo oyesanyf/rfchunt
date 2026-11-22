@@ -7,8 +7,11 @@ evaluations, anomalies, and discovery cascade hypotheses.
 import contextlib
 import json
 import os
+import random
 import sqlite3
 import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -148,16 +151,38 @@ class Database:
             return text
         return self.secret_box.decrypt_str(text)
 
+    @staticmethod
+    def _is_busy_operational_error(exc: sqlite3.OperationalError) -> bool:
+        msg = str(exc).lower()
+        return ("locked" in msg) or ("busy" in msg)
+
     def _configure_pragmas(self) -> None:
         """Configures production WAL mode, 30s busy timeout, and NORMAL synchrony."""
         with self._lock:
             cur = self.conn.cursor()
             try:
+                cur.execute("PRAGMA busy_timeout = 30000;")
                 # In-memory databases do not support WAL mode
                 is_mem = self._is_memory_db()
                 if not is_mem:
-                    cur.execute("PRAGMA journal_mode = WAL;")
-                cur.execute("PRAGMA busy_timeout = 30000;")
+                    max_attempts = 12
+                    for attempt in range(max_attempts):
+                        try:
+                            mode_row = cur.execute("PRAGMA journal_mode;").fetchone()
+                            current_mode = (
+                                str(mode_row[0]).strip().lower()
+                                if mode_row is not None and mode_row[0] is not None
+                                else ""
+                            )
+                            if current_mode != "wal":
+                                cur.execute("PRAGMA journal_mode = WAL;")
+                            break
+                        except sqlite3.OperationalError as exc:
+                            if self._is_busy_operational_error(exc) and attempt < max_attempts - 1:
+                                delay = min(0.25, 0.01 * (2 ** min(attempt, 5))) + random.uniform(0.0, 0.025)
+                                time.sleep(delay)
+                                continue
+                            raise
                 cur.execute("PRAGMA synchronous = NORMAL;")
                 cur.execute("PRAGMA foreign_keys = ON;")
             finally:
@@ -191,8 +216,23 @@ class Database:
             sp_name: Optional[str] = None
             started_outer_tx = False
             if next_depth == 1 and not self.conn.in_transaction:
-                self.conn.execute("BEGIN")
-                started_outer_tx = True
+                max_attempts = 10
+                for attempt in range(max_attempts):
+                    try:
+                        self.conn.execute("BEGIN IMMEDIATE")
+                        started_outer_tx = True
+                        break
+                    except sqlite3.OperationalError as exc:
+                        if self._is_busy_operational_error(exc) and attempt < max_attempts - 1:
+                            if self.conn.in_transaction:
+                                try:
+                                    self.conn.rollback()
+                                except Exception:
+                                    pass
+                            delay = min(0.25, 0.01 * (2 ** min(attempt, 5))) + random.uniform(0.0, 0.02)
+                            time.sleep(delay)
+                            continue
+                        raise
             else:
                 sp_name = f"sp_batch_{next_depth}"
                 self.conn.execute(f"SAVEPOINT {sp_name}")
@@ -238,8 +278,26 @@ class Database:
 
     def _init_schema(self) -> None:
         with self._lock:
-            with self.conn:
-                self.conn.executescript("""
+            max_attempts = 12
+            for attempt in range(max_attempts):
+                try:
+                    self._init_schema_once()
+                    return
+                except sqlite3.OperationalError as exc:
+                    if self.conn.in_transaction:
+                        try:
+                            self.conn.rollback()
+                        except Exception:
+                            pass
+                    if self._is_busy_operational_error(exc) and attempt < max_attempts - 1:
+                        delay = min(0.25, 0.01 * (2 ** min(attempt, 5))) + random.uniform(0.0, 0.025)
+                        time.sleep(delay)
+                        continue
+                    raise
+
+    def _init_schema_once(self) -> None:
+        with self._lock:
+            self.conn.executescript("""
                 CREATE TABLE IF NOT EXISTS rfcs (
                     rfc_id TEXT PRIMARY KEY,
                     title TEXT,
@@ -633,57 +691,185 @@ class Database:
                     source_mode TEXT DEFAULT 'python_static',
                     discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS blackboard_nodes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    node_id TEXT UNIQUE NOT NULL,
+                    task_id TEXT NOT NULL DEFAULT 'default',
+                    node_type TEXT NOT NULL CHECK(node_type IN ('FACT', 'INTENT', 'HINT')),
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    priority REAL NOT NULL DEFAULT 0.0,
+                    domain TEXT DEFAULT '',
+                    rfc_id TEXT DEFAULT '',
+                    source_agent TEXT DEFAULT '',
+                    claimed_by TEXT DEFAULT '',
+                    claimed_at TIMESTAMP,
+                    completed_at TIMESTAMP,
+                    content TEXT NOT NULL DEFAULT '',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    parent_node_id TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             """)
             self._run_migrations()
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_blackboard_type_status_prio "
+                    "ON blackboard_nodes(node_type, status, priority DESC, id ASC)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_blackboard_task_type "
+                    "ON blackboard_nodes(task_id, node_type, status)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_blackboard_domain_rfc "
+                    "ON blackboard_nodes(domain, rfc_id)"
+                )
+                self.conn.commit()
+            except Exception:
+                if self.conn.in_transaction:
+                    self.conn.rollback()
+                raise
 
     def _run_migrations(self) -> None:
         """Ordered transactional schema migrations recorded in `schema_migrations`."""
         with self._lock:
+            required_versions = {
+                "001_attack_chains_artex_cols",
+                "002_chain_retests_original_traffic_id",
+                "003_approval_decisions_action_summary",
+                "004_blackboard_nodes",
+            }
             cur = self.conn.cursor()
             cur.execute("SELECT version FROM schema_migrations")
             applied = {str(r[0]) for r in cur.fetchall()}
+            if required_versions.issubset(applied):
+                return
 
             def _table_cols(table: str) -> set:
                 cur.execute(f"PRAGMA table_info({table})")
                 return {str(r[1]) for r in cur.fetchall()}
 
-            with self.conn:
-                if "001_attack_chains_artex_cols" not in applied:
-                    existing = _table_cols("attack_chains")
-                    for col_name, col_def in (
-                        ("task_id", "TEXT DEFAULT 'default'"),
-                        ("poe_level", "INTEGER DEFAULT 0"),
-                        ("verification_status", "TEXT DEFAULT 'UNVERIFIED'"),
-                        ("evidence_quote", "TEXT DEFAULT ''"),
-                        ("traffic_id", "TEXT DEFAULT ''"),
-                        ("hop_count", "INTEGER DEFAULT 1"),
-                        ("source_scanners_json", "TEXT DEFAULT '[]'"),
-                        ("remote_artex_task_id", "TEXT DEFAULT ''"),
-                    ):
-                        if col_name not in existing:
-                            self.conn.execute(f"ALTER TABLE attack_chains ADD COLUMN {col_name} {col_def}")
-                    self.conn.execute(
-                        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)",
-                        ("001_attack_chains_artex_cols",),
-                    )
+            max_attempts = 12
+            for attempt in range(max_attempts):
+                try:
+                    self.conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        cur.execute("SELECT version FROM schema_migrations")
+                        applied = {str(r[0]) for r in cur.fetchall()}
 
-                if "002_chain_retests_original_traffic_id" not in applied:
-                    existing = _table_cols("chain_retests")
-                    if "original_traffic_id" not in existing:
-                        self.conn.execute("ALTER TABLE chain_retests ADD COLUMN original_traffic_id TEXT DEFAULT ''")
-                    self.conn.execute(
-                        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)",
-                        ("002_chain_retests_original_traffic_id",),
-                    )
+                        if "001_attack_chains_artex_cols" not in applied:
+                            existing = _table_cols("attack_chains")
+                            for col_name, col_def in (
+                                ("task_id", "TEXT DEFAULT 'default'"),
+                                ("poe_level", "INTEGER DEFAULT 0"),
+                                ("verification_status", "TEXT DEFAULT 'UNVERIFIED'"),
+                                ("evidence_quote", "TEXT DEFAULT ''"),
+                                ("traffic_id", "TEXT DEFAULT ''"),
+                                ("hop_count", "INTEGER DEFAULT 1"),
+                                ("source_scanners_json", "TEXT DEFAULT '[]'"),
+                                ("remote_artex_task_id", "TEXT DEFAULT ''"),
+                            ):
+                                if col_name not in existing:
+                                    self.conn.execute(f"ALTER TABLE attack_chains ADD COLUMN {col_name} {col_def}")
+                            self.conn.execute(
+                                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)",
+                                ("001_attack_chains_artex_cols",),
+                            )
 
-                if "003_approval_decisions_action_summary" not in applied:
-                    existing = _table_cols("approval_decisions")
-                    if "action_summary" not in existing:
-                        self.conn.execute("ALTER TABLE approval_decisions ADD COLUMN action_summary TEXT DEFAULT ''")
-                    self.conn.execute(
-                        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)",
-                        ("003_approval_decisions_action_summary",),
-                    )
+                        if "002_chain_retests_original_traffic_id" not in applied:
+                            existing = _table_cols("chain_retests")
+                            if "original_traffic_id" not in existing:
+                                self.conn.execute("ALTER TABLE chain_retests ADD COLUMN original_traffic_id TEXT DEFAULT ''")
+                            self.conn.execute(
+                                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)",
+                                ("002_chain_retests_original_traffic_id",),
+                            )
+
+                        if "003_approval_decisions_action_summary" not in applied:
+                            existing = _table_cols("approval_decisions")
+                            if "action_summary" not in existing:
+                                self.conn.execute("ALTER TABLE approval_decisions ADD COLUMN action_summary TEXT DEFAULT ''")
+                            self.conn.execute(
+                                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)",
+                                ("003_approval_decisions_action_summary",),
+                            )
+
+                        if "004_blackboard_nodes" not in applied:
+                            self.conn.execute(
+                                """
+                                CREATE TABLE IF NOT EXISTS blackboard_nodes (
+                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    node_id TEXT UNIQUE NOT NULL,
+                                    task_id TEXT NOT NULL DEFAULT 'default',
+                                    node_type TEXT NOT NULL CHECK(node_type IN ('FACT', 'INTENT', 'HINT')),
+                                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                                    priority REAL NOT NULL DEFAULT 0.0,
+                                    domain TEXT DEFAULT '',
+                                    rfc_id TEXT DEFAULT '',
+                                    source_agent TEXT DEFAULT '',
+                                    claimed_by TEXT DEFAULT '',
+                                    claimed_at TIMESTAMP,
+                                    completed_at TIMESTAMP,
+                                    content TEXT NOT NULL DEFAULT '',
+                                    payload_json TEXT NOT NULL DEFAULT '{}',
+                                    parent_node_id TEXT DEFAULT '',
+                                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                                )
+                                """
+                            )
+                            existing = _table_cols("blackboard_nodes")
+                            for col_name, col_def in (
+                                ("task_id", "TEXT NOT NULL DEFAULT 'default'"),
+                                ("node_type", "TEXT NOT NULL DEFAULT 'FACT'"),
+                                ("status", "TEXT NOT NULL DEFAULT 'ACTIVE'"),
+                                ("priority", "REAL NOT NULL DEFAULT 0.0"),
+                                ("domain", "TEXT DEFAULT ''"),
+                                ("rfc_id", "TEXT DEFAULT ''"),
+                                ("source_agent", "TEXT DEFAULT ''"),
+                                ("claimed_by", "TEXT DEFAULT ''"),
+                                ("claimed_at", "TIMESTAMP"),
+                                ("completed_at", "TIMESTAMP"),
+                                ("content", "TEXT NOT NULL DEFAULT ''"),
+                                ("payload_json", "TEXT NOT NULL DEFAULT '{}'"),
+                                ("parent_node_id", "TEXT DEFAULT ''"),
+                                ("created_at", "TIMESTAMP"),
+                                ("updated_at", "TIMESTAMP"),
+                            ):
+                                if col_name not in existing:
+                                    self.conn.execute(f"ALTER TABLE blackboard_nodes ADD COLUMN {col_name} {col_def}")
+                            self.conn.execute(
+                                "CREATE INDEX IF NOT EXISTS idx_blackboard_type_status_prio "
+                                "ON blackboard_nodes(node_type, status, priority DESC, id ASC)"
+                            )
+                            self.conn.execute(
+                                "CREATE INDEX IF NOT EXISTS idx_blackboard_task_type "
+                                "ON blackboard_nodes(task_id, node_type, status)"
+                            )
+                            self.conn.execute(
+                                "CREATE INDEX IF NOT EXISTS idx_blackboard_domain_rfc "
+                                "ON blackboard_nodes(domain, rfc_id)"
+                            )
+                            self.conn.execute(
+                                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)",
+                                ("004_blackboard_nodes",),
+                            )
+
+                        self.conn.commit()
+                        return
+                    except Exception:
+                        if self.conn.in_transaction:
+                            self.conn.rollback()
+                        raise
+                except sqlite3.OperationalError as exc:
+                    if self._is_busy_operational_error(exc) and attempt < max_attempts - 1:
+                        delay = min(0.25, 0.01 * (2 ** min(attempt, 5))) + random.uniform(0.0, 0.025)
+                        time.sleep(delay)
+                        continue
+                    raise
 
     def _migrate_attack_chains_columns(self) -> None:
         """Backward-compatible wrapper invoking ordered transactional migrations."""
@@ -1162,6 +1348,7 @@ class Database:
                 "chain_retests",
                 "llm_usage",
                 "approval_decisions",
+                "blackboard_nodes",
             ])
         if not keep_rfcs:
             tables_to_clear.append("rfcs")
@@ -1230,6 +1417,7 @@ class Database:
             "worker_execution_traces", "traffic_evidence", "chain_retests",
             "llm_usage", "approval_decisions",
             "mantis_findings", "mantis_threat_models", "rea_findings",
+            "blackboard_nodes",
         ]
         counts = {}
         with self._lock:
@@ -2310,3 +2498,834 @@ class Database:
                             d[k] = [raw_k] if raw_k else []
                 rows.append(d)
             return rows
+
+    # ------------------------------------------------------------------
+    # Cairn Blackboard Persistence & Atomic Intent Claiming (M1)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _decode_blackboard_row(row: sqlite3.Row) -> Dict[str, Any]:
+        d = dict(row)
+        raw_payload = d.get("payload_json")
+        if isinstance(raw_payload, str) and raw_payload.strip():
+            try:
+                decoded = json.loads(raw_payload)
+                d["payload"] = decoded if isinstance(decoded, dict) else {"value": decoded}
+            except (ValueError, TypeError):
+                d["payload"] = {}
+        elif isinstance(raw_payload, dict):
+            d["payload"] = dict(raw_payload)
+        else:
+            d["payload"] = {}
+        return d
+
+    def add_blackboard_node(
+        self,
+        node_type: str,
+        content: str,
+        *,
+        node_id: Optional[str] = None,
+        status: Optional[str] = None,
+        priority: float = 0.0,
+        task_id: str = "default",
+        domain: str = "",
+        rfc_id: str = "",
+        source_agent: str = "",
+        payload: Optional[Dict[str, Any]] = None,
+        parent_node_id: str = "",
+    ) -> str:
+        """Inserts or updates a FACT, INTENT, or HINT node in `blackboard_nodes`."""
+        nt = str(node_type or "").strip().upper()
+        if nt not in ("FACT", "INTENT", "HINT"):
+            raise ValueError(f"Unsupported blackboard node_type: {node_type!r}")
+
+        resolved_status = (
+            str(status).strip().upper()
+            if status is not None and str(status).strip()
+            else ("PENDING" if nt == "INTENT" else "ACTIVE")
+        )
+        nid = str(node_id).strip() if node_id is not None and str(node_id).strip() else f"{nt.lower()}-{uuid.uuid4().hex[:12]}"
+        payload_str = json.dumps(payload if payload is not None else {})
+        task_val = str(task_id or "default")
+        domain_val = "" if domain is None else str(domain)
+        rfc_val = "" if rfc_id is None else str(rfc_id)
+        agent_val = "" if source_agent is None else str(source_agent)
+        parent_val = "" if parent_node_id is None else str(parent_node_id)
+        content_val = "" if content is None else str(content)
+        prio_val = float(priority)
+
+        with self._lock:
+            with self._tx():
+                self.conn.execute(
+                    """
+                    INSERT INTO blackboard_nodes (
+                        node_id, task_id, node_type, status, priority,
+                        domain, rfc_id, source_agent, content, payload_json, parent_node_id
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        task_id = excluded.task_id,
+                        node_type = excluded.node_type,
+                        status = excluded.status,
+                        priority = excluded.priority,
+                        domain = excluded.domain,
+                        rfc_id = excluded.rfc_id,
+                        source_agent = excluded.source_agent,
+                        content = excluded.content,
+                        payload_json = excluded.payload_json,
+                        parent_node_id = excluded.parent_node_id,
+                        claimed_by = CASE WHEN excluded.status = 'PENDING' THEN '' ELSE blackboard_nodes.claimed_by END,
+                        claimed_at = CASE WHEN excluded.status = 'PENDING' THEN NULL ELSE blackboard_nodes.claimed_at END,
+                        completed_at = CASE WHEN excluded.status = 'PENDING' THEN NULL ELSE blackboard_nodes.completed_at END,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        nid,
+                        task_val,
+                        nt,
+                        resolved_status,
+                        prio_val,
+                        domain_val,
+                        rfc_val,
+                        agent_val,
+                        content_val,
+                        payload_str,
+                        parent_val,
+                    ),
+                )
+        return nid
+
+    def get_blackboard_nodes(
+        self,
+        *,
+        node_type: Optional[str] = None,
+        status: Optional[str] = None,
+        task_id: Optional[str] = None,
+        domain: Optional[str] = None,
+        rfc_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Queries `blackboard_nodes` ordered by `priority DESC, id ASC` with decoded `payload`."""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if node_type:
+            clauses.append("node_type = ?")
+            params.append(str(node_type).strip().upper())
+        if status:
+            clauses.append("status = ?")
+            params.append(str(status).strip().upper())
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(str(task_id))
+        if domain:
+            clauses.append("domain = ?")
+            params.append(str(domain))
+        if rfc_id:
+            clauses.append("rfc_id = ?")
+            params.append(str(rfc_id))
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_sql = ""
+        if limit is not None and int(limit) > 0:
+            limit_sql = " LIMIT ?"
+            params.append(int(limit))
+
+        sql = f"SELECT * FROM blackboard_nodes {where_sql} ORDER BY priority DESC, id ASC{limit_sql}"
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(sql, tuple(params))
+            return [self._decode_blackboard_row(r) for r in cur.fetchall()]
+
+    def add_fact(
+        self,
+        content: str,
+        *,
+        node_id: Optional[str] = None,
+        task_id: str = "default",
+        domain: str = "",
+        rfc_id: str = "",
+        source_agent: str = "",
+        payload: Optional[Dict[str, Any]] = None,
+        parent_node_id: str = "",
+    ) -> str:
+        """Persists a confirmed FACT observation onto the blackboard."""
+        return self.add_blackboard_node(
+            "FACT",
+            content,
+            node_id=node_id,
+            status="ACTIVE",
+            priority=0.0,
+            task_id=task_id,
+            domain=domain,
+            rfc_id=rfc_id,
+            source_agent=source_agent,
+            payload=payload,
+            parent_node_id=parent_node_id,
+        )
+
+    def get_facts(
+        self,
+        *,
+        task_id: Optional[str] = None,
+        domain: Optional[str] = None,
+        rfc_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Retrieves FACT nodes matching the given filters."""
+        return self.get_blackboard_nodes(
+            node_type="FACT",
+            task_id=task_id,
+            domain=domain,
+            rfc_id=rfc_id,
+            limit=limit,
+        )
+
+    def queue_intent(
+        self,
+        content: str,
+        *,
+        priority: float = 0.0,
+        node_id: Optional[str] = None,
+        task_id: str = "default",
+        domain: str = "",
+        rfc_id: str = "",
+        source_agent: str = "",
+        payload: Optional[Dict[str, Any]] = None,
+        parent_node_id: str = "",
+    ) -> str:
+        """Enqueues an unexplored INTENT hypothesis in PENDING state."""
+        return self.add_blackboard_node(
+            "INTENT",
+            content,
+            node_id=node_id,
+            status="PENDING",
+            priority=float(priority),
+            task_id=task_id,
+            domain=domain,
+            rfc_id=rfc_id,
+            source_agent=source_agent,
+            payload=payload,
+            parent_node_id=parent_node_id,
+        )
+
+    def claim_next_intent(
+        self,
+        worker_id: str,
+        *,
+        task_id: Optional[str] = None,
+        domain: Optional[str] = None,
+        include_global: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Atomically claims the highest-priority PENDING INTENT (FIFO tie-break by id ASC).
+        Uses BEGIN IMMEDIATE (or SAVEPOINT when already inside batch_writes) so
+        concurrent threads and separate Database connections never double-claim.
+        When `include_global=True` and `domain` is non-empty, matches `domain`
+        case-insensitively alongside `'global'` and `''` atomically inside the
+        same transaction.
+        """
+        clauses: List[str] = ["node_type = 'INTENT'", "status = 'PENDING'"]
+        params: List[Any] = []
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(str(task_id))
+        if domain:
+            if include_global:
+                clauses.append("LOWER(COALESCE(domain, '')) IN (LOWER(?), 'global', '')")
+            else:
+                clauses.append("domain = ?")
+            params.append(str(domain))
+        where_sql = " AND ".join(clauses)
+        worker_val = str(worker_id or "")
+
+        def _do_claim() -> Optional[Dict[str, Any]]:
+            cur = self.conn.cursor()
+            cur.execute(
+                f"SELECT node_id FROM blackboard_nodes WHERE {where_sql} ORDER BY priority DESC, id ASC LIMIT 1",
+                tuple(params),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            target_node_id = str(row["node_id"])
+            upd = self.conn.execute(
+                """
+                UPDATE blackboard_nodes
+                SET status = 'CLAIMED',
+                    claimed_by = ?,
+                    claimed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE node_id = ?
+                  AND status = 'PENDING'
+                """,
+                (worker_val, target_node_id),
+            )
+            if upd.rowcount != 1:
+                return None
+            cur.execute("SELECT * FROM blackboard_nodes WHERE node_id = ? LIMIT 1", (target_node_id,))
+            claimed_row = cur.fetchone()
+            return self._decode_blackboard_row(claimed_row) if claimed_row is not None else None
+
+        with self._lock:
+            if self._batch_depth > 0 or self.conn.in_transaction:
+                sp_name = "sp_claim_intent"
+                self.conn.execute(f"SAVEPOINT {sp_name}")
+                try:
+                    claimed = _do_claim()
+                    self.conn.execute(f"RELEASE SAVEPOINT {sp_name}")
+                    return claimed
+                except Exception:
+                    if self.conn.in_transaction:
+                        self.conn.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                        self.conn.execute(f"RELEASE SAVEPOINT {sp_name}")
+                    raise
+
+            last_exc: Optional[Exception] = None
+            for attempt in range(5):
+                try:
+                    self.conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        claimed = _do_claim()
+                        self.conn.commit()
+                        return claimed
+                    except Exception:
+                        if self.conn.in_transaction:
+                            self.conn.rollback()
+                        raise
+                except sqlite3.OperationalError as exc:
+                    msg = str(exc).lower()
+                    if ("locked" in msg or "busy" in msg) and attempt < 4:
+                        last_exc = exc
+                        time.sleep(0.01 * (attempt + 1))
+                        continue
+                    raise
+            if last_exc is not None:
+                raise last_exc
+            return None
+
+    def complete_intent(
+        self,
+        node_id: str,
+        *,
+        status: str = "DONE",
+        result_payload: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Marks an INTENT as DONE (or FAILED/etc.) and optionally merges result_payload."""
+        resolved_status = str(status or "DONE").strip().upper()
+        nid = str(node_id or "").strip()
+        if not nid:
+            return False
+
+        with self._lock:
+            with self._tx():
+                if result_payload is not None:
+                    cur = self.conn.cursor()
+                    cur.execute(
+                        "SELECT payload_json FROM blackboard_nodes WHERE node_id = ? AND node_type = 'INTENT' LIMIT 1",
+                        (nid,),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        return False
+                    existing: Dict[str, Any] = {}
+                    raw_existing = row["payload_json"]
+                    if isinstance(raw_existing, str) and raw_existing.strip():
+                        try:
+                            parsed = json.loads(raw_existing)
+                            existing = parsed if isinstance(parsed, dict) else {"value": parsed}
+                        except (ValueError, TypeError):
+                            existing = {}
+                    merged = {**existing, **result_payload}
+                    upd = self.conn.execute(
+                        """
+                        UPDATE blackboard_nodes
+                        SET status = ?,
+                            completed_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP,
+                            payload_json = ?
+                        WHERE node_id = ?
+                          AND node_type = 'INTENT'
+                        """,
+                        (resolved_status, json.dumps(merged), nid),
+                    )
+                else:
+                    upd = self.conn.execute(
+                        """
+                        UPDATE blackboard_nodes
+                        SET status = ?,
+                            completed_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE node_id = ?
+                          AND node_type = 'INTENT'
+                        """,
+                        (resolved_status, nid),
+                    )
+                return bool(upd.rowcount > 0)
+
+    def reclaim_stale_intents(
+        self,
+        *,
+        task_id: Optional[str] = None,
+        worker_id: Optional[str] = None,
+    ) -> int:
+        """Resets interrupted CLAIMED intents back to PENDING for crash-resilient resume."""
+        clauses: List[str] = ["node_type = 'INTENT'", "status = 'CLAIMED'"]
+        params: List[Any] = []
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(str(task_id))
+        if worker_id:
+            clauses.append("claimed_by = ?")
+            params.append(str(worker_id))
+        where_sql = " AND ".join(clauses)
+
+        with self._lock:
+            with self._tx():
+                cur = self.conn.execute(
+                    f"""
+                    UPDATE blackboard_nodes
+                    SET status = 'PENDING',
+                        claimed_by = '',
+                        claimed_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE {where_sql}
+                    """,
+                    tuple(params),
+                )
+                return int(cur.rowcount or 0)
+
+    def list_intents(
+        self,
+        *,
+        status: Optional[str] = None,
+        task_id: Optional[str] = None,
+        domain: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Lists INTENT nodes filtered by optional status, task_id, and domain."""
+        return self.get_blackboard_nodes(
+            node_type="INTENT",
+            status=status,
+            task_id=task_id,
+            domain=domain,
+            limit=limit,
+        )
+
+    def add_hint(
+        self,
+        content: str,
+        *,
+        priority: float = 10.0,
+        node_id: Optional[str] = None,
+        task_id: str = "default",
+        domain: str = "global",
+        rfc_id: str = "",
+        source_agent: str = "cli",
+        active: bool = True,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Persists an operator or Harness² steering HINT onto the blackboard."""
+        status_val = "ACTIVE" if active else "INACTIVE"
+        domain_val = "global" if domain is None else str(domain)
+        return self.add_blackboard_node(
+            "HINT",
+            content,
+            node_id=node_id,
+            status=status_val,
+            priority=float(priority),
+            task_id=task_id,
+            domain=domain_val,
+            rfc_id=rfc_id,
+            source_agent=source_agent,
+            payload=payload,
+        )
+
+    def get_active_hints(
+        self,
+        *,
+        task_id: Optional[str] = None,
+        domain: Optional[str] = None,
+        rfc_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieves active HINTs ordered by priority DESC, id ASC.
+        When `domain` is provided, matches hints for that domain as well as 'global' and ''.
+        """
+        clauses: List[str] = ["node_type = 'HINT'", "status = 'ACTIVE'"]
+        params: List[Any] = []
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(str(task_id))
+        if domain:
+            clauses.append("LOWER(COALESCE(domain, '')) IN (LOWER(?), 'global', '')")
+            params.append(str(domain))
+        if rfc_id:
+            clauses.append("rfc_id = ?")
+            params.append(str(rfc_id))
+
+        where_sql = " AND ".join(clauses)
+        limit_sql = ""
+        if limit is not None and int(limit) > 0:
+            limit_sql = " LIMIT ?"
+            params.append(int(limit))
+
+        sql = f"SELECT * FROM blackboard_nodes WHERE {where_sql} ORDER BY priority DESC, id ASC{limit_sql}"
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(sql, tuple(params))
+            return [self._decode_blackboard_row(r) for r in cur.fetchall()]
+
+    def deactivate_hint(self, node_id: str) -> bool:
+        """Deactivates an existing HINT node by setting status = 'INACTIVE'."""
+        nid = str(node_id or "").strip()
+        if not nid:
+            return False
+        with self._lock:
+            with self._tx():
+                cur = self.conn.execute(
+                    """
+                    UPDATE blackboard_nodes
+                    SET status = 'INACTIVE',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE node_id = ?
+                      AND node_type = 'HINT'
+                    """,
+                    (nid,),
+                )
+                return bool(cur.rowcount > 0)
+
+    def export_blackboard_trees(
+        self,
+        *,
+        task_id: Optional[str] = None,
+        limit_tasks: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        Read-only lineage export returning `blackboard_nodes` grouped by `task_id`
+        with joined outcome telemetry from `evaluations`, `implementation_anomalies`,
+        `reproducible_vulnerabilities`, and `attack_chains`.
+
+        Preserves existing schema and migration `004_blackboard_nodes` untouched.
+        """
+        with self._lock:
+            cur = self.conn.cursor()
+            if task_id is not None and str(task_id).strip():
+                tid_filter = str(task_id).strip()
+                cur.execute(
+                    "SELECT DISTINCT task_id FROM blackboard_nodes WHERE task_id = ?",
+                    (tid_filter,),
+                )
+                task_ids = [str(r[0]) for r in cur.fetchall() if r[0] is not None]
+            else:
+                if limit_tasks is not None and int(limit_tasks) > 0:
+                    cur.execute(
+                        "SELECT task_id FROM blackboard_nodes GROUP BY task_id ORDER BY MAX(id) DESC LIMIT ?",
+                        (int(limit_tasks),),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT task_id FROM blackboard_nodes GROUP BY task_id ORDER BY MAX(id) DESC"
+                    )
+                task_ids = [str(r[0]) for r in cur.fetchall() if r[0] is not None]
+
+            if not task_ids:
+                return []
+
+            tid_placeholders = ",".join("?" for _ in task_ids)
+            cur.execute(
+                f"SELECT * FROM blackboard_nodes WHERE task_id IN ({tid_placeholders}) ORDER BY id ASC",
+                tuple(task_ids),
+            )
+            nodes_by_task: Dict[str, List[Dict[str, Any]]] = {tid: [] for tid in task_ids}
+            probe_ids: set = set()
+            anomaly_ids: set = set()
+            vuln_ids: set = set()
+            chain_ids: set = set()
+
+            for raw_row in cur.fetchall():
+                decoded = self._decode_blackboard_row(raw_row)
+                tid = str(decoded.get("task_id") or "default")
+                nodes_by_task.setdefault(tid, []).append(decoded)
+                payload = decoded.get("payload") if isinstance(decoded.get("payload"), dict) else {}
+                p_id = payload.get("probe_id")
+                if p_id is not None and not isinstance(p_id, bool):
+                    try:
+                        probe_ids.add(int(p_id))
+                    except (TypeError, ValueError):
+                        pass
+                a_id = payload.get("anomaly_id")
+                if isinstance(a_id, str) and a_id.strip():
+                    anomaly_ids.add(a_id.strip())
+                v_id = payload.get("vuln_id") or payload.get("parent_vuln_id")
+                if isinstance(v_id, str) and v_id.strip():
+                    vuln_ids.add(v_id.strip())
+                c_id = payload.get("chain_id")
+                if isinstance(c_id, str) and c_id.strip():
+                    chain_ids.add(c_id.strip())
+
+            evals_by_probe: Dict[int, List[Dict[str, Any]]] = {}
+            if probe_ids:
+                try:
+                    p_list = sorted(probe_ids)
+                    p_ph = ",".join("?" for _ in p_list)
+                    cur.execute(
+                        f"SELECT eval_id, probe_id, target_host, target_port, is_vulnerable, "
+                        f"desync_class, finding_status, details, tested_at "
+                        f"FROM evaluations WHERE probe_id IN ({p_ph}) ORDER BY eval_id ASC",
+                        tuple(p_list),
+                    )
+                    for row in cur.fetchall():
+                        d = dict(row)
+                        evals_by_probe.setdefault(int(d["probe_id"]), []).append(d)
+                except sqlite3.OperationalError:
+                    pass
+
+            anomalies_by_id: Dict[str, Dict[str, Any]] = {}
+            if anomaly_ids:
+                try:
+                    a_list = sorted(anomaly_ids)
+                    a_ph = ",".join("?" for _ in a_list)
+                    cur.execute(
+                        f"SELECT anomaly_id, target_engine, category, observed_behavior, "
+                        f"expected_behavior, triggering_rule_id, is_environmental_noise, created_at "
+                        f"FROM implementation_anomalies WHERE anomaly_id IN ({a_ph})",
+                        tuple(a_list),
+                    )
+                    for row in cur.fetchall():
+                        d = dict(row)
+                        anomalies_by_id[str(d["anomaly_id"])] = d
+                except sqlite3.OperationalError:
+                    pass
+
+            vulns_by_id: Dict[str, Dict[str, Any]] = {}
+            vulns_by_anomaly: Dict[str, Dict[str, Any]] = {}
+            if vuln_ids or anomaly_ids:
+                try:
+                    v_clauses: List[str] = []
+                    v_params: List[Any] = []
+                    if vuln_ids:
+                        v_list = sorted(vuln_ids)
+                        v_clauses.append(f"vuln_id IN ({','.join('?' for _ in v_list)})")
+                        v_params.extend(v_list)
+                    if anomaly_ids:
+                        a_list = sorted(anomaly_ids)
+                        v_clauses.append(f"anomaly_id IN ({','.join('?' for _ in a_list)})")
+                        v_params.extend(a_list)
+                    cur.execute(
+                        f"SELECT vuln_id, anomaly_id, impact, reproducibility_rate, "
+                        f"verification_attempts, successful_reproductions, delta_debug_steps, created_at "
+                        f"FROM reproducible_vulnerabilities WHERE {' OR '.join(v_clauses)}",
+                        tuple(v_params),
+                    )
+                    for row in cur.fetchall():
+                        d = dict(row)
+                        if d.get("vuln_id"):
+                            vulns_by_id[str(d["vuln_id"])] = d
+                        if d.get("anomaly_id"):
+                            vulns_by_anomaly[str(d["anomaly_id"])] = d
+                except sqlite3.OperationalError:
+                    pass
+
+            chains_by_task: Dict[str, List[Dict[str, Any]]] = {}
+            chains_by_id: Dict[str, Dict[str, Any]] = {}
+            chains_by_anomaly: Dict[str, List[Dict[str, Any]]] = {}
+            try:
+                c_clauses: List[str] = [f"task_id IN ({tid_placeholders})"]
+                c_params: List[Any] = list(task_ids)
+                if chain_ids:
+                    c_list = sorted(chain_ids)
+                    c_clauses.append(f"chain_id IN ({','.join('?' for _ in c_list)})")
+                    c_params.extend(c_list)
+                if anomaly_ids:
+                    a_list = sorted(anomaly_ids)
+                    c_clauses.append(f"framing_anomaly_id IN ({','.join('?' for _ in a_list)})")
+                    c_params.extend(a_list)
+                cur.execute(
+                    f"SELECT chain_id, title, attack_type, target_host, target_endpoint, "
+                    f"framing_anomaly_id, is_verified, severity, task_id, poe_level, "
+                    f"verification_status, hop_count, created_at "
+                    f"FROM attack_chains WHERE {' OR '.join(c_clauses)} ORDER BY created_at ASC",
+                    tuple(c_params),
+                )
+                for row in cur.fetchall():
+                    d = dict(row)
+                    cid = str(d.get("chain_id") or "")
+                    ctid = str(d.get("task_id") or "default")
+                    if cid:
+                        chains_by_id[cid] = d
+                    chains_by_task.setdefault(ctid, []).append(d)
+                    faid = str(d.get("framing_anomaly_id") or "").strip()
+                    if faid:
+                        chains_by_anomaly.setdefault(faid, []).append(d)
+            except sqlite3.OperationalError:
+                pass
+
+        trees: List[Dict[str, Any]] = []
+        for tid in task_ids:
+            raw_nodes = nodes_by_task.get(tid) or []
+            if not raw_nodes:
+                continue
+
+            node_id_set = {str(n.get("node_id") or "") for n in raw_nodes}
+            children_by_parent: Dict[str, List[str]] = {}
+            root_node_ids: List[str] = []
+            for n in raw_nodes:
+                nid = str(n.get("node_id") or "")
+                pid = str(n.get("parent_node_id") or "").strip()
+                if pid and pid in node_id_set and pid != nid:
+                    children_by_parent.setdefault(pid, []).append(nid)
+                else:
+                    root_node_ids.append(nid)
+
+            enriched_nodes: List[Dict[str, Any]] = []
+            task_eval_map: Dict[int, Dict[str, Any]] = {}
+            task_anom_map: Dict[str, Dict[str, Any]] = {}
+            task_vuln_map: Dict[str, Dict[str, Any]] = {}
+            task_chain_map: Dict[str, Dict[str, Any]] = {
+                str(ch["chain_id"]): ch for ch in chains_by_task.get(tid, []) if ch.get("chain_id")
+            }
+            domains_set: set = set()
+            rfcs_set: set = set()
+            fact_cnt = 0
+            intent_cnt = 0
+            hint_cnt = 0
+            anom_node_cnt = 0
+            vuln_node_cnt = 0
+            max_poe = 0
+
+            for n in raw_nodes:
+                nid = str(n.get("node_id") or "")
+                ntype = str(n.get("node_type") or "").upper()
+                if ntype == "FACT":
+                    fact_cnt += 1
+                elif ntype == "INTENT":
+                    intent_cnt += 1
+                elif ntype == "HINT":
+                    hint_cnt += 1
+
+                dom = str(n.get("domain") or "").strip()
+                if dom:
+                    domains_set.add(dom)
+                rfc = str(n.get("rfc_id") or "").strip()
+                if rfc:
+                    rfcs_set.add(rfc)
+
+                payload = n.get("payload") if isinstance(n.get("payload"), dict) else {}
+                matched_evals: List[Dict[str, Any]] = []
+                p_id = payload.get("probe_id")
+                if p_id is not None and not isinstance(p_id, bool):
+                    try:
+                        matched_evals = list(evals_by_probe.get(int(p_id), []))
+                        for ev in matched_evals:
+                            task_eval_map[int(ev["eval_id"])] = ev
+                    except (TypeError, ValueError):
+                        pass
+
+                a_id = str(payload.get("anomaly_id") or "").strip()
+                matched_anom = anomalies_by_id.get(a_id) if a_id else None
+                if matched_anom is not None:
+                    task_anom_map[a_id] = matched_anom
+
+                v_id = str(payload.get("vuln_id") or payload.get("parent_vuln_id") or "").strip()
+                matched_vuln = vulns_by_id.get(v_id) if v_id else None
+                if matched_vuln is None and a_id:
+                    matched_vuln = vulns_by_anomaly.get(a_id)
+                if matched_vuln is not None and matched_vuln.get("vuln_id"):
+                    task_vuln_map[str(matched_vuln["vuln_id"])] = matched_vuln
+
+                matched_chains: List[Dict[str, Any]] = []
+                seen_cids: set = set()
+                c_id = str(payload.get("chain_id") or "").strip()
+                if c_id and c_id in chains_by_id:
+                    matched_chains.append(chains_by_id[c_id])
+                    seen_cids.add(c_id)
+                    task_chain_map[c_id] = chains_by_id[c_id]
+                if a_id:
+                    for ch in chains_by_anomaly.get(a_id, []):
+                        cid_k = str(ch.get("chain_id") or "")
+                        if cid_k and cid_k not in seen_cids:
+                            matched_chains.append(ch)
+                            seen_cids.add(cid_k)
+                            task_chain_map[cid_k] = ch
+
+                outcome_str = str(payload.get("outcome") or "").strip().upper()
+                is_noise = bool(
+                    payload.get("is_noise_discard")
+                    or (matched_anom is not None and bool(matched_anom.get("is_environmental_noise")))
+                )
+                is_confirmed_vuln = bool(
+                    payload.get("is_confirmed_vuln")
+                    or matched_vuln is not None
+                    or nid.startswith("fact:vuln:")
+                    or any(bool(ev.get("is_vulnerable")) for ev in matched_evals)
+                    or any(bool(ch.get("is_verified")) for ch in matched_chains)
+                )
+                is_anomaly = bool(
+                    payload.get("is_anomaly")
+                    or outcome_str == "ANOMALY"
+                    or nid.startswith("fact:anomaly:")
+                    or matched_anom is not None
+                    or is_confirmed_vuln
+                )
+                poe_candidates = [int(payload.get("poe_level", 0) or 0)]
+                poe_candidates.extend(int(ch.get("poe_level", 0) or 0) for ch in matched_chains)
+                if is_confirmed_vuln and max(poe_candidates) < 2:
+                    poe_candidates.append(2)
+                node_poe = max(poe_candidates)
+
+                if is_anomaly:
+                    anom_node_cnt += 1
+                if is_confirmed_vuln:
+                    vuln_node_cnt += 1
+                if node_poe > max_poe:
+                    max_poe = node_poe
+
+                enriched = dict(n)
+                enriched["children"] = list(children_by_parent.get(nid, []))
+                enriched["outcomes"] = {
+                    "is_anomaly": is_anomaly,
+                    "is_confirmed_vuln": is_confirmed_vuln,
+                    "is_noise_discard": is_noise,
+                    "poe_level": node_poe,
+                    "evaluation": matched_evals[-1] if matched_evals else None,
+                    "evaluations": matched_evals,
+                    "anomaly": matched_anom,
+                    "vulnerability": matched_vuln,
+                    "attack_chains": matched_chains,
+                }
+                enriched_nodes.append(enriched)
+
+            task_chains_list = list(task_chain_map.values())
+            for ch in task_chains_list:
+                ch_poe = int(ch.get("poe_level", 0) or 0)
+                if ch_poe > max_poe:
+                    max_poe = ch_poe
+
+            trees.append(
+                {
+                    "task_id": tid,
+                    "node_count": len(enriched_nodes),
+                    "root_node_ids": root_node_ids,
+                    "children_by_parent": children_by_parent,
+                    "nodes": enriched_nodes,
+                    "outcomes": {
+                        "evaluations": list(task_eval_map.values()),
+                        "anomalies": list(task_anom_map.values()),
+                        "reproducible_vulnerabilities": list(task_vuln_map.values()),
+                        "attack_chains": task_chains_list,
+                    },
+                    "summary": {
+                        "fact_count": fact_cnt,
+                        "intent_count": intent_cnt,
+                        "hint_count": hint_cnt,
+                        "anomaly_count": anom_node_cnt,
+                        "confirmed_vuln_count": vuln_node_cnt,
+                        "verified_chain_count": sum(1 for ch in task_chains_list if ch.get("is_verified")),
+                        "max_poe_level": max_poe,
+                        "domains": sorted(domains_set),
+                        "rfc_ids": sorted(rfcs_set),
+                    },
+                }
+            )
+        return trees

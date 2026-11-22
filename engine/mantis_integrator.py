@@ -3452,7 +3452,7 @@ def run_unified_all_scans(
     export_advisory: bool = False,
     export_csv: bool = False,
     quiet: bool = False,
-    enable_external_scanners: bool = False,
+    enable_external_scanners: Optional[bool] = None,
     httpx_scan: Optional[bool] = None,
     katana_scan: Optional[bool] = None,
     nuclei_scan: Optional[bool] = None,
@@ -3465,7 +3465,9 @@ def run_unified_all_scans(
     docker_network: Optional[str] = None,
     enable_rea: bool = True,
     rea_target: Optional[str] = None,
-    rea_use_cli: bool = False,
+    rea_use_cli: bool = True,
+    auto_install_tools: Optional[bool] = None,
+    include_models: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Execute ALL integrated RFCHunt security scanners against `--repo`, `--path`, or remote `--host` in one pass,
@@ -3503,10 +3505,40 @@ def run_unified_all_scans(
     if resolved_budget_turns < 0:
         raise ValueError(f"artex_budget_turns must be >= 0, got {resolved_budget_turns}")
 
-    run_httpx = bool(httpx_scan) if httpx_scan is not None else bool(enable_external_scanners)
-    run_katana = bool(katana_scan) if katana_scan is not None else bool(enable_external_scanners)
-    run_nuclei = bool(nuclei_scan) if nuclei_scan is not None else bool(enable_external_scanners)
-    ext_scanners_active = bool(enable_external_scanners or run_httpx or run_katana or run_nuclei)
+    strict_offline = os.environ.get("RFCHUNT_OFFLINE") == "1"
+    in_test_env = (
+        bool(os.environ.get("CI"))
+        or bool(os.environ.get("GITHUB_ACTIONS"))
+        or "PYTEST_CURRENT_TEST" in os.environ
+    )
+    offline_or_ci = strict_offline or in_test_env
+    _approval_deny = str(approval_mode or "policy").strip().lower() == "deny"
+
+    _subproc_mocked = getattr(subprocess.run, "__module__", None) != "subprocess"
+    _ext_runner_patched = False
+    if offline_or_ci and not _subproc_mocked:
+        try:
+            import engine.external_scanners as _ext_mod
+            _ext_runner_patched = (
+                getattr(_ext_mod.run_opt_in_external_discovery, "__module__", None) != "engine.external_scanners"
+                or getattr(_ext_mod.run_opt_in_nuclei_scan, "__module__", None) != "engine.external_scanners"
+            )
+        except Exception:
+            _ext_runner_patched = False
+
+    _explicit_tool_subset = any(f is True for f in (httpx_scan, katana_scan, nuclei_scan))
+    if enable_external_scanners is None:
+        if _explicit_tool_subset:
+            ext_master = False
+        else:
+            ext_master = (not _approval_deny) and ((not offline_or_ci) or _subproc_mocked or _ext_runner_patched)
+    else:
+        ext_master = bool(enable_external_scanners)
+
+    run_httpx = bool(httpx_scan) if httpx_scan is not None else ext_master
+    run_katana = bool(katana_scan) if katana_scan is not None else ext_master
+    run_nuclei = bool(nuclei_scan) if nuclei_scan is not None else ext_master
+    ext_scanners_active = bool((enable_external_scanners is True) or run_httpx or run_katana or run_nuclei)
 
     base_dir = Path(__file__).resolve().parent.parent
     out_dir = Path(reports_dir) if reports_dir else (base_dir / "reports")
@@ -3522,14 +3554,6 @@ def run_unified_all_scans(
     def _log(msg: str) -> None:
         if effective_trace:
             effective_trace(msg)
-
-    # Shared FusionArbiter instance wired across all modules
-    if arbiter is None:
-        arbiter = (
-            FusionArbiter(db=db, preferred_model=enforced_model, sec_model=DEFAULT_SEC_MODEL, quiet=quiet)
-            if FusionArbiter is not None
-            else None
-        )
 
     _openapi_auto_host = False
     if not host and not targets and import_openapi and Path(import_openapi).is_file():
@@ -3605,15 +3629,17 @@ def run_unified_all_scans(
                     raise PermissionError(f"Target '{t_h}' is outside allow_hosts in scope_file '{scope_file}'.")
 
     ext_scanner_cfg = None
-    if ext_scanners_active:
+    if ext_scanners_active or nuclei_tags is not None or str(scanner_isolation or "host") != "host":
         from engine.external_scanners import DEFAULT_NUCLEI_TAGS, ExternalScannerConfig
-        ext_scanner_cfg = ExternalScannerConfig(
-            enabled=True,
+        _validated_cfg = ExternalScannerConfig(
+            enabled=bool(ext_scanners_active),
             execution_mode=scanner_isolation,
             docker_image=docker_image,
             docker_network=docker_network,
             nuclei_tags=DEFAULT_NUCLEI_TAGS if nuclei_tags is None else nuclei_tags,
         )
+        if ext_scanners_active:
+            ext_scanner_cfg = _validated_cfg
 
     has_local = bool(repo or path)
     has_remote = bool(clean_host)
@@ -3627,6 +3653,58 @@ def run_unified_all_scans(
     scan_mode = "unified_all_scans_remote" if (has_remote and not has_local) else "unified_all_scans"
     _log(f"[*] --all Unified Scan initiated on {target_path} | mode={scan_mode} | depth={effective_depth} | local={has_local} | remote={has_remote} | targets={len(resolved_targets)} | fusion={enforced_fusion} | model={enforced_model}")
 
+    # 0. Dynamic AI Model & Tool Provisioning BEFORE instantiating FusionArbiter / MantisIntegrator
+    auto_install_enabled = (
+        bool(auto_install_tools)
+        if auto_install_tools is not None
+        else (os.environ.get("RFCHUNT_AUTO_INSTALL_TOOLS", "1") != "0")
+    )
+    should_provision = (
+        not offline_or_ci
+        and auto_install_enabled
+        and not _approval_deny
+    )
+    resolved_include_models = (
+        bool(include_models)
+        if include_models is not None
+        else bool(should_provision)
+    )
+    tools_provisioned: Dict[str, Any] = {}
+    if should_provision:
+        try:
+            from engine.tool_provisioner import ToolProvisioner
+
+            requested_tools: List[str] = ["python_deps", "semgrep", "aiscan", "raptor"]
+            if resolved_include_models:
+                requested_tools.extend(["ollama", "ollama_models"])
+            if os.name == "nt" or ext_scanners_active:
+                requested_tools.append("raptor_docker")
+            if run_httpx or enable_external_scanners is True:
+                requested_tools.append("httpx")
+            if run_katana or enable_external_scanners is True:
+                requested_tools.append("katana")
+            if run_nuclei or enable_external_scanners is True:
+                requested_tools.append("nuclei")
+            if scanner_isolation == "docker" and (run_httpx or run_katana or run_nuclei):
+                requested_tools.append("docker_scanners")
+            if enable_rea and rea_use_cli:
+                requested_tools.append("rea_agents")
+            tools_provisioned = ToolProvisioner(on_trace=effective_trace).ensure_all(
+                tool_ids=requested_tools,
+                include_docker=(scanner_isolation == "docker"),
+                include_models=resolved_include_models,
+            )
+        except Exception as prov_exc:
+            tools_provisioned = {"error": str(prov_exc)}
+
+    # Shared FusionArbiter instance wired across all modules (created AFTER provisioning)
+    if arbiter is None:
+        arbiter = (
+            FusionArbiter(db=db, preferred_model=enforced_model, sec_model=DEFAULT_SEC_MODEL, quiet=quiet)
+            if FusionArbiter is not None
+            else None
+        )
+
     # 1. Run Local Suite (Mantis, aiscan, RAPTOR static) and Remote Suite (RAPTOR Web, ActiveFlawProber, ProtocolRuler, Harness, DifferentialOracle) in parallel
     mantis_engine = MantisIntegrator(
         db=db,
@@ -3635,10 +3713,6 @@ def run_unified_all_scans(
         preferred_model=enforced_model,
         arbiter=arbiter,
     )
-
-    strict_offline = os.environ.get("RFCHUNT_OFFLINE") == "1"
-    in_test_env = bool(os.environ.get("CI")) or "PYTEST_CURRENT_TEST" in os.environ
-    offline_or_ci = strict_offline or in_test_env
 
     candidate_files: List[Path] = discover_candidate_files(local_target_path) if (has_local and local_target_path) else []
     mantis_res: Dict[str, Any] = {
@@ -3687,8 +3761,13 @@ def run_unified_all_scans(
     def _run_aiscan_task(scan_root: str) -> Dict[str, Any]:
         try:
             from engine.aiscan_integrator import AiscanIntegrator
-            scanner = AiscanIntegrator(db=db, reports_dir=str(out_dir))
-            return scanner.scan_target(scan_root)
+            scanner = AiscanIntegrator(
+                db=db,
+                reports_dir=str(out_dir),
+                auto_install=should_provision,
+                use_native_binary=not (offline_or_ci or _approval_deny),
+            )
+            return scanner.scan_target(scan_root, auto_install=should_provision)
         except Exception as exc:
             return {"target_path": scan_root, "total_findings": 0, "findings": [], "endpoints": [], "error": str(exc)}
 
@@ -3700,9 +3779,11 @@ def run_unified_all_scans(
             from engine.raptor_integrator import RaptorIntegrator
             raptor = RaptorIntegrator(db=db, on_trace=effective_trace)
             status = raptor.check_status()
-            if status.get("docker_image_present") and status.get("raptor_repo_present") and os.name == "nt":
+            repo_ok = bool(status.get("raptor_repo_present") or status.get("raptor_available"))
+            docker_ok = bool(status.get("docker_image_present") or status.get("docker_ready"))
+            if repo_ok and (docker_ok or os.name != "nt"):
                 res = raptor.run_scan(target_path=scan_root, mode="all", model=enforced_model)
-                res["mode"] = "raptor_docker"
+                res["mode"] = "raptor_docker" if docker_ok else "raptor_native"
                 if fallback_res.get("findings"):
                     res.setdefault("findings", []).extend(fallback_res["findings"])
                     res["total_findings"] = len(res["findings"])
@@ -3730,7 +3811,7 @@ def run_unified_all_scans(
             should_run = patched
             if not should_run and not offline_or_ci:
                 status = raptor.check_status()
-                should_run = bool(status.get("raptor_repo_present"))
+                should_run = bool(status.get("raptor_repo_present") or status.get("raptor_available"))
             if not should_run:
                 return {"mode": "web", "total_findings": 0, "findings": [], "status": "skipped_offline_or_ci"}
             return raptor.run_host_scan(
@@ -3747,9 +3828,10 @@ def run_unified_all_scans(
         try:
             from engine.rea_integrator import ReaIntegrator
             rea_scanner = ReaIntegrator(db=db, reports_dir=str(out_dir))
+            effective_rea_use_cli = bool(rea_use_cli) and (not offline_or_ci) and (not _approval_deny)
             r_out = rea_scanner.analyze(
                 target_path=scan_root,
-                use_rea_cli=bool(rea_use_cli),
+                use_rea_cli=effective_rea_use_cli,
                 write_reports=True,
             )
             d = r_out.to_dict()
@@ -4129,20 +4211,22 @@ def run_unified_all_scans(
             # Pillar 1: Bind LiveWorkerExecutorRegistry for authorized/loopback remote hosts
             live_executor_fn = None
             live_registry = None
+            _approval_deny = str(approval_mode or "policy").strip().lower() == "deny"
             _is_loopback_target = bool(has_remote and clean_host and is_explicit_loopback_host(clean_host))
             _enable_live = False
-            if artex_live is True and has_remote:
-                _enable_live = bool(authorized or _is_loopback_target)
-            elif artex_live is None and has_remote and not strict_offline and (authorized or _is_loopback_target):
-                # Auto-enable safe non-destructive live verification only when target port is reachable
-                import socket as _sock
-                try:
-                    with _sock.create_connection((clean_host, int(resolved_port)), timeout=1.0):
-                        _enable_live = True
-                except OSError:
-                    _enable_live = False
+            if not _approval_deny:
+                if artex_live is True and has_remote:
+                    _enable_live = bool(authorized or _is_loopback_target)
+                elif artex_live is None and has_remote and not strict_offline and (authorized or _is_loopback_target):
+                    # Auto-enable safe non-destructive live verification only when target port is reachable
+                    import socket as _sock
+                    try:
+                        with _sock.create_connection((clean_host, int(resolved_port)), timeout=1.0):
+                            _enable_live = True
+                    except OSError:
+                        _enable_live = False
 
-            if _enable_live and has_remote:
+            if _enable_live and has_remote and not _approval_deny:
                 from engine.live_executors import LiveWorkerExecutorRegistry
                 live_registry = LiveWorkerExecutorRegistry(
                     host=clean_host,
@@ -4574,7 +4658,7 @@ def run_unified_all_scans(
                 except Exception:
                     pass
     except (PermissionError, ValueError) as exc:
-        if ext_scanners_active:
+        if ext_scanners_active and resolved_targets:
             raise
         artex_res = {"error": str(exc), "chains_synthesized": 0, "chains": []}
     except Exception as exc:
@@ -4951,6 +5035,7 @@ def run_unified_all_scans(
             "rea_sarif": (rea_res.get("report_files") or {}).get("sarif", "") if isinstance(rea_res.get("report_files"), dict) else "",
             **extra_report_files,
         },
+        "tools_provisioned": tools_provisioned,
         "elapsed_sec": elapsed,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }

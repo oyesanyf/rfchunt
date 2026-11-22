@@ -15,9 +15,11 @@ Ensures zero-crash local AI execution for RFC Hunt Swarm:
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,6 +32,9 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import httpx
 
 logger = logging.getLogger("terminator.ollama")
+
+HEALTH_PROBE_MAX_TIMEOUT_SEC: float = 0.4
+CREATE_NO_WINDOW: int = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 EMBEDDING_MODEL_MARKERS: Tuple[str, ...] = (
     "embed",
@@ -49,6 +54,173 @@ def is_embedding_model(tag: str) -> bool:
     if not low:
         return False
     return any(marker in low for marker in EMBEDDING_MODEL_MARKERS)
+
+
+def get_free_memory_gb() -> float:
+    """
+    Evaluates runtime FREE/AVAILABLE system RAM in GB (NEVER total physical RAM)
+    across Windows, Linux, and macOS.
+    """
+    try:
+        if os.name == "nt":
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return float(stat.ullAvailPhys) / (1024 ** 3)
+        elif os.path.isfile("/proc/meminfo"):
+            with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        kb = int(line.split()[1])
+                        return float(kb) / (1024 ** 2)
+    except Exception:
+        pass
+
+    try:
+        import psutil  # type: ignore[import-untyped]
+
+        return float(psutil.virtual_memory().available) / (1024 ** 3)
+    except Exception:
+        pass
+
+    if sys.platform == "darwin" and not OllamaLifecycleManager._is_automated_or_offline_env():
+        try:
+            proc = subprocess.run(
+                ["vm_stat"],
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=HEALTH_PROBE_MAX_TIMEOUT_SEC,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                page_size = 4096
+                m_ps = re.search(r"page size of (\d+) bytes", proc.stdout)
+                if m_ps:
+                    page_size = int(m_ps.group(1))
+                free_pages = 0
+                for key in ("Pages free", "Pages inactive", "Pages speculative"):
+                    m_pg = re.search(rf"{key}:\s+(\d+)", proc.stdout)
+                    if m_pg:
+                        free_pages += int(m_pg.group(1))
+                if free_pages > 0:
+                    return float(free_pages * page_size) / (1024 ** 3)
+        except Exception:
+            pass
+    return 8.0
+
+
+def get_free_vram_mb(*, allow_in_tests: bool = False) -> float:
+    """
+    Evaluates runtime FREE/AVAILABLE GPU VRAM in MB (NEVER total VRAM) via `nvidia-smi`
+    with a strict <=400ms timeout and zero subprocesses in offline/CI/test runs.
+    """
+    if OllamaLifecycleManager._is_automated_or_offline_env(allow_in_tests=allow_in_tests):
+        return 0.0
+
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi and os.name == "nt":
+        sys_cand = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "nvidia-smi.exe"
+        if sys_cand.is_file():
+            nvidia_smi = str(sys_cand)
+    if not nvidia_smi:
+        return 0.0
+
+    try:
+        cf = CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0
+        proc = subprocess.run(
+            [nvidia_smi, "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=HEALTH_PROBE_MAX_TIMEOUT_SEC,
+            check=False,
+            creationflags=cf,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            free_vals: List[float] = []
+            for raw_line in proc.stdout.splitlines():
+                clean = raw_line.strip()
+                if not clean:
+                    continue
+                try:
+                    val = float(clean.split(",")[0].strip())
+                    if val >= 0.0:
+                        free_vals.append(val)
+                except ValueError:
+                    continue
+            if free_vals:
+                return max(free_vals)
+    except Exception:
+        pass
+    return 0.0
+
+
+def get_runtime_free_memory(*, allow_in_tests: bool = False) -> Tuple[float, float]:
+    """Returns `(free_ram_gb, free_vram_mb)` strictly from runtime free/available memory."""
+    return get_free_memory_gb(), get_free_vram_mb(allow_in_tests=allow_in_tests)
+
+
+def size_qwen_for_free_memory(free_ram_gb: float, free_vram_mb: float = 0.0) -> str:
+    """
+    Sizes the base Qwen model strictly from runtime free/available memory
+    (NEVER total physical RAM, NEVER appends `-coder` suffixes).
+    """
+    ram = max(0.0, float(free_ram_gb))
+    vram = max(0.0, float(free_vram_mb))
+    if ram >= 48.0 or vram >= 24576.0:
+        return "qwen2.5:32b"
+    if ram >= 24.0 or vram >= 14336.0:
+        return "qwen2.5:14b"
+    if ram >= 12.0 or vram >= 4608.0:
+        return "qwen2.5:7b"
+    if ram >= 6.0 or vram >= 2048.0:
+        return "qwen2.5:3b"
+    return "qwen2.5:1.5b"
+
+
+def select_raptor_model_for_free_memory(
+    free_ram_gb: Optional[float] = None,
+    free_vram_mb: Optional[float] = None,
+    *,
+    available_tags: Optional[Iterable[str]] = None,
+    allow_in_tests: bool = False,
+) -> str:
+    """
+    Selects the best RAPTOR Ollama model strictly from runtime free RAM/VRAM.
+    Uses Foundation-Sec-8B (abliterated preferred when installed) when >=8GB free RAM
+    or >=6GB free VRAM is available; otherwise falls back to free-memory-sized `qwen2.5`.
+    """
+    eff_ram = get_free_memory_gb() if free_ram_gb is None else float(free_ram_gb)
+    eff_vram = get_free_vram_mb(allow_in_tests=allow_in_tests) if free_vram_mb is None else float(free_vram_mb)
+    sized_qwen = size_qwen_for_free_memory(eff_ram, eff_vram)
+    if eff_ram >= 8.0 or eff_vram >= 6144.0:
+        gen_tags = [t for t in (available_tags or ()) if t and not is_embedding_model(t)]
+        for tag in gen_tags:
+            tl = tag.lower()
+            if ("abliterat" in tl or "obliterat" in tl) and ("foundation-sec" in tl or "cisco" in tl):
+                return tag
+        return "fenkohq/foundation-sec-8b:latest"
+    return sized_qwen
 
 
 class OllamaLifecycleManager:
@@ -127,37 +299,31 @@ class OllamaLifecycleManager:
     @classmethod
     def probe_ollama(cls, endpoint: str = DEFAULT_ENDPOINT, fast_timeout: float = 0.4) -> Optional[List[str]]:
         """
-        Probes Ollama `/api/tags`.
-        Starts with a strict 400ms fast probe; if Ollama is busy swapping weights on localhost,
-        allows a single 3.5s grace read so active local models are never mistakenly marked empty.
+        Probes Ollama `/api/tags` with a strict <=400ms health probe timeout.
+        On timeout while Ollama is busy or restarting, falls back immediately to
+        cached endpoint tags rather than blocking the caller.
         """
         norm_ep = (endpoint or cls.DEFAULT_ENDPOINT).rstrip("/")
+        probe_timeout = min(max(float(fast_timeout), 0.05), HEALTH_PROBE_MAX_TIMEOUT_SEC)
         try:
-            resp = httpx.get(f"{norm_ep}/api/tags", timeout=fast_timeout)
+            resp = httpx.get(f"{norm_ep}/api/tags", timeout=probe_timeout)
             if resp.status_code == 200:
                 models = [m["name"] for m in resp.json().get("models", []) if "name" in m]
                 cls._update_cache(norm_ep, models)
                 return models
-        except httpx.ReadTimeout:
-            try:
-                resp = httpx.get(f"{norm_ep}/api/tags", timeout=3.5)
-                if resp.status_code == 200:
-                    models = [m["name"] for m in resp.json().get("models", []) if "name" in m]
-                    cls._update_cache(norm_ep, models)
-                    return models
-            except Exception:
-                with cls._lock:
-                    cached = cls._cached_by_endpoint.get(norm_ep)
-                    if cached and cached[1]:
-                        return list(cached[1])
-                    if cls._cached_tags:
-                        return list(cls._cached_tags)
+        except httpx.TimeoutException:
+            with cls._lock:
+                cached = cls._cached_by_endpoint.get(norm_ep)
+                if cached and cached[1]:
+                    return list(cached[1])
+                if cls._cached_tags:
+                    return list(cls._cached_tags)
         except Exception:
             pass
         return None
 
     @classmethod
-    def install_ollama_if_missing(cls) -> Optional[str]:
+    def install_ollama_if_missing(cls, *, allow_in_tests: bool = False) -> Optional[str]:
         """
         Automatically installs Ollama if the binary is not present on the machine.
         Strictly uses `shell=False` and process-scoped environment variables.
@@ -166,7 +332,7 @@ class OllamaLifecycleManager:
         if existing:
             return existing
 
-        if cls._is_automated_or_offline_env():
+        if os.environ.get("RFCHUNT_AUTO_INSTALL_TOOLS") == "0" or cls._is_automated_or_offline_env(allow_in_tests=allow_in_tests):
             return None
 
         print("[*] [Ollama Auto-Setup] Ollama binary not found. Attempting automatic installation...", file=sys.stderr)
@@ -187,6 +353,7 @@ class OllamaLifecycleManager:
                             "--accept-package-agreements",
                             "--accept-source-agreements",
                         ],
+                        shell=False,
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
@@ -215,6 +382,7 @@ class OllamaLifecycleManager:
                     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
                     subprocess.run(
                         [str(installer_path), "/SILENT"],
+                        shell=False,
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
@@ -237,6 +405,7 @@ class OllamaLifecycleManager:
                     if resp.status_code == 200 and resp.content:
                         subprocess.run(
                             [sh_bin],
+                            shell=False,
                             input=resp.content,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
@@ -252,10 +421,17 @@ class OllamaLifecycleManager:
         return cls.find_ollama_binary()
 
     @classmethod
-    def ensure_ollama_ready(cls, endpoint: str = DEFAULT_ENDPOINT, auto_install: bool = True) -> List[str]:
+    def ensure_ollama_ready(
+        cls,
+        endpoint: str = DEFAULT_ENDPOINT,
+        auto_install: bool = True,
+        *,
+        allow_in_tests: bool = False,
+    ) -> List[str]:
         """
         Ensures the Ollama daemon is installed, running, and returns available model tags.
-        Uses endpoint-keyed in-process caching so repeated calls within 30s are instantaneous.
+        Uses endpoint-keyed in-process caching so repeated calls within 30s are instantaneous
+        and enforces <=400ms health probes.
         """
         norm_ep = (endpoint or cls.DEFAULT_ENDPOINT).rstrip("/")
         with cls._lock:
@@ -263,17 +439,21 @@ class OllamaLifecycleManager:
             if cached and cached[1] and (time.time() - cached[0]) < 30.0:
                 return list(cached[1])
 
-            tags = cls.probe_ollama(endpoint=norm_ep, fast_timeout=0.4)
+            if os.environ.get("RFCHUNT_OFFLINE") == "1":
+                return list(cached[1]) if cached else list(cls._cached_tags)
+
+            tags = cls.probe_ollama(endpoint=norm_ep, fast_timeout=HEALTH_PROBE_MAX_TIMEOUT_SEC)
             if tags is not None:
                 cls._daemon_checked = True
                 return tags
 
-            if cls._is_automated_or_offline_env():
+            if cls._is_automated_or_offline_env(allow_in_tests=allow_in_tests):
                 return list(cached[1]) if cached else list(cls._cached_tags)
 
+            effective_auto_install = bool(auto_install) and (os.environ.get("RFCHUNT_AUTO_INSTALL_TOOLS", "1") != "0")
             ollama_bin = cls.find_ollama_binary()
-            if not ollama_bin and auto_install and not cls._daemon_checked:
-                ollama_bin = cls.install_ollama_if_missing()
+            if not ollama_bin and effective_auto_install and not cls._daemon_checked:
+                ollama_bin = cls.install_ollama_if_missing(allow_in_tests=allow_in_tests)
 
             cls._daemon_checked = True
             if not ollama_bin:
@@ -289,6 +469,7 @@ class OllamaLifecycleManager:
             try:
                 subprocess.Popen(
                     [ollama_bin, "serve"],
+                    shell=False,
                     env=proc_env,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
@@ -301,7 +482,7 @@ class OllamaLifecycleManager:
 
             for _ in range(16):
                 time.sleep(0.5)
-                tags = cls.probe_ollama(endpoint=norm_ep, fast_timeout=0.5)
+                tags = cls.probe_ollama(endpoint=norm_ep, fast_timeout=HEALTH_PROBE_MAX_TIMEOUT_SEC)
                 if tags is not None:
                     print(f"[+] [Ollama Auto-Start] Ollama daemon online ({len(tags)} models available).", file=sys.stderr)
                     return tags
@@ -365,7 +546,7 @@ class OllamaLifecycleManager:
             cls._pulling_models.add(clean_name)
 
         print(
-            f"[*] [Ollama Dynamic Install] Model '{clean_name}' is missing locally — pulling dynamically...",
+            f"[*] [Ollama Dynamic Install] Model '{clean_name}' is missing locally -- pulling dynamically...",
             file=sys.stderr,
             flush=True,
         )
@@ -377,6 +558,7 @@ class OllamaLifecycleManager:
                 try:
                     res = subprocess.run(
                         [ollama_bin, "pull", clean_name],
+                        shell=False,
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
@@ -392,7 +574,7 @@ class OllamaLifecycleManager:
                 ok = cls._pull_model_via_http(clean_name, endpoint=norm_ep, timeout_sec=timeout_sec)
 
             if ok:
-                refreshed = cls.probe_ollama(endpoint=norm_ep, fast_timeout=2.0) or []
+                refreshed = cls.probe_ollama(endpoint=norm_ep, fast_timeout=HEALTH_PROBE_MAX_TIMEOUT_SEC) or []
                 if any(t.lower() == clean_name.lower() or t.lower().startswith(clean_name.lower() + ":") for t in refreshed):
                     print(f"[+] [Ollama Dynamic Install] Successfully installed '{clean_name}'.", file=sys.stderr, flush=True)
                     return True
@@ -413,25 +595,31 @@ class OllamaLifecycleManager:
         cls,
         available_tags: List[str],
         endpoint: str = DEFAULT_ENDPOINT,
-        free_ram_gb: float = 16.0,
+        free_ram_gb: Optional[float] = None,
         preferred_model: Optional[str] = None,
         sec_model: Optional[str] = None,
         arbiter_model: Optional[str] = None,
         allow_in_tests: bool = False,
+        free_vram_mb: Optional[float] = None,
     ) -> List[str]:
         """
         Ensures the 3-specialist refusal-free ModelFusion panel models are dynamically pulled
-        when missing on a live online machine (skipped automatically in CI / pytest / offline).
+        when missing on a live online machine, sized strictly from runtime free RAM/VRAM
+        (skipped automatically in CI / pytest / offline).
         """
         if cls._is_automated_or_offline_env(allow_in_tests=allow_in_tests):
             return list(available_tags)
 
         norm_ep = (endpoint or cls.DEFAULT_ENDPOINT).rstrip("/")
-        # Only attempt dynamic pulls when Ollama daemon is actually reachable
-        current = list(available_tags) if available_tags else (cls.probe_ollama(endpoint=norm_ep, fast_timeout=0.8) or [])
-        if current == [] and cls.probe_ollama(endpoint=norm_ep, fast_timeout=0.8) is None:
+        # Only attempt dynamic pulls when Ollama daemon is actually reachable (<=400ms probe)
+        probed = cls.probe_ollama(endpoint=norm_ep, fast_timeout=HEALTH_PROBE_MAX_TIMEOUT_SEC) if not available_tags else list(available_tags)
+        if not available_tags and probed is None:
             return list(available_tags)
+        current = list(probed or [])
 
+        eff_ram = get_free_memory_gb() if free_ram_gb is None else float(free_ram_gb)
+        eff_vram = get_free_vram_mb(allow_in_tests=allow_in_tests) if free_vram_mb is None else float(free_vram_mb)
+        sized_qwen = size_qwen_for_free_memory(eff_ram, eff_vram)
         gen_tags = cls.filter_generative_tags(current)
 
         def _has_abliterated_family(keywords: Tuple[str, ...]) -> bool:
@@ -445,53 +633,71 @@ class OllamaLifecycleManager:
             cl = cand.strip().lower()
             return any(t.lower() == cl or t.lower().startswith(cl + ":") for t in gen_tags)
 
-        # 1. Protocol Specialist (Abliterated Gemma)
+        # 1. Protocol Specialist (Abliterated Gemma when free memory supports 12B, else memory-sized Qwen/Gemma)
         if preferred_model and preferred_model.lower() not in ("auto", "gemma2:2b", "hf.co/obliteratus/gemma-4-12b-obliterated:q4_k_m", "gemma-4-12b-obliterated"):
             role1_cands = [preferred_model] if not _has_exact(preferred_model) else []
         elif not _has_abliterated_family(("gemma",)):
-            role1_cands = (
-                ["hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M", "gemma2:2b"]
-                if free_ram_gb >= 8.0
-                else ["gemma2:2b"]
-            )
+            if eff_ram >= 10.0 or eff_vram >= 8192.0:
+                role1_cands = ["hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M", sized_qwen, "gemma2:2b"]
+            elif eff_ram >= 6.0 or eff_vram >= 2048.0:
+                role1_cands = [sized_qwen, "gemma2:2b"]
+            else:
+                role1_cands = [sized_qwen]
         else:
             role1_cands = []
 
-        # 2. Boundary Specialist (Abliterated Foundation-Sec)
+        # 2. Boundary Specialist (Abliterated Foundation-Sec when >=8GB free RAM or >=6GB free VRAM, else memory-sized Qwen)
         if sec_model and sec_model.lower() != "fenkohq/foundation-sec-8b:latest":
             role2_cands = [sec_model] if not _has_exact(sec_model) else []
         elif not _has_abliterated_family(("foundation-sec", "cisco")):
-            role2_cands = ["huihui_ai/foundation-sec-abliterated:8b", "fenkohq/foundation-sec-8b:latest"]
+            if eff_ram >= 8.0 or eff_vram >= 6144.0:
+                role2_cands = ["huihui_ai/foundation-sec-abliterated:8b", "fenkohq/foundation-sec-8b:latest", sized_qwen]
+            else:
+                role2_cands = [sized_qwen]
         else:
             role2_cands = []
 
-        # 3. Reasoning Arbiter (Abliterated GLM / DeepSeek-R1)
+        # 3. Reasoning Arbiter (Abliterated GLM / DeepSeek-R1 scaled strictly to runtime free RAM/VRAM)
         if arbiter_model:
             role3_cands = [arbiter_model] if not _has_exact(arbiter_model) else []
         elif not _has_abliterated_family(("glm", "deepseek-r1")):
-            if free_ram_gb >= 22.0:
+            if eff_ram >= 24.0 or eff_vram >= 14336.0:
                 role3_cands = [
                     "huihui_ai/glm-4.7-flash-abliterated:latest",
                     "huihui_ai/deepseek-r1-abliterated:8b",
                     "glm4:9b",
+                    sized_qwen,
                 ]
-            else:
+            elif eff_ram >= 10.0 or eff_vram >= 6144.0:
                 role3_cands = [
                     "huihui_ai/deepseek-r1-abliterated:8b",
                     "glm4:9b",
+                    sized_qwen,
                 ]
+            elif eff_ram >= 6.0 or eff_vram >= 2048.0:
+                role3_cands = [
+                    "deepseek-r1:1.5b",
+                    sized_qwen,
+                ]
+            else:
+                role3_cands = [sized_qwen]
         else:
             role3_cands = []
 
         pulled_any = False
+        satisfied_models: set = {t.lower() for t in gen_tags}
         for cands in (role1_cands, role2_cands, role3_cands):
             for cand in cands:
+                cl = cand.strip().lower()
+                if any(m == cl or m.startswith(cl + ":") for m in satisfied_models):
+                    break
                 if cls.ensure_model_installed(cand, endpoint=norm_ep, allow_in_tests=allow_in_tests):
                     pulled_any = True
+                    satisfied_models.add(cl)
                     break
 
         if pulled_any:
-            refreshed = cls.probe_ollama(endpoint=norm_ep, fast_timeout=2.0)
+            refreshed = cls.probe_ollama(endpoint=norm_ep, fast_timeout=HEALTH_PROBE_MAX_TIMEOUT_SEC)
             if refreshed is not None:
                 return refreshed
         return current
@@ -528,6 +734,7 @@ class OllamaLifecycleManager:
                     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
                     res = subprocess.run(
                         [ollama_bin, "pull", clean_name],
+                        shell=False,
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
@@ -537,11 +744,11 @@ class OllamaLifecycleManager:
                     )
                     if res.returncode == 0:
                         ok = True
-                        cls.probe_ollama(endpoint=endpoint, fast_timeout=1.0)
+                        cls.probe_ollama(endpoint=endpoint, fast_timeout=HEALTH_PROBE_MAX_TIMEOUT_SEC)
                 if not ok:
                     ok = cls._pull_model_via_http(clean_name, endpoint=endpoint, timeout_sec=600)
                     if ok:
-                        cls.probe_ollama(endpoint=endpoint, fast_timeout=1.0)
+                        cls.probe_ollama(endpoint=endpoint, fast_timeout=HEALTH_PROBE_MAX_TIMEOUT_SEC)
                 if not ok:
                     with cls._lock:
                         cls._failed_pulls.add(clean_name)

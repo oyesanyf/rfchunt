@@ -480,20 +480,30 @@ class ReaIntegrator:
 
     @staticmethod
     def check_rea_cli_status() -> Dict[str, Any]:
-        """Checks for a locally pre-installed `rea-agents` or `rea` binary without network calls."""
+        """Checks for a locally pre-installed `rea-agents` or `rea` binary (or repo-local node/rea.mjs)."""
         for bin_name in ("rea-agents", "rea"):
             found = shutil.which(bin_name)
             if found:
                 p = Path(found)
                 # ExecutionPolicy requires native executable or non-shell binary; report status transparently
                 is_script_shim = p.suffix.lower() in (".cmd", ".bat", ".ps1", ".sh")
-                return {
-                    "installed": not is_script_shim,
-                    "binary_path": str(p),
-                    "binary_name": p.name,
-                    "is_script_shim": is_script_shim,
-                    "attribution_url": REA_ATTRIBUTION_URL,
-                }
+                if not is_script_shim:
+                    return {
+                        "installed": True,
+                        "binary_path": str(p),
+                        "binary_name": p.name,
+                        "is_script_shim": False,
+                        "attribution_url": REA_ATTRIBUTION_URL,
+                    }
+        try:
+            from engine.tool_provisioner import ToolProvisioner
+
+            entry = ToolProvisioner().find_rea_entrypoint()
+            if entry and entry.get("installed"):
+                entry["attribution_url"] = REA_ATTRIBUTION_URL
+                return entry
+        except Exception:
+            pass
         return {
             "installed": False,
             "binary_path": None,
@@ -958,9 +968,12 @@ class ReaIntegrator:
         target: str,
         command: str = "analyze-javascript-application",
         timeout_sec: int = 60,
+        *,
+        auto_install: bool = True,
     ) -> Dict[str, Any]:
         """
-        Opt-in adapter for locally pre-installed `rea-agents` CLI (`shell=False` only, never `npx -y ...@latest`).
+        Opt-in adapter for local `rea-agents` CLI (`shell=False` only, never `npx -y ...@latest`).
+        Dynamically installs `rea-agents` locally via ToolProvisioner when live online and missing.
         """
         if os.environ.get("RFCHUNT_OFFLINE") == "1":
             return {"ok": False, "reason": "offline_mode", "data": {}}
@@ -968,11 +981,24 @@ class ReaIntegrator:
             raise PermissionError(f"Disallowed rea-agents command '{command}'.")
 
         cli_info = self.check_rea_cli_status()
+        if (not cli_info.get("installed") or not cli_info.get("binary_path")) and auto_install:
+            try:
+                from engine.tool_provisioner import ToolProvisioner
+                prov = ToolProvisioner()
+                if not prov.is_offline_or_blocked():
+                    prov.ensure_tool("rea_agents")
+                    cli_info = self.check_rea_cli_status()
+            except Exception as exc:
+                logger.debug("Dynamic rea-agents install skipped/failed: %s", exc)
+
         if not cli_info.get("installed") or not cli_info.get("binary_path"):
             return {"ok": False, "reason": "rea_cli_not_installed", "data": {}}
 
         bin_path = str(cli_info["binary_path"])
-        argv = [bin_path, command, str(target), "--json"]
+        if cli_info.get("mode") == "node_mjs" and cli_info.get("script_path"):
+            argv = [bin_path, str(cli_info["script_path"]), command, str(target), "--json"]
+        else:
+            argv = [bin_path, command, str(target), "--json"]
 
         policy = ExecutionPolicy.get_instance()
         policy.validate_intent(StructuredIntentProposal(

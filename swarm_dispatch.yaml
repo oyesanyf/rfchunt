@@ -1,0 +1,40 @@
+version: 1
+
+runtime:
+  execution: local          # "local" -> scanner_isolation="host", "docker" -> scanner_isolation="docker"
+  docker_image: null        # Optional explicit OCI image when execution == "docker"
+  docker_network: none      # null | "bridge" | "none" ("host" is strictly forbidden)
+  offline: true             # Sets RFCHUNT_OFFLINE=1 during dispatched execution
+
+workers:
+  backend: all              # "swarm" | "all" | "mantis" | "artex"
+  concurrency: 4
+  artex_workers: 3
+  preferred_model: "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"
+  sec_model: null
+  use_fusion: true
+  approval_mode: policy     # "policy" | "prompt" | "deny"
+  noise_profile: null       # null | "off" | "quiet" | "balanced" | "aggressive"
+  escalation:
+    enabled: true
+    fast_local_model: null          # null -> auto-sized from runtime free RAM/VRAM (never -coder)
+    max_escalation_fraction: 0.05   # Escalate top ~1-5% high-signal anomalies/chains only
+    min_poe_for_escalation: 1       # Require POE >= 1 before escalating
+    strong_local_model: null        # null -> auto-sized stronger local Ollama model when free RAM/VRAM allows
+    frontier_api_opt_in: false      # Strictly local-only by default
+    frontier_provider: null         # Opt-in only ("anthropic" | "openai" | "google" | "gemini" | "openrouter")
+    frontier_model: null            # Opt-in only (e.g., "claude-sonnet-4-20250514")
+    frontier_api_env_var: null      # Env var NAME only (e.g., "ANTHROPIC_API_KEY"); raw keys rejected
+
+workspace:
+  root: ".swarm_workspaces"
+  per_target_isolation: true
+
+targets:
+  - name: local_http_lab
+    host: "127.0.0.1"
+    port: 8080
+    tls: false
+    authorized: true
+    modes: ["all"]
+    rfcs: ["9112"]

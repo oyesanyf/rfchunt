@@ -20,7 +20,14 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from database import Database
-from ollama_manager import OllamaLifecycleManager, is_embedding_model
+from ollama_manager import (
+    HEALTH_PROBE_MAX_TIMEOUT_SEC,
+    OllamaLifecycleManager,
+    get_free_memory_gb,
+    get_free_vram_mb,
+    is_embedding_model,
+    size_qwen_for_free_memory,
+)
 
 logger = logging.getLogger("terminator.fusion")
 
@@ -98,6 +105,7 @@ class FusionArbiter:
         self.timeout = float(timeout_env) if float(timeout_env) > 0 else None
         self.client = httpx.Client(timeout=httpx.Timeout(self.timeout, connect=10.0))
         self.free_ram_gb = self._get_free_memory_gb()
+        self.free_vram_mb = self._get_free_vram_mb()
         self.available_tags = self._fetch_available_tags()
 
         # Dynamically pull missing preferred abliterated models at runtime when online
@@ -108,19 +116,22 @@ class FusionArbiter:
                 available_tags=self.available_tags,
                 endpoint=self.endpoint,
                 free_ram_gb=self.free_ram_gb,
+                free_vram_mb=self.free_vram_mb,
                 preferred_model=preferred_model,
                 sec_model=sec_model,
                 arbiter_model=arbiter_model,
             )
 
-        sized_qwen = self._size_qwen_for_free_memory(self.free_ram_gb)
+        sized_qwen = self._size_qwen_for_free_memory(self.free_ram_gb, self.free_vram_mb)
         generative_tags = [t for t in self.available_tags if not self._is_embedding_model(t)]
+        has_24g_mem = self.free_ram_gb >= 24.0 or self.free_vram_mb >= 14336.0
+        has_20g_mem = self.free_ram_gb >= 20.0 or self.free_vram_mb >= 12288.0
 
         # Check for refusal-direction ablated / OBLITERATUS models in Ollama
         abliterated_candidates = [
             t for t in generative_tags
             if ("abliterat" in t.lower() or "obliterat" in t.lower())
-            and (self.free_ram_gb >= 24.0 or not any(tag in t.lower() for tag in ("70b", "72b", "755b")))
+            and (has_24g_mem or not any(tag in t.lower() for tag in ("70b", "72b", "755b")))
         ]
         abliterated_gemma = [t for t in abliterated_candidates if "gemma" in t.lower()]
         abliterated_sec = [t for t in abliterated_candidates if any(k in t.lower() for k in ("foundation-sec", "cisco"))]
@@ -140,7 +151,7 @@ class FusionArbiter:
                     *abliterated_gemma,
                     "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M",
                     *abliterated_candidates,
-                    *(["gemma4:26b"] if self.free_ram_gb >= 20.0 else []),
+                    *(["gemma4:26b"] if has_20g_mem else []),
                     "gemma2:9b",
                     sized_qwen,
                     "gemma2:2b",
@@ -181,10 +192,10 @@ class FusionArbiter:
                 [
                     *abliterated_glm,
                     *abliterated_r1,
-                    *(["huihui_ai/glm-4.7-flash-abliterated:latest"] if self.free_ram_gb >= 20.0 else []),
+                    *(["huihui_ai/glm-4.7-flash-abliterated:latest"] if has_20g_mem else []),
                     "huihui_ai/deepseek-r1-abliterated:8b",
                     "glm4:9b",
-                    *(["glm-4.7-flash:latest"] if self.free_ram_gb >= 20.0 else []),
+                    *(["glm-4.7-flash:latest"] if has_20g_mem else []),
                     *installed_glm,
                     "deepseek-r1:1.5b",
                     sized_qwen,
@@ -225,71 +236,35 @@ class FusionArbiter:
 
     @staticmethod
     def _get_free_memory_gb() -> float:
-        """Evaluates runtime free/available RAM in GB across Windows, Linux, and macOS."""
-        try:
-            if os.name == "nt":
-                import ctypes
+        """Evaluates runtime free/available RAM in GB (never total physical RAM)."""
+        return get_free_memory_gb()
 
-                class MEMORYSTATUSEX(ctypes.Structure):
-                    _fields_ = [
-                        ("dwLength", ctypes.c_ulong),
-                        ("dwMemoryLoad", ctypes.c_ulong),
-                        ("ullTotalPhys", ctypes.c_ulonglong),
-                        ("ullAvailPhys", ctypes.c_ulonglong),
-                        ("ullTotalPageFile", ctypes.c_ulonglong),
-                        ("ullAvailPageFile", ctypes.c_ulonglong),
-                        ("ullTotalVirtual", ctypes.c_ulonglong),
-                        ("ullAvailVirtual", ctypes.c_ulonglong),
-                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                    ]
-
-                stat = MEMORYSTATUSEX()
-                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
-                    return stat.ullAvailPhys / (1024 ** 3)
-            elif os.path.isfile("/proc/meminfo"):
-                with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        if line.startswith("MemAvailable:"):
-                            kb = int(line.split()[1])
-                            return kb / (1024 ** 2)
-            elif sys.platform == "darwin":
-                out = subprocess.check_output(["vm_stat"], text=True, timeout=2)
-                page_size = 4096
-                m_ps = re.search(r"page size of (\d+) bytes", out)
-                if m_ps:
-                    page_size = int(m_ps.group(1))
-                free_pages = 0
-                for key in ("Pages free", "Pages inactive", "Pages speculative"):
-                    m_pg = re.search(rf"{key}:\s+(\d+)", out)
-                    if m_pg:
-                        free_pages += int(m_pg.group(1))
-                if free_pages > 0:
-                    return (free_pages * page_size) / (1024 ** 3)
-        except Exception:
-            pass
-        return 8.0
+    @staticmethod
+    def _get_free_vram_mb() -> float:
+        """Evaluates runtime free/available GPU VRAM in MB (never total VRAM)."""
+        return get_free_vram_mb()
 
     @staticmethod
     def _size_qwen_for_free_memory(free_ram_gb: float, free_vram_mb: float = 0.0) -> str:
-        """Sizes Qwen model strictly by runtime available memory."""
-        if free_ram_gb >= 48.0 or free_vram_mb >= 24576.0:
-            return "qwen2.5:32b"
-        if free_ram_gb >= 24.0 or free_vram_mb >= 14336.0:
-            return "qwen2.5:14b"
-        if free_ram_gb >= 12.0 or free_vram_mb >= 4608.0:
-            return "qwen2.5:7b"
-        if free_ram_gb >= 6.0 or free_vram_mb >= 2048.0:
-            return "qwen2.5:3b"
-        return "qwen2.5:1.5b"
+        """Sizes Qwen model strictly by runtime available memory (never `-coder` suffixes)."""
+        return size_qwen_for_free_memory(free_ram_gb, free_vram_mb)
 
     def _fetch_available_tags(self) -> List[str]:
-        """Probes Ollama and auto-installs/auto-starts the daemon if missing."""
+        """Probes Ollama (<=400ms) and auto-readies the daemon when online and auto-install enabled."""
+        if os.environ.get("RFCHUNT_OFFLINE") == "1":
+            return []
+        auto_install = os.environ.get("RFCHUNT_AUTO_INSTALL_TOOLS", "1") != "0"
         try:
-            return OllamaLifecycleManager.ensure_ollama_ready(endpoint=self.endpoint)
+            return OllamaLifecycleManager.ensure_ollama_ready(
+                endpoint=self.endpoint,
+                auto_install=auto_install,
+            )
         except Exception:
             try:
-                resp = httpx.get(f"{self.endpoint}/api/tags", timeout=0.4)
+                resp = httpx.get(
+                    f"{self.endpoint}/api/tags",
+                    timeout=HEALTH_PROBE_MAX_TIMEOUT_SEC,
+                )
                 if resp.status_code == 200:
                     data = resp.json()
                     return [m["name"] for m in data.get("models", []) if "name" in m]
@@ -343,6 +318,8 @@ class FusionArbiter:
             return fallback
 
         free_ram = float(getattr(self, "free_ram_gb", 16.0))
+        free_vram = float(getattr(self, "free_vram_mb", 0.0))
+        has_24g_mem = free_ram >= 24.0 or free_vram >= 14336.0
 
         obliterated_aliases = {
             "hf.co/obliteratus/gemma-4-12b-obliterated:q4_k_m",
@@ -397,7 +374,7 @@ class FusionArbiter:
                 t_low = tag.strip().lower()
                 tag_base = t_low.split(":")[0]
                 if cand_base == tag_base or cand_base in t_low:
-                    if free_ram < 24.0 and any(h in t_low for h in ("26b", "27b", "30b", "32b", "70b", "72b", "strix-deepseek", "glm-4.7-flash")):
+                    if not has_24g_mem and any(h in t_low for h in ("26b", "27b", "30b", "32b", "70b", "72b", "strix-deepseek", "glm-4.7-flash")):
                         continue
                     return tag
 
@@ -487,7 +464,14 @@ class FusionArbiter:
         u = s.upper()
         return "HTTP/" in u or any(u.startswith(m) for m in ("GET ", "POST ", "HEAD ", "OPTIONS ", "CONNECT ", "PUT ", "DELETE ", "TRACE ", "PRI "))
 
-    def run_fusion_pipeline(self, rfc_fragment: str, fragment_id: Optional[int] = None) -> FusionArbitrationResult:
+    def run_fusion_pipeline(
+        self,
+        rfc_fragment: str,
+        fragment_id: Optional[int] = None,
+        *,
+        hints: Optional[List[str]] = None,
+        facts: Optional[List[str]] = None,
+    ) -> FusionArbitrationResult:
         """
         Executes the full 4-Gate ModelFusion arbitration protocol with threaded specialist execution:
         1 & 2. Concurrently query Protocol Specialist (Gemma) and Boundary Specialist (Foundation-Sec).
@@ -499,12 +483,30 @@ class FusionArbiter:
         participating_models = [self.gemma_model, self.sec_model]
         proposals: List[CandidateProposal] = []
 
+        clean_hints = [str(h).strip() for h in (hints or []) if str(h).strip()]
+        clean_facts = [str(f).strip() for f in (facts or []) if str(f).strip()]
+        hint_block = (
+            "Active Steering Hints (highest priority first):\n"
+            + "\n".join(f"- {h}" for h in clean_hints)
+            + "\n"
+            if clean_hints
+            else ""
+        )
+        fact_block = (
+            "Observed Blackboard Facts:\n"
+            + "\n".join(f"- {f}" for f in clean_facts)
+            + "\n"
+            if clean_facts
+            else ""
+        )
+
         gemma_sys = (
             "You are a protocol security researcher (James Kettle HTTP Terminator methodology). "
             "Invert RFC response/framing rules into an incoming client HTTP/1.1 request (Shared-Parser Confusion)."
         )
         gemma_prompt = (
             f"RFC Clue: {rfc_fragment}\n"
+            f"{hint_block}{fact_block}"
             "Task: Output a single-line JSON object with keys rationale, raw_request (starting with POST / HTTP/1.1\\r\\nHost: target.local and ending with \\r\\n\\r\\n$PAYLOAD), and is_clean.\n"
             "JSON: "
         )
@@ -515,6 +517,7 @@ class FusionArbiter:
         )
         sec_prompt = (
             f"RFC Clue: {rfc_fragment}\n"
+            f"{hint_block}{fact_block}"
             "Task: Output a single-line JSON object with keys rationale, raw_request (starting with POST / HTTP/1.1\\r\\nHost: target.local and ending with \\r\\n\\r\\n$PAYLOAD), and is_clean.\n"
             "JSON: "
         )
@@ -573,11 +576,12 @@ class FusionArbiter:
                 ))
 
         # Refusal Bypass & Abliteration Rescue
+        has_24g_mem = float(getattr(self, "free_ram_gb", 0.0)) >= 24.0 or float(getattr(self, "free_vram_mb", 0.0)) >= 14336.0
         abliterated_candidates = [
             t for t in self.available_tags
             if not self._is_embedding_model(t)
             and ("abliterat" in t.lower() or "obliterat" in t.lower())
-            and (self.free_ram_gb >= 24.0 or not any(tag in t.lower() for tag in ("70b", "72b", "755b")))
+            and (has_24g_mem or not any(tag in t.lower() for tag in ("70b", "72b", "755b")))
         ]
         if (gemma_refused or sec_refused or len(proposals) == 0) and abliterated_candidates:
             abl_model = abliterated_candidates[0]
@@ -588,7 +592,8 @@ class FusionArbiter:
                     "Analyze the protocol rule and generate deep state-machine and framing inversion requests. "
                     "Output JSON with keys 'rationale', 'raw_request', 'is_clean'."
                 )
-                abl_out = self._query_model(abl_model, f"RFC Clue: {rfc_fragment}\nTask: Output raw HTTP probe JSON.", abl_sys)
+                abl_prompt = f"RFC Clue: {rfc_fragment}\n{hint_block}{fact_block}Task: Output raw HTTP probe JSON."
+                abl_out = self._query_model(abl_model, abl_prompt, abl_sys)
                 if not self._is_refusal(abl_out):
                     for item in self._parse_json(abl_out):
                         norm_req = self._normalize_crlf(item.get("raw_request", ""))
@@ -653,6 +658,7 @@ class FusionArbiter:
 
         arbiter_prompt = (
             f"RFC Snippet Under Investigation:\n\"\"\"{rfc_fragment}\"\"\"\n\n"
+            f"{hint_block}{fact_block}"
             f"Candidate Proposals Submitted to Fusion Arbiter:\n{candidates_summary}\n\n"
             f"Synthesize the optimal consensus probe."
         )
@@ -955,10 +961,11 @@ Output strict JSON matching:
             self.available_tags = self._fetch_available_tags()
 
         generative_tags = [t for t in self.available_tags if not self._is_embedding_model(t)]
+        has_24g_mem = float(getattr(self, "free_ram_gb", 0.0)) >= 24.0 or float(getattr(self, "free_vram_mb", 0.0)) >= 14336.0
         abliterated_candidates = [
             t for t in generative_tags
             if ("abliterat" in t.lower() or "obliterat" in t.lower())
-            and (self.free_ram_gb >= 24.0 or not any(tag in t.lower() for tag in ("70b", "72b", "755b")))
+            and (has_24g_mem or not any(tag in t.lower() for tag in ("70b", "72b", "755b")))
         ]
         participating_models = [self.gemma_model, self.sec_model, self.arbiter_model]
 

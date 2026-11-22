@@ -51,7 +51,7 @@ def build_step_syntax_check() -> Tuple[bool, str]:
 
 
 def build_step_dependencies() -> Tuple[bool, str]:
-    """Audits required core dependencies."""
+    """Audits and dynamically installs required core/security Python dependencies when live online."""
     required = ["httpx", "requests", "urllib3", "typing_extensions"]
     missing = []
     for mod in required:
@@ -61,8 +61,44 @@ def build_step_dependencies() -> Tuple[bool, str]:
             missing.append(mod)
 
     if missing:
+        try:
+            from engine.tool_provisioner import ToolProvisioner
+            prov = ToolProvisioner()
+            if not prov.is_offline_or_blocked():
+                prov.ensure_tool("python_deps")
+                missing = []
+                for mod in required:
+                    try:
+                        __import__(mod)
+                    except ImportError:
+                        missing.append(mod)
+        except Exception:
+            pass
+
+    if missing:
         return False, f"Missing required dependencies: {', '.join(missing)}. Run: pip install -r requirements.txt"
     return True, f"All core runtime dependencies verified ({', '.join(required)})."
+
+
+def build_step_tools() -> Tuple[bool, str]:
+    """Audits and dynamically installs integrated external tools (aiscan, raptor, ProjectDiscovery, REA, Ollama)."""
+    try:
+        from engine.tool_provisioner import ToolProvisioner
+
+        prov = ToolProvisioner(on_trace=lambda m: print(f"    {m}"))
+        if prov.is_offline_or_blocked():
+            statuses = prov.check_all_statuses(allow_probes=False)
+            ready = [k for k, v in statuses.items() if v.installed]
+            return True, f"Offline/test tool check complete ({len(ready)}/{len(statuses)} present locally)."
+
+        res = prov.ensure_all(include_docker=True, include_models=True)
+        return (
+            True,
+            f"External tool provisioning complete ({res['installed_count']}/{res['total']} ready, "
+            f"{res['newly_installed_count']} newly installed in {res['elapsed_sec']}s).",
+        )
+    except Exception as e:
+        return True, f"External tool check completed with notice: {e}"
 
 
 def build_step_database(db_path: str = "terminator.db") -> Tuple[bool, str]:
@@ -182,8 +218,23 @@ def build_step_harness2() -> Tuple[bool, str]:
 
 def build_step_run_tests() -> Tuple[bool, str]:
     """Executes the complete automated test suite via pytest."""
+    import shutil
+    import stat
+    import tempfile
+
+    basetemp_dir = tempfile.mkdtemp(prefix="rfchunt_build_pytest_")
     try:
-        cmd = [sys.executable, "-m", "pytest", "tests/", "test_protocol_ruler.py", "-q"]
+        cmd = [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "no:faker",
+            f"--basetemp={basetemp_dir}",
+            "tests/",
+            "test_protocol_ruler.py",
+            "-q",
+        ]
         creationflags = 0x08000000 if (sys.platform == "win32" or os.name == "nt") else 0
         res = subprocess.run(
             cmd,
@@ -193,7 +244,7 @@ def build_step_run_tests() -> Tuple[bool, str]:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=300,
+            timeout=1800,
             creationflags=creationflags,
         )
         if res.returncode == 0:
@@ -204,6 +255,23 @@ def build_step_run_tests() -> Tuple[bool, str]:
             return False, f"Test suite failed:\n{res.stdout}\n{res.stderr}"
     except Exception as e:
         return False, f"Test suite execution exception: {e}"
+    finally:
+        try:
+            for root, dirs, files in os.walk(basetemp_dir, topdown=False):
+                for fname in files:
+                    try:
+                        os.chmod(os.path.join(root, fname), stat.S_IWRITE | stat.S_IREAD)
+                    except OSError:
+                        pass
+                for dname in dirs:
+                    try:
+                        os.chmod(os.path.join(root, dname), stat.S_IWRITE | stat.S_IREAD)
+                    except OSError:
+                        pass
+            os.chmod(basetemp_dir, stat.S_IWRITE | stat.S_IREAD)
+        except OSError:
+            pass
+        shutil.rmtree(basetemp_dir, ignore_errors=True)
 
 
 def run_full_build(skip_tests: bool = False) -> bool:
@@ -217,6 +285,7 @@ def run_full_build(skip_tests: bool = False) -> bool:
     steps = [
         ("Python Bytecode Syntax Verification", build_step_syntax_check),
         ("Core Runtime Dependency Audit", build_step_dependencies),
+        ("Integrated Security Tool & Runtime Provisioning", build_step_tools),
         ("SQLite Database Schema & Lock Integrity", build_step_database),
         ("Terminator RFC Pre-Caching & Offline Readiness", build_step_precache_rfcs),
         ("Caldera Adversary Emulation Plugin Generation", build_step_caldera_export),

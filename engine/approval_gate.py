@@ -950,7 +950,7 @@ class ApprovalGate:
                 if callable(validator):
                     allowlist_ok, _ = validator(tokens_for_allowlist, shell=shell)
                 else:
-                    from engine.execution_policy import _is_python_binary_name, _is_safe_aiscan_name
+                    from engine.execution_policy import _is_python_binary_name, _is_safe_aiscan_name, _is_safe_rea_node
 
                     base_bin = _extract_basename_lower(tokens_for_allowlist[0])
                     base_stem = base_bin[:-4] if base_bin.endswith(".exe") else base_bin
@@ -960,6 +960,7 @@ class ApprovalGate:
                         and (
                             _is_python_binary_name(base_bin)
                             or _is_safe_aiscan_name(base_bin)
+                            or _is_safe_rea_node(tokens_for_allowlist)
                             or base_stem in {"httpx", "katana", "nuclei", "docker", "ollama"}
                             or _is_safe_raptor_ps1(tokens_for_allowlist)
                         )

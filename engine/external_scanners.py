@@ -728,6 +728,24 @@ def _find_non_python_httpx_on_path(skip_path: str) -> Optional[str]:
     return None
 
 
+def _try_auto_install_external_scanner(tool_name: str) -> bool:
+    """Dynamically provisions a missing ProjectDiscovery scanner when live online."""
+    if tool_name not in ("httpx", "katana", "nuclei"):
+        return False
+    if _is_subprocess_run_mocked():
+        return False
+    try:
+        from engine.tool_provisioner import ToolProvisioner
+
+        prov = ToolProvisioner()
+        if prov.is_offline_or_blocked():
+            return False
+        res = prov.ensure_tool(tool_name)
+        return bool(res.installed)
+    except Exception:
+        return False
+
+
 def _resolve_host_binary(binary_path: Optional[str], tool_name: str) -> str:
     """Validate and resolve a host scanner binary path against strict allowlists."""
     candidate_in = tool_name if binary_path is None else binary_path
@@ -759,7 +777,15 @@ def _resolve_host_binary(binary_path: Optional[str], tool_name: str) -> str:
                     alt = _find_non_python_httpx_on_path(found_valid)
                     if alt:
                         return alt
+                    if _try_auto_install_external_scanner("httpx"):
+                        alt_installed = _find_non_python_httpx_on_path(found_valid)
+                        if alt_installed:
+                            return alt_installed
                 return found_valid
+            if binary_path is None and _try_auto_install_external_scanner(tool_name):
+                found_after = shutil.which(validated)
+                if found_after:
+                    return _validate_binary_candidate(found_after, tool_name)
     return validated
 
 

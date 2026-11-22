@@ -396,23 +396,23 @@ Modular toolkit providing discrete CLI commands for each phase of the research f
 
 ---
 
-## The 20 Protocol & Application Security Modules
+## The 21+ Protocol & Application Security Modules
 
 | # | Module | Source File | Core Responsibility |
 | :-: | :--- | :--- | :--- |
 | **1** | **ABNF Grammar Extractor** | `engine/abnf_engine.py` | Compiles formal RFC 5234 ABNF grammar rules to find boundary edge-cases. |
 | **2** | **Context-Free Generator** | `probe_generator.py` | Synthesizes unanchored HTTP request templates from isolated micro-fragments. |
 | **3** | **Semantic Constraint Compiler** | `engine/semantic_compiler.py` | Extracts normative RFC keywords (`MUST`, `SHOULD NOT`) into validation rules. |
-| **4** | **Differential Oracle** | `engine/differential_oracle.py`| Dispatches probes across a 4-parser matrix to detect metamorphic divergences. |
+| **4** | **Differential Oracle** | `engine/differential_oracle.py`| Dispatches probes across a 4-parser matrix (plus optional Docker parser matrix) to detect metamorphic divergences. |
 | **5** | **Stateful Sequence Engine** | `engine/sequence_engine.py` | Manages persistent TCP channels to test 3-step canary contamination. |
 | **6** | **RFC Evolution Tracker** | `engine/errata_tracker.py` | Tracks official IETF technical errata and historical specification updates. |
 | **7** | **Metamorphic Invariance Oracle** | `engine/metamorphic_engine.py`| Tests semantic equivalence across case, whitespace, and encoding mutations. |
 | **8** | **Delta-Debugging Engine** | `engine/delta_debugger.py` | Recursively slices payloads to isolate the absolute minimal root-cause byte sequence. |
-| **9** | **Causal Anomaly Classifier** | `engine/causal_classifier.py` | Classifies anomalies into discrete taxonomy (`CL.0`, `TE.CL`, Response Forking, Leaks). |
+| **9** | **Causal Anomaly Classifier** | `engine/causal_classifier.py` | Classifies anomalies into discrete taxonomy (`CL.0`, `TE.CL`, Response Forking, Leaks) and structural novelty detection. |
 | **10**| **Cross-Protocol Analyzer** | `engine/boundary_analyzer.py`| Translates SMTP/MIME delimiters and BDAT frames into HTTP parser confusion probes. |
 | **11**| **Research Knowledge Graph** | `engine/knowledge_graph.py` | Maintains an interconnected SQLite knowledge graph of RFCs, rules, and findings. |
 | **12**| **Defensive Publisher** | `engine/defensive_publisher.py`| Exports Snort/Suricata rules (Arm 106), Nuclei templates, and pytest suites (Arm 107). |
-| **13**| **Open-Dream-RSI World Model** | `engine/dream_world_model.py` | Offline protocol world model and policy self-improvement via evolutionary dream rollouts. |
+| **13**| **Open-Dream-RSI World Model** | `engine/dream_world_model.py` | Offline protocol world model and replay-tree meta-exploration RL policy self-improvement. |
 | **14**| **MITRE Caldera Adversary Export** | `engine/caldera_integration.py`| Translates confirmed protocol flaws into MITRE Caldera adversary abilities and profiles. |
 | **15**| **RAPTOR Autonomous Framework** | `engine/raptor_engine.py` | Integrates Semgrep, CodeQL, PQC crypto audits, and live web DAST into `terminator.db`. |
 | **16**| **Google Research Harness² Engine** | `engine/harness2_engine.py` | Two-level recursive agent harnessing (`Propose–Probe–Compose` across `c1..c8` + per-domain `Library`). |
@@ -420,19 +420,56 @@ Modular toolkit providing discrete CLI commands for each phase of the research f
 | **18**| **haasonsaas/aiscan AI Auditor** | `engine/aiscan_integrator.py` | High-speed AI risk audit, prompt injection sink scanning, and model credential discovery. |
 | **19**| **Prompt Smuggling Synthesizer** | `engine/prompt_smuggling_synthesizer.py` | Novel attack class: couples wire framing desyncs (CL.TE, TE.CL) with backend AI endpoints. |
 | **20**| **Google Mantis Security Toolkit** | `engine/mantis_integrator.py` | Automated STRIDE threat modeling, `--depth` 1..100 hypothesis audit, Tier 1/2 sandbox canary repro, calibrated CVSS v3.1 rubric, verified patching, and unified `--all` orchestrator (ModelFusion + Abliterated models). |
+| **21**| **REA Client Surface Analyzer** | `engine/rea_integrator.py` | `morluto/rea` JS/Electron `.asar`/source-map & same-origin bundle analyzer (`rea-agents` CLI included by default in `--all`; opt out with `--no-rea-cli` or `--no-rea`). |
+| **22**| **External Scanners (`httpx`, `katana`, `nuclei`)** | `engine/external_scanners.py` | ProjectDiscovery `httpx`, `katana`, and non-destructive allowlisted `nuclei` templates — included in `--all` by default for live hosts (opt out via `--no-external-scanners`, `--no-httpx-scan`, `--no-katana-scan`, `--no-nuclei-scan`). |
+
+### Unified `--all` Integrated Toolchain (Default-ON)
+
+All integrated scanners and local AI models are included in `--all` by default (never silently skipped as opt-in when targeting applicable surfaces, while strictly honoring target authorization, `ApprovalGate`, non-destructive `nuclei` allowlists, and offline/CI guards):
+
+| Tool / Engine | Included in `--all` by Default | Applicable Surface | Opt-Out Flag(s) |
+| :--- | :---: | :--- | :--- |
+| **Google Mantis** (`engine/mantis_integrator.py`) | Yes | Local `--repo`/`--path` & live `--host` | — |
+| **haasonsaas/aiscan** (`engine/aiscan_integrator.py`) | Yes | Local `--repo`/`--path` | — |
+| **RAPTOR SAST/PQC/SCA/DAST** (`engine/raptor_integrator.py`) | Yes | Local `--repo`/`--path` & live `--host` | — |
+| **BaaRai/ARTEX Dual-Graph** (`engine/dual_graph_engine.py`) | Yes | Local `--repo`/`--path` & live `--host` | `--no-artex-live` |
+| **Prompt Smuggling Synthesizer** (`engine/prompt_smuggling_synthesizer.py`) | Yes | Local `--repo`/`--path` & live `--host` | — |
+| **Module 21 REA + `rea-agents` CLI** (`engine/rea_integrator.py`) | Yes | Local JS/Electron/web bundles & live `--host` | `--no-rea-cli`, `--no-rea` |
+| **ProjectDiscovery `httpx`** (`engine/external_scanners.py`) | Yes (live hosts) | Live `--host` / `--targets` | `--no-httpx-scan`, `--no-external-scanners` |
+| **ProjectDiscovery `katana`** (`engine/external_scanners.py`) | Yes (live hosts) | Live `--host` / `--targets` | `--no-katana-scan`, `--no-external-scanners` |
+| **ProjectDiscovery `nuclei` (safe tags)** (`engine/external_scanners.py`) | Yes (live hosts) | Live `--host` / `--targets` | `--no-nuclei-scan`, `--no-external-scanners` |
+| **Ollama Runtime & Free-RAM/VRAM Models** (`engine/tool_provisioner.py`) | Yes (online) | Auto-provisioned before Fusion/Mantis | `--no-include-models`, `--no-auto-install` |
 
 ### Google Mantis & Unified `--all` Multi-Scanner Quickstart
 
 ```powershell
-# Run ALL integrated scanners (Google Mantis, aiscan, ARTEX Dual-Graph, RAPTOR SAST/PQC/SCA, Prompt Smuggling)
+# Run ALL integrated scanners (Google Mantis, aiscan, ARTEX Dual-Graph, RAPTOR SAST/PQC/SCA,
+# Prompt Smuggling, Module 21 REA + rea-agents CLI, and httpx/katana/nuclei on live hosts)
 # Enforces ModelFusion + Abliterated Trio (hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M + Cisco Foundation-Sec + GLM) with zero safety filtering
 py -3.12 -u rfc_hunt_swarm.py --all --repo . --depth 30
+
+# Run --all against an authorized live host (includes httpx, katana, safe nuclei, and rea-agents by default)
+py -3.12 -u rfc_hunt_swarm.py --all --host 127.0.0.1 --port 8080 --authorized
+
+# Opt out of specific default-ON tools when desired
+py -3.12 -u rfc_hunt_swarm.py --all --host 127.0.0.1 --port 8080 --authorized --no-nuclei-scan --no-rea-cli --no-include-models
 
 # Target a single file or subdirectory via --path
 py -3.12 -u main.py --all --path engine/mantis_integrator.py --depth 50
 
 # Standalone Google Mantis deep audit with patch synthesis
 py -3.12 -u rfc_hunt_swarm.py --mantis --repo . --mantis-mode patch --depth 100
+
+# AIxCC Engines, Replay-Tree Dream-RSI Empirical Benchmark & Pure-CLI Swarm Board
+py -3.12 -u rfc_hunt_swarm.py slice --repo . --json
+py -3.12 -u rfc_hunt_swarm.py fuzz-bridge --repo . --fuzz-dry-run --json
+py -3.12 -u rfc_hunt_swarm.py sandbox-invariants --repo . --json
+py -3.12 -u rfc_hunt_swarm.py poe-verify --repo . --json
+py -3.12 -u rfc_hunt_swarm.py oracle --docker-parser-matrix --json
+py -3.12 -u rfc_hunt_swarm.py novelty --json
+py -3.12 -u rfc_hunt_swarm.py --mode dream --dream-benchmark --dream-seeds 10 --dream-budget 40 --json
+py -3.12 -u rfc_hunt_swarm.py --mode dream --dream-benchmark --dream-live-lab --dream-seeds 5 --json
+py -3.12 -u rfc_hunt_swarm.py swarm-board --db terminator.db --watch --interval 1.0 --plain
 ```
 
 - **SARIF 2.1.0 & Reports**: Written headless to `reports/combined_report.sarif`, `reports/mantis_report.sarif`, and `reports/combined_audit_summary.json`.

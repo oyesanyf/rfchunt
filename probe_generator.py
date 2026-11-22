@@ -6,6 +6,7 @@ Integrates with ModelFusionAdapter to run refusal-free abliterated Google Gemma 
 local security models via Ollama at zero cost 24/7 (100% local execution, no safety refusal guardrails).
 """
 
+import inspect
 import json
 import os
 import re
@@ -55,21 +56,55 @@ Strict Rules:
             except Exception as e:
                 pass
 
-    def generate_candidate_probes(self, rfc_fragment: str, fragment_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    def generate_candidate_probes(
+        self,
+        rfc_fragment: str,
+        fragment_id: Optional[int] = None,
+        *,
+        hints: Optional[List[str]] = None,
+        facts: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Generates edge-case candidate probes from a single micro-fragment.
         If use_fusion is True, executes the full multi-model consensus arbitration protocol.
         """
         if self.use_fusion and self.arbiter:
-            arb_result = self.arbiter.run_fusion_pipeline(rfc_fragment, fragment_id)
+            run_fn = self.arbiter.run_fusion_pipeline
+            try:
+                sig = inspect.signature(run_fn)
+                arb_kwargs: Dict[str, Any] = {}
+                if "hints" in sig.parameters:
+                    arb_kwargs["hints"] = hints
+                if "facts" in sig.parameters:
+                    arb_kwargs["facts"] = facts
+                arb_result = run_fn(rfc_fragment, fragment_id, **arb_kwargs)
+            except (TypeError, ValueError):
+                arb_result = run_fn(rfc_fragment, fragment_id)
             if arb_result.fused_probes:
                 return arb_result.fused_probes
+
+        clean_hints = [str(h).strip() for h in (hints or []) if str(h).strip()]
+        clean_facts = [str(f).strip() for f in (facts or []) if str(f).strip()]
+        hint_section = (
+            "\nActive Steering Hints (highest priority first):\n"
+            + "\n".join(f"- {h}" for h in clean_hints)
+            + "\n"
+            if clean_hints
+            else ""
+        )
+        fact_section = (
+            "\nObserved Blackboard Facts:\n"
+            + "\n".join(f"- {f}" for f in clean_facts)
+            + "\n"
+            if clean_facts
+            else ""
+        )
 
         user_prompt = f"""
 Create HTTP requests that surface state-machine, connection, or buffer edge-cases in webservers and reverse proxies. Novel techniques only.
 You must use this inspiration:
 \"\"\"{rfc_fragment}\"\"\"
-
+{hint_section}{fact_section}
 Generate 1 to 3 raw HTTP request templates.
 Remember:
 - Use host 'target.local'
@@ -116,15 +151,23 @@ Remember:
         except Exception as e:
             print(f"[!] Error in LLM probe generation: {e}")
 
-        return self._synthesize_rfc_grammar_probes(rfc_fragment, fragment_id)
+        return self._synthesize_rfc_grammar_probes(rfc_fragment, fragment_id, hints=hints, facts=facts)
 
-    def _synthesize_rfc_grammar_probes(self, rfc_fragment: str, fragment_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    def _synthesize_rfc_grammar_probes(
+        self,
+        rfc_fragment: str,
+        fragment_id: Optional[int] = None,
+        *,
+        hints: Optional[List[str]] = None,
+        facts: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Deterministic RFC-anchored grammar probe synthesizer (Zero-Empty-State guarantee):
         Constructs targeted HTTP/1.1 Rule-Inversion and Boundary probes from RFC fragment semantics
         whenever the LLM panel is warming up or returns unparseable JSON.
         """
-        frag_lower = (rfc_fragment or "").lower()
+        clean_hints = [str(h).strip() for h in (hints or []) if str(h).strip()]
+        frag_lower = " ".join([rfc_fragment or "", *clean_hints]).lower()
         templates = []
 
         if "connect" in frag_lower or "tunnel" in frag_lower or ":protocol" in frag_lower:

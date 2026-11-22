@@ -31,6 +31,9 @@ if sys.platform == "win32":
 import argparse
 import concurrent.futures
 import contextlib
+import hashlib
+import inspect
+import math
 import os
 from pathlib import Path
 import operator
@@ -43,6 +46,12 @@ END = "__end__"
 StateGraph = None  # Resolved lazily by _resolve_langgraph() to keep CLI startup fast
 
 
+def _merge_history(left: Optional[List[str]], right: Optional[List[str]]) -> List[str]:
+    base = list(left) if isinstance(left, list) else []
+    delta = list(right) if isinstance(right, list) else []
+    return base + delta
+
+
 def _resolve_langgraph():
     """Loads `langgraph.graph` lazily when `ProtocolResearchSwarm` builds its graph."""
     try:
@@ -52,55 +61,63 @@ def _resolve_langgraph():
         _fallback_end = "__end__"
 
         class _CompiledFallbackGraph:
-            def __init__(self, entry_point, nodes, edges, cond_edges):
+            def __init__(self, entry_point, nodes, edges, cond_edges, cond_maps=None):
                 self._entry = entry_point
                 self._nodes = nodes
                 self._edges = edges
                 self._cond_edges = cond_edges
+                self._cond_maps = cond_maps or {}
 
             @property
             def nodes(self):
                 return self._nodes
 
+            @staticmethod
+            def _merge_updates(cur: dict, updates: dict) -> None:
+                for k, v in (updates or {}).items():
+                    if k == "history":
+                        cur["history"] = _merge_history(cur.get("history"), v)
+                    else:
+                        cur[k] = v
+
+            def _next_node(self, node_name: str, cur: dict) -> str:
+                if node_name in self._cond_edges:
+                    route_key = self._cond_edges[node_name](cur)
+                    cond_map = self._cond_maps.get(node_name)
+                    if cond_map is not None:
+                        return cond_map.get(route_key, route_key)
+                    return route_key
+                return self._edges.get(node_name, _fallback_end)
+
             def invoke(self, state: dict, config: Optional[dict] = None) -> dict:
                 cur = dict(state)
-                recursion_limit = (config or {}).get("recursion_limit", 150)
+                if "history" in cur and not isinstance(cur.get("history"), list):
+                    cur["history"] = []
+                recursion_limit = (config or {}).get("recursion_limit", 500)
                 node_name = self._entry
                 steps = 0
                 while node_name and node_name != _fallback_end and steps < recursion_limit:
                     steps += 1
                     fn = self._nodes[node_name]
                     updates = fn(cur) or {}
-                    for k, v in updates.items():
-                        if k == "history" and isinstance(cur.get("history"), list) and isinstance(v, list):
-                            cur["history"] = cur["history"] + v
-                        else:
-                            cur[k] = v
-                    if node_name in self._cond_edges:
-                        node_name = self._cond_edges[node_name](cur)
-                    else:
-                        node_name = self._edges.get(node_name, _fallback_end)
+                    self._merge_updates(cur, updates)
+                    node_name = self._next_node(node_name, cur)
                 return cur
 
             def stream(self, state: dict, config: Optional[dict] = None):
                 cur = dict(state)
-                recursion_limit = (config or {}).get("recursion_limit", 150)
+                if "history" in cur and not isinstance(cur.get("history"), list):
+                    cur["history"] = []
+                recursion_limit = (config or {}).get("recursion_limit", 500)
                 node_name = self._entry
                 steps = 0
                 while node_name and node_name != _fallback_end and steps < recursion_limit:
                     steps += 1
                     fn = self._nodes[node_name]
                     updates = fn(cur) or {}
-                    for k, v in updates.items():
-                        if k == "history" and isinstance(cur.get("history"), list) and isinstance(v, list):
-                            cur["history"] = cur["history"] + v
-                        else:
-                            cur[k] = v
+                    self._merge_updates(cur, updates)
                     yield {node_name: updates}
-                    if node_name in self._cond_edges:
-                        node_name = self._cond_edges[node_name](cur)
-                    else:
-                        node_name = self._edges.get(node_name, _fallback_end)
+                    node_name = self._next_node(node_name, cur)
 
         class _FallbackStateGraph:
             def __init__(self, state_schema=None):
@@ -108,6 +125,7 @@ def _resolve_langgraph():
                 self._nodes = {}
                 self._edges = {}
                 self._cond_edges = {}
+                self._cond_maps = {}
 
             def add_node(self, name: str, fn):
                 self._nodes[name] = fn
@@ -118,11 +136,19 @@ def _resolve_langgraph():
             def add_edge(self, src: str, dst: str):
                 self._edges[src] = dst
 
-            def add_conditional_edges(self, src: str, router_fn):
+            def add_conditional_edges(self, src: str, router_fn, path_map: Optional[Dict[Any, str]] = None):
                 self._cond_edges[src] = router_fn
+                if path_map is not None:
+                    self._cond_maps[src] = dict(path_map)
 
             def compile(self):
-                return _CompiledFallbackGraph(self._entry, self._nodes, self._edges, self._cond_edges)
+                return _CompiledFallbackGraph(
+                    self._entry,
+                    self._nodes,
+                    self._edges,
+                    self._cond_edges,
+                    self._cond_maps,
+                )
 
         return _fallback_end, _FallbackStateGraph
 
@@ -264,7 +290,18 @@ class ResearchState(TypedDict, total=False):
     harness2_runs_dir: str
     harness2_domain: str
     current_harness2_result: Optional[Dict[str, Any]]
-    history: Annotated[List[str], operator.add]
+    ooda_phase: str
+    blackboard_bootstrapped: bool
+    active_intent_id: Optional[str]
+    active_intent: Optional[Dict[str, Any]]
+    active_hints: List[Dict[str, Any]]
+    task_id: str
+    workspace_dir: Optional[str]
+    blackboard_domain: str
+    zero_anomaly_streak: int
+    early_stop_triggered: bool
+    dream_stack_profile: str
+    history: Annotated[List[str], _merge_history]
 
 
 
@@ -376,6 +413,8 @@ class ProtocolResearchSwarm:
         terminator_categories: Optional[List[str]] = None,
         preferred_model: Optional[str] = None,
         use_fusion: bool = True,
+        novelty_threshold: float = 0.72,
+        stack_profile: Optional[str] = None,
     ):
         host = re.sub(r"^https?://", "", str(host).strip(), flags=re.IGNORECASE).split("/")[0]
         if ":" in host and not host.startswith("["):
@@ -413,19 +452,25 @@ class ProtocolResearchSwarm:
         self.errata = RFCEvolutionTracker()
         self.metamorphic = MetamorphicTestingEngine()
         self.debugger = DeltaDebugger(host, port, use_tls=self.use_tls)
-        self.classifier = CausalAnomalyClassifier()
+        self.classifier = CausalAnomalyClassifier(db=self.db, novelty_threshold=novelty_threshold)
         self.boundary = CrossProtocolBoundaryAnalyzer()
-        self.knowledge_graph = ResearchKnowledgeGraph()
+        self.knowledge_graph = ResearchKnowledgeGraph(db=self.db)
+        self.kg_lock = threading.RLock()
+        self.enable_active_audit = True
+        self._reclaimed_task_ids: set = set()
         self.containment = HostContainmentManager()
         self.publisher = DefensiveIntelligencePublisher(db=self.db, containment_manager=self.containment)
         self.publisher.sync_db_findings()
 
-        # Open Dream-RSI Engine (Modules 13-15)
+        # Open Dream-RSI Engine (Modules 13-15: Replay-Tree Meta-Exploration RL)
+        self.stack_profile = stack_profile
         self.dream_world_model = ProtocolWorldModel(target_host=host, target_port=port)
         self.dream_world_model.ingest_history_from_db(db_path=db_path)
         self.dream_optimizer = DreamRSIOptimizer(self.dream_world_model)
         self.dream_store = DreamPolicyStore()
-        latest_pol = self.dream_store.get_latest_policy()
+        latest_pol = self.dream_store.get_latest_policy(stack_profile=stack_profile)
+        self.active_meta_policy: Optional[DreamPolicy] = latest_pol
+        self._zero_anomaly_streaks: Dict[Tuple[str, str], int] = {}
         if latest_pol:
             self.bandit.apply_dream_policy(latest_pol)
 
@@ -433,6 +478,7 @@ class ProtocolResearchSwarm:
         self.harness2_engine = Harness2ProtocolEngine(
             target_host=host, target_port=port, db_path=db_path
         )
+        self._dual_graph_engines: Dict[str, Any] = {}
 
         # Run-level Pass/Fail Telemetry
         self.stats_lock = threading.Lock()
@@ -492,68 +538,498 @@ class ProtocolResearchSwarm:
             }
         return self.run_stats["per_rfc"][rfc_id]
 
-    # Agent 1: Fetch and Chunk (Replaces manual string entry)
-    def fetch_and_chunk_agent(self, state: ResearchState) -> dict:
-        raw_rfc = str(state.get("rfc_num", "9112")).strip().upper().replace("RFC-", "").replace("RFC", "")
+    @staticmethod
+    def _resolve_task_id(state: Optional[ResearchState]) -> str:
+        val = str((state or {}).get("task_id") or "").strip()
+        return val or "default"
+
+    @staticmethod
+    def _resolve_blackboard_domain(state: Optional[ResearchState]) -> str:
+        raw = (state or {}).get("blackboard_domain")
+        if raw is None or not str(raw).strip():
+            raw = (state or {}).get("harness2_domain")
+        val = str(raw or "").strip()
+        if val.lower() in ("", "auto"):
+            return ""
+        return val
+
+    @staticmethod
+    def _parse_rfc_info(state: Optional[ResearchState]) -> Tuple[int, str]:
+        raw_rfc = str((state or {}).get("rfc_num", "9112")).strip().upper().replace("RFC-", "").replace("RFC", "")
         rfc_num = 0 if raw_rfc in ("0", "MCP") or not raw_rfc.isdigit() else int(raw_rfc)
-        rfc_label = f"RFC{rfc_num}"
+        return rfc_num, f"RFC{rfc_num}"
+
+    def _score_meta_priority(
+        self,
+        base_priority: float,
+        *,
+        source_kind: str = "llm_candidate",
+        domain: str = "",
+        mutator_family: str = "",
+        depth: int = 0,
+        has_active_hint: bool = False,
+    ) -> float:
+        """Applies active Dream-RSI meta-exploration policy weights when present."""
+        policy = getattr(self, "active_meta_policy", None)
+        if policy is not None and hasattr(policy, "score_intent_priority"):
+            try:
+                return float(
+                    policy.score_intent_priority(
+                        float(base_priority),
+                        source_kind=source_kind,
+                        domain=domain,
+                        mutator_family=mutator_family,
+                        depth=depth,
+                        has_active_hint=has_active_hint,
+                    )
+                )
+            except Exception:
+                return float(base_priority)
+        return float(base_priority)
+
+    def _get_dual_graph_engine(
+        self, task_id: str, state: Optional[ResearchState] = None
+    ) -> Any:
+        from engine.dual_graph_engine import DualGraphAttackEngine
+
+        eff_task = str(task_id or "default").strip() or "default"
+        with self.kg_lock:
+            eng = self._dual_graph_engines.get(eff_task)
+            if eng is not None:
+                return eng
+            ws_dir = (state or {}).get("workspace_dir")
+            if ws_dir:
+                reports_dir = Path(str(ws_dir)) / "reports"
+            elif str(self.db_path or "").strip() not in ("", ":memory:"):
+                reports_dir = Path(self.db_path).resolve().parent / "reports"
+            else:
+                reports_dir = Path.cwd() / "reports"
+            eng = DualGraphAttackEngine(
+                db=self.db,
+                reports_dir=reports_dir,
+                task_id=eff_task,
+            )
+            eng.ingest_target_infrastructure(
+                host=self.host,
+                port=self.port,
+                endpoints=["/"],
+            )
+            self._dual_graph_engines[eff_task] = eng
+            return eng
+
+    def _fetch_active_hints(
+        self,
+        task_id: str,
+        domain: str,
+        rfc_label: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        eff_domain = domain if domain and domain.lower() != "auto" else None
+        merged: Dict[str, Dict[str, Any]] = {}
+        try:
+            primary_rows = self.db.get_active_hints(task_id=task_id, domain=eff_domain, limit=0)
+            for row in primary_rows:
+                nid = str(row.get("node_id") or "")
+                if nid:
+                    merged[nid] = row
+            if task_id != "default":
+                default_rows = self.db.get_active_hints(task_id="default", domain=eff_domain, limit=0)
+                for row in default_rows:
+                    nid = str(row.get("node_id") or "")
+                    if nid and nid not in merged:
+                        merged[nid] = row
+        except Exception:
+            return []
+
+        filtered = [
+            row
+            for row in merged.values()
+            if not rfc_label
+            or str(row.get("rfc_id") or "") in ("", rfc_label)
+            or (
+                str(row.get("source_agent") or "") == "dream_rsi_agent"
+                and bool(domain)
+                and str(row.get("domain") or "").lower() == domain.lower()
+            )
+        ]
+        filtered.sort(key=lambda r: (-float(r.get("priority", 0.0) or 0.0), int(r.get("id", 0) or 0)))
+        if limit is not None and int(limit) > 0:
+            return filtered[: int(limit)]
+        return filtered
+
+    def _candidate_from_intent(self, intent: Dict[str, Any]) -> Dict[str, Any]:
+        payload = intent.get("payload") if isinstance(intent.get("payload"), dict) else {}
+        if payload.get("raw_request"):
+            cand = dict(payload)
+            if not cand.get("rationale"):
+                cand["rationale"] = str(intent.get("content") or "Blackboard INTENT probe")
+            return cand
+
+        content = str(intent.get("content") or "").strip()
+        kg_node_id = str(payload.get("kg_node_id") or "")
+        attrs = payload.get("attributes") if isinstance(payload.get("attributes"), dict) else {}
+        rule_name = ""
+        raw_stmt = str(attrs.get("raw_statement") or "")
+        if "=" in raw_stmt:
+            rule_name = raw_stmt.split("=", 1)[0].strip().rstrip("/")
+        elif kg_node_id.upper().startswith("ABNF-"):
+            parts = kg_node_id.split("-", 2)
+            if len(parts) == 3:
+                rule_name = parts[2].lower()
+
+        raw_req = ""
+        if rule_name:
+            try:
+                inversions = self.abnf.generate_inversions(rule_name)
+                if inversions:
+                    _, mut_bytes = inversions[0]
+                    mut_str = mut_bytes.decode("latin-1", errors="replace")
+                    upper_mut = mut_str.lstrip().upper()
+                    http_methods = ("GET ", "POST ", "HEAD ", "OPTIONS ", "PUT ", "DELETE ", "CONNECT ", "TRACE ", "PRI ")
+                    if any(upper_mut.startswith(m) for m in http_methods) and "HTTP/" in upper_mut:
+                        raw_req = mut_str
+                    elif ":" in mut_str and "\n" in mut_str:
+                        hdr = mut_str.rstrip("\r\n")
+                        raw_req = f"GET / HTTP/1.1\r\nHost: target.local\r\n{hdr}\r\nConnection: close\r\n\r\n"
+                    else:
+                        raw_req = (
+                            f"POST / HTTP/1.1\r\nHost: target.local\r\n"
+                            f"X-ABNF-Rule: {rule_name}\r\n"
+                            f"Content-Length: {len(mut_bytes)}\r\n"
+                            f"Connection: close\r\n\r\n{mut_str}"
+                        )
+            except Exception:
+                raw_req = ""
+
+        if not raw_req:
+            try:
+                synth = self.generator._synthesize_rfc_grammar_probes(content)
+                if synth:
+                    raw_req = str(synth[0].get("raw_request") or "")
+            except Exception:
+                raw_req = ""
+
+        if not raw_req:
+            raw_req = "GET / HTTP/1.1\r\nHost: target.local\r\nConnection: close\r\n\r\n"
+
+        return {
+            "raw_request": raw_req,
+            "rationale": content or f"ABNF requirement {kg_node_id}",
+            "is_clean": False,
+            "source_type": "abnf" if kg_node_id else "intent",
+            "kg_node_id": kg_node_id,
+        }
+
+    # Agent 1: Fetch and Chunk (Cairn Bootstrap)
+    def fetch_and_chunk_agent(self, state: ResearchState) -> dict:
+        task_id = self._resolve_task_id(state)
+        domain = self._resolve_blackboard_domain(state)
+        rfc_num, rfc_label = self._parse_rfc_info(state)
+
         with self.stats_lock:
             self.active_rfc_id = rfc_label
             r_stat = self._ensure_rfc_stat(rfc_label)
-        # Fetch actual text
-        rfc_text = self.fetcher.fetch_rfc_by_number(rfc_num) or ""
+
+        try:
+            self.db.reclaim_stale_intents(task_id=task_id)
+        except Exception:
+            pass
+
+        existing_task_nodes = {
+            r["node_id"]: r["status"]
+            for r in self.db.get_blackboard_nodes(task_id=task_id, limit=0)
+        }
+        existing_all_ids = {
+            r["node_id"]
+            for r in self.db.get_blackboard_nodes(limit=0)
+        }
+        with self.kg_lock:
+            self.knowledge_graph.task_id = task_id
+            self.knowledge_graph.domain = domain
+            self.knowledge_graph.seed_mirrored_ids(existing_all_ids)
+
+        # Cairn Bootstrap: ActiveFlawProber baseline capabilities & findings
+        audit_fact_id = f"fact:bootstrap:active_audit:{task_id}"
+        if audit_fact_id not in existing_task_nodes and getattr(self, "enable_active_audit", True):
+            try:
+                from engine.active_flaw_prober import ActiveFlawProber
+                orig_mod = getattr(ActiveFlawProber.run_active_audit, "__module__", "")
+                is_patched = orig_mod != "engine.active_flaw_prober"
+                if os.environ.get("RFCHUNT_OFFLINE") != "1" or is_patched:
+                    prober = ActiveFlawProber(
+                        host=self.host,
+                        port=self.port,
+                        use_tls=self.use_tls,
+                        timeout=2.0,
+                        db=self.db,
+                        on_trace=lambda *_a, **_kw: None,
+                    )
+                    prober_vulns = prober.run_active_audit() or []
+                    for idx, pv in enumerate(prober_vulns):
+                        if isinstance(pv, dict):
+                            vid = str(pv.get("vuln_id") or f"ACTIVE-{idx+1}")
+                            aid = str(pv.get("anomaly_id") or "")
+                            imp = str(pv.get("impact") or "UNKNOWN")
+                            prov = str(pv.get("provenance_chain") or pv.get("behavior") or "ActiveFlawProber")
+                        else:
+                            vid = str(getattr(pv, "vuln_id", f"ACTIVE-{idx+1}"))
+                            aid = str(getattr(pv, "anomaly_id", ""))
+                            imp_obj = getattr(pv, "impact", "UNKNOWN")
+                            imp = str(getattr(imp_obj, "value", imp_obj))
+                            prov = str(getattr(pv, "provenance_chain", "ActiveFlawProber"))
+                        self.db.add_fact(
+                            f"ActiveFlawProber finding {vid} ({imp}): {prov}",
+                            node_id=f"fact:active_flaw:{task_id}:{vid}",
+                            task_id=task_id,
+                            domain=domain,
+                            rfc_id=rfc_label,
+                            source_agent="ActiveFlawProber",
+                            payload={"vuln_id": vid, "anomaly_id": aid, "impact": imp, "provenance": prov},
+                        )
+                    self.db.add_fact(
+                        f"ActiveFlawProber baseline audit completed against {self.host}:{self.port} ({len(prober_vulns)} findings)",
+                        node_id=audit_fact_id,
+                        task_id=task_id,
+                        domain=domain,
+                        rfc_id=rfc_label,
+                        source_agent="ActiveFlawProber",
+                        payload={"host": self.host, "port": self.port, "findings_count": len(prober_vulns)},
+                    )
+            except Exception as exc:
+                self.db.add_fact(
+                    f"ActiveFlawProber baseline audit handled safely against {self.host}:{self.port}: {exc}",
+                    node_id=audit_fact_id,
+                    task_id=task_id,
+                    domain=domain,
+                    rfc_id=rfc_label,
+                    source_agent="ActiveFlawProber",
+                    payload={"host": self.host, "port": self.port, "error": str(exc)},
+                )
+
+        # Fetch actual RFC text
+        rfc_text = self.fetcher.fetch_rfc_by_number(rfc_num) or state.get("rfc_text") or ""
         if not rfc_text:
             with self.stats_lock:
                 r_stat["status"] = "UNAVAILABLE"
+            unavail_fact_id = f"fact:bootstrap:rfc_unavailable:{task_id}:{rfc_label}"
+            if unavail_fact_id not in existing_task_nodes:
+                self.db.add_fact(
+                    f"{rfc_label} unavailable or empty during bootstrap.",
+                    node_id=unavail_fact_id,
+                    task_id=task_id,
+                    domain=domain,
+                    rfc_id=rfc_label,
+                    source_agent="fetch_and_chunk_agent",
+                )
             return {
                 "rfc_text": "",
-                "fragments": [],
-                "history": [f"fetch_and_chunk: RFC{rfc_num} unavailable or empty."],
+                "fragments": list(state.get("fragments") or []),
+                "blackboard_bootstrapped": True,
+                "task_id": task_id,
+                "blackboard_domain": domain,
+                "history": [f"fetch_and_chunk: {rfc_label} unavailable or empty."],
             }
 
-        # Mod 1 & 3: Extractor / Compiler
-        self.knowledge_graph.add_node(f"RFC{rfc_num}", "RFC", f"Specification RFC{rfc_num}")
-        abnf_reqs = self.abnf.extract_from_rfc_text(f"RFC{rfc_num}", rfc_text)
-        for req in abnf_reqs:
-            self.knowledge_graph.add_node(req.requirement_id, "REQUIREMENT", req.raw_statement[:40])
-            self.knowledge_graph.add_edge(f"RFC{rfc_num}", req.requirement_id, "DEFINES")
+        # Mod 1 & 3: Extractor / Compiler + KnowledgeGraph blackboard seeding
+        abnf_reqs = self.abnf.extract_from_rfc_text(rfc_label, rfc_text)
+        with self.kg_lock:
+            self.knowledge_graph.add_node(
+                rfc_label,
+                "RFC",
+                f"Specification {rfc_label}",
+                attributes={"rfc_id": rfc_label, "domain": domain, "task_id": task_id},
+            )
+            for req in abnf_reqs:
+                self.knowledge_graph.add_node(
+                    req.requirement_id,
+                    "REQUIREMENT",
+                    req.raw_statement[:80],
+                    attributes={
+                        "rfc_id": rfc_label,
+                        "domain": domain,
+                        "task_id": task_id,
+                        "raw_statement": req.raw_statement,
+                        "formal_expression": req.formal_expression,
+                    },
+                )
+                self.knowledge_graph.add_edge(rfc_label, req.requirement_id, "DEFINES")
+                kg_bb_id = f"kg:{req.requirement_id}"
+                if kg_bb_id not in existing_task_nodes and kg_bb_id in existing_all_ids:
+                    abnf_seed_id = f"intent:abnf:{task_id}:{req.requirement_id}"
+                    if abnf_seed_id not in existing_task_nodes:
+                        self.db.queue_intent(
+                            f"[REQUIREMENT] {req.raw_statement[:80]}",
+                            priority=1.0,
+                            node_id=abnf_seed_id,
+                            task_id=task_id,
+                            domain=domain,
+                            rfc_id=rfc_label,
+                            source_agent="fetch_and_chunk_agent",
+                            payload={
+                                "kg_node_id": req.requirement_id,
+                                "kg_node_type": "REQUIREMENT",
+                                "label": req.raw_statement[:80],
+                                "attributes": {
+                                    "rfc_id": rfc_label,
+                                    "domain": domain,
+                                    "raw_statement": req.raw_statement,
+                                },
+                            },
+                        )
+                        existing_task_nodes[abnf_seed_id] = "PENDING"
 
         # Chunk for LLM Generator (prioritizing Terminator framing/delimiter fragments)
         fragments = RFCChunker.chunk_document_for_terminator(rfc_text, rfc_num=rfc_num)
-        self.db.save_fragments(f"RFC{rfc_num}", fragments)
-        
+        if not fragments and state.get("fragments"):
+            fragments = list(state.get("fragments") or [])
+        rfc_fact_id = f"fact:bootstrap:rfc:{task_id}:{rfc_label}"
+        if rfc_fact_id not in existing_task_nodes:
+            self.db.save_fragments(rfc_label, fragments)
+            self.db.add_fact(
+                f"Bootstrapped {rfc_label}: extracted {len(abnf_reqs)} ABNF rules and {len(fragments)} fragments.",
+                node_id=rfc_fact_id,
+                task_id=task_id,
+                domain=domain,
+                rfc_id=rfc_label,
+                source_agent="fetch_and_chunk_agent",
+                payload={
+                    "rfc_id": rfc_label,
+                    "abnf_count": len(abnf_reqs),
+                    "fragment_count": len(fragments),
+                },
+            )
+
         return {
             "rfc_text": rfc_text,
             "fragments": fragments,
-            "history": [f"fetch_and_chunk: Fetched RFC{rfc_num}, Extracted {len(abnf_reqs)} ABNF rules, Chunked into {len(fragments)} fragments."]
+            "blackboard_bootstrapped": True,
+            "task_id": task_id,
+            "blackboard_domain": domain,
+            "history": [f"fetch_and_chunk: Fetched {rfc_label}, Extracted {len(abnf_reqs)} ABNF rules, Chunked into {len(fragments)} fragments."],
         }
 
-    # Agent 2: LLM Probe Generation (Original Generator)
+    # Agent 2: LLM Probe Generation (Cairn Reason)
     def llm_generator_agent(self, state: ResearchState) -> dict:
+        task_id = self._resolve_task_id(state)
+        domain = self._resolve_blackboard_domain(state)
+        _, rfc_label = self._parse_rfc_info(state)
+
         fragments = list(state.get("fragments", []))
-        new_cycle_count = state.get("cycle_count", 0) + 1
+        new_cycle_count = int(state.get("cycle_count", 0) or 0) + 1
+        dg_created: List[str] = []
+        try:
+            dg_engine = self._get_dual_graph_engine(task_id, state=state)
+            dg_created = dg_engine.reason_from_blackboard_facts(
+                db=self.db,
+                task_id=task_id,
+                round_num=new_cycle_count,
+            ) or []
+        except Exception as exc:
+            if self.debug:
+                print(f"[llm_generator_agent] [!] DualGraph reason hook skipped: {exc}")
+
         if not fragments:
+            empty_hist = ["llm_generator: No fragments left to process."]
+            if dg_created:
+                empty_hist.append(
+                    f"llm_generator: DualGraph queued {len(dg_created)} multi-hop intent(s)."
+                )
             return {
                 "generated_candidates": [],
                 "cycle_count": new_cycle_count,
-                "history": ["llm_generator: No fragments left to process."],
+                "history": empty_hist,
             }
-        
+
         current_frag_tuple = fragments.pop(0)
         frag_text = current_frag_tuple[0] if isinstance(current_frag_tuple, tuple) else current_frag_tuple
-        
+        frag_score = (
+            float(current_frag_tuple[2])
+            if isinstance(current_frag_tuple, tuple) and len(current_frag_tuple) >= 3
+            else 1.0
+        )
+
+        # Fetch live HINT and FACT nodes from SQLite blackboard
+        active_hint_rows = self._fetch_active_hints(task_id=task_id, domain=domain, rfc_label=rfc_label, limit=50)
+        hint_texts = [str(h.get("content") or "").strip() for h in active_hint_rows if str(h.get("content") or "").strip()]
+        fact_rows = self.db.get_facts(task_id=task_id, limit=25)
+        fact_texts = [str(f.get("content") or "").strip() for f in fact_rows if str(f.get("content") or "").strip()]
+
         preview = frag_text.strip().replace("\r", " ").replace("\n", " ")[:70]
         print(f"\n[llm_generator_agent] [Cycle {new_cycle_count}/{state.get('max_cycles', 3)}] Synthesizing probes for fragment ({len(fragments) + 1} remaining in queue): \"{preview}...\"")
-        
-        # Call Local LLM to generate probes based on this RFC fragment (guarded by semaphore)
+
+        # Call Local LLM to generate probes based on raw RFC fragment + blackboard hints/facts
         with self.llm_semaphore:
-            llm_probes = self.generator.generate_candidate_probes(frag_text)
-        
+            gen_fn = self.generator.generate_candidate_probes
+            try:
+                sig = inspect.signature(gen_fn)
+                gen_kwargs: Dict[str, Any] = {}
+                if "hints" in sig.parameters:
+                    gen_kwargs["hints"] = hint_texts or None
+                if "facts" in sig.parameters:
+                    gen_kwargs["facts"] = fact_texts or None
+                llm_probes = gen_fn(frag_text, **gen_kwargs)
+            except (TypeError, ValueError):
+                llm_probes = gen_fn(frag_text)
+
         # Retain base LLM probes and append permuted variants
         all_candidates = list(llm_probes)
         for p in llm_probes:
             perms = self.permutator.permute_probe(p, categories=self.terminator_categories)
             all_candidates.extend(perms)
+
+        # Persist candidate probes as PENDING INTENTs on the SQLite blackboard (never reset DONE/CLAIMED/PENDING)
+        existing_intents = {
+            r["node_id"]: r["status"]
+            for r in self.db.list_intents(task_id=task_id, limit=0)
+        }
+        queued_count = 0
+        for cand in all_candidates:
+            raw_req_val = cand.get("raw_request", "")
+            if isinstance(raw_req_val, bytes):
+                raw_req_str = raw_req_val.decode("latin-1", errors="replace")
+            else:
+                raw_req_str = str(raw_req_val or "")
+            if not raw_req_str.strip():
+                continue
+
+            req_hash = hashlib.sha1(raw_req_str.encode("latin-1", errors="replace")).hexdigest()[:16]
+            cand_node_id = f"intent:llm:{task_id}:{rfc_label}:{req_hash}"
+            if existing_intents.get(cand_node_id) in ("DONE", "CLAIMED", "PENDING"):
+                continue
+
+            src_type = str(cand.get("source_type") or "llm")
+            base_boost = 10.0 if src_type in ("llm", "fusion", "grammar") else 5.0
+            base_prio = float(frag_score) + base_boost
+            prio = self._score_meta_priority(
+                base_prio,
+                source_kind="abnf_seed" if src_type == "abnf" else "llm_candidate",
+                domain=domain,
+                mutator_family=str(cand.get("mutator_family") or cand.get("mutation_name") or ""),
+                depth=max(0, new_cycle_count - 1),
+                has_active_hint=bool(hint_texts),
+            )
+            cand_payload = {
+                "raw_request": raw_req_str,
+                "rationale": str(cand.get("rationale") or ""),
+                "is_clean": bool(cand.get("is_clean", False)),
+                "source_type": src_type,
+                "probe_id": cand.get("probe_id"),
+                "fragment_id": cand.get("fragment_id"),
+                "rfc_id": rfc_label,
+                "hints_applied": len(hint_texts),
+            }
+            self.db.queue_intent(
+                raw_req_str,
+                priority=prio,
+                node_id=cand_node_id,
+                task_id=task_id,
+                domain=domain,
+                rfc_id=rfc_label,
+                source_agent="llm_generator_agent",
+                payload=cand_payload,
+            )
+            existing_intents[cand_node_id] = "PENDING"
+            queued_count += 1
 
         with self.stats_lock:
             self.run_stats["fragments_processed"] += 1
@@ -561,17 +1037,21 @@ class ProtocolResearchSwarm:
             r_stat = self._ensure_rfc_stat(self.active_rfc_id)
             r_stat["fragments"] += 1
             r_stat["base_probes"] += len(llm_probes)
-            
-        print(f"[llm_generator_agent] -> LLM generated {len(llm_probes)} base probes -> {len(all_candidates)} total candidates ready for execution.")
+
+        dg_note = f", dg_intents={len(dg_created)}" if dg_created else ""
+        print(f"[llm_generator_agent] -> LLM generated {len(llm_probes)} base probes -> {len(all_candidates)} total candidates ({queued_count} intents queued, {len(hint_texts)} hints{dg_note}).")
         return {
             "fragments": fragments,
             "current_fragment": frag_text,
             "generated_candidates": all_candidates,
+            "active_hints": active_hint_rows,
             "cycle_count": new_cycle_count,
-            "history": [f"llm_generator: Fragment processed (cycle {new_cycle_count}). LLM yielded {len(llm_probes)} base probes -> {len(all_candidates)} total candidates."]
+            "task_id": task_id,
+            "blackboard_domain": domain,
+            "history": [f"llm_generator: Fragment processed (cycle {new_cycle_count}). LLM yielded {len(llm_probes)} base probes -> {len(all_candidates)} total candidates ({queued_count} intents queued{dg_note})."],
         }
 
-    # Route: Check if we have candidates to test
+    # Route: Check if we have candidates to test (Legacy helper retained for backward compatibility)
     def route_after_generation(self, state: ResearchState) -> str:
         cands = state.get("generated_candidates", [])
         if not cands:
@@ -710,13 +1190,224 @@ class ProtocolResearchSwarm:
                 "baseline_resp_bytes": baseline_resp_bytes,
             }
 
-    # Agent 3: Execution and Differential Oracle (Combines sequence and metamorphic with multithreaded semaphore)
+    def _record_and_print_eval_item(self, item: Dict[str, Any]) -> None:
+        proto_prefix = "https" if self.use_tls else "http"
+        p_bytes = item["probe_bytes"]
+        seq_report = item["seq_report"]
+        resp_summary = item["resp_summary"]
+        resp_details = item["resp_details"]
+        anomaly = item["anomaly"]
+
+        with self.stats_lock:
+            self.run_stats["total_candidates_executed"] += 1
+            r_stat = self._ensure_rfc_stat(self.active_rfc_id)
+            r_stat["executed"] += 1
+            if anomaly:
+                self.run_stats["probes_failed_anomaly"] += 1
+                r_stat["failed_anomalies"] += 1
+                self.run_stats["anomalies_recorded"].append({
+                    "rfc": self.active_rfc_id,
+                    "anomaly_id": anomaly.anomaly_id,
+                    "category": anomaly.category.value,
+                    "behavior": anomaly.observed_behavior,
+                })
+            elif not item["resp_bytes"] and any(s.socket_error for s in seq_report.steps):
+                self.run_stats["socket_errors"] += 1
+                r_stat["socket_errors"] += 1
+            else:
+                self.run_stats["probes_passed"] += 1
+                r_stat["passed"] += 1
+
+        if self.debug:
+            print(f"\n{'='*75}")
+            print("[*] PROTOCOL EVALUATION TRACE [Kettle Evaluation Oracle] (Threaded Semaphore Pool)")
+            print(f"{'='*75}")
+            print(f"[CONNECT] -> {proto_prefix}://{self.host}:{self.port} (Socket Connected | TLS: {self.use_tls})")
+            for idx, s in enumerate(seq_report.steps, 1):
+                sent_fmt = format_kettle_http_bytes(s.sent_bytes, max_len=2000, is_debug=self.verbose)
+                s_sum, s_det = format_clean_kettle_response(
+                    s.received_bytes, latency_ms=s.latency * 1000, sock_error=s.socket_error, is_verbose=self.verbose
+                )
+                print(f"\n>>> [REQ {idx}: {s.step_name.upper()}] ({len(s.sent_bytes)} bytes)")
+                print(sent_fmt)
+                print(f"\n<<< [RESP {idx}] {s_sum}")
+                if s_det:
+                    print(s_det)
+            print("\n--- SEQUENCE EVALUATION ---")
+            print(f"  Desynchronization : {seq_report.has_desynchronization}")
+            print(f"  Pipeline Leak     : {seq_report.has_pipeline_leak}")
+            print(f"  Verdict           : {seq_report.details}")
+            print(f"{'='*75}\n")
+        elif self.show_response or self.verbose:
+            print(f"\n{'='*28} PROBE TRANSMISSION {'='*28}")
+            print(f"Target: {proto_prefix}://{self.host}:{self.port}")
+            print(f"--- Raw Probe Sent ({len(p_bytes)} bytes) ---")
+            print(format_kettle_http_bytes(p_bytes, max_len=2000, is_debug=self.verbose))
+            print(f"--- Host Response: {resp_summary} ---")
+            if resp_details:
+                print(resp_details)
+            print(f"{'='*76}\n")
+
+    # Agent 3: Execution and Differential Oracle (Cairn Explore)
     def execution_oracle_agent(self, state: ResearchState) -> dict:
-        cands = state.get("generated_candidates", [])
+        task_id = self._resolve_task_id(state)
+        domain = self._resolve_blackboard_domain(state)
+        _, rfc_label = self._parse_rfc_info(state)
+
+        worker_id = f"oracle:{os.getpid()}:{threading.get_ident()}"
+        intent = self.db.claim_next_intent(
+            worker_id,
+            task_id=task_id,
+            domain=domain or None,
+            include_global=bool(domain),
+        )
+
+        if intent is not None:
+            intent_domain = domain or str(intent.get("domain") or "")
+            intent_rfc = str(intent.get("rfc_id") or rfc_label)
+            intent_completed = False
+
+            try:
+                candidate = self._candidate_from_intent(intent)
+                kg_node_id = str(candidate.get("kg_node_id") or "")
+                item = self._evaluate_single_candidate(candidate)
+
+                self._record_and_print_eval_item(item)
+                detected_anomaly = item["anomaly"]
+
+                if detected_anomaly:
+                    self.db.save_implementation_anomaly(
+                        anomaly_id=detected_anomaly.anomaly_id,
+                        target_engine=detected_anomaly.target_engine,
+                        category=detected_anomaly.category.value,
+                        observed_behavior=detected_anomaly.observed_behavior,
+                        expected_behavior=detected_anomaly.expected_behavior,
+                        raw_probe=detected_anomaly.raw_probe.decode("latin-1", errors="replace"),
+                        raw_response=detected_anomaly.raw_response.decode("latin-1", errors="replace"),
+                    )
+                    self.db.complete_intent(
+                        intent["node_id"],
+                        status="DONE",
+                        result_payload={
+                            "outcome": "ANOMALY",
+                            "anomaly_id": detected_anomaly.anomaly_id,
+                            "category": detected_anomaly.category.value,
+                        },
+                    )
+                    intent_completed = True
+                    self.db.add_fact(
+                        f"Anomaly {detected_anomaly.anomaly_id} ({detected_anomaly.category.value}): {detected_anomaly.observed_behavior}",
+                        node_id=f"fact:anomaly:{detected_anomaly.anomaly_id}",
+                        task_id=task_id,
+                        domain=intent_domain,
+                        rfc_id=intent_rfc,
+                        source_agent="execution_oracle_agent",
+                        parent_node_id=intent["node_id"],
+                        payload={
+                            "anomaly_id": detected_anomaly.anomaly_id,
+                            "category": detected_anomaly.category.value,
+                            "resp_summary": item["resp_summary"],
+                        },
+                    )
+                    if kg_node_id:
+                        with self.kg_lock:
+                            self.knowledge_graph.task_id = task_id
+                            self.knowledge_graph.domain = intent_domain
+                            self.knowledge_graph.record_testing_event(
+                                kg_node_id, detected_anomaly.anomaly_id, is_vulnerability=False
+                            )
+                    self._zero_anomaly_streaks[(task_id, intent_rfc)] = 0
+                    return {
+                        "active_intent_id": intent["node_id"],
+                        "active_intent": intent,
+                        "generated_candidates": [],
+                        "current_probe": item["probe_bytes"],
+                        "current_anomaly": detected_anomaly,
+                        "baseline_resp": item["baseline_resp_bytes"],
+                        "zero_anomaly_streak": 0,
+                        "history": [f"execution_oracle: Claimed {intent['node_id']} -> ANOMALY DETECTED ({detected_anomaly.anomaly_id})."],
+                    }
+
+                self.db.complete_intent(
+                    intent["node_id"],
+                    status="DONE",
+                    result_payload={
+                        "outcome": "CONFORMANT",
+                        "resp_summary": item["resp_summary"],
+                    },
+                )
+                intent_completed = True
+                self.db.add_fact(
+                    f"Target conformant for {str(intent.get('content') or '')[:120]} -> {item['resp_summary']}",
+                    node_id=f"fact:conformant:{intent['node_id']}",
+                    task_id=task_id,
+                    domain=intent_domain,
+                    rfc_id=intent_rfc,
+                    source_agent="execution_oracle_agent",
+                    parent_node_id=intent["node_id"],
+                    payload={"resp_summary": item["resp_summary"]},
+                )
+                if kg_node_id:
+                    with self.kg_lock:
+                        self.knowledge_graph.task_id = task_id
+                        self.knowledge_graph.domain = intent_domain
+                        self.knowledge_graph.record_testing_event(
+                            kg_node_id, f"CONFORM-{intent['node_id']}", is_vulnerability=False
+                        )
+                prev_streak = int(
+                    state.get(
+                        "zero_anomaly_streak",
+                        self._zero_anomaly_streaks.get((task_id, intent_rfc), 0),
+                    )
+                    or 0
+                )
+                new_streak = prev_streak + 1
+                self._zero_anomaly_streaks[(task_id, intent_rfc)] = new_streak
+                return {
+                    "active_intent_id": None,
+                    "active_intent": None,
+                    "generated_candidates": [],
+                    "current_probe": item["probe_bytes"],
+                    "current_anomaly": None,
+                    "baseline_resp": item["baseline_resp_bytes"],
+                    "zero_anomaly_streak": new_streak,
+                    "history": [f"execution_oracle: Claimed {intent['node_id']} -> Host: {item['resp_summary']} | Conformant."],
+                }
+            except Exception as exc:
+                if not intent_completed:
+                    self.db.complete_intent(
+                        intent["node_id"],
+                        status="FAILED",
+                        result_payload={"error": str(exc)},
+                    )
+                self.db.add_fact(
+                    f"Evaluation failed for intent {intent['node_id']}: {exc}",
+                    node_id=f"fact:failed:{intent['node_id']}",
+                    task_id=task_id,
+                    domain=intent_domain,
+                    rfc_id=intent_rfc,
+                    source_agent="execution_oracle_agent",
+                    parent_node_id=intent["node_id"],
+                    payload={"error": str(exc)},
+                )
+                return {
+                    "active_intent_id": None,
+                    "active_intent": None,
+                    "generated_candidates": [],
+                    "current_anomaly": None,
+                    "history": [f"execution_oracle: Intent {intent['node_id']} FAILED ({exc})."],
+                }
+
+        # Legacy fallback when called directly with volatile generated_candidates and no DB intents
+        cands = list(state.get("generated_candidates") or [])
         if not cands:
-            return {"history": ["execution_oracle: No candidates to execute."]}
-        
-        # Batch evaluation bounded by semaphore
+            return {
+                "active_intent_id": None,
+                "active_intent": None,
+                "current_anomaly": None,
+                "history": ["execution_oracle: No pending intents or candidates to execute."],
+            }
+
         batch_size = min(len(cands), self.concurrency)
         batch = [cands.pop(0) for _ in range(batch_size)]
 
@@ -726,80 +1417,21 @@ class ProtocolResearchSwarm:
         else:
             eval_results = [self._evaluate_single_candidate(b) for b in batch]
 
-        proto_prefix = "https" if self.use_tls else "http"
         detected_anomaly = None
         detected_probe = b""
         detected_baseline = b""
         first_resp_summary = ""
 
         for item in eval_results:
-            p_bytes = item["probe_bytes"]
-            seq_report = item["seq_report"]
-            resp_summary = item["resp_summary"]
-            resp_details = item["resp_details"]
-            anomaly = item["anomaly"]
-            b_resp = item["baseline_resp_bytes"]
-
             if not first_resp_summary:
-                first_resp_summary = resp_summary
-
-            with self.stats_lock:
-                self.run_stats["total_candidates_executed"] += 1
-                r_stat = self._ensure_rfc_stat(self.active_rfc_id)
-                r_stat["executed"] += 1
-                if anomaly:
-                    self.run_stats["probes_failed_anomaly"] += 1
-                    r_stat["failed_anomalies"] += 1
-                    self.run_stats["anomalies_recorded"].append({
-                        "rfc": self.active_rfc_id,
-                        "anomaly_id": anomaly.anomaly_id,
-                        "category": anomaly.category.value,
-                        "behavior": anomaly.observed_behavior,
-                    })
-                elif not item["resp_bytes"] and any(s.socket_error for s in seq_report.steps):
-                    self.run_stats["socket_errors"] += 1
-                    r_stat["socket_errors"] += 1
-                else:
-                    self.run_stats["probes_passed"] += 1
-                    r_stat["passed"] += 1
-
-            if self.debug:
-                print(f"\n{'='*75}")
-                print(f"[*] PROTOCOL EVALUATION TRACE [Kettle Evaluation Oracle] (Threaded Semaphore Pool)")
-                print(f"{'='*75}")
-                print(f"[CONNECT] -> {proto_prefix}://{self.host}:{self.port} (Socket Connected | TLS: {self.use_tls})")
-                for idx, s in enumerate(seq_report.steps, 1):
-                    sent_fmt = format_kettle_http_bytes(s.sent_bytes, max_len=2000, is_debug=self.verbose)
-                    s_sum, s_det = format_clean_kettle_response(
-                        s.received_bytes, latency_ms=s.latency * 1000, sock_error=s.socket_error, is_verbose=self.verbose
-                    )
-                    print(f"\n>>> [REQ {idx}: {s.step_name.upper()}] ({len(s.sent_bytes)} bytes)")
-                    print(sent_fmt)
-                    print(f"\n<<< [RESP {idx}] {s_sum}")
-                    if s_det:
-                        print(s_det)
-                print(f"\n--- SEQUENCE EVALUATION ---")
-                print(f"  Desynchronization : {seq_report.has_desynchronization}")
-                print(f"  Pipeline Leak     : {seq_report.has_pipeline_leak}")
-                print(f"  Verdict           : {seq_report.details}")
-                print(f"{'='*75}\n")
-            elif self.show_response or self.verbose:
-                print(f"\n{'='*28} PROBE TRANSMISSION {'='*28}")
-                print(f"Target: {proto_prefix}://{self.host}:{self.port}")
-                print(f"--- Raw Probe Sent ({len(p_bytes)} bytes) ---")
-                print(format_kettle_http_bytes(p_bytes, max_len=2000, is_debug=self.verbose))
-                print(f"--- Host Response: {resp_summary} ---")
-                if resp_details:
-                    print(resp_details)
-                print(f"{'='*76}\n")
-
-            if anomaly and not detected_anomaly:
-                detected_anomaly = anomaly
-                detected_probe = p_bytes
-                detected_baseline = b_resp
+                first_resp_summary = item["resp_summary"]
+            self._record_and_print_eval_item(item)
+            if item["anomaly"] and not detected_anomaly:
+                detected_anomaly = item["anomaly"]
+                detected_probe = item["probe_bytes"]
+                detected_baseline = item["baseline_resp_bytes"]
 
         if detected_anomaly:
-            # SAVE to Database thread-safely
             self.db.save_implementation_anomaly(
                 anomaly_id=detected_anomaly.anomaly_id,
                 target_engine=detected_anomaly.target_engine,
@@ -814,7 +1446,7 @@ class ProtocolResearchSwarm:
                 "current_probe": detected_probe,
                 "current_anomaly": detected_anomaly,
                 "baseline_resp": detected_baseline,
-                "history": [f"execution_oracle (multithreaded): Batch of {len(batch)} probes completed. ANOMALY DETECTED! Saved to DB ({detected_anomaly.anomaly_id})."]
+                "history": [f"execution_oracle (multithreaded): Batch of {len(batch)} probes completed. ANOMALY DETECTED! Saved to DB ({detected_anomaly.anomaly_id})."],
             }
 
         last_item = eval_results[-1] if eval_results else {}
@@ -823,38 +1455,51 @@ class ProtocolResearchSwarm:
             "current_probe": last_item.get("probe_bytes", b""),
             "current_anomaly": None,
             "baseline_resp": last_item.get("baseline_resp_bytes", b""),
-            "history": [f"execution_oracle (multithreaded): Batch of {len(batch)} probes evaluated concurrently -> Host: {first_resp_summary} | Target healthy/conformant."]
+            "history": [f"execution_oracle (multithreaded): Batch of {len(batch)} probes evaluated concurrently -> Host: {first_resp_summary} | Target healthy/conformant."],
         }
 
+    # Legacy routing helper retained for backward compatibility
     def route_after_execution(self, state: ResearchState) -> str:
         if state.get("current_anomaly"):
             return "triage_debugger_agent"
-        # If no anomaly, keep looping through candidates
         if state.get("generated_candidates"):
             return "execution_oracle_agent"
-        
-        # Cycle count & fragment exhaustion logic
         if state.get("cycle_count", 0) >= state.get("max_cycles", 3) or not state.get("fragments"):
             if state.get("enable_dream_rsi", False):
                 return "dream_rsi_agent"
             return END
-            
-        # Get more from LLM
         return "llm_generator_agent"
 
-    # Agent 4: Triage & Delta Debugger (Mods 8 & 9)
+    # Agent 4: Triage & Delta Debugger (Cairn Explore)
     def triage_debugger_agent(self, state: ResearchState) -> dict:
-        anomaly = state["current_anomaly"]
+        task_id = self._resolve_task_id(state)
+        domain = self._resolve_blackboard_domain(state)
+        _, rfc_label = self._parse_rfc_info(state)
+
+        anomaly = state.get("current_anomaly")
+        if anomaly is None:
+            return {
+                "current_anomaly": None,
+                "current_vuln": None,
+                "active_intent_id": None,
+                "active_intent": None,
+                "history": ["triage_debugger: No anomaly in state."],
+            }
         baseline_resp = state.get("baseline_resp")
-        
-        # 1. Framing Artifact / Leftover Baseline Guard:
-        # Never classify leftover baseline-response bytes as a confirmed vulnerability
+
+        # 1. Framing Artifact / Leftover Baseline Guard
         is_artifact, artifact_reason = self.classifier.is_framing_artifact(anomaly, baseline_resp=baseline_resp)
         if is_artifact:
             with self.stats_lock:
                 self.run_stats["triage_discarded"] += 1
                 self._ensure_rfc_stat(self.active_rfc_id)["triage_discarded"] += 1
-            return {"current_anomaly": None, "current_vuln": None, "history": [f"triage_debugger: Discarded anomaly: {artifact_reason}"]}
+            return {
+                "current_anomaly": None,
+                "current_vuln": None,
+                "active_intent_id": None,
+                "active_intent": None,
+                "history": [f"triage_debugger: Discarded anomaly: {artifact_reason}"],
+            }
 
         # 2. Environmental Noise Filter
         is_noise = self.classifier.filter_environmental_noise(anomaly, baseline_is_healthy=True, baseline_resp=baseline_resp)
@@ -862,12 +1507,18 @@ class ProtocolResearchSwarm:
             with self.stats_lock:
                 self.run_stats["triage_discarded"] += 1
                 self._ensure_rfc_stat(self.active_rfc_id)["triage_discarded"] += 1
-            return {"current_anomaly": None, "current_vuln": None, "history": ["triage_debugger: Discarded anomaly as environmental noise / framing artifact."]}
-            
+            return {
+                "current_anomaly": None,
+                "current_vuln": None,
+                "active_intent_id": None,
+                "active_intent": None,
+                "history": ["triage_debugger: Discarded anomaly as environmental noise / framing artifact."],
+            }
+
         # 3. Minimize & Reproduce (Mod 8)
         vuln = self.debugger.minimize_and_reproduce(anomaly, max_verification_trials=3)
         if vuln.reproducibility_rate >= 0.66:
-            # 4. Evidence Validation Gate: Confirm finding cannot be explained by ordinary framing
+            # 4. Evidence Validation Gate
             is_valid_evidence, evidence_reason = self.classifier.validate_evidence(vuln, anomaly, baseline_resp=baseline_resp)
             if not is_valid_evidence:
                 with self.stats_lock:
@@ -876,7 +1527,9 @@ class ProtocolResearchSwarm:
                 return {
                     "current_anomaly": None,
                     "current_vuln": None,
-                    "history": [f"triage_debugger: Discarded finding: evidence validator rejected ({evidence_reason})."]
+                    "active_intent_id": None,
+                    "active_intent": None,
+                    "history": [f"triage_debugger: Discarded finding: evidence validator rejected ({evidence_reason})."],
                 }
 
             # SAVE to Database
@@ -891,9 +1544,41 @@ class ProtocolResearchSwarm:
                 delta_debug_steps=vuln.delta_debug_steps,
                 provenance_chain=vuln.provenance_chain,
             )
-            
-            # Novelty Classifier (Mod 9)
-            is_novel, tech = self.classifier.classify_novelty(vuln)
+
+            # Commit confirmed vulnerability FACT onto blackboard
+            self.db.add_fact(
+                f"Confirmed {vuln.impact.value} vulnerability {vuln.vuln_id}: {anomaly.observed_behavior}",
+                node_id=f"fact:vuln:{vuln.vuln_id}:{task_id}",
+                task_id=task_id,
+                domain=domain,
+                rfc_id=rfc_label,
+                source_agent="triage_debugger_agent",
+                parent_node_id=str(state.get("active_intent_id") or ""),
+                payload={
+                    "vuln_id": vuln.vuln_id,
+                    "anomaly_id": anomaly.anomaly_id,
+                    "impact": vuln.impact.value,
+                    "reproducibility_rate": vuln.reproducibility_rate,
+                    "minimized_probe": vuln.minimized_probe.decode("latin-1", errors="replace"),
+                    "observed_behavior": anomaly.observed_behavior,
+                },
+            )
+
+            # Novelty Classifier (Mod 9 + AIxCC #4 Structural Fingerprint & Offline Corpus)
+            classify_fn = self.classifier.classify_novelty
+            try:
+                _cls_sig = inspect.signature(classify_fn)
+                if "oracle_violated" in _cls_sig.parameters:
+                    is_novel, tech = classify_fn(
+                        vuln,
+                        anomaly=anomaly,
+                        oracle_violated=True,
+                        baseline_resp=baseline_resp,
+                    )
+                else:
+                    is_novel, tech = classify_fn(vuln)
+            except (TypeError, ValueError):
+                is_novel, tech = classify_fn(vuln)
             novel_name = None
             if is_novel and tech:
                 self.db.save_novel_technique(
@@ -915,22 +1600,28 @@ class ProtocolResearchSwarm:
                     "repro": f"{vuln.reproducibility_rate * 100:.0f}% ({vuln.successful_reproductions}/{vuln.verification_attempts})",
                     "behavior": anomaly.observed_behavior,
                 })
-                
+
             return {
-                "current_vuln": vuln, 
-                "novel_technique_found": novel_name, 
-                "history": [f"triage_debugger: Confirmed Vulnerability {vuln.vuln_id}! Saved to DB."]
+                "current_vuln": vuln,
+                "novel_technique_found": novel_name,
+                "history": [f"triage_debugger: Confirmed Vulnerability {vuln.vuln_id}! Saved to DB."],
             }
-        
+
         with self.stats_lock:
             self.run_stats["triage_discarded"] += 1
             self._ensure_rfc_stat(self.active_rfc_id)["triage_discarded"] += 1
-        return {"current_vuln": None, "history": ["triage_debugger: Failed reproducibility verification."]}
+        return {
+            "current_anomaly": None,
+            "current_vuln": None,
+            "active_intent_id": None,
+            "active_intent": None,
+            "history": ["triage_debugger: Failed reproducibility verification."],
+        }
 
+    # Legacy routing helper retained for backward compatibility
     def route_after_triage(self, state: ResearchState) -> str:
         if state.get("current_vuln"):
             return "cascade_and_publish_agent"
-        # If discarded or failed to reproduce, keep testing
         if state.get("generated_candidates"):
             return "execution_oracle_agent"
         if state.get("cycle_count", 0) >= state.get("max_cycles", 3) or not state.get("fragments"):
@@ -939,42 +1630,161 @@ class ProtocolResearchSwarm:
             return END
         return "llm_generator_agent"
 
-    # Agent 5: Discovery Cascade, Knowledge Graph, Publish, & Forensics
+    # Agent 5: Discovery Cascade, Knowledge Graph, Publish, & Forensics (Cairn Reason)
     def cascade_and_publish_agent(self, state: ResearchState) -> dict:
-        vuln = state["current_vuln"]
-        anomaly = state["current_anomaly"]
+        task_id = self._resolve_task_id(state)
+        domain = self._resolve_blackboard_domain(state)
+        rfc_num_int, rfc_label = self._parse_rfc_info(state)
+
+        vuln = state.get("current_vuln")
+        anomaly = state.get("current_anomaly")
+        if vuln is None or anomaly is None:
+            return {
+                "cascade_results": None,
+                "current_vuln": None,
+                "current_anomaly": None,
+                "active_intent_id": None,
+                "active_intent": None,
+                "history": ["cascade_publish: Missing vulnerability or anomaly context."],
+            }
+
         baseline_resp = state.get("baseline_resp")
         frag_text = state.get("current_fragment", "")
         rfc_num = str(state.get("rfc_num", "9112")).replace("RFC-", "").replace("RFC", "")
-        
-        # Evidence Validation Gate:
-        # Suspend automatic publication of new detection rules until the evidence validator
-        # confirms that the anomalous bytes cannot be explained by ordinary response framing.
+
+        # Evidence Validation Gate
         is_confirmed, validation_reason = self.classifier.validate_evidence(vuln, anomaly, baseline_resp=baseline_resp)
         if not is_confirmed:
             print(f"[*] [SUSPENDED] Automatic rule publication suspended for {vuln.vuln_id}: {validation_reason}")
             return {
                 "cascade_results": None,
-                "history": [f"cascade_publish: Suspended automatic publication ({validation_reason})."]
+                "current_vuln": None,
+                "current_anomaly": None,
+                "active_intent_id": None,
+                "active_intent": None,
+                "history": [f"cascade_publish: Suspended automatic publication ({validation_reason})."],
             }
+
+        # Read HINT + FACT context from blackboard (keep frag_text unpolluted)
+        active_hints = self._fetch_active_hints(task_id=task_id, domain=domain, rfc_label=rfc_label, limit=20)
+        recent_facts = self.db.get_facts(task_id=task_id, limit=20)
+        hint_summary = "; ".join(str(h.get("content") or "").strip() for h in active_hints[:5] if str(h.get("content") or "").strip())
+        fact_summary = "; ".join(str(f.get("content") or "").strip() for f in recent_facts[:5] if str(f.get("content") or "").strip())
+        rationale_ctx = "Swarm detected vulnerability."
+        if hint_summary:
+            rationale_ctx += f" Active hints: {hint_summary}"
+        details_ctx = str(anomaly.observed_behavior or "")
+        if fact_summary:
+            details_ctx += f" | Observed facts: {fact_summary}"
 
         # 1. Cascade (LLM extrapolation)
         cascade_res = self.cascade_engine.cascade_from_finding({
-            "rationale": "Swarm detected vulnerability.",
+            "rationale": rationale_ctx,
             "rfc_fragment": frag_text,
-            "details": anomaly.observed_behavior,
+            "details": details_ctx,
         })
-        
-        # 2. Update Knowledge Graph (Mod 11)
-        self.knowledge_graph.add_node(vuln.vuln_id, "VULNERABILITY", f"{vuln.impact.value} ({vuln.vuln_id})")
-        self.knowledge_graph.add_edge(anomaly.anomaly_id, vuln.vuln_id, "PROVES_VULN")
-        
+
+        # 2. Update Knowledge Graph (Mod 11) under kg_lock
+        with self.kg_lock:
+            self.knowledge_graph.task_id = task_id
+            self.knowledge_graph.domain = domain
+            self.knowledge_graph.add_node(
+                vuln.vuln_id,
+                "VULNERABILITY",
+                f"{vuln.impact.value} ({vuln.vuln_id})",
+                attributes={"rfc_id": rfc_label, "domain": domain, "task_id": task_id},
+            )
+            self.knowledge_graph.add_edge(anomaly.anomaly_id, vuln.vuln_id, "PROVES_VULN")
+
+        # Ensure confirmed vuln FACT exists scoped to task_id
+        fact_nid = self.db.add_fact(
+            f"Confirmed {vuln.impact.value} vulnerability {vuln.vuln_id}: {anomaly.observed_behavior}",
+            node_id=f"fact:vuln:{vuln.vuln_id}:{task_id}",
+            task_id=task_id,
+            domain=domain,
+            rfc_id=rfc_label,
+            source_agent="cascade_and_publish_agent",
+            parent_node_id=str(state.get("active_intent_id") or ""),
+            payload={"vuln_id": vuln.vuln_id, "anomaly_id": anomaly.anomaly_id, "impact": vuln.impact.value},
+        )
+
+        # Queue follow-up probes from cascade_res["suggested_probes"] onto blackboard
+        suggested = cascade_res.get("suggested_probes", []) if isinstance(cascade_res, dict) else []
+        if suggested:
+            existing_intents = {
+                r["node_id"]: r["status"]
+                for r in self.db.list_intents(task_id=task_id, limit=0)
+            }
+            hyp_text = str(cascade_res.get("hypothesis", "Cascade follow-up")) if isinstance(cascade_res, dict) else "Cascade follow-up"
+            for sp in suggested:
+                if isinstance(sp, dict):
+                    raw_val = sp.get("raw_request")
+                    if isinstance(raw_val, (bytes, bytearray)):
+                        raw_req = bytes(raw_val).decode("latin-1", errors="replace").strip()
+                    else:
+                        raw_req = str(raw_val or "").strip()
+                    rat = str(sp.get("rationale") or hyp_text)
+                    is_clean = bool(sp.get("is_clean", False))
+                elif isinstance(sp, (bytes, bytearray)):
+                    raw_req = bytes(sp).decode("latin-1", errors="replace").strip()
+                    rat = hyp_text
+                    is_clean = False
+                elif isinstance(sp, str):
+                    raw_req = sp.strip()
+                    rat = hyp_text
+                    is_clean = False
+                else:
+                    continue
+                if not raw_req:
+                    continue
+                c_hash = hashlib.sha1(raw_req.encode("latin-1", errors="replace")).hexdigest()[:16]
+                c_nid = f"intent:cascade:{task_id}:{rfc_label}:{c_hash}"
+                if existing_intents.get(c_nid) in ("DONE", "CLAIMED", "PENDING"):
+                    continue
+                casc_prio = max(
+                    25.0,
+                    self._score_meta_priority(
+                        25.0,
+                        source_kind="cascade_intent",
+                        domain=domain,
+                        depth=1,
+                        has_active_hint=bool(active_hints),
+                    ),
+                )
+                self.db.queue_intent(
+                    raw_req,
+                    priority=casc_prio,
+                    node_id=c_nid,
+                    task_id=task_id,
+                    domain=domain,
+                    rfc_id=rfc_label,
+                    source_agent="cascade_and_publish_agent",
+                    payload={
+                        "raw_request": raw_req,
+                        "rationale": rat,
+                        "is_clean": is_clean,
+                        "source_type": "cascade",
+                        "parent_vuln_id": vuln.vuln_id,
+                    },
+                    parent_node_id=fact_nid,
+                )
+                existing_intents[c_nid] = "PENDING"
+
         # 3. Publish Arm 106 & 107 (Mod 12)
-        arm106, arm107 = self.publisher.publish_finding(vuln, rfc_anchor=f"RFC{rfc_num}", evidence_verified=True)
-        
+        arm106, arm107 = self.publisher.publish_finding(vuln, rfc_anchor=rfc_label, evidence_verified=True)
+
         # 4. Forensic Logging (Original functionality)
+        def _json_safe(val: Any) -> Any:
+            if isinstance(val, (bytes, bytearray)):
+                return bytes(val).decode("latin-1", errors="replace")
+            if isinstance(val, dict):
+                return {str(k): _json_safe(v) for k, v in val.items()}
+            if isinstance(val, (list, tuple)):
+                return [_json_safe(v) for v in val]
+            return val
+
         self.forensics.record_finding(
-            rfc_num=int(rfc_num) if rfc_num.isdigit() else 0,
+            rfc_num=rfc_num_int if str(rfc_num).isdigit() else 0,
             rfc_fragment=frag_text,
             rationale="Swarm node detection",
             raw_request=vuln.minimized_probe.decode('latin-1', errors='replace'),
@@ -983,7 +1793,7 @@ class ProtocolResearchSwarm:
             details=anomaly.observed_behavior,
             metadata={"arm106": arm106.rule_id if arm106 else "", "arm107": arm107.test_id if arm107 else ""},
             weaponization=None,
-            cascade=cascade_res,
+            cascade=_json_safe(cascade_res),
             concept_analysis=None
         )
         self.forensics.save_forensic_report()
@@ -1006,25 +1816,75 @@ class ProtocolResearchSwarm:
         arm_id = arm106.rule_id if arm106 else "SUSPENDED"
         return {
             "cascade_results": cascade_res,
-            "history": [f"cascade_publish: Ran Cascade, Published rules ({arm_id}), and saved Forensic trace!"]
+            "current_vuln": None,
+            "current_anomaly": None,
+            "active_intent_id": None,
+            "active_intent": None,
+            "history": [f"cascade_publish: Ran Cascade, Published rules ({arm_id}), and saved Forensic trace!"],
         }
 
     # Agent 13: Dream-RSI & Google Research Harness² (Recursive Self-Improvement & Agent Harnessing)
     def dream_rsi_agent(self, state: ResearchState) -> dict:
         rollouts = state.get("dream_rollouts", 300)
-        print(f"\n[*] [DREAM-RSI] Initiating Off-Policy Dreaming Cycle ({rollouts} rollouts)...")
+        bb_task_id = self._resolve_task_id(state)
+        bb_domain = self._resolve_blackboard_domain(state) or "global"
+        _, rfc_label = self._parse_rfc_info(state)
+
+        # Refresh ReplayTreePool from live SQLite blackboard before evolving DreamPolicy
+        replay_trees_loaded = 0
+        if hasattr(self.dream_world_model, "replay_pool") and self.dream_world_model.replay_pool is not None:
+            try:
+                replay_trees_loaded = int(self.dream_world_model.replay_pool.ingest_from_db(self.db) or 0)
+            except Exception:
+                replay_trees_loaded = 0
+
+        print(f"\n[*] [DREAM-RSI] Initiating Off-Policy Dreaming Cycle ({rollouts} rollouts, replay_trees={replay_trees_loaded})...")
         evolved_policy = self.dream_optimizer.evolve_policy_generation(rollouts_per_candidate=rollouts)
         self.dream_store.save_policy(evolved_policy)
         self.bandit.apply_dream_policy(evolved_policy)
+        self.active_meta_policy = evolved_policy
 
+        sim_backend = str(getattr(evolved_policy, "simulator_backend", "synthetic_heuristic_fallback"))
+        val_fit = float(getattr(evolved_policy, "val_fitness_score", 0.0) or 0.0)
         gain_str = f"+{evolved_policy.rsi_gain * 100:.1f}%" if evolved_policy.rsi_gain > 0 else "0.0%"
-        print(f"[+] [DREAM-RSI] Policy Evolved: Gen {evolved_policy.generation} | RSI Gain: {gain_str} | Hot-reloaded into Swarm Scheduler.")
-        hist_notes = [f"dream_rsi: Evolved Gen {evolved_policy.generation} policy (gain: {gain_str})."]
+        print(
+            f"[+] [DREAM-RSI] Policy Evolved: Gen {evolved_policy.generation} | Backend: {sim_backend} "
+            f"| Val Fitness: {val_fit:.2f} | RSI Gain: {gain_str} | Hot-reloaded into Swarm Scheduler."
+        )
+        hist_notes = [
+            f"dream_rsi: Evolved Gen {evolved_policy.generation} policy "
+            f"(backend={sim_backend}, val_fitness={val_fit:.2f}, gain={gain_str})."
+        ]
+
+        try:
+            self.db.add_fact(
+                f"Dream-RSI evolved Gen {evolved_policy.generation} policy "
+                f"(backend={sim_backend}, val_fitness={val_fit:.2f}, gain={gain_str}, "
+                f"branch_width={getattr(evolved_policy, 'branch_width', 3)}, "
+                f"early_stop_patience={getattr(evolved_policy, 'early_stop_patience', 4)})",
+                node_id=f"fact:dream_rsi:{bb_task_id}:gen{evolved_policy.generation}",
+                task_id=bb_task_id,
+                domain=bb_domain,
+                rfc_id=rfc_label,
+                source_agent="dream_rsi_agent",
+                payload={
+                    "generation": evolved_policy.generation,
+                    "simulator_backend": sim_backend,
+                    "val_fitness_score": val_fit,
+                    "rsi_gain": float(evolved_policy.rsi_gain),
+                    "replay_trees_loaded": replay_trees_loaded,
+                    "branch_width": int(getattr(evolved_policy, "branch_width", 3) or 3),
+                    "early_stop_patience": int(getattr(evolved_policy, "early_stop_patience", 4) or 4),
+                    "depth_vs_breadth_alpha": float(getattr(evolved_policy, "depth_vs_breadth_alpha", 0.5) or 0.5),
+                },
+            )
+        except Exception:
+            pass
 
         h2_dict = None
         if state.get("enable_harness2", True):
             rfc_num = str(state.get("rfc_num", "9112")).replace("RFC-", "").replace("RFC", "")
-            task_id = f"RFC{rfc_num}"
+            h2_task_id = f"RFC{rfc_num}"
             h2_mode = state.get("harness2_mode", "parallel") or "parallel"
             h2_k = int(state.get("harness2_k", 1) or 1)
             h2_domain = state.get("harness2_domain", "auto") or "auto"
@@ -1033,10 +1893,10 @@ class ProtocolResearchSwarm:
 
             print(
                 f"[*] [HARNESS²] Initiating Google Research Recursive Agent Harnessing "
-                f"(Task={task_id}, Mode={h2_mode}, k={h2_k}, R={4*h2_k} rollouts, P={3*h2_k} stages)..."
+                f"(Task={h2_task_id}, Mode={h2_mode}, k={h2_k}, R={4*h2_k} rollouts, P={3*h2_k} stages)..."
             )
             h2_res = self.harness2_engine.run_mode(
-                mode=h2_mode, task_id=task_id, k=h2_k, domain=h2_domain
+                mode=h2_mode, task_id=h2_task_id, k=h2_k, domain=h2_domain
             )
             h2_dict = h2_res.to_dict()
             self.db.save_harness2_run(h2_dict)
@@ -1046,8 +1906,54 @@ class ProtocolResearchSwarm:
                 f"Score: {best_score:.1f}) | Persisted c1..c8 tree & EXPERIENCE.md to {runs_dir}."
             )
             hist_notes.append(
-                f"harness2: Adopted {h2_res.adopted_label} on {task_id} (mode={h2_res.mode}, k={h2_k}, score={best_score:.1f})."
+                f"harness2: Adopted {h2_res.adopted_label} on {h2_task_id} (mode={h2_res.mode}, k={h2_k}, score={best_score:.1f})."
             )
+
+            exp = getattr(h2_res, "experience", None)
+            if not isinstance(exp, dict) and isinstance(h2_dict, dict):
+                exp = h2_dict.get("experience")
+            if isinstance(exp, dict):
+                lesson = str(exp.get("lesson") or "").strip()
+                if lesson:
+                    cue = str(exp.get("cue") or "").strip()
+                    evidence = str(exp.get("evidence") or "").strip()
+                    parts: List[str] = []
+                    if cue:
+                        parts.append(f"Cue: {cue}")
+                    parts.append(f"Lesson: {lesson}")
+                    if evidence:
+                        parts.append(f"Evidence: {evidence}")
+                    hint_content = " | ".join(parts)
+                    h2_res_domain = (
+                        str(getattr(h2_res, "domain", "") or "").strip()
+                        or self._resolve_blackboard_domain(state)
+                        or "global"
+                    )
+                    h2_res_rfc = str(getattr(h2_res, "task_id", "") or h2_task_id).strip()
+                    digest = hashlib.sha1(
+                        f"{bb_task_id}|{h2_res_domain}|{h2_res_rfc}|{lesson}".encode("utf-8", errors="replace")
+                    ).hexdigest()[:16]
+                    self.db.add_hint(
+                        hint_content,
+                        priority=25.0,
+                        node_id=f"hint:harness2:{digest}",
+                        task_id=bb_task_id,
+                        domain=h2_res_domain,
+                        rfc_id=h2_res_rfc,
+                        source_agent="dream_rsi_agent",
+                        active=True,
+                        payload={
+                            "cue": cue,
+                            "lesson": lesson,
+                            "evidence": evidence,
+                            "adopted_label": str(getattr(h2_res, "adopted_label", "") or ""),
+                            "mode": str(getattr(h2_res, "mode", "") or h2_mode),
+                            "h2_task_id": h2_res_rfc,
+                        },
+                    )
+                    hist_notes.append(
+                        f"harness2_hint: Promoted domain lesson for {h2_res_domain} ({h2_res_rfc})."
+                    )
 
         return {
             "current_dream_policy": evolved_policy.to_dict(),
@@ -1055,7 +1961,7 @@ class ProtocolResearchSwarm:
             "history": hist_notes,
         }
 
-
+    # Legacy routing helper retained for backward compatibility
     def route_after_publish(self, state: ResearchState) -> str:
         if state.get("generated_candidates"):
             return "execution_oracle_agent"
@@ -1065,6 +1971,100 @@ class ProtocolResearchSwarm:
             return END
         return "llm_generator_agent"
 
+    def blackboard_router(self, state: ResearchState) -> dict:
+        """Central OODA blackboard router deciding the next Cairn task phase from SQLite + state."""
+        task_id = self._resolve_task_id(state)
+        domain = self._resolve_blackboard_domain(state)
+        _, rfc_label = self._parse_rfc_info(state)
+
+        reclaim_now = False
+        with self.stats_lock:
+            if task_id not in self._reclaimed_task_ids:
+                self._reclaimed_task_ids.add(task_id)
+                reclaim_now = True
+        if reclaim_now:
+            try:
+                self.db.reclaim_stale_intents(task_id=task_id)
+            except Exception:
+                pass
+
+        active_hints = self._fetch_active_hints(task_id=task_id, domain=domain, rfc_label=rfc_label, limit=50)
+
+        max_cycles_raw = state.get("max_cycles")
+        max_cycles = 3 if max_cycles_raw is None else int(max_cycles_raw)
+        cycle_count = int(state.get("cycle_count", 0) or 0)
+        zero_streak = int(
+            state.get(
+                "zero_anomaly_streak",
+                self._zero_anomaly_streaks.get((task_id, rfc_label), 0),
+            )
+            or 0
+        )
+        early_stop_triggered = False
+
+        if not bool(state.get("blackboard_bootstrapped", False)):
+            phase = "Bootstrap"
+        elif state.get("current_vuln") is not None:
+            phase = "Publish"
+        elif state.get("current_anomaly") is not None:
+            phase = "Triage"
+        else:
+            all_pending = self.db.list_intents(
+                status="PENDING",
+                task_id=task_id,
+                limit=0,
+            )
+            if domain:
+                dom_l = domain.lower()
+                pending_intents = [
+                    r for r in all_pending
+                    if str(r.get("domain") or "").lower() in ("", "global", dom_l)
+                ]
+            else:
+                pending_intents = all_pending
+
+            policy = getattr(self, "active_meta_policy", None)
+            patience = int(getattr(policy, "early_stop_patience", 0) or 0) if policy is not None else 0
+            has_high_priority_pending = any(
+                str(r.get("source_agent") or "") in ("cascade_and_publish_agent", "DualGraphAttackEngine")
+                or float(r.get("priority", 0.0) or 0.0) >= 25.0
+                for r in pending_intents
+            )
+            early_stop_due = (
+                policy is not None
+                and patience > 0
+                and zero_streak >= patience
+                and cycle_count >= 1
+                and not has_high_priority_pending
+            )
+
+            if pending_intents:
+                phase = "Explore"
+            elif bool(state.get("fragments")) and cycle_count < max_cycles and not early_stop_due:
+                phase = "Reason"
+            elif bool(state.get("enable_dream_rsi", False)) and state.get("current_dream_policy") is None:
+                early_stop_triggered = bool(early_stop_due and bool(state.get("fragments")) and cycle_count < max_cycles)
+                phase = "DreamRSI"
+            else:
+                early_stop_triggered = bool(early_stop_due and bool(state.get("fragments")) and cycle_count < max_cycles)
+                phase = "Done"
+
+        hist_msg = f"blackboard_router: OODA -> {phase} (hints={len(active_hints)})"
+        if early_stop_triggered:
+            hist_msg += f" [early_stop_patience={patience}, zero_anomaly_streak={zero_streak}]"
+
+        return {
+            "ooda_phase": phase,
+            "task_id": task_id,
+            "blackboard_domain": domain,
+            "active_hints": active_hints,
+            "zero_anomaly_streak": zero_streak,
+            "early_stop_triggered": early_stop_triggered,
+            "history": [hist_msg],
+        }
+
+    def _select_blackboard_route(self, state: ResearchState) -> str:
+        return str(state.get("ooda_phase") or "Done")
 
     def build_graph(self):
         global END, StateGraph
@@ -1072,6 +2072,7 @@ class ProtocolResearchSwarm:
         builder = StateGraph(ResearchState)
 
         # Add Nodes
+        builder.add_node("blackboard_router", self.blackboard_router)
         builder.add_node("fetch_and_chunk_agent", self.fetch_and_chunk_agent)
         builder.add_node("llm_generator_agent", self.llm_generator_agent)
         builder.add_node("execution_oracle_agent", self.execution_oracle_agent)
@@ -1079,17 +2080,30 @@ class ProtocolResearchSwarm:
         builder.add_node("cascade_and_publish_agent", self.cascade_and_publish_agent)
         builder.add_node("dream_rsi_agent", self.dream_rsi_agent)
 
-        # Edges
-        builder.set_entry_point("fetch_and_chunk_agent")
-        builder.add_edge("fetch_and_chunk_agent", "llm_generator_agent")
-        builder.add_edge("dream_rsi_agent", END)
-        
-        builder.add_conditional_edges("llm_generator_agent", self.route_after_generation)
-        builder.add_conditional_edges("execution_oracle_agent", self.route_after_execution)
-        builder.add_conditional_edges("triage_debugger_agent", self.route_after_triage)
-        builder.add_conditional_edges("cascade_and_publish_agent", self.route_after_publish)
+        # Central OODA Hub Edges
+        builder.set_entry_point("blackboard_router")
+        routing_map = {
+            "Bootstrap": "fetch_and_chunk_agent",
+            "Reason": "llm_generator_agent",
+            "Explore": "execution_oracle_agent",
+            "Triage": "triage_debugger_agent",
+            "Publish": "cascade_and_publish_agent",
+            "DreamRSI": "dream_rsi_agent",
+            "Done": END,
+        }
+        builder.add_conditional_edges("blackboard_router", self._select_blackboard_route, routing_map)
 
-        return builder.compile()
+        builder.add_edge("fetch_and_chunk_agent", "blackboard_router")
+        builder.add_edge("llm_generator_agent", "blackboard_router")
+        builder.add_edge("execution_oracle_agent", "blackboard_router")
+        builder.add_edge("triage_debugger_agent", "blackboard_router")
+        builder.add_edge("cascade_and_publish_agent", "blackboard_router")
+        builder.add_edge("dream_rsi_agent", END)
+
+        compiled = builder.compile()
+        if hasattr(compiled, "with_config"):
+            return compiled.with_config({"recursion_limit": 500})
+        return compiled
 
     def print_run_summary(self) -> str:
         """
@@ -1398,9 +2412,11 @@ def cmd_export(args):
 
 
 def cmd_oracle(args):
-    """Executes the independent 4-parser differential matrix across Strict RFC 7230, Permissive Legacy, CDN Proxy, and Async Microservice."""
+    """Executes the independent 4-parser differential matrix or real Docker parser matrix across nginx/envoy/haproxy/undici/go/hyper."""
     from engine.differential_oracle import MultiImplementationDifferentialOracle
     oracle = MultiImplementationDifferentialOracle()
+    as_json = bool(getattr(args, "as_json", False))
+    plain = bool(getattr(args, "plain", False))
     if getattr(args, "probe", None):
         raw_p = args.probe
         if raw_p.startswith("\\x"):
@@ -1409,6 +2425,33 @@ def cmd_oracle(args):
             probe_bytes = raw_p.encode("latin-1")
     else:
         probe_bytes = b"POST / HTTP/1.1\r\nHost: target.local\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+
+    if bool(getattr(args, "docker_parser_matrix", False)):
+        parsers = _parse_csv_list(getattr(args, "parsers", None))
+        probes_arg = [probe_bytes] if getattr(args, "probe", None) else None
+        payload = oracle.run_docker_parser_matrix(
+            probes=probes_arg,
+            parsers=parsers,
+            fallback_to_4parsers=bool(getattr(args, "fallback_4parsers", False)),
+        )
+        if as_json:
+            from engine.cli_render import render_json
+            render_json(payload)
+            return
+        from engine.cli_render import render_kv_panel
+        render_kv_panel(
+            "AIxCC Real Docker Differential Parser Matrix",
+            {
+                "Status": payload.get("status", "unknown"),
+                "Backend": payload.get("parser_matrix_backend", "docker_parser_matrix"),
+                "Active Parsers": ", ".join(payload.get("active_parsers") or []) or "none",
+                "Unavailable Parsers": ", ".join(payload.get("unavailable_parsers") or []) or "none",
+                "Probes Evaluated": payload.get("probes_evaluated", 0),
+                "Divergences Detected": payload.get("divergences_detected", 0),
+            },
+            plain=plain,
+        )
+        return
 
     print(f"\n{'='*75}")
     print("[*] 4-PARSER DIFFERENTIAL MATRIX EVALUATION")
@@ -1748,24 +2791,26 @@ def cmd_artex(args):
             )
             traffic_session.proxy_config = proxy_cfg
 
+        _approval_deny = str(approval_mode or "policy").strip().lower() == "deny"
         artex_live_val = getattr(args, "artex_live", None)
-        if getattr(args, "no_artex_live", False):
+        if getattr(args, "no_artex_live", False) or _approval_deny:
             artex_live_val = False
         _is_loopback = is_explicit_loopback_host(t_host)
         _enable_live = False
-        if artex_live_val is True:
-            _enable_live = bool(authorized or _is_loopback)
-        elif artex_live_val is None and (authorized or _is_loopback):
-            import socket as _sock
-            try:
-                with _sock.create_connection((t_host, t_port), timeout=1.0):
-                    _enable_live = True
-            except OSError:
-                _enable_live = False
+        if not _approval_deny:
+            if artex_live_val is True:
+                _enable_live = bool(authorized or _is_loopback)
+            elif artex_live_val is None and (authorized or _is_loopback):
+                import socket as _sock
+                try:
+                    with _sock.create_connection((t_host, t_port), timeout=1.0):
+                        _enable_live = True
+                except OSError:
+                    _enable_live = False
 
         live_executor_fn = None
         live_registry = None
-        if _enable_live:
+        if _enable_live and not _approval_deny:
             from engine.live_executors import LiveWorkerExecutorRegistry
             live_registry = LiveWorkerExecutorRegistry(
                 host=t_host,
@@ -2222,6 +3267,769 @@ def cmd_mantis(args):
         db.close()
 
 
+def _validate_cli_hint_args(
+    args: Any,
+    *,
+    default_task_id: str = "default",
+) -> Tuple[str, float, str, str, str]:
+    """Validates CLI --hint* arguments without creating directories or SQLite DBs."""
+    raw_hint = getattr(args, "hint", None)
+    if raw_hint is None or not isinstance(raw_hint, str) or not raw_hint.strip() or "\x00" in raw_hint:
+        print(
+            "[!] Error: --hint must be a non-empty string without NUL bytes.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        prio = float(getattr(args, "hint_priority", 10.0))
+    except (TypeError, ValueError):
+        print("[!] Error: --hint-priority must be a finite numeric value.", file=sys.stderr)
+        sys.exit(1)
+    if not math.isfinite(prio):
+        print("[!] Error: --hint-priority must be finite.", file=sys.stderr)
+        sys.exit(1)
+
+    raw_domain = getattr(args, "hint_domain", "global")
+    raw_domain_str = "global" if raw_domain is None else str(raw_domain)
+    if "\x00" in raw_domain_str:
+        print("[!] Error: --hint-domain must not contain NUL bytes.", file=sys.stderr)
+        sys.exit(1)
+    hint_domain = raw_domain_str.strip() or "global"
+
+    explicit_dests = getattr(args, "_explicit_cli_dests", set())
+    if "hint_task_id" in explicit_dests:
+        raw_tid = getattr(args, "hint_task_id", default_task_id)
+    elif "task_id" in explicit_dests:
+        raw_tid = getattr(args, "task_id", default_task_id)
+    elif default_task_id and default_task_id != "default":
+        raw_tid = default_task_id
+    else:
+        raw_tid = getattr(args, "task_id", None) or getattr(args, "hint_task_id", None) or default_task_id or "default"
+    raw_tid_str = str(default_task_id if raw_tid is None else raw_tid)
+    if "\x00" in raw_tid_str:
+        print("[!] Error: --hint-task-id must not contain NUL bytes.", file=sys.stderr)
+        sys.exit(1)
+    hint_task_id = raw_tid_str.strip() or default_task_id or "default"
+
+    raw_rfc = getattr(args, "hint_rfc", "")
+    raw_rfc_str = "" if raw_rfc is None else str(raw_rfc)
+    if "\x00" in raw_rfc_str:
+        print("[!] Error: --hint-rfc must not contain NUL bytes.", file=sys.stderr)
+        sys.exit(1)
+    hint_rfc = raw_rfc_str.strip()
+
+    return raw_hint, prio, hint_domain, hint_task_id, hint_rfc
+
+
+def _persist_cli_hint(
+    args: Any,
+    db: Optional[Any] = None,
+    *,
+    default_task_id: str = "default",
+) -> Dict[str, Any]:
+    """Validates CLI --hint flags and persists a HINT node into terminator.db."""
+    as_json = bool(getattr(args, "as_json", False))
+    raw_hint, prio, hint_domain, hint_task_id, hint_rfc = _validate_cli_hint_args(
+        args,
+        default_task_id=default_task_id,
+    )
+
+    if db is not None:
+        node_id = db.add_hint(
+            raw_hint,
+            priority=prio,
+            task_id=hint_task_id,
+            domain=hint_domain,
+            rfc_id=hint_rfc,
+            source_agent="cli",
+            active=True,
+        )
+    else:
+        db_path = str(getattr(args, "db", "terminator.db") or "terminator.db")
+        if db_path != ":memory:":
+            parent_dir = Path(db_path).parent
+            if str(parent_dir):
+                parent_dir.mkdir(parents=True, exist_ok=True)
+        local_db = _resolve_db_cls()(db_path)
+        try:
+            node_id = local_db.add_hint(
+                raw_hint,
+                priority=prio,
+                task_id=hint_task_id,
+                domain=hint_domain,
+                rfc_id=hint_rfc,
+                source_agent="cli",
+                active=True,
+            )
+        finally:
+            local_db.close()
+
+    return {
+        "status": "injected",
+        "node_id": node_id,
+        "node_type": "HINT",
+        "domain": hint_domain,
+        "priority": prio,
+        "task_id": hint_task_id,
+        "rfc_id": hint_rfc,
+        "active": True,
+        "as_json": as_json,
+    }
+
+
+def cmd_hint(args):
+    """CLI-only runtime HINT injection into SQLite blackboard (zero GUI/HTTP calls)."""
+    res = _persist_cli_hint(args)
+    payload = {k: v for k, v in res.items() if k != "as_json"}
+    if res.get("as_json"):
+        from engine.cli_render import render_json
+        render_json(payload)
+        return
+    print(
+        f"[+] Blackboard HINT persisted: id={payload['node_id']} "
+        f"domain={payload['domain']} task_id={payload['task_id']} priority={payload['priority']}"
+    )
+
+
+def _run_all_aixcc_extensions(
+    args: Any,
+    res: Dict[str, Any],
+    *,
+    repo: Optional[str],
+    path: Optional[str],
+    host: Optional[str],
+    port: Optional[int],
+    use_tls: Optional[bool],
+    reports_dir: str,
+    db: Any,
+    task_id: str,
+    approval_mode: str,
+    as_json: bool,
+) -> None:
+    """
+    Runs AIxCC upgrade engines cleanly inside `--all` (`cmd_all`) without ever
+    writing inside target `--repo`/`--path` directories or crashing `--all` when
+    Docker or optional toolchains are absent.
+    """
+    engines = res.setdefault("engines", {})
+    local_target = repo or path
+    local_target_exists = bool(local_target and os.path.exists(str(local_target)))
+    in_offline_or_pytest = bool(
+        os.environ.get("PYTEST_CURRENT_TEST")
+        or os.environ.get("RFCHUNT_OFFLINE") == "1"
+        or str(approval_mode or "").strip().lower() == "deny"
+    )
+    out_root = Path(str(reports_dir or "reports"))
+
+    # 1. Whole-Repo Multi-Language Call-Graph & Taint Slicer + Tiered Model Escalation (AIxCC #2)
+    run_slicer = not bool(getattr(args, "no_call_graph_slice", False))
+    if local_target_exists and run_slicer:
+        try:
+            from engine.call_graph_slicer import slice_repository
+            from engine.swarm_dispatcher import DispatchEscalationConfig, TieredModelRouter
+
+            slice_report = slice_repository(
+                str(local_target),
+                enable_codeql=bool(
+                    getattr(args, "slice_codeql", False) or getattr(args, "include_codeql", False)
+                ),
+                max_depth=int(getattr(args, "slice_max_depth", 8) or 8),
+                max_slices=int(getattr(args, "slice_max_slices", 200) or 200),
+            )
+            esc_fraction = float(getattr(args, "escalation_fraction", 0.05) or 0.05)
+            esc_fraction = max(0.01, min(1.0, esc_fraction))
+            min_poe_esc = max(0, int(getattr(args, "min_poe_escalation", 1) if getattr(args, "min_poe_escalation", None) is not None else 1))
+            esc_cfg = DispatchEscalationConfig(
+                enabled=True,
+                max_escalation_fraction=esc_fraction,
+                min_poe_for_escalation=min_poe_esc,
+                frontier_api_opt_in=bool(getattr(args, "frontier_api_opt_in", False)),
+            )
+            router = TieredModelRouter(config=esc_cfg, offline=bool(os.environ.get("RFCHUNT_OFFLINE") == "1"))
+            routing_candidates: List[Any] = list(slice_report.slices)
+            for f_item in (res.get("findings") or [])[:100]:
+                if isinstance(f_item, dict):
+                    routing_candidates.append(f_item)
+            routing_plan = router.rank_and_route(routing_candidates)
+
+            slice_dict = slice_report.to_dict()
+            engines["call_graph_slicer"] = {
+                "status": "completed",
+                "repo_root": slice_dict.get("repo_root"),
+                "files_scanned": slice_dict.get("files_scanned", 0),
+                "languages_detected": slice_dict.get("languages_detected", {}),
+                "parser_backends": slice_dict.get("parser_backends", {}),
+                "tree_sitter_available": slice_dict.get("tree_sitter_available", False),
+                "symbols_count": slice_dict.get("symbols_count", 0),
+                "edges_count": slice_dict.get("edges_count", 0),
+                "total_slices": len(slice_report.slices),
+                "cross_file_slices_count": slice_dict.get("cross_file_slices_count", 0),
+                "codeql": slice_dict.get("codeql", {}),
+                "elapsed_sec": round(float(slice_dict.get("elapsed_sec", 0.0) or 0.0), 4),
+                "top_slices": [s.to_dict() for s in slice_report.slices[:20]],
+            }
+            plan_dict = routing_plan.to_dict() if hasattr(routing_plan, "to_dict") else {}
+            engines["tiered_escalation"] = plan_dict
+
+            if hasattr(db, "add_fact"):
+                for sl in slice_report.slices[:15]:
+                    if sl.is_cross_file and sl.sanitizer_status != "sanitized":
+                        db.add_fact(
+                            f"[TAINT_SLICE:{sl.severity}] {sl.sink_class} ({sl.cwe_id}) across {len(sl.files_involved)} files: {sl.entry_symbol} -> {sl.sink_symbol}",
+                            node_id=f"fact:taint_slice:{task_id}:{sl.slice_id}",
+                            task_id=task_id,
+                            domain="global",
+                            source_agent="call_graph_slicer",
+                            payload={
+                                "slice_id": sl.slice_id,
+                                "sink_class": sl.sink_class,
+                                "cwe_id": sl.cwe_id,
+                                "severity": sl.severity,
+                                "sanitizer_status": sl.sanitizer_status,
+                                "files_involved": list(sl.files_involved),
+                                "is_cross_file": sl.is_cross_file,
+                            },
+                        )
+        except Exception as exc:
+            engines["call_graph_slicer"] = {"status": "error", "error": str(exc)}
+    elif not run_slicer:
+        engines["call_graph_slicer"] = {"status": "disabled"}
+
+    # 2. Multi-Language LLM-Guided Coverage Fuzzing Bridge (AIxCC #3)
+    explicit_fuzz = bool(getattr(args, "fuzz_bridge", False))
+    disable_fuzz = bool(getattr(args, "no_fuzz_bridge", False))
+    if local_target_exists and not disable_fuzz:
+        if explicit_fuzz or not in_offline_or_pytest:
+            try:
+                from engine.fuzz_bridge import run_fuzz_bridge_scan
+
+                exec_containers = (not bool(getattr(args, "fuzz_dry_run", False))) and (
+                    str(approval_mode or "").strip().lower() != "deny"
+                )
+                fuzz_langs = _parse_csv_list(getattr(args, "fuzz_languages", None))
+                fuzz_out = out_root / "fuzz_bridge"
+                fuzz_res = run_fuzz_bridge_scan(
+                    str(local_target),
+                    output_dir=str(fuzz_out),
+                    db=db,
+                    task_id=task_id,
+                    languages=fuzz_langs,
+                    timeout_sec=float(getattr(args, "fuzz_timeout", 60.0) or 60.0),
+                    max_total_time_sec=int(getattr(args, "fuzz_max_time", 30) or 30),
+                    cpp_backend=str(getattr(args, "fuzz_cpp_backend", "afl++") or "afl++"),
+                    execute_containers=exec_containers,
+                )
+                engines["fuzz_bridge"] = fuzz_res
+            except Exception as exc:
+                engines["fuzz_bridge"] = {"status": "error", "error": str(exc)}
+        else:
+            engines["fuzz_bridge"] = {
+                "status": "skipped_offline_or_test_guard",
+                "reason": "Skipped automatic container fuzzing under offline/test/deny guard; pass --fuzz-bridge explicitly to run.",
+                "detected_languages": [],
+                "crashes": [],
+                "plateaus": [],
+            }
+    elif disable_fuzz:
+        engines["fuzz_bridge"] = {"status": "disabled"}
+
+    # 3. Real Differential Docker Parser Matrix (AIxCC #1a)
+    explicit_dpm = bool(getattr(args, "docker_parser_matrix", False))
+    disable_dpm = bool(getattr(args, "no_docker_parser_matrix", False))
+    if not disable_dpm and (explicit_dpm or (bool(host) and not in_offline_or_pytest)):
+        try:
+            from engine.differential_oracle import MultiImplementationDifferentialOracle
+
+            dpm_parsers = _parse_csv_list(getattr(args, "parsers", None))
+            dpm_oracle = MultiImplementationDifferentialOracle()
+            engines["docker_parser_matrix"] = dpm_oracle.run_docker_parser_matrix(
+                parsers=dpm_parsers,
+                fallback_to_4parsers=bool(getattr(args, "fallback_4parsers", False)),
+            )
+        except Exception as exc:
+            engines["docker_parser_matrix"] = {"status": "error", "error": str(exc)}
+    elif disable_dpm:
+        engines["docker_parser_matrix"] = {"status": "disabled"}
+
+    # 4. Sandboxed Repo Invariant Runner (AIxCC #1b)
+    explicit_inv = bool(getattr(args, "sandbox_invariants", False))
+    disable_inv = bool(getattr(args, "no_sandbox_invariants", False))
+    if local_target_exists and not disable_inv:
+        if explicit_inv or not in_offline_or_pytest:
+            try:
+                from engine.sandbox_invariant_runner import SandboxInvariantRunner
+
+                inv_runner = SandboxInvariantRunner()
+                inv_report = inv_runner.run(
+                    str(local_target),
+                    db=db,
+                    task_id=task_id,
+                    preferred_runtime=getattr(args, "invariant_runtime", None),
+                    image=getattr(args, "invariant_image", None),
+                )
+                engines["sandbox_invariants"] = inv_report.to_dict()
+            except Exception as exc:
+                engines["sandbox_invariants"] = {"status": "error", "error": str(exc)}
+        else:
+            engines["sandbox_invariants"] = {
+                "status": "skipped_offline_or_test_guard",
+                "reason": "Skipped automatic container invariant check under offline/test/deny guard; pass --sandbox-invariants explicitly to run.",
+                "invariants_checked": 0,
+                "failures_count": 0,
+            }
+    elif disable_inv:
+        engines["sandbox_invariants"] = {"status": "disabled"}
+
+    # 5. Containerized Non-Destructive POE==3 Verifier (AIxCC #5a)
+    explicit_poe = bool(getattr(args, "poe_verify", False))
+    disable_poe = bool(getattr(args, "no_poe_verify", False))
+    if not disable_poe:
+        if explicit_poe or not in_offline_or_pytest:
+            try:
+                from engine.poe_container_verifier import ContainerPOEVerifier
+
+                all_findings = res.get("findings") if isinstance(res.get("findings"), list) else []
+                poe_verifier = ContainerPOEVerifier()
+                poe_batch = poe_verifier.verify_findings(
+                    all_findings,
+                    repo_path=str(local_target) if local_target_exists else None,
+                    db=db,
+                    task_id=task_id,
+                )
+                if poe_batch.results:
+                    res["findings"] = ContainerPOEVerifier.apply_verifications_to_findings(
+                        all_findings,
+                        poe_batch.results,
+                        drop_false_positives=bool(getattr(args, "drop_unverified_fp", False)),
+                    )
+                engines["poe_verifier"] = poe_batch.to_dict()
+            except Exception as exc:
+                engines["poe_verifier"] = {"status": "error", "error": str(exc)}
+        else:
+            engines["poe_verifier"] = {
+                "status": "skipped_offline_or_test_guard",
+                "reason": "Skipped automatic container POE==3 verification under offline/test/deny guard; pass --poe-verify explicitly to run.",
+                "verified_count": 0,
+                "downgraded_count": 0,
+            }
+    elif disable_poe:
+        engines["poe_verifier"] = {"status": "disabled"}
+
+    # 6. Offline Known-Technique Novelty Corpus + Optional Explicit Refresh (AIxCC #4)
+    try:
+        from engine.novelty_corpus import NoveltyCorpusIndex, refresh_novelty_corpus
+
+        raw_refresh = getattr(args, "refresh_novelty_corpus", None) or []
+        refresh_sources: List[str] = []
+        for item in raw_refresh:
+            for tok in str(item).split(","):
+                tok_s = tok.strip()
+                if tok_s:
+                    refresh_sources.append(tok_s)
+        nov_thresh = float(getattr(args, "novelty_threshold", 0.72) or 0.72)
+        if refresh_sources:
+            engines["novelty_corpus"] = refresh_novelty_corpus(
+                refresh_sources,
+                db=db,
+                allow_network=bool(getattr(args, "novelty_allow_network", False)),
+                output_path=getattr(args, "novelty_export", None),
+                novelty_threshold=nov_thresh,
+            )
+        else:
+            idx = NoveltyCorpusIndex(db=db, include_workspace_templates=True, novelty_threshold=nov_thresh)
+            summary = idx.summary()
+            engines["novelty_corpus"] = {
+                "status": "ready_offline",
+                "entry_count": summary.get("total_entries", len(idx)),
+                "total_corpus_entries": summary.get("total_entries", len(idx)),
+                "novelty_threshold": nov_thresh,
+                "network_calls": 0,
+            }
+    except (PermissionError, ValueError):
+        raise
+    except Exception as exc:
+        engines["novelty_corpus"] = {"status": "error", "error": str(exc)}
+
+
+def cmd_novelty(args):
+    """Inspects offline structural novelty corpus or refreshes it from explicit local/opt-in sources (AIxCC #4)."""
+    from engine.cli_render import render_json, render_kv_panel
+    from engine.novelty_corpus import NoveltyCorpusIndex, refresh_novelty_corpus
+
+    as_json = bool(getattr(args, "as_json", False))
+    plain = bool(getattr(args, "plain", False))
+    err_stream = sys.stderr if as_json else sys.stdout
+
+    raw_refresh = getattr(args, "refresh_novelty_corpus", None) or []
+    sources: List[str] = []
+    for item in raw_refresh:
+        for tok in str(item).split(","):
+            tok_s = tok.strip()
+            if tok_s:
+                sources.append(tok_s)
+    if not sources and getattr(args, "target_arg", None):
+        sources.append(str(args.target_arg).strip())
+
+    nov_thresh = float(getattr(args, "novelty_threshold", 0.72) or 0.72)
+    allow_net = bool(getattr(args, "novelty_allow_network", False))
+    export_path = getattr(args, "novelty_export", None)
+
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        if sources:
+            payload = refresh_novelty_corpus(
+                sources,
+                db=db,
+                allow_network=allow_net,
+                output_path=export_path,
+                novelty_threshold=nov_thresh,
+            )
+            payload.setdefault("status", "refreshed")
+        else:
+            idx = NoveltyCorpusIndex(db=db, include_workspace_templates=True, novelty_threshold=nov_thresh)
+            if export_path:
+                idx.export_catalog(export_path)
+            summary = idx.summary()
+            payload = {
+                "status": "ready_offline",
+                "total_entries": summary.get("total_entries", len(idx)),
+                "total_corpus_entries": summary.get("total_entries", len(idx)),
+                "novelty_threshold": nov_thresh,
+                "sources_breakdown": summary.get("by_source", {}),
+                "corpus_summary": summary,
+                "allow_network": False,
+                "exported_path": export_path or "",
+            }
+    except (PermissionError, ValueError) as exc:
+        print(f"[!] Novelty corpus refresh rejected: {exc}", file=err_stream)
+        sys.exit(1)
+    finally:
+        db.close()
+
+    if as_json:
+        render_json(payload)
+        return
+
+    render_kv_panel(
+        "AIxCC Structural Novelty Corpus Index",
+        {
+            "Status": payload.get("status", "ready_offline"),
+            "Total Entries": payload.get("total_corpus_entries", payload.get("total_entries", 0)),
+            "Added / Updated": f"{payload.get('added', 0)} / {payload.get('updated', 0)}",
+            "Novelty Threshold": payload.get("novelty_threshold", nov_thresh),
+            "Allow Network": payload.get("allow_network", allow_net),
+            "Exported Catalog": payload.get("exported_path") or "-",
+        },
+        plain=plain,
+    )
+
+
+def cmd_swarm_board(args):
+    """Pure-CLI Swarm Overview & live terminal status board inspecting SQLite blackboard (zero GUI)."""
+    from engine.swarm_cli_board import watch_board_from_db
+
+    db_path = getattr(args, "db", "terminator.db")
+    task_id = getattr(args, "task_id", None)
+    watch = bool(getattr(args, "watch", False))
+    interval = max(0.1, float(getattr(args, "interval", 1.0) or 1.0))
+    limit_events = max(1, int(getattr(args, "board_events", 15) or 15))
+    width = max(60, int(getattr(args, "board_width", 100) or 100))
+    plain = bool(getattr(args, "plain", False))
+    as_json = bool(getattr(args, "as_json", False))
+
+    watch_board_from_db(
+        db_path,
+        task_id=task_id,
+        interval=interval,
+        limit_events=limit_events,
+        plain=plain,
+        as_json=as_json,
+        width=width,
+        watch=watch,
+    )
+
+
+def cmd_sandbox_invariants(args):
+    """Runs isolated `--network=none` container security invariants against a local repo (AIxCC #1b)."""
+    from engine.cli_render import render_json, render_kv_panel, render_table
+    from engine.sandbox_invariant_runner import SandboxInvariantRunner
+
+    as_json = bool(getattr(args, "as_json", False))
+    plain = bool(getattr(args, "plain", False))
+    target_path = (
+        getattr(args, "repo", None)
+        or getattr(args, "path", None)
+        or getattr(args, "target_arg", None)
+        or "."
+    )
+    if not os.path.exists(str(target_path)):
+        print(f"[!] Target path does not exist: {target_path}", file=(sys.stderr if as_json else sys.stdout))
+        sys.exit(1)
+
+    task_id = str(getattr(args, "task_id", None) or "default").strip() or "default"
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        runner = SandboxInvariantRunner()
+        report = runner.run(
+            str(target_path),
+            db=db,
+            task_id=task_id,
+            preferred_runtime=getattr(args, "invariant_runtime", None),
+            image=getattr(args, "invariant_image", None),
+        )
+        payload = report.to_dict()
+    finally:
+        db.close()
+
+    if as_json:
+        render_json(payload)
+        return
+
+    render_kv_panel(
+        "AIxCC Sandboxed Repo Invariant Runner",
+        {
+            "Repository": payload.get("repo_path", str(target_path)),
+            "Status": payload.get("status", "unknown"),
+            "Container Mode": payload.get("container_mode", "docker_network_none"),
+            "Checked / Passed / Failed": f"{payload.get('invariants_checked', 0)} / {payload.get('passed_count', 0)} / {payload.get('failures_count', 0)}",
+            "Persisted FACTs": len(payload.get("fact_ids") or []),
+        },
+        plain=plain,
+    )
+    rows = [
+        [
+            r.get("invariant_id", ""),
+            "PASS" if r.get("passed") else "FAIL",
+            r.get("severity", ""),
+            r.get("file_path", ""),
+            str(r.get("evidence", ""))[:80],
+        ]
+        for r in (payload.get("results") or [])
+    ]
+    render_table("Security Invariants", ["Invariant ID", "Outcome", "Severity", "File", "Evidence"], rows, plain=plain)
+
+
+def cmd_poe_verify(args):
+    """Runs containerized non-destructive POE==3 verification on HIGH/CRITICAL findings (AIxCC #5a)."""
+    import json as _json
+    from engine.cli_render import render_json, render_kv_panel, render_table
+    from engine.poe_container_verifier import ContainerPOEVerifier
+
+    as_json = bool(getattr(args, "as_json", False))
+    plain = bool(getattr(args, "plain", False))
+    repo_path = getattr(args, "repo", None) or getattr(args, "path", None)
+    task_id = str(getattr(args, "task_id", None) or "default").strip() or "default"
+    findings_json_path = getattr(args, "findings_json", None)
+
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        findings: List[Dict[str, Any]] = []
+        if findings_json_path:
+            raw_doc = _json.loads(Path(str(findings_json_path)).read_text(encoding="utf-8"))
+            if isinstance(raw_doc, list):
+                findings = [x for x in raw_doc if isinstance(x, dict)]
+            elif isinstance(raw_doc, dict) and isinstance(raw_doc.get("findings"), list):
+                findings = [x for x in raw_doc["findings"] if isinstance(x, dict)]
+        else:
+            if hasattr(db, "get_mantis_findings"):
+                findings.extend(db.get_mantis_findings(limit=200) or [])
+            if hasattr(db, "get_attack_chains"):
+                findings.extend(db.get_attack_chains(limit=100, task_id=getattr(args, "task_id", None)) or [])
+
+        verifier = ContainerPOEVerifier()
+        batch = verifier.verify_findings(
+            findings,
+            repo_path=str(repo_path) if repo_path and os.path.exists(str(repo_path)) else None,
+            db=db,
+            task_id=task_id,
+        )
+        payload = batch.to_dict()
+    finally:
+        db.close()
+
+    if as_json:
+        render_json(payload)
+        return
+
+    render_kv_panel(
+        "AIxCC Containerized POE==3 Verifier",
+        {
+            "Status": payload.get("status", "unknown"),
+            "Candidates Evaluated": payload.get("evaluated_count", 0),
+            "POE==3 Verified": payload.get("verified_count", 0),
+            "False Positives Downgraded": payload.get("downgraded_count", 0),
+            "Skipped": payload.get("skipped_count", 0),
+        },
+        plain=plain,
+    )
+    rows = [
+        [
+            r.get("finding_id", ""),
+            r.get("status", ""),
+            r.get("poe_level", 0),
+            r.get("verified", False),
+            str(r.get("evidence", ""))[:80],
+        ]
+        for r in (payload.get("results") or [])
+    ]
+    render_table("POE==3 Verification Results", ["Finding ID", "Status", "POE", "Verified", "Evidence"], rows, plain=plain)
+
+
+def cmd_call_graph_slice(args):
+    """Whole-repo multi-language call-graph & taint slicer with tiered model escalation (AIxCC #2)."""
+    from engine.call_graph_slicer import slice_repository
+    from engine.cli_render import render_json, render_kv_panel, render_table
+    from engine.swarm_dispatcher import DispatchEscalationConfig, TieredModelRouter
+
+    as_json = bool(getattr(args, "as_json", False))
+    plain = bool(getattr(args, "plain", False))
+    target_path = (
+        getattr(args, "repo", None)
+        or getattr(args, "path", None)
+        or getattr(args, "target_arg", None)
+        or "."
+    )
+    if not os.path.exists(str(target_path)):
+        print(f"[!] Target path does not exist: {target_path}", file=(sys.stderr if as_json else sys.stdout))
+        sys.exit(1)
+
+    report = slice_repository(
+        str(target_path),
+        enable_codeql=bool(getattr(args, "slice_codeql", False) or getattr(args, "include_codeql", False)),
+        max_depth=int(getattr(args, "slice_max_depth", 8) or 8),
+        max_slices=int(getattr(args, "slice_max_slices", 200) or 200),
+    )
+    esc_fraction = max(0.01, min(1.0, float(getattr(args, "escalation_fraction", 0.05) or 0.05)))
+    min_poe_esc = max(0, int(getattr(args, "min_poe_escalation", 1) if getattr(args, "min_poe_escalation", None) is not None else 1))
+    router = TieredModelRouter(
+        config=DispatchEscalationConfig(
+            enabled=True,
+            max_escalation_fraction=esc_fraction,
+            min_poe_for_escalation=min_poe_esc,
+            frontier_api_opt_in=bool(getattr(args, "frontier_api_opt_in", False)),
+        ),
+        offline=bool(os.environ.get("RFCHUNT_OFFLINE") == "1"),
+    )
+    plan = router.rank_and_route(report.slices)
+    payload = {
+        "call_graph": report.to_dict(),
+        "escalation_plan": plan.to_dict() if hasattr(plan, "to_dict") else {},
+    }
+    if as_json:
+        render_json(payload)
+        return
+
+    render_kv_panel(
+        "AIxCC Whole-Repo Call-Graph & Taint Slicer",
+        {
+            "Repository": report.repo_root,
+            "Files Scanned": report.files_scanned,
+            "Languages": ", ".join(f"{k}({v})" for k, v in sorted(report.languages_detected.items())) or "none",
+            "Tree-sitter Available": report.tree_sitter_available,
+            "Symbols / Call Edges": f"{report.symbols_count} / {report.edges_count}",
+            "Taint Slices (Cross-File)": f"{len(report.slices)} ({report.cross_file_slices_count} cross-file)",
+            "CodeQL Status": getattr(report.codeql, "status", "disabled"),
+            "Escalated Candidates": payload["escalation_plan"].get("escalated_count", 0),
+        },
+        plain=plain,
+    )
+    rows = [
+        [
+            s.severity,
+            s.cwe_id,
+            s.sink_class,
+            s.sanitizer_status,
+            f"{s.entry_symbol} -> {s.sink_symbol} ({len(s.files_involved)}f)",
+        ]
+        for s in report.slices[:30]
+    ]
+    render_table(
+        "Top Extracted Multi-File Taint Slices",
+        ["Severity", "CWE", "Sink Class", "Sanitizer", "Path"],
+        rows,
+        plain=plain,
+    )
+
+
+def cmd_fuzz_bridge(args):
+    """Multi-language LLM-guided isolated container coverage fuzzing bridge (AIxCC #3)."""
+    from engine.cli_render import render_json, render_kv_panel, render_table
+    from engine.fuzz_bridge import run_fuzz_bridge_scan
+
+    as_json = bool(getattr(args, "as_json", False))
+    plain = bool(getattr(args, "plain", False))
+    target_path = (
+        getattr(args, "repo", None)
+        or getattr(args, "path", None)
+        or getattr(args, "target_arg", None)
+        or "."
+    )
+    if not os.path.exists(str(target_path)):
+        print(f"[!] Target path does not exist: {target_path}", file=(sys.stderr if as_json else sys.stdout))
+        sys.exit(1)
+
+    task_id = str(getattr(args, "task_id", None) or "default").strip() or "default"
+    out_dir = Path(str(getattr(args, "output_dir", None) or "reports")) / "fuzz_bridge"
+    fuzz_langs = _parse_csv_list(getattr(args, "fuzz_languages", None))
+    exec_containers = not bool(getattr(args, "fuzz_dry_run", False))
+    if str(getattr(args, "approval_mode", "policy") or "policy").strip().lower() == "deny":
+        exec_containers = False
+
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        _stdout_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+        with _stdout_ctx:
+            payload = run_fuzz_bridge_scan(
+                str(target_path),
+                output_dir=str(out_dir),
+                db=db,
+                task_id=task_id,
+                languages=fuzz_langs,
+                timeout_sec=float(getattr(args, "fuzz_timeout", 60.0) or 60.0),
+                max_total_time_sec=int(getattr(args, "fuzz_max_time", 30) or 30),
+                cpp_backend=str(getattr(args, "fuzz_cpp_backend", "afl++") or "afl++"),
+                execute_containers=exec_containers,
+            )
+    finally:
+        db.close()
+
+    if as_json:
+        render_json(payload)
+        return
+
+    render_kv_panel(
+        "AIxCC Multi-Language Coverage Fuzzing Bridge",
+        {
+            "Repository": payload.get("repo_path", str(target_path)),
+            "Status": payload.get("status", "unknown"),
+            "Languages Detected": ", ".join(payload.get("detected_languages") or []) or "none",
+            "Harnesses Generated": len(payload.get("generated_artifacts") or []),
+            "Sanitizer Crashes": len(payload.get("crashes") or []),
+            "Coverage Plateaus": len(payload.get("plateaus") or []),
+            "Blackboard FACTs / INTENTs": f"{len(payload.get('blackboard_fact_ids') or [])} / {len(payload.get('blackboard_intent_ids') or [])}",
+            "Work Dir": payload.get("work_dir", str(out_dir)),
+        },
+        plain=plain,
+    )
+    rows = [
+        [
+            t.get("language", ""),
+            t.get("backend", ""),
+            t.get("status", ""),
+            len(t.get("crashes") or []),
+            len(t.get("plateaus") or []),
+        ]
+        for t in (payload.get("target_results") or [])
+    ]
+    render_table(
+        "Fuzz Target Results",
+        ["Language", "Backend", "Status", "Crashes", "Plateaus"],
+        rows,
+        plain=plain,
+    )
+
+
 def cmd_all(args):
     """
     Unified --all orchestrator running Google Mantis, haasonsaas/aiscan, BaaRai/ARTEX Dual-Graph,
@@ -2272,13 +4080,34 @@ def cmd_all(args):
             print(f"[!] Target authorization error for {host}: {reason}", file=(sys.stderr if as_json else sys.stdout))
             sys.exit(1)
 
+    all_task_id = str(getattr(args, "task_id", None) or "default").strip() or "default"
+    if getattr(args, "hint", None) is not None:
+        _validate_cli_hint_args(args, default_task_id=all_task_id)
     db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
     try:
+        if getattr(args, "hint", None) is not None and hasattr(db, "add_hint"):
+            _persist_cli_hint(args, db=db)
+
+        if hasattr(db, "reclaim_stale_intents"):
+            try:
+                db.reclaim_stale_intents(task_id=all_task_id)
+            except Exception:
+                pass
+
+        active_hints: List[Dict[str, Any]] = []
+        if hasattr(db, "get_active_hints"):
+            try:
+                active_hints = db.get_active_hints(task_id=all_task_id, limit=50)
+            except Exception:
+                active_hints = []
+
         if not as_json:
             print(f"\n{'='*75}")
             print(f"[*] UNIFIED --all SECURITY AUDIT (Fusion + Abliterated Models Enforced)")
             target_disp = f"host={host or targets}" if (host or targets) and not repo and not path else os.path.abspath(str(repo or path))
             print(f"[*] Target: {target_disp} | Depth: {depth} | Model: {preferred_model}")
+            if active_hints:
+                print(f"[*] Active Blackboard Hints: {len(active_hints)}")
             print(f"{'='*75}")
 
         raw_port = getattr(args, "port", None)
@@ -2298,71 +4127,167 @@ def cmd_all(args):
 
         raw_profiles = getattr(args, "artex_llm_profiles", None)
         artex_llm_profiles = _parse_csv_list(raw_profiles) if not isinstance(raw_profiles, list) else raw_profiles
+        approval_mode_val = str(getattr(args, "approval_mode", "policy") or "policy").strip() or "policy"
         artex_live_val = getattr(args, "artex_live", None)
-        if getattr(args, "no_artex_live", False):
+        if getattr(args, "no_artex_live", False) or approval_mode_val.lower() == "deny":
             artex_live_val = False
+
+        if getattr(args, "no_external_scanners", False):
+            raw_ext_flag = False
+        elif getattr(args, "enable_external_scanners", False):
+            raw_ext_flag = True
+        else:
+            raw_ext_flag = None
+        raw_rea_cli = getattr(args, "rea_cli", None)
+        rea_use_cli_val = True if raw_rea_cli is None else bool(raw_rea_cli)
+        include_models_val = bool(getattr(args, "include_models", True))
+
+        unified_kwargs: Dict[str, Any] = dict(
+            repo=repo,
+            path=path,
+            host=host,
+            targets=targets,
+            port=port_arg,
+            use_tls=getattr(args, "tls", None),
+            authorized=authorized,
+            allow_destructive=allow_destructive,
+            depth=depth,
+            mantis_mode=mantis_mode,
+            use_fusion=True,
+            preferred_model=preferred_model,
+            db=db,
+            reports_dir=reports_dir,
+            artex_rounds=artex_rounds,
+            artex_url=getattr(args, "artex_url", None),
+            artex_token=getattr(args, "artex_token", None),
+            artex_proxy=getattr(args, "artex_proxy", None),
+            artex_ca_cert=getattr(args, "artex_ca_cert", None),
+            artex_noise_profile=getattr(args, "artex_noise_profile", None),
+            artex_llm_profiles=artex_llm_profiles,
+            artex_llm_rotate=bool(getattr(args, "artex_llm_rotate", False)),
+            artex_wait_sse=bool(getattr(args, "artex_wait_sse", False)),
+            artex_budget_turns=int(getattr(args, "artex_budget_turns", 0) or 0),
+            artex_retest=bool(getattr(args, "artex_retest", False)),
+            artex_workers=int(getattr(args, "artex_workers", 3) or 3),
+            artex_live=artex_live_val,
+            embedded_proxy=bool(getattr(args, "embedded_proxy", False)),
+            embedded_proxy_port=int(getattr(args, "embedded_proxy_port", 0) or 0),
+            auth_profile=getattr(args, "auth_profile", None),
+            import_har=getattr(args, "import_har", None),
+            import_openapi=getattr(args, "import_openapi", None),
+            scope_file=getattr(args, "scope_file", None),
+            approval_mode=approval_mode_val,
+            approval_rules=getattr(args, "approval_rules", None),
+            strict_poe=bool(getattr(args, "strict_poe", False)),
+            export_advisory=bool(getattr(args, "export_advisory", False)),
+            export_csv=bool(getattr(args, "export_csv", False)),
+            quiet=as_json,
+            enable_external_scanners=raw_ext_flag,
+            httpx_scan=getattr(args, "httpx_scan", None),
+            katana_scan=getattr(args, "katana_scan", None),
+            nuclei_scan=getattr(args, "nuclei_scan", None),
+            nuclei_tags=getattr(args, "nuclei_tags", None),
+            scanner_isolation=getattr(args, "scanner_isolation", "host") or "host",
+            docker_image=getattr(args, "docker_image", None),
+            docker_network=getattr(args, "docker_network", None),
+            artex_multiturn=bool(getattr(args, "artex_multiturn", False)),
+            artex_intent_turns=artex_intent_turns,
+            artex_intent_tokens=artex_intent_tokens,
+            enable_rea=not bool(getattr(args, "no_rea", False)),
+            rea_target=getattr(args, "rea_target", None),
+            rea_use_cli=rea_use_cli_val,
+            auto_install_tools=bool(getattr(args, "auto_install", True)),
+        )
+        try:
+            _unified_sig = inspect.signature(run_unified_all_scans)
+            if "include_models" in _unified_sig.parameters or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in _unified_sig.parameters.values()
+            ):
+                unified_kwargs["include_models"] = include_models_val
+        except (TypeError, ValueError):
+            unified_kwargs["include_models"] = include_models_val
 
         try:
             _stdout_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
             with _stdout_ctx:
-                res = run_unified_all_scans(
+                res = run_unified_all_scans(**unified_kwargs)
+                _run_all_aixcc_extensions(
+                    args,
+                    res,
                     repo=repo,
                     path=path,
                     host=host,
-                    targets=targets,
                     port=port_arg,
                     use_tls=getattr(args, "tls", None),
-                    authorized=authorized,
-                    allow_destructive=allow_destructive,
-                    depth=depth,
-                    mantis_mode=mantis_mode,
-                    use_fusion=True,
-                    preferred_model=preferred_model,
-                    db=db,
                     reports_dir=reports_dir,
-                    artex_rounds=artex_rounds,
-                    artex_url=getattr(args, "artex_url", None),
-                    artex_token=getattr(args, "artex_token", None),
-                    artex_proxy=getattr(args, "artex_proxy", None),
-                    artex_ca_cert=getattr(args, "artex_ca_cert", None),
-                    artex_noise_profile=getattr(args, "artex_noise_profile", None),
-                    artex_llm_profiles=artex_llm_profiles,
-                    artex_llm_rotate=bool(getattr(args, "artex_llm_rotate", False)),
-                    artex_wait_sse=bool(getattr(args, "artex_wait_sse", False)),
-                    artex_budget_turns=int(getattr(args, "artex_budget_turns", 0) or 0),
-                    artex_retest=bool(getattr(args, "artex_retest", False)),
-                    artex_workers=int(getattr(args, "artex_workers", 3) or 3),
-                    artex_live=artex_live_val,
-                    embedded_proxy=bool(getattr(args, "embedded_proxy", False)),
-                    embedded_proxy_port=int(getattr(args, "embedded_proxy_port", 0) or 0),
-                    auth_profile=getattr(args, "auth_profile", None),
-                    import_har=getattr(args, "import_har", None),
-                    import_openapi=getattr(args, "import_openapi", None),
-                    scope_file=getattr(args, "scope_file", None),
-                    approval_mode=getattr(args, "approval_mode", "policy") or "policy",
-                    approval_rules=getattr(args, "approval_rules", None),
-                    strict_poe=bool(getattr(args, "strict_poe", False)),
-                    export_advisory=bool(getattr(args, "export_advisory", False)),
-                    export_csv=bool(getattr(args, "export_csv", False)),
-                    quiet=as_json,
-                    enable_external_scanners=bool(getattr(args, "enable_external_scanners", False)),
-                    httpx_scan=getattr(args, "httpx_scan", None),
-                    katana_scan=getattr(args, "katana_scan", None),
-                    nuclei_scan=getattr(args, "nuclei_scan", None),
-                    nuclei_tags=getattr(args, "nuclei_tags", None),
-                    scanner_isolation=getattr(args, "scanner_isolation", "host") or "host",
-                    docker_image=getattr(args, "docker_image", None),
-                    docker_network=getattr(args, "docker_network", None),
-                    artex_multiturn=bool(getattr(args, "artex_multiturn", False)),
-                    artex_intent_turns=artex_intent_turns,
-                    artex_intent_tokens=artex_intent_tokens,
-                    enable_rea=not bool(getattr(args, "no_rea", False)),
-                    rea_target=getattr(args, "rea_target", None),
-                    rea_use_cli=bool(getattr(args, "rea_cli", False)),
+                    db=db,
+                    task_id=all_task_id,
+                    approval_mode=approval_mode_val,
+                    as_json=as_json,
                 )
         except (PermissionError, ValueError) as exc:
             print(f"[!] Target authorization or scanner configuration error for {host or targets or repo or path}: {exc}", file=(sys.stderr if as_json else sys.stdout))
             sys.exit(1)
+
+        export_sarif_arg = getattr(args, "export_sarif", None)
+        if export_sarif_arg:
+            import shutil as _shutil
+            src_sarif = (res.get("report_files") or {}).get("combined_sarif")
+            if src_sarif and os.path.isfile(str(src_sarif)):
+                sarif_req = Path(str(export_sarif_arg))
+                out_dir_resolved = Path(str(reports_dir)).resolve()
+                if sarif_req.is_absolute():
+                    dst_sarif = sarif_req
+                else:
+                    dst_sarif = (out_dir_resolved / sarif_req).resolve()
+                    if not dst_sarif.is_relative_to(out_dir_resolved):
+                        raise ValueError(f"--export-sarif path escapes output directory: {export_sarif_arg}")
+                dst_sarif.parent.mkdir(parents=True, exist_ok=True)
+                if Path(str(src_sarif)).resolve() != dst_sarif.resolve():
+                    _shutil.copyfile(str(src_sarif), str(dst_sarif))
+                res.setdefault("report_files", {})["exported_sarif"] = str(dst_sarif)
+
+        if hasattr(db, "add_fact"):
+            try:
+                total_agg = int(res.get("total_aggregated_findings", 0) or 0)
+                chains_syn = int(res.get("chains_synthesized", 0) or 0)
+                db.add_fact(
+                    f"Unified --all scan completed on {res.get('target_path') or host or repo or '.'} "
+                    f"(findings={total_agg}, chains={chains_syn}, hints_active={len(active_hints)})",
+                    node_id=f"fact:all_scan:{all_task_id}",
+                    task_id=all_task_id,
+                    domain="global",
+                    source_agent="cmd_all",
+                    payload={
+                        "target": res.get("target_path"),
+                        "total_findings": total_agg,
+                        "chains_synthesized": chains_syn,
+                        "hints_active": len(active_hints),
+                        "severity_counts": res.get("severity_counts") or {},
+                    },
+                )
+                for f_idx, f_item in enumerate((res.get("findings") or [])[:50]):
+                    if not isinstance(f_item, dict):
+                        continue
+                    f_title = str(f_item.get("title") or f_item.get("rule_id") or f_item.get("description") or f"finding-{f_idx+1}")
+                    f_sev = str(f_item.get("severity") or "INFO")
+                    db.add_fact(
+                        f"[{f_sev}] {f_title}",
+                        node_id=f"fact:all_finding:{all_task_id}:{f_idx}",
+                        task_id=all_task_id,
+                        domain="global",
+                        source_agent="cmd_all",
+                        payload={
+                            "rule_id": f_item.get("rule_id"),
+                            "severity": f_sev,
+                            "cwe": f_item.get("cwe"),
+                            "file_path": f_item.get("file_path") or f_item.get("file"),
+                            "capability_class": f_item.get("capability_class"),
+                            "endpoint": f_item.get("endpoint"),
+                        },
+                    )
+            except Exception:
+                pass
 
         if getattr(args, "as_json", False):
             from engine.cli_render import render_json
@@ -2392,7 +4317,50 @@ def cmd_all(args):
         )
         print(f"    POE Breakdown       : {poe_bd}")
         print(f"    Module 19 Smuggling : {eng.get('prompt_smuggling', {}).get('probes_generated', 0)} probes synthesized")
+        if "call_graph_slicer" in eng:
+            cg = eng.get("call_graph_slicer") or {}
+            te = eng.get("tiered_escalation") or {}
+            print(
+                f"    Call-Graph Slicer   : {cg.get('total_slices', 0)} slices "
+                f"({cg.get('cross_file_slices_count', 0)} cross-file, "
+                f"escalated={te.get('escalated_count', 0)}, status={cg.get('status', 'ok')})"
+            )
+        if "fuzz_bridge" in eng:
+            fb = eng.get("fuzz_bridge") or {}
+            print(
+                f"    Fuzzing Bridge      : {fb.get('status', 'unknown')} "
+                f"(langs={','.join(fb.get('detected_languages') or []) or 'none'}, "
+                f"crashes={len(fb.get('crashes') or [])}, plateaus={len(fb.get('plateaus') or [])})"
+            )
+        if "docker_parser_matrix" in eng:
+            dpm = eng.get("docker_parser_matrix") or {}
+            print(
+                f"    Docker Parser Matrix: {dpm.get('status', 'unknown')} "
+                f"(divergences={dpm.get('divergences_detected', 0)}, "
+                f"active={','.join(dpm.get('active_parsers') or []) or 'none'})"
+            )
+        if "sandbox_invariants" in eng:
+            si = eng.get("sandbox_invariants") or {}
+            print(
+                f"    Sandbox Invariants  : {si.get('status', 'unknown')} "
+                f"(checked={si.get('invariants_checked', 0)}, failures={si.get('failures_count', 0)})"
+            )
+        if "poe_verifier" in eng:
+            pv = eng.get("poe_verifier") or {}
+            print(
+                f"    POE==3 Verifier     : {pv.get('status', 'unknown')} "
+                f"(verified={pv.get('verified_count', 0)}, downgraded={pv.get('downgraded_count', 0)})"
+            )
+        if "novelty_corpus" in eng:
+            nc = eng.get("novelty_corpus") or {}
+            print(
+                f"    Novelty Corpus      : {nc.get('status', 'ready_offline')} "
+                f"(entries={nc.get('total_entries', nc.get('entry_count', 0))}, "
+                f"threshold={nc.get('novelty_threshold', 0.72)})"
+            )
         print(f"    Combined SARIF      : {res['report_files'].get('combined_sarif')}")
+        if res["report_files"].get("exported_sarif"):
+            print(f"    Exported SARIF      : {res['report_files'].get('exported_sarif')}")
         print(f"    Combined JSON       : {res['report_files'].get('combined_json')}")
         if res["report_files"].get("combined_csv"):
             print(f"    Combined CSV        : {res['report_files'].get('combined_csv')}")
@@ -2406,6 +4374,22 @@ def cmd_all(args):
             traces=traces_for_render,
             plain=bool(getattr(args, "plain", False)),
         )
+        if bool(getattr(args, "swarm_board", False)):
+            try:
+                from engine.swarm_cli_board import create_all_scan_board, update_all_board_from_result
+
+                target_disp_board = str(res.get("target_path") or host or repo or ".")
+                cli_board = create_all_scan_board(
+                    target_disp_board,
+                    task_id=all_task_id,
+                    plain=bool(getattr(args, "plain", False)),
+                    json_mode=as_json,
+                    width=max(60, int(getattr(args, "board_width", 100) or 100)),
+                )
+                update_all_board_from_result(cli_board, res)
+                print(cli_board.render(plain=bool(getattr(args, "plain", False)), width=max(60, int(getattr(args, "board_width", 100) or 100))))
+            except Exception:
+                pass
     finally:
         db.close()
 
@@ -2580,7 +4564,7 @@ def cmd_scanner(args):
         print(f"[!] Invalid --nuclei-tags: {exc}", file=err_stream)
         sys.exit(1)
 
-    enable_all = bool(getattr(args, "enable_external_scanners", False))
+    enable_all = bool(getattr(args, "enable_external_scanners", False)) and not bool(getattr(args, "no_external_scanners", False))
     hx = getattr(args, "httpx_scan", None)
     kt = getattr(args, "katana_scan", None)
     nc = getattr(args, "nuclei_scan", None)
@@ -3658,33 +5642,75 @@ def cmd_ruler(args):
 
 
 def cmd_dream(args):
-    """Executes offline Dream-RSI policy evolution over accumulated database trajectories."""
+    """Executes offline Replay-Tree Dream-RSI policy evolution or 4-baseline empirical RL benchmark."""
     db_path = getattr(args, "db", "terminator.db")
     target_host = getattr(args, "target", None) or getattr(args, "host", "127.0.0.1")
     target_port = int(getattr(args, "port", 5006) or 5006)
     export_path = getattr(args, "export", None) or getattr(args, "dream_export", "data/dream_policies.json")
     generations = int(getattr(args, "generations", 2) or 2)
     rollouts = int(getattr(args, "rollouts", None) or getattr(args, "dream_rollouts", 200) or 200)
+    stack_profile = getattr(args, "dream_stack_profile", None)
+    as_json = bool(getattr(args, "as_json", False))
 
-    print(f"[*] Initializing Dream-RSI World Model from {db_path}...")
-    model = ProtocolWorldModel(target_host=target_host, target_port=target_port)
-    loaded = model.ingest_history_from_db(db_path)
-    print(f"[+] Loaded {loaded} execution trajectories into offline World Model.")
+    if bool(getattr(args, "dream_benchmark", False)):
+        from engine.cli_render import render_json
+        from engine.dream_rl_benchmark import run_dream_benchmark_cli
 
-    optimizer = DreamRSIOptimizer(model)
-    store = DreamPolicyStore(storage_path=export_path)
+        num_seeds = max(2, int(getattr(args, "dream_seeds", 10) or 10))
+        budget_steps = max(1, int(getattr(args, "dream_budget", 40) or 40))
+        live_lab = bool(getattr(args, "dream_live_lab", False))
+        _bench_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+        with _bench_ctx:
+            report = run_dream_benchmark_cli(
+                db_path=db_path,
+                live_lab=live_lab,
+                num_seeds=num_seeds,
+                budget_steps=budget_steps,
+                generations=generations,
+                stack_profile=stack_profile,
+                strict_offline=bool(os.environ.get("RFCHUNT_OFFLINE") == "1" and not live_lab),
+                save_policy_path=export_path if export_path else None,
+            )
+        if as_json:
+            render_json(report.to_dict())
+            return
+        print(report.format_markdown_table())
+        return
 
-    print(f"[*] Executing {generations} generations of off-policy dreaming ({rollouts} rollouts each)...")
-    for _ in range(generations):
-        evolved = optimizer.evolve_policy_generation(rollouts_per_candidate=rollouts)
-        store.save_policy(evolved)
-        gain_str = f"+{evolved.rsi_gain * 100:.1f}%" if evolved.rsi_gain > 0 else "0.0%"
-        print(f"  [Gen {evolved.generation}] Fitness: {evolved.fitness_score:.2f} | RSI Gain: {gain_str} | Yield: {evolved.simulated_yield:.1%}")
+    _dream_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+    with _dream_ctx:
+        print(f"[*] Initializing Dream-RSI World Model from {db_path}...")
+        model = ProtocolWorldModel(target_host=target_host, target_port=target_port)
+        loaded = model.ingest_history_from_db(db_path)
+        print(f"[+] Loaded {loaded} execution trajectories into offline World Model (backend={getattr(model, 'backend_label', 'unknown')}).")
 
-    summary = store.export_summary()
-    print(f"\n[+] Dream-RSI Optimization Complete. Policies saved to {export_path}.")
-    print(f"    Total Cumulative Gain: {summary.get('cumulative_rsi_gain_pct', 0.0)}%")
-    print(f"    Dominant Mutators: {summary.get('dominant_mutators', [])}")
+        optimizer = DreamRSIOptimizer(model)
+        store = DreamPolicyStore(storage_path=export_path)
+
+        print(f"[*] Executing {generations} generations of off-policy dreaming ({rollouts} rollouts each)...")
+        evolved_history = []
+        for _ in range(generations):
+            evolved = optimizer.evolve_policy_generation(rollouts_per_candidate=rollouts)
+            if stack_profile:
+                evolved.stack_profile = str(stack_profile)
+            store.save_policy(evolved)
+            evolved_history.append(evolved.to_dict())
+            gain_str = f"+{evolved.rsi_gain * 100:.1f}%" if evolved.rsi_gain > 0 else "0.0%"
+            backend = getattr(evolved, "simulator_backend", "synthetic_heuristic_fallback")
+            val_fit = float(getattr(evolved, "val_fitness_score", 0.0) or 0.0)
+            print(
+                f"  [Gen {evolved.generation}] Backend: {backend} | Fitness: {evolved.fitness_score:.2f} "
+                f"| Val: {val_fit:.2f} | RSI Gain: {gain_str} | Yield: {evolved.simulated_yield:.1%}"
+            )
+
+        summary = store.export_summary(stack_profile=stack_profile)
+        print(f"\n[+] Dream-RSI Optimization Complete. Policies saved to {export_path}.")
+        print(f"    Total Cumulative Gain: {summary.get('cumulative_rsi_gain_pct', 0.0)}%")
+        print(f"    Dominant Mutators: {summary.get('dominant_mutators', [])}")
+
+    if as_json:
+        from engine.cli_render import render_json
+        render_json({"summary": summary, "generations": evolved_history})
 
 
 def cmd_caldera(args):
@@ -3719,6 +5745,75 @@ def cmd_caldera(args):
         print("[*] No action specified. Exporting to default directory: ./caldera_export...")
         res = bridge.export_plugin(output_dir="caldera_export")
         print(f"[+] Caldera plugin successfully exported to {res['plugin_path']} ({res['abilities_count']} abilities).")
+
+
+def cmd_setup(args):
+    """Inspects and dynamically installs ALL external tools & runtime dependencies for RFCHunt."""
+    from engine.cli_render import render_json, render_kv_panel, render_table
+    from engine.tool_provisioner import ToolProvisioner
+
+    as_json = bool(getattr(args, "as_json", False))
+    plain = bool(getattr(args, "plain", False))
+    status_only = bool(getattr(args, "tool_status", False)) and not (
+        bool(getattr(args, "install_tools", False))
+        or getattr(args, "command", None) in ("setup", "install-tools", "install")
+        or getattr(args, "mode", None) in ("setup", "install-tools", "install")
+    )
+    include_docker = bool(getattr(args, "include_docker", True))
+    include_models = bool(getattr(args, "include_models", True))
+    raw_tools = getattr(args, "tools", None)
+    tool_ids = _parse_csv_list(raw_tools) if raw_tools else None
+
+    trace_fn = (lambda msg: print(msg, file=sys.stderr, flush=True)) if as_json else (lambda msg: print(msg, flush=True))
+    prov = ToolProvisioner(on_trace=None if status_only else trace_fn)
+
+    if status_only:
+        statuses = prov.check_all_statuses(tool_ids=tool_ids)
+        payload = {
+            "offline_or_test_mode": prov.is_offline_or_blocked(),
+            "total": len(statuses),
+            "installed_count": sum(1 for s in statuses.values() if s.installed),
+            "tools": {k: v.to_dict() for k, v in statuses.items()},
+        }
+    else:
+        payload = prov.ensure_all(
+            tool_ids=tool_ids,
+            include_docker=include_docker,
+            include_models=include_models,
+            force=bool(getattr(args, "force_install", False)),
+        )
+
+    if as_json:
+        render_json(payload)
+        return
+
+    render_kv_panel(
+        "RFCHunt Dynamic Tool Provisioner",
+        {
+            "Installed / Ready": f"{payload.get('installed_count', 0)}/{payload.get('total', 0)}",
+            "Newly Installed": payload.get("newly_installed_count", 0),
+            "Local Bin Dir": payload.get("bin_dir", str(prov.bin_dir)),
+            "Mode": "Status Only" if status_only else ("Offline/Test Skipped" if payload.get("offline_or_test_skipped") else "Dynamic Install Complete"),
+        },
+        plain=plain,
+    )
+    rows = []
+    for tid, info in (payload.get("tools") or {}).items():
+        state = "READY" if info.get("installed") else "MISSING"
+        rows.append([
+            tid,
+            info.get("category", ""),
+            state,
+            info.get("method", ""),
+            str(info.get("path_or_source") or info.get("error") or info.get("detail") or "")[:64],
+        ])
+    render_table(
+        "Integrated RFCHunt Toolchain Status",
+        ["Tool ID", "Category", "State", "Method", "Location / Detail"],
+        rows,
+        as_json=False,
+        plain=plain,
+    )
 
 
 def cmd_build(args):
@@ -3791,13 +5886,16 @@ EXAMPLES:
 
 ALL_MODES = [
     "single", "terminator", "corpus", "all", "all_scans", "pqc", "ruler",
-    "build", "lab", "mcp", "hunt", "auto", "start",
+    "build", "setup", "install-tools", "install", "lab", "mcp", "hunt", "auto", "start",
     "fetch", "chunk", "generate", "permute", "evaluate",
-    "weaponize", "cascade", "dream", "caldera", "harness2",
+    "weaponize", "cascade", "dream", "caldera", "harness2", "hint",
     "dashboard", "export", "oracle", "differential", "h2", "http2", "audit", "merkle",
     "ui", "vulns", "findings", "list", "raptor", "mantis", "rea", "clean", "clean-db",
     "aiscan", "ai", "artex", "artex-loop", "chain", "dual_graph", "dual-graph", "smuggle", "prompt_smuggle",
     "scanner", "proxy", "retest", "chains", "traces", "coverage", "export-advisory", "archive",
+    "slice", "call-graph", "call_graph", "fuzz", "fuzz-bridge", "fuzz_bridge",
+    "invariants", "sandbox-invariants", "sandbox_invariants", "poe-verify", "poe_verify",
+    "novelty", "novelty-refresh", "novelty_refresh", "swarm-board", "swarm_board", "board",
 ]
 
 
@@ -4041,6 +6139,42 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
                             Example: python -u rfc_hunt_swarm.py --build --skip-tests
    --mcp                    Shortcut to launch the Model Context Protocol (MCP) JSON-RPC server over stdio
                             Example: python -u rfc_hunt_swarm.py --mcp
+
+10. BLACKBOARD RUNTIME HINTS & YAML SWARM DISPATCHER FLAGS:
+   --hint TEXT              Inject a live operator steering HINT onto the SQLite blackboard (standalone or combined with scan)
+                            Example: python -u rfc_hunt_swarm.py hint --hint "Focus on TE+CL ambiguity" --hint-domain http11_framing
+   --hint-domain DOM        Protocol domain scope for injected HINT (default: global)
+   --hint-priority N        Numeric priority score for injected HINT (default: 10.0)
+   --hint-task-id ID        Task ID scope for injected HINT (default: default)
+   --hint-rfc RFC           Optional RFC number associated with the HINT
+   --dispatch, --dispatch-config PATH
+                            Execute a Cairn-style swarm_dispatch.yaml configuration with per-target workspace isolation
+                            Example: python -u rfc_hunt_swarm.py --dispatch swarm_dispatch.yaml
+
+11. UNIFIED --all DEFAULT-ON TOOLCHAIN & OPT-OUT FLAGS:
+   --all                    Runs Google Mantis, aiscan, RAPTOR, ARTEX Dual-Graph, Prompt Smuggling, Module 21 REA
+                            (including rea-agents CLI by default), and live-host httpx/katana/nuclei (non-destructive tags)
+                            by default with dynamic Ollama & tool provisioning.
+   --no-external-scanners   Opt out of httpx, katana, and nuclei during --all
+   --no-httpx-scan          Opt out of ProjectDiscovery httpx discovery during --all
+   --no-katana-scan         Opt out of ProjectDiscovery katana crawling during --all
+   --no-nuclei-scan         Opt out of ProjectDiscovery nuclei template scanning during --all
+   --no-rea-cli             Opt out of locally installed rea-agents CLI during --all (keep embedded Python REA analyzer)
+   --no-include-models      Skip dynamic Ollama AI model pulls during --setup and --all auto-provisioning
+
+12. AIxCC SECURITY ENGINES, REPLAY-TREE DREAM-RSI BENCHMARK & PURE-CLI SWARM BOARD:
+   slice / call-graph       Whole-repo multi-language call-graph & taint slicer + tiered model escalation
+   fuzz-bridge              Isolated --network=none container coverage fuzzing bridge (cargo-fuzz, AFL++/LibAFL, Atheris, Jazzer)
+   sandbox-invariants       Isolated --network=none container security invariant runner persisting Cairn FACTs
+   poe-verify               Containerized non-destructive POE==3 verifier (promotes verified findings, downgrades FPs)
+   oracle --docker-parser-matrix
+                            Real local Docker differential parser matrix (nginx, envoy, haproxy, undici, go, hyper)
+   novelty / --refresh-novelty-corpus PATH
+                            Offline structural novelty corpus & explicit local/opt-in feed refresh
+   --mode dream --dream-benchmark [--dream-live-lab] [--dream-seeds 10] [--dream-budget 40]
+                            4-baseline matched-seed empirical Dream-RSI RL benchmark with exact Student-t 95% CIs
+   swarm-board [--watch --interval 1.0] [--plain] [--json]
+                            Pure-CLI Swarm Overview & live terminal status board (zero GUI, Unicode icons / --plain ASCII)
 ===============================================================================
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -4133,6 +6267,11 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--no-dream-rsi", dest="dream_rsi", action="store_false", help="Disable default Open Dream-RSI evolution cycle")
     parser.add_argument("--dream-rollouts", "--rollouts", dest="dream_rollouts", type=int, default=300, help="Number of simulated rollouts per dream generation (default: 300)")
     parser.add_argument("--dream-export", "--export", dest="dream_export", type=str, default="data/dream_policies.json", help="Path to export evolved Dream-RSI policies")
+    parser.add_argument("--dream-benchmark", dest="dream_benchmark", action="store_true", default=False, help="Run 4-baseline matched-seed empirical Dream-RSI RL benchmark with 95%% CIs")
+    parser.add_argument("--dream-seeds", dest="dream_seeds", type=int, default=10, help="Number of matched episode seeds for --dream-benchmark (default: 10)")
+    parser.add_argument("--dream-budget", dest="dream_budget", type=int, default=40, help="Step budget per episode for --dream-benchmark (default: 40)")
+    parser.add_argument("--dream-live-lab", "--live-lab", dest="dream_live_lab", action="store_true", default=False, help="Run --dream-benchmark against local loopback 127.0.0.1 TestLabServer (zero external traffic)")
+    parser.add_argument("--dream-stack-profile", dest="dream_stack_profile", type=str, default=None, help="Optional target stack profile for stack-specific Dream-RSI policies (e.g. nginx, envoy, node, rust)")
     parser.add_argument("--export-caldera", type=str, default="caldera_export", help="Directory to export Caldera plugin structure (default: caldera_export, runs automatically)")
     parser.add_argument("--no-caldera", action="store_true", help="Disable default Caldera export")
     parser.add_argument("--caldera-url", "--push", dest="caldera_url", type=str, default=None, help="Optional Caldera server URL to push confirmed findings live")
@@ -4194,10 +6333,14 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--strict-poe", dest="strict_poe", action="store_true", default=False, help="Require POE>=2 to mark chains VERIFIED")
     parser.add_argument("--export-advisory", dest="export_advisory", action="store_true", default=False, help="Export GHSA-ready Markdown advisories")
     parser.add_argument("--export-csv", dest="export_csv", action="store_true", default=False, help="Export formula-neutralized CSV of findings & chains")
-    parser.add_argument("--enable-external-scanners", dest="enable_external_scanners", action="store_true", default=False, help="Opt-in to external black-box scanners (httpx, katana, nuclei)")
-    parser.add_argument("--httpx-scan", dest="httpx_scan", action="store_true", default=None, help="Opt-in to ProjectDiscovery httpx discovery")
-    parser.add_argument("--katana-scan", dest="katana_scan", action="store_true", default=None, help="Opt-in to ProjectDiscovery katana crawling")
-    parser.add_argument("--nuclei-scan", dest="nuclei_scan", action="store_true", default=None, help="Opt-in to ProjectDiscovery nuclei non-destructive scanning")
+    parser.add_argument("--enable-external-scanners", dest="enable_external_scanners", action="store_true", default=False, help="Enable external black-box scanners (httpx, katana, nuclei) — included in --all by default for live hosts; opt-in for standalone `scanner` mode")
+    parser.add_argument("--no-external-scanners", dest="no_external_scanners", action="store_true", default=False, help="Disable external black-box scanners (httpx, katana, nuclei) during --all")
+    parser.add_argument("--httpx-scan", dest="httpx_scan", action="store_true", default=None, help="Enable ProjectDiscovery httpx discovery (included in --all by default for live hosts)")
+    parser.add_argument("--no-httpx-scan", dest="httpx_scan", action="store_false", help="Disable ProjectDiscovery httpx discovery during --all")
+    parser.add_argument("--katana-scan", dest="katana_scan", action="store_true", default=None, help="Enable ProjectDiscovery katana crawling (included in --all by default for live hosts)")
+    parser.add_argument("--no-katana-scan", dest="katana_scan", action="store_false", help="Disable ProjectDiscovery katana crawling during --all")
+    parser.add_argument("--nuclei-scan", dest="nuclei_scan", action="store_true", default=None, help="Enable ProjectDiscovery nuclei non-destructive scanning (included in --all by default for live hosts)")
+    parser.add_argument("--no-nuclei-scan", dest="nuclei_scan", action="store_false", help="Disable ProjectDiscovery nuclei scanning during --all")
     parser.add_argument("--nuclei-tags", dest="nuclei_tags", type=str, default=None, help="Comma-separated non-destructive nuclei tags (e.g. tech,misconfig,exposure,headers)")
     parser.add_argument("--scanner-isolation", dest="scanner_isolation", choices=["host", "docker"], default="host", help="External scanner execution isolation mode (host|docker)")
     parser.add_argument("--docker-image", dest="docker_image", type=str, default=None, help="Optional explicit OCI image for docker isolation")
@@ -4234,7 +6377,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--export-sarif", type=str, default=None, help="Export aggregated vulnerability findings to specified SARIF file in reports/")
 
     # Google Mantis Integration (Module 20) & Unified --all Multi-Scanner Orchestrator
-    parser.add_argument("--all", "--run-all", "--all-scans", dest="run_all_scans", action="store_true", help="Execute ALL integrated scanners (Google Mantis, aiscan, ARTEX Dual-Graph, RAPTOR, Prompt Smuggling) with mandatory ModelFusion + Abliterated models")
+    parser.add_argument("--all", "--run-all", "--all-scans", dest="run_all_scans", action="store_true", help="Execute ALL integrated scanners (Google Mantis, aiscan, ARTEX Dual-Graph, RAPTOR, Prompt Smuggling, Module 21 REA + rea-agents CLI, and httpx/katana/nuclei for live hosts) with mandatory ModelFusion + Abliterated models")
     parser.add_argument("--repo", dest="repo", type=str, default=None, help="Repository directory path for --all, --mantis, or --raptor audits")
     parser.add_argument("--path", dest="path", type=str, default=None, help="Specific file or directory path for --all, --mantis, or --raptor audits")
     parser.add_argument("--mantis", "--enable-mantis", dest="enable_mantis", action="store_true", help="Enable Google Mantis toolkit (Module 20: threat modeling, depth hypotheses, Tier 1/2 repro, CVSS rubric, patching)")
@@ -4245,9 +6388,74 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--mantis-report", action="store_true", help="Display stored Google Mantis findings from terminator.db")
     parser.add_argument("--rea", dest="enable_rea_only", action="store_true", help="Run Module 21 (morluto/rea) JS/Electron/.asar/source-map & same-origin bundle surface analyzer")
     parser.add_argument("--rea-target", dest="rea_target", type=str, default=None, help="Target JS/Electron/.asar/web bundle path for Module 21 REA")
-    parser.add_argument("--rea-cli", dest="rea_cli", action="store_true", default=False, help="Opt-in to locally installed rea-agents CLI (shell=False)")
+    parser.add_argument("--rea-cli", dest="rea_cli", action="store_true", default=None, help="Enable locally installed rea-agents CLI (shell=False; included in --all by default)")
+    parser.add_argument("--no-rea-cli", dest="rea_cli", action="store_false", help="Disable rea-agents CLI invocation during --all (use embedded Python REA analyzer only)")
     parser.add_argument("--no-rea", dest="no_rea", action="store_true", default=False, help="Disable Module 21 REA during --all")
     parser.add_argument("--output-dir", type=str, default="reports", help="Output directory for SARIF, JSON, and text audit reports (default: reports)")
+
+    # Dynamic Tool Provisioner (aiscan, RAPTOR, httpx/katana/nuclei, ARTEX, rea-agents, Semgrep, Python deps, Ollama)
+    parser.add_argument("--setup", "--install-tools", "--provision-tools", dest="install_tools", action="store_true", help="Inspect and dynamically install ALL required & integrated RFCHunt tools (aiscan, RAPTOR, httpx, katana, nuclei, artex, rea-agents, semgrep, Python deps, Ollama)")
+    parser.add_argument("--tool-status", "--tools-status", "--check-tools", dest="tool_status", action="store_true", help="Print installation status across the complete integrated toolchain")
+    parser.add_argument("--tools", dest="tools", type=str, default=None, help="Optional comma-separated tool IDs for setup/status (e.g. 'aiscan,raptor,httpx,katana,nuclei,rea_agents')")
+    parser.add_argument("--include-docker", dest="include_docker", action="store_true", default=True, help="Include Docker container images during tool provisioning (default: True)")
+    parser.add_argument("--no-docker-tools", dest="include_docker", action="store_false", help="Skip Docker image pulls during tool provisioning")
+    parser.add_argument("--no-include-models", dest="include_models", action="store_false", default=True, help="Skip pulling Ollama AI models during setup and --all auto-provisioning")
+    parser.add_argument("--force-install", dest="force_install", action="store_true", default=False, help="Force reinstall/re-verify cached tools during setup")
+    parser.add_argument("--no-auto-install", dest="auto_install", action="store_false", default=True, help="Disable automatic runtime installation of missing tools")
+
+    # Cairn Blackboard Runtime Hints & Unified YAML Dispatcher
+    parser.add_argument("--hint", dest="hint", type=str, default=None, help="Inject a live operator steering HINT into the SQLite blackboard")
+    parser.add_argument("--hint-domain", dest="hint_domain", type=str, default="global", help="Protocol domain scope for --hint (default: global)")
+    parser.add_argument("--hint-priority", dest="hint_priority", type=float, default=10.0, help="Numeric priority score for --hint (default: 10.0)")
+    parser.add_argument("--hint-task-id", dest="hint_task_id", type=str, default="default", action=_TrackExplicitStore, help="Task ID scope for --hint (default: default)")
+    parser.add_argument("--hint-rfc", dest="hint_rfc", type=str, default="", help="Optional RFC identifier for --hint")
+    parser.add_argument("--dispatch", "--dispatch-config", dest="dispatch", type=str, default=None, help="Path to unified swarm_dispatch.yaml configuration")
+
+    # AIxCC Upgrade #2: Whole-Repo Call-Graph & Taint Slicer + Tiered Model Escalation
+    parser.add_argument("--no-call-graph-slice", dest="no_call_graph_slice", action="store_true", default=False, help="Disable whole-repo call-graph & taint slicing during --all")
+    parser.add_argument("--slice-max-depth", dest="slice_max_depth", type=int, default=8, help="Maximum call-graph traversal depth for taint slicing (default: 8)")
+    parser.add_argument("--slice-max-slices", dest="slice_max_slices", type=int, default=200, help="Maximum taint slices to extract (default: 200)")
+    parser.add_argument("--slice-codeql", dest="slice_codeql", action="store_true", default=False, help="Enable optional CodeQL CLI path extraction in CallGraphSlicer")
+    parser.add_argument("--escalation-fraction", dest="escalation_fraction", type=float, default=0.05, help="Top high-signal fraction for tiered model escalation (default: 0.05)")
+    parser.add_argument("--min-poe-escalation", dest="min_poe_escalation", type=int, default=1, help="Minimum POE level required for tiered model escalation (default: 1)")
+    parser.add_argument("--frontier-api-opt-in", dest="frontier_api_opt_in", action="store_true", default=False, help="Explicitly opt-in to configured frontier API backend for top escalated candidates (default: False, local-only)")
+
+    # AIxCC Upgrade #3: Multi-Language LLM-Guided Coverage Fuzzing Bridge
+    parser.add_argument("--fuzz-bridge", dest="fuzz_bridge", action="store_true", default=False, help="Explicitly enable multi-language isolated container fuzzing bridge in --all")
+    parser.add_argument("--no-fuzz-bridge", dest="no_fuzz_bridge", action="store_true", default=False, help="Disable multi-language coverage fuzzing bridge during --all")
+    parser.add_argument("--fuzz-languages", dest="fuzz_languages", type=str, default=None, help="Comma-separated languages for fuzzing bridge (rust,cpp,c,python,js,ts,java)")
+    parser.add_argument("--fuzz-timeout", dest="fuzz_timeout", type=float, default=60.0, help="Per-target wall timeout in seconds for isolated fuzz container (default: 60.0)")
+    parser.add_argument("--fuzz-max-time", dest="fuzz_max_time", type=int, default=30, help="Max fuzzer run time in seconds inside container (default: 30)")
+    parser.add_argument("--fuzz-cpp-backend", dest="fuzz_cpp_backend", choices=["afl++", "libafl"], default="afl++", help="C/C++ coverage fuzzer backend (default: afl++)")
+    parser.add_argument("--fuzz-dry-run", dest="fuzz_dry_run", action="store_true", default=False, help="Generate harnesses, seed corpora, and dictionaries without executing Docker containers")
+
+    # AIxCC Upgrades #1 & #5a: Docker Differential Parser Matrix, Sandbox Invariants & POE==3 Verifier
+    parser.add_argument("--docker-parser-matrix", dest="docker_parser_matrix", action="store_true", default=False, help="Run real local Docker differential parser matrix (nginx, envoy, haproxy, node_undici, go_net_http, rust_hyper)")
+    parser.add_argument("--no-docker-parser-matrix", dest="no_docker_parser_matrix", action="store_true", default=False, help="Disable Docker differential parser matrix during --all")
+    parser.add_argument("--parsers", dest="parsers", type=str, default=None, help="Comma-separated parser names for Docker parser matrix (e.g. nginx,envoy,haproxy,node_undici,go_net_http,rust_hyper)")
+    parser.add_argument("--fallback-4parsers", dest="fallback_4parsers", action="store_true", default=False, help="Fall back to offline 4-parser matrix if Docker parser matrix is unavailable")
+    parser.add_argument("--sandbox-invariants", dest="sandbox_invariants", action="store_true", default=False, help="Explicitly run isolated --network=none container repo security invariants in --all")
+    parser.add_argument("--no-sandbox-invariants", dest="no_sandbox_invariants", action="store_true", default=False, help="Disable sandboxed repo invariant runner during --all")
+    parser.add_argument("--invariant-runtime", dest="invariant_runtime", type=str, default=None, help="Optional preferred runtime for sandbox invariant runner (python|node)")
+    parser.add_argument("--invariant-image", dest="invariant_image", type=str, default=None, help="Optional explicit OCI image for sandbox invariant runner")
+    parser.add_argument("--poe-verify", dest="poe_verify", action="store_true", default=False, help="Explicitly run containerized non-destructive POE==3 verification on HIGH/CRITICAL findings in --all")
+    parser.add_argument("--no-poe-verify", dest="no_poe_verify", action="store_true", default=False, help="Disable containerized POE==3 verification during --all")
+    parser.add_argument("--drop-unverified-fp", dest="drop_unverified_fp", action="store_true", default=False, help="Drop unverified false positives downgraded by POE==3 verifier from final findings list")
+    parser.add_argument("--findings-json", dest="findings_json", type=str, default=None, help="Optional JSON findings file path for standalone `poe-verify` mode")
+
+    # AIxCC Upgrade #4: Structural Fingerprinting & Offline Known-Technique Novelty Corpus
+    parser.add_argument("--refresh-novelty-corpus", dest="refresh_novelty_corpus", action="append", default=[], help="Explicitly ingest local JSON/YAML/Nuclei catalog paths (or opt-in URLs with --novelty-allow-network) into the novelty corpus")
+    parser.add_argument("--novelty-allow-network", dest="novelty_allow_network", action="store_true", default=False, help="Explicitly allow remote HTTP(S) feeds during --refresh-novelty-corpus (default: False, strictly offline)")
+    parser.add_argument("--novelty-threshold", dest="novelty_threshold", type=float, default=0.72, help="Maximum structural similarity threshold below which 3-trial invariant-violating findings are tagged novel (default: 0.72)")
+    parser.add_argument("--novelty-export", dest="novelty_export", type=str, default=None, help="Optional output JSON path to export the merged novelty corpus catalog")
+
+    # Pure-CLI Swarm Overview & Live Terminal Status Board (Zero GUI)
+    parser.add_argument("--swarm-board", dest="swarm_board", action="store_true", default=False, help="Render pure-CLI Swarm Overview board during --all and OODA Swarm runs (Unicode live icons / --plain ASCII fallback, zero GUI)")
+    parser.add_argument("--no-swarm-board", dest="swarm_board", action="store_false", help="Disable pure-CLI Swarm Overview board rendering")
+    parser.add_argument("--watch", dest="watch", action="store_true", default=False, help="Continuously refresh `swarm-board` from SQLite DB until interrupted")
+    parser.add_argument("--interval", dest="interval", type=float, default=1.0, help="Refresh interval in seconds for `swarm-board --watch` (default: 1.0)")
+    parser.add_argument("--board-width", dest="board_width", type=int, default=100, help="Column width for pure-CLI Swarm Overview board (default: 100)")
+    parser.add_argument("--board-events", dest="board_events", type=int, default=15, help="Max recent blackboard events shown in `swarm-board` (default: 15)")
 
     return parser
 
@@ -4434,11 +6642,14 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "ui", "build", "mcp", "kettle", "all_active", "enable_raptor", "list_terminators",
             "run_all_scans", "enable_mantis", "enable_artex", "enable_aiscan", "enable_prompt_smuggle",
             "enable_rea_only", "clean_db", "raptor_status", "raptor_findings", "raptor_setup",
-            "harness2_report", "mantis_report", "aiscan_report",
+            "harness2_report", "mantis_report", "aiscan_report", "install_tools", "tool_status",
         )
-    ):
+    ) and getattr(args, "hint", None) is None and not getattr(args, "dispatch", None):
         build_swarm_parser().print_help()
         sys.exit(0)
+
+    if not getattr(args, "auto_install", True):
+        os.environ["RFCHUNT_AUTO_INSTALL_TOOLS"] = "0"
 
     # Resolve positional command / shortcut flags into active_mode
     if not explicit_mode_given:
@@ -4452,6 +6663,10 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             active_mode = "corpus"
         elif args.all_active:
             active_mode = "all_active"
+        elif getattr(args, "install_tools", False) and not getattr(args, "run_all_scans", False):
+            active_mode = "setup"
+        elif getattr(args, "tool_status", False) and not getattr(args, "run_all_scans", False):
+            active_mode = "setup"
         elif getattr(args, "enable_rea_only", False) and not getattr(args, "run_all_scans", False):
             active_mode = "rea"
         else:
@@ -4470,6 +6685,17 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         active_mode = "export"
     elif active_mode in ("clean", "clean-db"):
         active_mode = "clean_db"
+    elif active_mode in ("install-tools", "install"):
+        active_mode = "setup"
+
+    if active_mode == "setup":
+        _dispatch_cmd("cmd_setup", args)
+        return
+
+    # If user combined --install-tools / --setup with a scan command (e.g. `--install-tools --all`),
+    # provision the entire toolchain up front before executing the scan.
+    if getattr(args, "install_tools", False):
+        cmd_setup(args)
 
     # Handle Database Clean & Vacuum
     if getattr(args, "clean_db", False) or active_mode == "clean_db":
@@ -4507,6 +6733,8 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
                     "enable_rea_only",
                 )
             )
+            and getattr(args, "hint", None) is None
+            and not getattr(args, "dispatch", None)
         )
         if standalone_clean:
             return
@@ -4550,6 +6778,62 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
     from engine.execution_policy import ExecutionPolicy
     ExecutionPolicy.get_instance().allow_destructive = ExecutionPolicy.get_instance().allow_destructive or bool(getattr(args, "allow_destructive", False))
 
+    # Standalone CLI-only blackboard hint injection (zero GUI / HTTP server calls)
+    has_non_hint_action = explicit_mode_given and active_mode != "hint"
+    has_shortcut_action = any(
+        getattr(args, flag, False)
+        for flag in (
+            "ui", "build", "mcp", "kettle", "all_active", "enable_raptor",
+            "list_terminators", "run_all_scans", "enable_mantis",
+            "enable_artex", "enable_aiscan", "enable_prompt_smuggle",
+            "enable_rea_only", "install_tools", "tool_status",
+            "raptor_status", "raptor_findings", "raptor_setup",
+            "harness2_report", "mantis_report", "aiscan_report",
+        )
+    )
+    if active_mode == "hint" or (
+        getattr(args, "hint", None) is not None
+        and not getattr(args, "dispatch", None)
+        and not has_non_hint_action
+        and not has_shortcut_action
+    ):
+        cmd_hint(args)
+        return
+
+    # Unified Cairn-style YAML dispatcher (--dispatch / --dispatch-config)
+    if getattr(args, "dispatch", None):
+        from engine.swarm_dispatcher import execute_dispatch, load_dispatch_config
+
+        if getattr(args, "hint", None) is not None:
+            # Validate all --hint* flags early before creating any workspaces/DBs
+            _validate_cli_hint_args(args)
+
+        cfg = load_dispatch_config(args.dispatch)
+        has_db_flag = "db" in explicit_dests or any(a == "--db" or a.startswith("--db=") for a in raw_argv)
+        has_output_dir_flag = "output_dir" in explicit_dests or any(
+            a == "--output-dir" or a.startswith("--output-dir=") for a in raw_argv
+        )
+        as_json = bool(getattr(args, "as_json", False))
+        _disp_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+        with _disp_ctx:
+            dispatch_results = execute_dispatch(
+                cfg,
+                db_override=(args.db if has_db_flag else None),
+                output_dir_override=(args.output_dir if has_output_dir_flag else None),
+                extra_args=args,
+                hint_persister=(
+                    lambda a, db_h, target_task_id="default": _persist_cli_hint(
+                        a,
+                        db=db_h,
+                        default_task_id=target_task_id,
+                    )["node_id"]
+                ),
+            )
+        if as_json:
+            from engine.cli_render import render_json
+            render_json({"status": "dispatched", "targets": dispatch_results})
+        return
+
     # Handle standalone modes that do not require remote target authorization first
     if active_mode == "build":
         _dispatch_cmd("cmd_build", args)
@@ -4568,6 +6852,34 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         a in ("--artex-rounds", "--rounds") or a.startswith(("--artex-rounds=", "--rounds="))
         for a in raw_argv
     )
+
+    if active_mode in ("slice", "call-graph", "call_graph"):
+        _dispatch_cmd("cmd_call_graph_slice", args)
+        return
+
+    if active_mode in ("fuzz", "fuzz-bridge", "fuzz_bridge"):
+        _dispatch_cmd("cmd_fuzz_bridge", args)
+        return
+
+    if active_mode in ("invariants", "sandbox-invariants", "sandbox_invariants"):
+        _dispatch_cmd("cmd_sandbox_invariants", args)
+        return
+
+    if active_mode in ("poe-verify", "poe_verify"):
+        _dispatch_cmd("cmd_poe_verify", args)
+        return
+
+    if active_mode in ("novelty", "novelty-refresh", "novelty_refresh") or (
+        bool(getattr(args, "refresh_novelty_corpus", None))
+        and not getattr(args, "run_all_scans", False)
+        and not explicit_mode_given
+    ):
+        _dispatch_cmd("cmd_novelty", args)
+        return
+
+    if active_mode in ("swarm-board", "swarm_board", "board"):
+        _dispatch_cmd("cmd_swarm_board", args)
+        return
 
     if active_mode in ("scanner", "artex-loop", "proxy", "retest", "chains", "traces", "coverage", "export-advisory", "archive", "rea"):
         if active_mode == "rea":
@@ -4659,6 +6971,12 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         _dispatch_cmd("cmd_vulns", args)
         return
 
+    if getattr(args, "hint", None) is not None and not (
+        getattr(args, "run_all_scans", False) or active_mode in ("all", "all_scans")
+    ):
+        with (contextlib.redirect_stdout(sys.stderr) if getattr(args, "as_json", False) else contextlib.nullcontext()):
+            _persist_cli_hint(args)
+
     if getattr(args, "run_all_scans", False) or active_mode in ("all", "all_scans"):
         if not has_host_flag:
             args.host = None
@@ -4705,6 +7023,11 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         _dispatch_cmd("cmd_harness2", args, check_main_shim=(caller_profile == "main"))
         return
 
+    if getattr(args, "dream_benchmark", False) and not explicit_mode_given:
+        _sync_modular_args(args, "dream", raw_argv)
+        _dispatch_cmd("cmd_dream", args)
+        return
+
 
     # Normalize args.host cleanly if still unstripped
     if args.host:
@@ -4729,7 +7052,6 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             print(f"[!] Target authorization error for {t_host}: {reason}")
             sys.exit(1)
 
-    import os
     import socket as _sock
     os.environ["OLLAMA_TIMEOUT"] = str(args.timeout)
 
@@ -4865,6 +7187,8 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             terminator_categories=term_cats,
             preferred_model=args.model,
             use_fusion=args.fusion,
+            novelty_threshold=float(getattr(args, "novelty_threshold", 0.72) or 0.72),
+            stack_profile=getattr(args, "dream_stack_profile", None),
         )
         graph = swarm.build_graph()
 
@@ -4894,28 +7218,80 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         swarm.run_stats["rfcs_scheduled"] = len(rfcs_to_scan)
         print(f"\n[*] Queue ready: {len(rfcs_to_scan)} RFC(s) scheduled for Swarm processing.\n" + "="*60)
 
-        # Step 0: Active Canonical Flaw Verification Suite
+        # Step 0: Active Canonical Flaw Verification Suite (idempotent on crash resume)
+        run_task_id = str(getattr(args, "task_id", None) or "default").strip() or "default"
+        try:
+            swarm.db.reclaim_stale_intents(task_id=run_task_id)
+        except Exception:
+            pass
+        raw_h2_domain = str(getattr(args, "harness2_domain", "auto") or "auto").strip()
+        run_domain = "" if raw_h2_domain.lower() in ("", "auto") else raw_h2_domain
+        audit_fact_id = f"fact:bootstrap:active_audit:{run_task_id}"
+        already_audited = any(
+            f.get("node_id") == audit_fact_id
+            for f in swarm.db.get_facts(task_id=run_task_id, limit=0)
+        )
         if not args.comb_only:
-            from engine.active_flaw_prober import ActiveFlawProber
-            active_prober = ActiveFlawProber(
-                host=t_host,
-                port=t_port,
-                use_tls=t_tls,
-                timeout=args.timeout if (0 < args.timeout <= 10.0) else 3.5,
-                db=swarm.db,
-                on_trace=print,
-            )
-            canonical_vulns = active_prober.run_active_audit()
-            for v in canonical_vulns:
-                with swarm.stats_lock:
-                    swarm.run_stats["vulnerabilities_confirmed"].append({
-                        "rfc": "CANONICAL",
-                        "vuln_id": v.vuln_id,
-                        "anomaly_id": v.anomaly_id,
-                        "impact": v.impact.value,
-                        "repro": f"{v.reproducibility_rate * 100:.0f}% ({v.successful_reproductions}/{v.verification_attempts})",
-                        "behavior": "Canonical PortSwigger attack vector verified",
-                    })
+            if not already_audited:
+                from engine.active_flaw_prober import ActiveFlawProber
+                try:
+                    active_prober = ActiveFlawProber(
+                        host=t_host,
+                        port=t_port,
+                        use_tls=t_tls,
+                        timeout=args.timeout if (0 < args.timeout <= 10.0) else 3.5,
+                        db=swarm.db,
+                        on_trace=print,
+                    )
+                    canonical_vulns = active_prober.run_active_audit()
+                    for v in canonical_vulns:
+                        with swarm.stats_lock:
+                            swarm.run_stats["vulnerabilities_confirmed"].append({
+                                "rfc": "CANONICAL",
+                                "vuln_id": v.vuln_id,
+                                "anomaly_id": v.anomaly_id,
+                                "impact": v.impact.value,
+                                "repro": f"{v.reproducibility_rate * 100:.0f}% ({v.successful_reproductions}/{v.verification_attempts})",
+                                "behavior": "Canonical PortSwigger attack vector verified",
+                            })
+                        try:
+                            swarm.db.add_fact(
+                                f"ActiveFlawProber finding {v.vuln_id} ({v.impact.value}): {v.provenance_chain}",
+                                node_id=f"fact:active_flaw:{run_task_id}:{v.vuln_id}",
+                                task_id=run_task_id,
+                                domain=run_domain,
+                                rfc_id="CANONICAL",
+                                source_agent="ActiveFlawProber",
+                                payload={"vuln_id": v.vuln_id, "anomaly_id": v.anomaly_id, "impact": v.impact.value},
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        swarm.db.add_fact(
+                            f"ActiveFlawProber baseline audit completed against {t_host}:{t_port} ({len(canonical_vulns)} findings)",
+                            node_id=f"fact:bootstrap:active_audit:{run_task_id}",
+                            task_id=run_task_id,
+                            domain=run_domain,
+                            rfc_id="CANONICAL",
+                            source_agent="ActiveFlawProber",
+                            payload={"host": t_host, "port": t_port, "findings_count": len(canonical_vulns)},
+                        )
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    print(f"[-] Warning: Step 0 ActiveFlawProber handled safely: {exc}")
+                    try:
+                        swarm.db.add_fact(
+                            f"ActiveFlawProber baseline audit handled safely against {t_host}:{t_port}: {exc}",
+                            node_id=f"fact:bootstrap:active_audit:{run_task_id}",
+                            task_id=run_task_id,
+                            domain=run_domain,
+                            rfc_id="CANONICAL",
+                            source_agent="ActiveFlawProber",
+                            payload={"host": t_host, "port": t_port, "error": str(exc)},
+                        )
+                    except Exception:
+                        pass
 
             # Step 0b: RAPTOR Autonomous Security Analysis (if --raptor / --enable-raptor enabled)
             if getattr(args, "enable_raptor", False):
@@ -5006,16 +7382,66 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
                     "harness2_runs_dir": getattr(args, "harness2_runs_dir", "runs/harness2"),
                     "harness2_domain": getattr(args, "harness2_domain", "auto"),
                     "current_harness2_result": None,
+                    "ooda_phase": "Bootstrap",
+                    "blackboard_bootstrapped": False,
+                    "active_intent_id": None,
+                    "active_intent": None,
+                    "active_hints": [],
+                    "task_id": run_task_id,
+                    "workspace_dir": getattr(args, "workspace_dir", None),
+                    "blackboard_domain": run_domain,
                     "history": []
                 }
+
+                ooda_board = None
+                if bool(getattr(args, "swarm_board", False)) and not bool(getattr(args, "as_json", False)):
+                    try:
+                        from engine.swarm_cli_board import create_swarm_ooda_board
+
+                        ooda_board = create_swarm_ooda_board(
+                            rfc_num_str,
+                            t_host,
+                            t_port,
+                            task_id=run_task_id,
+                            plain=bool(getattr(args, "plain", False)),
+                            json_mode=False,
+                            width=max(60, int(getattr(args, "board_width", 100) or 100)),
+                        )
+                    except Exception:
+                        ooda_board = None
 
                 try:
                     for event in graph.stream(initial_state, {"recursion_limit": 5000}):
                         for node_name, state_update in event.items():
                             last_hist = state_update.get('history', [])[-1] if state_update.get('history') else ''
                             print(f"[{node_name}] -> {last_hist}")
+                            if ooda_board is not None:
+                                try:
+                                    node_to_task = {
+                                        "fetch_and_chunk_agent": "Bootstrap",
+                                        "llm_generator_agent": "Reason",
+                                        "execution_oracle_agent": "Explore",
+                                        "triage_debugger_agent": "Triage",
+                                        "cascade_and_publish_agent": "Publish",
+                                        "dream_rsi_agent": "DreamRSI",
+                                    }
+                                    t_key = node_to_task.get(node_name)
+                                    if t_key:
+                                        ooda_board.set_task_state(t_key, "Done", action=str(last_hist)[:90])
+                                    elif node_name == "blackboard_router":
+                                        nxt = str(state_update.get("ooda_phase") or "")
+                                        if nxt in node_to_task.values():
+                                            ooda_board.set_task_state(nxt, "Running", action=str(last_hist)[:90])
+                                    ooda_board.post_event(node_name, str(last_hist)[:120], kind="EVENT")
+                                except Exception:
+                                    pass
                             if "current_vuln" in state_update and state_update["current_vuln"]:
                                 print(f"    !!! VULNERABILITY CONFIRMED: {state_update['current_vuln'].vuln_id}")
+                    if ooda_board is not None:
+                        try:
+                            print(ooda_board.render(plain=bool(getattr(args, "plain", False)), width=max(60, int(getattr(args, "board_width", 100) or 100))))
+                        except Exception:
+                            pass
                     with swarm.stats_lock:
                         swarm.run_stats["rfcs_completed"] += 1
                         r_st = swarm._ensure_rfc_stat(rfc_label)

@@ -990,6 +990,66 @@ class TerminatorMCPServer:
                     },
                 },
             },
+            {
+                "name": "rfchunt_provision_tools",
+                "description": "[Dynamic Tool Provisioner] Checks installation status or dynamically installs all external RFCHunt dependencies (aiscan, RAPTOR, ProjectDiscovery httpx/katana/nuclei, BaaRai/ARTEX, morluto/rea rea-agents CLI, Semgrep, Python deps, Ollama runtime & abliterated models, RFC corpus cache).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "install_missing": {"type": "boolean", "default": False, "description": "If true (and online/allowed), dynamically install missing tools; if false, report status only"},
+                        "tools": {"type": "array", "items": {"type": "string"}, "description": "Optional subset of tool IDs (e.g. aiscan, raptor, httpx, katana, nuclei, artex, rea_agents, semgrep, python_deps, ollama, ollama_models, rfc_cache)"},
+                        "include_docker": {"type": "boolean", "default": True, "description": "Include Docker container images (danielcuthbert/raptor:latest, projectdiscovery/*)"},
+                        "include_models": {"type": "boolean", "default": True, "description": "Include Ollama abliterated ModelFusion models"},
+                        "force": {"type": "boolean", "default": False, "description": "Re-install even if already cached"},
+                    },
+                },
+            },
+            {
+                "name": "inject_blackboard_hint",
+                "description": (
+                    "[Cairn Blackboard] Persists a live operator or agent steering HINT "
+                    "into terminator.db so active OODA Reason passes absorb it without restarting."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "hint_text": {
+                            "type": "string",
+                            "description": "Non-empty steering rule or guardrail text to inject onto the blackboard.",
+                        },
+                        "domain": {
+                            "type": "string",
+                            "default": "global",
+                            "description": "Protocol domain scope (e.g. 'global', 'http11_framing', 'h2_translation').",
+                        },
+                        "priority": {
+                            "type": "number",
+                            "default": 10.0,
+                            "description": "Finite numeric priority score (higher values are retrieved first).",
+                        },
+                        "task_id": {
+                            "type": "string",
+                            "default": "default",
+                            "description": "Swarm task identifier scope.",
+                        },
+                        "rfc_num": {
+                            "type": "string",
+                            "description": "Optional RFC number or identifier (e.g. '9112', 'RFC9112').",
+                        },
+                        "source": {
+                            "type": "string",
+                            "default": "mcp",
+                            "description": "Source agent identifier stored on the HINT node.",
+                        },
+                        "active": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Whether the injected HINT starts ACTIVE (true) or INACTIVE (false).",
+                        },
+                    },
+                    "required": ["hint_text"],
+                },
+            },
         ]
 
     @staticmethod
@@ -2268,6 +2328,70 @@ class TerminatorMCPServer:
             out["total_findings"] = len(out.get("findings") or [])
             out["total_endpoints"] = len(out.get("discovered_endpoints") or [])
             return out
+
+        elif name == "rfchunt_provision_tools":
+            self._reject_shell_execution(args)
+            from engine.tool_provisioner import ToolProvisioner
+
+            install_missing = bool(self._parse_strict_bool(args, "install_missing", False))
+            include_docker = bool(self._parse_strict_bool(args, "include_docker", True))
+            include_models = bool(self._parse_strict_bool(args, "include_models", True))
+            force = bool(self._parse_strict_bool(args, "force", False))
+            raw_tools = args.get("tools")
+            tool_ids: Optional[List[str]] = None
+            if raw_tools is not None:
+                if not isinstance(raw_tools, list) or not all(isinstance(x, str) for x in raw_tools):
+                    raise ValueError("'tools' must be a list of tool ID strings.")
+                tool_ids = [str(x).strip() for x in raw_tools if str(x).strip()]
+
+            prov = ToolProvisioner()
+            if install_missing and not prov.is_offline_or_blocked():
+                return prov.ensure_all(
+                    tool_ids=tool_ids,
+                    include_docker=include_docker,
+                    include_models=include_models,
+                    force=force,
+                )
+            statuses = prov.check_all_statuses(tool_ids=tool_ids)
+            return {
+                "offline_or_test_mode": prov.is_offline_or_blocked(),
+                "total": len(statuses),
+                "installed_count": sum(1 for s in statuses.values() if s.installed),
+                "tools": {k: v.to_dict() for k, v in statuses.items()},
+            }
+
+        elif name == "inject_blackboard_hint":
+            self._reject_shell_execution(args)
+            hint_text = self._parse_strict_str(args, "hint_text", None, allow_empty=False)
+            if hint_text is None:
+                raise ValueError("Parameter 'hint_text' is required and must be a non-empty string.")
+            domain_raw = self._parse_strict_str(args, "domain", "global", allow_empty=False)
+            domain = (domain_raw or "global").strip()
+            priority = float(self._parse_strict_float(args, "priority", 10.0))
+            task_id_raw = self._parse_strict_str(args, "task_id", "default", allow_empty=False)
+            task_id = (task_id_raw or "default").strip()
+            rfc_num = (self._parse_strict_str(args, "rfc_num", "", allow_empty=True) or "").strip()
+            source_raw = self._parse_strict_str(args, "source", "mcp", allow_empty=False)
+            source = (source_raw or "mcp").strip()
+            active = bool(self._parse_strict_bool(args, "active", True))
+
+            node_id = self.db.add_hint(
+                hint_text,
+                priority=priority,
+                task_id=task_id,
+                domain=domain,
+                rfc_id=rfc_num,
+                source_agent=source,
+                active=active,
+            )
+            return {
+                "status": "injected",
+                "node_id": node_id,
+                "node_type": "HINT",
+                "domain": domain,
+                "priority": priority,
+                "active": active,
+            }
 
         raise ValueError(f"Unknown tool: {name}")
 

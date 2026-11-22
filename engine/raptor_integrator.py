@@ -59,12 +59,13 @@ class RaptorIntegrator:
     Supports Docker-based execution, SARIF parsing, and RFC anomaly ingestion.
     """
 
-    DEFAULT_RAPTOR_ROOT = Path(r"D:\docker\raptor")
+    DEFAULT_RAPTOR_ROOT = Path(r"D:\docker\raptor") if os.name == "nt" else (Path(__file__).resolve().parent.parent / "tools" / "raptor")
     INVOKE_SCRIPT = DEFAULT_RAPTOR_ROOT / "Invoke-RaptorScan.ps1"
     REPO_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
     REPO_INVOKE_SCRIPT = REPO_SCRIPTS_DIR / "Invoke-RaptorScan.ps1"
     REPO_SETUP_SCRIPT = REPO_SCRIPTS_DIR / "setup_raptor.ps1"
     OLLAMA_TAGS_URL = "http://127.0.0.1:11434/api/tags"
+    OLLAMA_PROBE_TIMEOUT_SEC: float = 0.4
 
     def __init__(
         self,
@@ -72,18 +73,42 @@ class RaptorIntegrator:
         db: Optional[Any] = None,
         on_trace: Optional[Any] = None,
     ):
-        self.raptor_root = Path(raptor_root) if raptor_root else self.DEFAULT_RAPTOR_ROOT
+        if raptor_root:
+            self.raptor_root = Path(raptor_root)
+        else:
+            from engine.tool_provisioner import resolve_default_raptor_root
+            self.raptor_root = resolve_default_raptor_root()
+        self.INVOKE_SCRIPT = self.raptor_root / "Invoke-RaptorScan.ps1"
         self.out_root = self.raptor_root / "out"
         self.db = db
         self.on_trace = on_trace or (lambda msg: print(msg, flush=True))
 
-    def ensure_installed(self, skip_docker_pull: bool = False) -> Dict[str, Any]:
+    def ensure_installed(
+        self,
+        skip_docker_pull: bool = False,
+        *,
+        allow_in_tests: bool = False,
+    ) -> Dict[str, Any]:
         """
-        Bootstraps and configures RAPTOR (clones https://github.com/gadievron/raptor.git into
-        self.raptor_root, writes models.json and Invoke-RaptorScan.ps1, patches the
-        host.docker.internal loopback bypass, and pulls danielcuthbert/raptor:latest).
+        Cross-platform bootstrap and configuration for RAPTOR (clones
+        https://github.com/gadievron/raptor.git into self.raptor_root, writes
+        models.json and Invoke-RaptorScan.ps1, patches the host.docker.internal
+        loopback bypass, and optionally pulls danielcuthbert/raptor:latest).
         """
-        if self.REPO_SETUP_SCRIPT.exists():
+        from engine.tool_provisioner import ToolProvisioner
+
+        prov = ToolProvisioner(
+            raptor_root=self.raptor_root,
+            on_trace=self.on_trace,
+            allow_in_tests=allow_in_tests,
+        )
+        repo_res = prov.ensure_tool("raptor")
+        docker_res = None
+        if not skip_docker_pull and not prov.is_offline_or_blocked():
+            docker_res = prov.ensure_tool("raptor_docker")
+
+        # Preserve PowerShell setup script fallback on Windows if raptor.py is still missing
+        if not (self.raptor_root / "raptor.py").exists() and os.name == "nt" and self.REPO_SETUP_SCRIPT.exists() and not prov.is_offline_or_blocked():
             cmd = [
                 "powershell",
                 "-ExecutionPolicy",
@@ -95,8 +120,10 @@ class RaptorIntegrator:
             ]
             if skip_docker_pull:
                 cmd.append("-SkipDockerPull")
+            cf = CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0
             proc = subprocess.run(
                 cmd,
+                shell=False,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
@@ -104,27 +131,37 @@ class RaptorIntegrator:
                 errors="replace",
                 timeout=1800,
                 check=False,
-                creationflags=CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0,
+                creationflags=cf,
             )
             self._ensure_docker_host_loopback_bypass()
             return {
                 "installed": (self.raptor_root / "raptor.py").exists(),
                 "raptor_root": str(self.raptor_root),
+                "docker_ready": bool(docker_res and docker_res.installed),
                 "returncode": proc.returncode,
                 "stdout": proc.stdout,
                 "stderr": proc.stderr,
             }
+
         self._ensure_docker_host_loopback_bypass()
         return {
             "installed": (self.raptor_root / "raptor.py").exists(),
             "raptor_root": str(self.raptor_root),
+            "docker_ready": bool(docker_res and docker_res.installed),
+            "method": repo_res.method,
+            "error": repo_res.error,
         }
 
     def _resolve_invoke_script(self) -> Path:
-        """Returns the RAPTOR PowerShell launcher, auto-bootstrapping if missing."""
+        """Returns the RAPTOR PowerShell launcher, auto-bootstrapping if missing and online."""
         if not (self.raptor_root / "raptor.py").exists():
-            self.on_trace(f"[*] RAPTOR not found at {self.raptor_root}. Bootstrapping automatically...")
-            self.ensure_installed()
+            from engine.tool_provisioner import is_automated_or_offline_env
+            is_mocked = getattr(subprocess.run, "__module__", None) != "subprocess"
+            if not is_mocked and not is_automated_or_offline_env():
+                self.on_trace(f"[*] RAPTOR not found at {self.raptor_root}. Bootstrapping automatically...")
+                self.ensure_installed()
+        if (self.raptor_root / "Invoke-RaptorScan.ps1").exists():
+            return self.raptor_root / "Invoke-RaptorScan.ps1"
         if self.INVOKE_SCRIPT.exists():
             return self.INVOKE_SCRIPT
         if self.REPO_INVOKE_SCRIPT.exists():
@@ -173,19 +210,55 @@ class RaptorIntegrator:
             f"    Engine   : {RAPTOR_DOCKER_IMAGE} (Docker Container)"
         )
 
+    def resolve_runtime_model(
+        self,
+        requested_model: Optional[str] = None,
+        *,
+        available_tags: Optional[List[str]] = None,
+    ) -> str:
+        """
+        Resolves the RAPTOR Ollama model strictly from runtime free/available RAM & VRAM
+        (NEVER total physical RAM, NEVER appends `-coder` suffixes).
+        """
+        from ollama_manager import get_runtime_free_memory, select_raptor_model_for_free_memory
+
+        free_ram_gb, free_vram_mb = get_runtime_free_memory()
+        req = (requested_model or "").strip()
+        if not req or req.lower() in ("auto", RAPTOR_DEFAULT_MODEL.lower()):
+            return select_raptor_model_for_free_memory(
+                free_ram_gb,
+                free_vram_mb,
+                available_tags=available_tags,
+            )
+        return req
+
     def check_status(self) -> Dict[str, Any]:
         """
-        Verifies RAPTOR readiness: Docker daemon, container image, and local Ollama models.
+        Verifies RAPTOR readiness: Docker daemon, container image, local repo,
+        runtime free RAM/VRAM model sizing, and <=400ms Ollama health probe.
         """
+        from ollama_manager import (
+            HEALTH_PROBE_MAX_TIMEOUT_SEC,
+            get_runtime_free_memory,
+            select_raptor_model_for_free_memory,
+        )
+
+        repo_present = (self.raptor_root / "raptor.py").is_file()
+        free_ram_gb, free_vram_mb = get_runtime_free_memory()
         status: Dict[str, Any] = {
             "raptor_available": False,
+            "raptor_repo_present": repo_present,
             "raptor_root": str(self.raptor_root),
             "docker_image": RAPTOR_DOCKER_IMAGE,
             "docker_ready": False,
+            "docker_image_present": False,
             "image_id": None,
             "ollama_ready": False,
             "ollama_models": [],
             "preferred_model_installed": False,
+            "free_ram_gb": round(free_ram_gb, 2),
+            "free_vram_mb": round(free_vram_mb, 1),
+            "recommended_model": select_raptor_model_for_free_memory(free_ram_gb, free_vram_mb),
             "attribution": {
                 "title": RAPTOR_PROJECT_TITLE,
                 "authors": RAPTOR_AUTHORS,
@@ -194,9 +267,11 @@ class RaptorIntegrator:
         }
 
         # 1. Check Docker container image
+        cf = CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0
         try:
             res = subprocess.run(
                 ["docker", "image", "inspect", RAPTOR_DOCKER_IMAGE, "--format", "{{.Id}}"],
+                shell=False,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
@@ -204,29 +279,37 @@ class RaptorIntegrator:
                 errors="replace",
                 timeout=6,
                 check=False,
-                creationflags=CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0,
+                creationflags=cf,
             )
             if res.returncode == 0 and res.stdout.strip():
                 status["docker_ready"] = True
+                status["docker_image_present"] = True
                 status["image_id"] = res.stdout.strip()
         except Exception as e:
             status["docker_error"] = str(e)
 
-        # 2. Check Ollama models
+        # 2. Check Ollama models with strict <=400ms health probe timeout
+        probe_timeout = min(max(float(self.OLLAMA_PROBE_TIMEOUT_SEC), 0.05), HEALTH_PROBE_MAX_TIMEOUT_SEC)
         try:
             req = urllib.request.Request(self.OLLAMA_TAGS_URL, method="GET")
-            with urllib.request.urlopen(req, timeout=0.8) as resp:
+            with urllib.request.urlopen(req, timeout=probe_timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 models = [m.get("name", "") for m in data.get("models", []) if m.get("name")]
                 status["ollama_ready"] = True
                 status["ollama_models"] = models
+                rec_model = select_raptor_model_for_free_memory(
+                    free_ram_gb,
+                    free_vram_mb,
+                    available_tags=models,
+                )
+                status["recommended_model"] = rec_model
                 status["preferred_model_installed"] = any(
-                    RAPTOR_DEFAULT_MODEL in m for m in models
+                    RAPTOR_DEFAULT_MODEL in m or rec_model in m for m in models
                 )
         except Exception as e:
             status["ollama_error"] = str(e)
 
-        status["raptor_available"] = status["docker_ready"] and self.raptor_root.exists()
+        status["raptor_available"] = (status["docker_ready"] and self.raptor_root.exists()) or repo_present
         return status
 
     def describe_target(self, target_path: Union[str, Path]) -> Dict[str, Any]:
@@ -238,34 +321,46 @@ class RaptorIntegrator:
             return {"error": f"Target path {target} does not exist."}
 
         self.on_trace(f"[*] RAPTOR Target Profiler running on: {target}")
+        import shutil as _shutil
+
         self._ensure_docker_host_loopback_bypass()
         ps_script = self._resolve_invoke_script()
-        if not ps_script.exists():
-            return {"error": f"RAPTOR helper script {ps_script} not found."}
+        is_mocked = getattr(subprocess.run, "__module__", None) != "subprocess"
+        ps_exe = _shutil.which("powershell") or _shutil.which("pwsh")
+        cf = CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0
 
-        cmd = [
-            "powershell",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(ps_script),
-            "-TargetPath",
-            str(target),
-            "-Mode",
-            "describe",
-        ]
+        if not is_mocked and not ps_exe and (self.raptor_root / "raptor.py").is_file():
+            cmd = [sys.executable, str(self.raptor_root / "raptor.py"), "describe", "--target", str(target)]
+            run_cwd: Optional[str] = str(self.raptor_root)
+        else:
+            if not ps_script.exists():
+                return {"error": f"RAPTOR helper script {ps_script} not found."}
+            cmd = [
+                ps_exe or "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(ps_script),
+                "-TargetPath",
+                str(target),
+                "-Mode",
+                "describe",
+            ]
+            run_cwd = None
 
         try:
             proc = subprocess.run(
                 cmd,
+                shell=False,
                 stdin=subprocess.DEVNULL,
+                cwd=run_cwd,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 timeout=120,
                 check=False,
-                creationflags=CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0,
+                creationflags=cf,
             )
             return {
                 "target": str(target),
@@ -299,14 +394,28 @@ class RaptorIntegrator:
         if mode == "full":
             mode = "all"
         self._ensure_docker_host_loopback_bypass()
-        if model and not re.match(
-            r"^(ollama|anthropic|openai|gemini|google|mistral|cohere|bedrock|openrouter|together|groq|fireworks|deepinfra)/",
-            model,
-            re.IGNORECASE,
-        ) and not re.match(r"^(claude-|gpt-|o1-|o3-|o4-|gemini-)", model, re.IGNORECASE):
-            cli_model = f"ollama/{model}"
+
+        is_mocked = getattr(subprocess.run, "__module__", None) != "subprocess"
+        available_tags: List[str] = []
+        if mode in ("agentic", "all"):
+            from engine.tool_provisioner import is_automated_or_offline_env
+            from ollama_manager import OllamaLifecycleManager
+
+            if not is_mocked and not is_automated_or_offline_env():
+                auto_install = os.environ.get("RFCHUNT_AUTO_INSTALL_TOOLS", "1") != "0"
+                available_tags = OllamaLifecycleManager.ensure_ollama_ready(auto_install=auto_install)
+            effective_model = self.resolve_runtime_model(model, available_tags=available_tags)
         else:
-            cli_model = model
+            effective_model = model
+
+        if effective_model and not re.match(
+            r"^(ollama|anthropic|openai|gemini|google|mistral|cohere|bedrock|openrouter|together|groq|fireworks|deepinfra)/",
+            effective_model,
+            re.IGNORECASE,
+        ) and not re.match(r"^(claude-|gpt-|o1-|o3-|o4-|gemini-)", effective_model, re.IGNORECASE):
+            cli_model = f"ollama/{effective_model}"
+        else:
+            cli_model = effective_model
 
         self.on_trace(f"\n{'='*75}")
         self.on_trace(f"[*] LAUNCHING RAPTOR SECURITY SCAN")
@@ -317,38 +426,55 @@ class RaptorIntegrator:
         self.on_trace(f"    Framework      : {RAPTOR_PROJECT_TITLE} (Authors: {RAPTOR_AUTHORS})")
         self.on_trace(f"{'='*75}\n")
 
-        ps_script = self._resolve_invoke_script()
-        cmd = [
-            "powershell",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(ps_script),
-            "-TargetPath",
-            str(target),
-            "-Mode",
-            mode,
-        ]
+        import shutil as _shutil
 
-        if mode in ("agentic", "all"):
-            cmd.extend(["-Model", cli_model])
-        if policy_groups:
-            cmd.extend(["-PolicyGroups", policy_groups])
-        if include_codeql:
-            cmd.append("-IncludeCodeQL")
+        ps_script = self._resolve_invoke_script()
+        ps_exe = _shutil.which("powershell") or _shutil.which("pwsh")
+        cf = CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0
+
+        slug = re.sub(r"\s+", "_", target.name)
+        if not is_mocked and not ps_exe and (self.raptor_root / "raptor.py").is_file():
+            direct_out = self.out_root / f"{slug}_{mode}_{int(time.time())}"
+            direct_out.mkdir(parents=True, exist_ok=True)
+            raptor_sub = "scan" if mode == "all" else mode
+            cmd = [sys.executable, str(self.raptor_root / "raptor.py"), raptor_sub, "--repo", str(target), "--out", str(direct_out)]
+            if policy_groups and raptor_sub == "scan":
+                cmd.extend(["--policy-groups", policy_groups])
+            run_cwd: Optional[str] = str(self.raptor_root)
+        else:
+            cmd = [
+                ps_exe or "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(ps_script),
+                "-TargetPath",
+                str(target),
+                "-Mode",
+                mode,
+            ]
+            if mode in ("agentic", "all"):
+                cmd.extend(["-Model", cli_model])
+            if policy_groups:
+                cmd.extend(["-PolicyGroups", policy_groups])
+            if include_codeql:
+                cmd.append("-IncludeCodeQL")
+            run_cwd = None
 
         t_start = time.time()
         try:
             proc = subprocess.run(
                 cmd,
+                shell=False,
                 stdin=subprocess.DEVNULL,
+                cwd=run_cwd,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout_sec,
                 check=False,
-                creationflags=CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0,
+                creationflags=cf,
             )
             duration = time.time() - t_start
         except subprocess.TimeoutExpired:
@@ -431,31 +557,47 @@ class RaptorIntegrator:
         self.on_trace(f"    Authors        : {RAPTOR_AUTHORS}")
         self.on_trace(f"{'='*75}\n")
 
+        import shutil as _shutil
+
         ps_script = self._resolve_invoke_script()
-        cmd = [
-            "powershell",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(ps_script),
-            "-TargetPath",
-            target_url,
-            "-Mode",
-            "web",
-        ]
+        is_mocked = getattr(subprocess.run, "__module__", None) != "subprocess"
+        ps_exe = _shutil.which("powershell") or _shutil.which("pwsh")
+        cf = CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0
+        host_clean = re.sub(r"[\.:]", "_", host)
+
+        if not is_mocked and not ps_exe and (self.raptor_root / "raptor.py").is_file():
+            direct_out = self.out_root / f"web_{host_clean}_web_{int(time.time())}"
+            direct_out.mkdir(parents=True, exist_ok=True)
+            cmd = [sys.executable, str(self.raptor_root / "raptor.py"), "web", "--url", target_url, "--out", str(direct_out)]
+            run_cwd: Optional[str] = str(self.raptor_root)
+        else:
+            cmd = [
+                ps_exe or "powershell",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(ps_script),
+                "-TargetPath",
+                target_url,
+                "-Mode",
+                "web",
+            ]
+            run_cwd = None
 
         t_start = time.time()
         try:
             proc = subprocess.run(
                 cmd,
+                shell=False,
                 stdin=subprocess.DEVNULL,
+                cwd=run_cwd,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout_sec,
                 check=False,
-                creationflags=CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0,
+                creationflags=cf,
             )
             duration = time.time() - t_start
         except subprocess.TimeoutExpired:

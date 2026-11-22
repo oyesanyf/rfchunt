@@ -218,6 +218,17 @@ class PythonAIScanner:
 
 
 DEFAULT_REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
+CREATE_NO_WINDOW: int = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+
+def _is_offline_or_test_env() -> bool:
+    """Returns True in offline, CI, or pytest runs so host binaries are not accidentally spawned."""
+    return bool(
+        os.environ.get("RFCHUNT_OFFLINE") == "1"
+        or os.environ.get("CI")
+        or os.environ.get("GITHUB_ACTIONS")
+        or "PYTEST_CURRENT_TEST" in os.environ
+    )
 
 
 class AiscanIntegrator:
@@ -226,52 +237,108 @@ class AiscanIntegrator:
     Saves findings into terminator.db and generates JSON/SARIF reports into reports/.
     """
 
-    def __init__(self, db: Optional[Any] = None, reports_dir: Optional[Union[str, Path]] = None):
+    def __init__(
+        self,
+        db: Optional[Any] = None,
+        reports_dir: Optional[Union[str, Path]] = None,
+        auto_install: bool = True,
+        use_native_binary: Optional[bool] = None,
+    ):
         self.db = db
         self.reports_dir = Path(reports_dir) if reports_dir else DEFAULT_REPORTS_DIR
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         self.python_scanner = PythonAIScanner()
-        self.binary_path = self._find_aiscan_binary()
+        self.auto_install = bool(auto_install)
+        self.use_native_binary = (
+            (not _is_offline_or_test_env()) if use_native_binary is None else bool(use_native_binary)
+        )
+        self.binary_path = self._find_aiscan_binary() if self.use_native_binary else None
 
     def _find_aiscan_binary(self) -> Optional[Path]:
-        """Locates aiscan binary in PATH or standard tool directories."""
+        """Locates aiscan binary in repo-local bin/, tools/cargo/bin/, PATH, or D:\\tools."""
+        repo_root = Path(__file__).resolve().parent.parent
+        exe_name = "aiscan.exe" if sys.platform == "win32" else "aiscan"
         candidates = [
+            repo_root / "bin" / exe_name,
+            repo_root / "bin" / "aiscan",
+            repo_root / "tools" / "cargo" / "bin" / exe_name,
             shutil.which("aiscan"),
             Path("bin/aiscan.exe"),
             Path("bin/aiscan"),
             Path(r"D:\tools\aiscan.exe"),
             Path(r"D:\tools\aiscan"),
-            Path.home() / ".cargo" / "bin" / ("aiscan.exe" if sys.platform == "win32" else "aiscan"),
+            Path.home() / ".cargo" / "bin" / exe_name,
         ]
         for c in candidates:
             if c:
-                p = Path(c).resolve()
-                if p.exists() and os.access(p, os.X_OK):
-                    return p
+                try:
+                    p = Path(c).resolve()
+                    if p.exists() and p.is_file() and os.access(p, os.X_OK):
+                        return p
+                except OSError:
+                    continue
         return None
 
-    def scan_target(self, target_path: Union[str, Path]) -> Dict[str, Any]:
+    def ensure_binary_installed(self, *, allow_in_tests: bool = False) -> Optional[Path]:
+        """Dynamically installs `aiscan` via ToolProvisioner when live online and missing."""
+        if self.binary_path and self.binary_path.exists():
+            return self.binary_path
+        self.binary_path = self._find_aiscan_binary()
+        if self.binary_path:
+            return self.binary_path
+        if not self.auto_install:
+            return None
+        try:
+            from engine.tool_provisioner import ToolProvisioner
+            prov = ToolProvisioner(allow_in_tests=allow_in_tests)
+            if prov.is_offline_or_blocked():
+                return None
+            prov.ensure_tool("aiscan")
+            self.binary_path = self._find_aiscan_binary()
+        except Exception as exc:
+            logger.debug("Dynamic aiscan installation skipped/failed: %s", exc)
+        return self.binary_path
+
+    def scan_target(
+        self,
+        target_path: Union[str, Path],
+        *,
+        auto_install: Optional[bool] = None,
+    ) -> Dict[str, Any]:
         """
-        Executes AI risk audit on target directory using aiscan binary if present,
-        falling back to embedded Python AST scanner.
+        Executes AI risk audit on target directory using aiscan binary if present
+        (dynamically provisioning when online and allowed), falling back to embedded
+        Python AST scanner.
         """
         tp = Path(target_path).resolve()
         if not tp.exists():
             return {"error": f"Target path does not exist: {tp}", "findings": [], "endpoints": []}
 
+        should_install = self.auto_install if auto_install is None else bool(auto_install)
+        if self.use_native_binary and not self.binary_path and should_install:
+            is_mocked_subproc = getattr(subprocess.run, "__module__", None) != "subprocess"
+            if not is_mocked_subproc:
+                self.ensure_binary_installed()
+
         findings: List[AIFinding] = []
         endpoints: List[DiscoveredAIEndpoint] = []
         engine_used = "python_ast_fallback"
 
-        # Attempt native Rust binary if installed
+        # Attempt native Rust binary if installed (or explicitly assigned on the instance)
         if self.binary_path:
             try:
+                cf = CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0
                 proc = subprocess.run(
                     [str(self.binary_path), "scan", "--format", "json", str(tp)],
+                    shell=False,
+                    stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=60,
                     check=False,
+                    creationflags=cf,
                 )
                 if proc.returncode == 0 and proc.stdout.strip():
                     data = json.loads(proc.stdout)

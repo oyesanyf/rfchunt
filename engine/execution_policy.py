@@ -232,6 +232,30 @@ def _is_safe_rea_name(binary_name: str) -> bool:
     return binary_name in {"rea-agents", "rea-agents.exe", "rea", "rea.exe"}
 
 
+def _is_safe_rea_node(tokens: Sequence[str]) -> bool:
+    """
+    Permits `[node(.exe), <repo_root>/tools/npm/node_modules/rea-agents/scripts/rea.mjs, <subcmd>, ...]`
+    strictly on Windows/POSIX so npm CLI `rea-agents` runs via native `node` without shell `.cmd` wrappers.
+    """
+    if len(tokens) < 3:
+        return False
+    t0 = str(tokens[0] or "")
+    t1 = str(tokens[1] or "")
+    if _validate_canonical_path_syntax(t0) is not None or _validate_canonical_path_syntax(t1) is not None:
+        return False
+    base_bin = _extract_basename_lower(t0)
+    if base_bin not in {"node", "node.exe"}:
+        return False
+    try:
+        repo_npm = (Path(__file__).resolve().parent.parent / "tools" / "npm" / "node_modules" / "rea-agents" / "scripts" / "rea.mjs").resolve()
+        resolved_script = Path(t1).resolve()
+        if resolved_script != repo_npm:
+            return False
+    except (OSError, RuntimeError):
+        return False
+    return _validate_rea_tokens(["rea-agents", *[str(t) for t in tokens[2:]]]) is None
+
+
 def _validate_rea_tokens(tokens: List[str]) -> Optional[str]:
     if len(tokens) < 2:
         return "Unrequested host OS command execution blocked: rea-agents requires an approved web/JS subcommand."
@@ -248,7 +272,12 @@ def _validate_rea_tokens(tokens: List[str]) -> Optional[str]:
     return None
 
 
-def _binary_tool_family(name: str, *, is_raptor_ps1: bool = False) -> Optional[str]:
+def _binary_tool_family(
+    name: str,
+    *,
+    is_raptor_ps1: bool = False,
+    is_rea_node: bool = False,
+) -> Optional[str]:
     n = str(name or "").strip().lower()
     if not n:
         return None
@@ -259,6 +288,8 @@ def _binary_tool_family(name: str, *, is_raptor_ps1: bool = False) -> Optional[s
         return "aiscan"
     if _is_safe_rea_name(n):
         return "rea"
+    if is_rea_node and n in ("node", "node.exe"):
+        return "node"
     if n in _ALLOWED_EXTERNAL_SCANNER_BINARIES:
         return stem
     if is_raptor_ps1 and n in ("powershell", "powershell.exe", "pwsh", "pwsh.exe"):
@@ -1609,6 +1640,7 @@ class ExecutionPolicy:
         from engine.approval_gate import _is_safe_raptor_ps1
 
         is_raptor_ps1 = _is_safe_raptor_ps1(tokens)
+        is_rea_node = _is_safe_rea_node(tokens)
 
         resolved_name: Optional[str] = None
         try:
@@ -1638,8 +1670,8 @@ class ExecutionPolicy:
                         False,
                         f"Unrequested host OS command execution blocked by execution policy: resolved binary '{resolved_name}' is forbidden.",
                     )
-                base_family = _binary_tool_family(binary_name, is_raptor_ps1=is_raptor_ps1)
-                res_family = _binary_tool_family(resolved_name, is_raptor_ps1=is_raptor_ps1)
+                base_family = _binary_tool_family(binary_name, is_raptor_ps1=is_raptor_ps1, is_rea_node=is_rea_node)
+                res_family = _binary_tool_family(resolved_name, is_raptor_ps1=is_raptor_ps1, is_rea_node=is_rea_node)
                 if not res_family:
                     return (
                         False,
@@ -1733,7 +1765,7 @@ class ExecutionPolicy:
             if docker_err:
                 return False, docker_err
 
-        if not (is_python or is_aiscan or is_rea or is_allowed_bin or is_raptor_ps1):
+        if not (is_python or is_aiscan or is_rea or is_rea_node or is_allowed_bin or is_raptor_ps1):
             return (
                 False,
                 f"Unrequested host OS command execution blocked by execution policy: '{binary_name}' is not an approved scanner tool.",

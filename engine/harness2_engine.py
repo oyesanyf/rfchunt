@@ -38,8 +38,11 @@ import ast
 import copy
 import hashlib
 import json
+import os
 import re
 import shutil
+import stat
+import sys
 import time
 import unicodedata
 import urllib.parse
@@ -445,13 +448,61 @@ def read_tree(
     return out
 
 
+def _clear_readonly_attr(
+    target: Union[str, os.PathLike[str]], *, is_dir: Optional[bool] = None
+) -> None:
+    """Clear read-only permission bits on a file or directory prior to removal."""
+    try:
+        st = os.lstat(target)
+        dir_flag = stat.S_ISDIR(st.st_mode) if is_dir is None else is_dir
+        needed = stat.S_IRWXU if dir_flag else (stat.S_IWUSR | stat.S_IRUSR)
+        os.chmod(target, st.st_mode | needed)
+    except OSError:
+        fallback = stat.S_IRWXU if is_dir else (stat.S_IWUSR | stat.S_IRUSR)
+        os.chmod(target, fallback)
+
+
+def _rmtree_force(path: Union[Path, str]) -> None:
+    """Recursively delete a file, symlink, or directory tree, clearing ReadOnly attributes."""
+    p = Path(path)
+    if not p.exists() and not p.is_symlink():
+        return
+    if p.is_symlink() or p.is_file():
+        if not p.is_symlink():
+            _clear_readonly_attr(p, is_dir=False)
+        p.unlink(missing_ok=True)
+        return
+
+    def _onexc(func: Callable[[str], Any], target: str, exc: BaseException) -> None:
+        if isinstance(exc, FileNotFoundError):
+            return
+        if not isinstance(exc, PermissionError):
+            raise exc
+        _clear_readonly_attr(target, is_dir=os.path.isdir(target))
+        parent = os.path.dirname(target)
+        if parent:
+            try:
+                _clear_readonly_attr(parent, is_dir=True)
+            except OSError:
+                pass
+        func(target)
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(p, onexc=_onexc)
+    else:
+        shutil.rmtree(
+            p,
+            onerror=lambda func, target, exc_info: _onexc(func, target, exc_info[1]),
+        )
+
+
 def write_tree(
     surface: SurfaceSpec, tree: Tree, dest: Path | str, *, stubs: bool = True
 ) -> Path:
     """Write a validated c1..c8 tree to disk, optionally including README component stubs."""
     dest = Path(dest)
-    if dest.exists():
-        shutil.rmtree(dest)
+    if dest.exists() or dest.is_symlink():
+        _rmtree_force(dest)
     dest.mkdir(parents=True, exist_ok=True)
 
     for a in surface.always_on:
