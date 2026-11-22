@@ -4059,6 +4059,112 @@ def cmd_docker_doctor(args):
             print(f"[*] Recommended: {rec}")
 
 
+def cmd_deep_audit(args):
+    """Runs 3-pillar deep code-repo audit: live loopback proxy fuzzing, line-by-line trust-boundary review, and coverage-guided fuzzing (`--deep-audit`)."""
+    from engine.cli_render import render_json, render_kv_panel, render_table
+    from engine.deep_repo_audit import run_deep_repo_audit
+
+    as_json = bool(getattr(args, "as_json", False))
+    plain = bool(getattr(args, "plain", False))
+    repo_path = (
+        getattr(args, "repo", None)
+        or getattr(args, "path", None)
+        or getattr(args, "target_arg", None)
+        or "."
+    )
+    output_dir = getattr(args, "output_dir", None) or "reports"
+    task_id = str(getattr(args, "task_id", None) or "deep-audit").strip() or "deep-audit"
+    approval_mode = str(getattr(args, "approval_mode", "policy") or "policy")
+
+    any_pillar = any(
+        bool(getattr(args, flag, False))
+        for flag in ("live_proxy_fuzz", "trust_boundary_review", "coverage_fuzz")
+    )
+    if bool(getattr(args, "deep_audit", False)) or not any_pillar:
+        en_live = True
+        en_tb = True
+        en_cov = True
+    else:
+        en_live = bool(getattr(args, "live_proxy_fuzz", False))
+        en_tb = bool(getattr(args, "trust_boundary_review", False))
+        en_cov = bool(getattr(args, "coverage_fuzz", False))
+
+    fuzz_langs_raw = getattr(args, "fuzz_languages", None)
+    fuzz_langs = [x.strip() for x in str(fuzz_langs_raw).split(",") if x.strip()] if fuzz_langs_raw else None
+
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        report = run_deep_repo_audit(
+            repo_path,
+            output_dir=output_dir,
+            enable_live_proxy_fuzz=en_live,
+            enable_trust_boundary_review=en_tb,
+            enable_coverage_fuzz=en_cov,
+            proxy_host=str(getattr(args, "proxy_host", "127.0.0.1") or "127.0.0.1"),
+            proxy_port=getattr(args, "proxy_port", None),
+            proxy_cmd=getattr(args, "proxy_cmd", None),
+            run_docker_matrix=bool(getattr(args, "docker_parser_matrix", False)),
+            max_trust_files=int(getattr(args, "trust_max_files", 30) or 30),
+            fuzz_dry_run=bool(getattr(args, "fuzz_dry_run", False)),
+            fuzz_max_time=int(getattr(args, "fuzz_max_time", 30) or 30),
+            fuzz_timeout=int(getattr(args, "fuzz_timeout", 60) or 60),
+            fuzz_languages=fuzz_langs,
+            approval_mode=approval_mode,
+            db=db,
+            task_id=task_id,
+        )
+        payload = report.to_dict()
+
+        if getattr(args, "enable_poc", False):
+            from engine.poc_generator import generate_poc_bundle
+            poc_dir = Path(str(output_dir)) / "deep_audit" / "pocs"
+            poc_rep = generate_poc_bundle(
+                report.findings,
+                output_dir=poc_dir,
+                repo_path=repo_path,
+                include_rejected_scripts=bool(getattr(args, "poc_include_rejected", False)),
+                run_container_verify=bool(getattr(args, "poc_container_verify", False)),
+                max_scripts=int(getattr(args, "poc_max", 50) or 50),
+                db=db,
+                task_id=task_id,
+            )
+            payload["poc_verification"] = poc_rep.to_dict()
+    finally:
+        db.close()
+
+    if as_json:
+        render_json(payload)
+        return
+
+    lp = payload.get("live_proxy_fuzz") or {}
+    tb = payload.get("trust_boundary_review") or {}
+    cf = payload.get("coverage_fuzz") or {}
+    render_kv_panel(
+        "RFCHunt --deep-audit Code Repository Security Audit",
+        {
+            "Repository": payload.get("repo_path", ""),
+            "Total Findings": payload.get("total_findings", 0),
+            "Live Proxy Fuzz": f"{lp.get('status', 'disabled')} (probes={lp.get('probes_sent', 0)}, divergences={len(lp.get('confirmed_divergences') or [])})",
+            "Trust-Boundary Review": f"{tb.get('status', 'disabled')} (files={tb.get('files_reviewed', 0)}, findings={tb.get('findings_count', 0)})",
+            "Coverage Fuzz": f"{cf.get('status', 'disabled')} (targets={','.join(cf.get('targets_scanned') or []) or 'none'}, langs={','.join(cf.get('detected_languages') or []) or 'none'}, crashes={cf.get('crashes_count', 0)})",
+            "Report": payload.get("report_markdown_path", ""),
+            "Elapsed": f"{payload.get('elapsed_sec', 0.0)}s",
+        },
+        plain=plain,
+    )
+    rows = [
+        [
+            f.get("severity", ""),
+            f.get("rule_id", ""),
+            f"{Path(str(f.get('file_path', ''))).name}:{f.get('line_number') or ''}",
+            str(f.get("title", ""))[:74],
+        ]
+        for f in (payload.get("findings") or [])[:35]
+    ]
+    if rows:
+        render_table("Deep Audit Findings (Top 35)", ["Severity", "Rule", "Location", "Title"], rows, plain=plain)
+
+
 def cmd_call_graph_slice(args):
     """Whole-repo multi-language call-graph & taint slicer with tiered model escalation (AIxCC #2)."""
     from engine.call_graph_slicer import slice_repository
@@ -4430,6 +4536,54 @@ def cmd_all(args):
                     _shutil.copyfile(str(src_sarif), str(dst_sarif))
                 res.setdefault("report_files", {})["exported_sarif"] = str(dst_sarif)
 
+        if any(
+            bool(getattr(args, flag, False))
+            for flag in ("deep_audit", "live_proxy_fuzz", "trust_boundary_review", "coverage_fuzz")
+        ):
+            deep_repo = repo or path or res.get("target_path")
+            if deep_repo and os.path.isdir(str(deep_repo)):
+                try:
+                    from engine.deep_repo_audit import run_deep_repo_audit
+                    any_p = any(
+                        bool(getattr(args, fl, False))
+                        for fl in ("live_proxy_fuzz", "trust_boundary_review", "coverage_fuzz")
+                    )
+                    en_live = True if (getattr(args, "deep_audit", False) or not any_p) else bool(getattr(args, "live_proxy_fuzz", False))
+                    en_tb = True if (getattr(args, "deep_audit", False) or not any_p) else bool(getattr(args, "trust_boundary_review", False))
+                    en_cov = True if (getattr(args, "deep_audit", False) or not any_p) else bool(getattr(args, "coverage_fuzz", False))
+                    fl_raw = getattr(args, "fuzz_languages", None)
+                    fl_list = [x.strip() for x in str(fl_raw).split(",") if x.strip()] if fl_raw else None
+                    deep_rep = run_deep_repo_audit(
+                        deep_repo,
+                        output_dir=reports_dir,
+                        enable_live_proxy_fuzz=en_live,
+                        enable_trust_boundary_review=en_tb,
+                        enable_coverage_fuzz=en_cov,
+                        proxy_host=str(getattr(args, "proxy_host", "127.0.0.1") or "127.0.0.1"),
+                        proxy_port=getattr(args, "proxy_port", None),
+                        proxy_cmd=getattr(args, "proxy_cmd", None),
+                        run_docker_matrix=bool(getattr(args, "docker_parser_matrix", False)),
+                        max_trust_files=int(getattr(args, "trust_max_files", 30) or 30),
+                        fuzz_dry_run=bool(getattr(args, "fuzz_dry_run", False)),
+                        fuzz_max_time=int(getattr(args, "fuzz_max_time", 30) or 30),
+                        fuzz_timeout=int(getattr(args, "fuzz_timeout", 60) or 60),
+                        fuzz_languages=fl_list,
+                        approval_mode=approval_mode_val,
+                        db=db,
+                        task_id=all_task_id,
+                    )
+                    deep_dict = deep_rep.to_dict()
+                    res["deep_audit"] = deep_dict
+                    res.setdefault("engines", {})["deep_audit"] = deep_dict
+                    res.setdefault("report_files", {})["deep_audit_md"] = deep_rep.report_markdown_path
+                    res.setdefault("report_files", {})["deep_audit_json"] = deep_rep.summary_json_path
+                    if deep_rep.findings:
+                        res.setdefault("findings", []).extend(deep_rep.findings)
+                except PermissionError:
+                    raise
+                except Exception as da_exc:
+                    res.setdefault("engines", {})["deep_audit"] = {"status": "error", "error": str(da_exc)}
+
         if getattr(args, "enable_poc", False):
             try:
                 from engine.poc_generator import generate_poc_bundle
@@ -4585,6 +4739,16 @@ def cmd_all(args):
                 f"(disclosure_worthy={poc_info.get('disclosure_worthy_count', 0)}, "
                 f"fp={vc.get('FALSE_POSITIVE', 0)}, fixtures={vc.get('TEST_FIXTURE', 0)}, "
                 f"scripts={poc_info.get('generated_script_count', 0)})"
+            )
+        if "deep_audit" in eng:
+            da_info = eng.get("deep_audit") or {}
+            tb_i = da_info.get("trust_boundary_review") or {}
+            lp_i = da_info.get("live_proxy_fuzz") or {}
+            cf_i = da_info.get("coverage_fuzz") or {}
+            print(
+                f"    Deep Repo Audit     : {da_info.get('status', 'completed')} "
+                f"(trust_files={tb_i.get('files_reviewed', 0)}, tb_findings={tb_i.get('findings_count', 0)}, "
+                f"proxy={lp_i.get('status', 'disabled')}, fuzz_targets={len(cf_i.get('targets_scanned') or [])})"
             )
         print(f"    Combined SARIF      : {res['report_files'].get('combined_sarif')}")
         if res["report_files"].get("exported_sarif"):
@@ -6126,6 +6290,7 @@ ALL_MODES = [
     "slice", "call-graph", "call_graph", "fuzz", "fuzz-bridge", "fuzz_bridge",
     "invariants", "sandbox-invariants", "sandbox_invariants", "poe-verify", "poe_verify",
     "poc", "poc-verify", "poc_verify", "docker-doctor", "docker_doctor", "doctor-docker",
+    "deep-audit", "deep_audit",
     "novelty", "novelty-refresh", "novelty_refresh", "swarm-board", "swarm_board", "board",
 ]
 
@@ -6572,6 +6737,14 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--fix", "--fix-docker", dest="fix_docker", action="store_true", default=False, help="Run non-destructive Windows Docker Desktop / WSL2 VHDX compression & bootstrap self-heal (for `docker-doctor`)")
     parser.add_argument("--include-all-wsl", dest="include_all_wsl", action="store_true", default=False, help="Also decompress non-Docker WSL2 distro VHDX files (e.g. Ubuntu) during `docker-doctor --fix`")
     parser.add_argument("--reset-docker-distro", dest="reset_docker_distro", action="store_true", default=False, help="Also unregister ONLY the stateless `docker-desktop` WSL runtime distro during `docker-doctor --fix` (preserves docker_data.vhdx)")
+    parser.add_argument("--deep-audit", dest="deep_audit", action="store_true", default=False, help="Enable 3-pillar deep repo audit (live 127.0.0.1 proxy fuzzing + line-by-line trust-boundary review + root & nested-crate coverage-guided fuzzing)")
+    parser.add_argument("--live-proxy-fuzz", dest="live_proxy_fuzz", action="store_true", default=False, help="Enable live loopback-only (127.0.0.1) proxy RFC 9112 fuzzing + differential parser cross-check")
+    parser.add_argument("--trust-boundary-review", dest="trust_boundary_review", action="store_true", default=False, help="Enable targeted line-by-line trust-boundary security review (proxies, path resolvers, authz/ACL, shell sinks, Rust FFI)")
+    parser.add_argument("--coverage-fuzz", dest="coverage_fuzz", action="store_true", default=False, help="Enable coverage-guided fuzzing across root repo parsers and nested crates (e.g. vendor/*/Cargo.toml)")
+    parser.add_argument("--proxy-host", dest="proxy_host", type=str, default="127.0.0.1", help="Loopback-only proxy host for --live-proxy-fuzz (default: 127.0.0.1)")
+    parser.add_argument("--proxy-port", dest="proxy_port", type=int, default=None, help="Existing loopback 127.0.0.1 proxy port to fuzz with --live-proxy-fuzz")
+    parser.add_argument("--proxy-cmd", dest="proxy_cmd", type=str, default=None, help="Optional safe command to launch target repo proxy on 127.0.0.1:<PORT> during --live-proxy-fuzz (shell=False)")
+    parser.add_argument("--trust-max-files", dest="trust_max_files", type=int, default=30, help="Max top-ranked trust-boundary files to audit line-by-line (default: 30)")
     parser.add_argument("--enable-external-scanners", dest="enable_external_scanners", action="store_true", default=False, help="Enable external black-box scanners (httpx, katana, nuclei) — included in --all by default for live hosts; opt-in for standalone `scanner` mode")
     parser.add_argument("--no-external-scanners", dest="no_external_scanners", action="store_true", default=False, help="Disable external black-box scanners (httpx, katana, nuclei) during --all")
     parser.add_argument("--httpx-scan", dest="httpx_scan", action="store_true", default=None, help="Enable ProjectDiscovery httpx discovery (included in --all by default for live hosts)")
@@ -7118,6 +7291,14 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
 
     if active_mode in ("docker-doctor", "docker_doctor", "doctor-docker"):
         _dispatch_cmd("cmd_docker_doctor", args)
+        return
+
+    if active_mode in ("deep-audit", "deep_audit") or (
+        any(bool(getattr(args, fl, False)) for fl in ("deep_audit", "live_proxy_fuzz", "trust_boundary_review", "coverage_fuzz"))
+        and not getattr(args, "run_all_scans", False)
+        and not explicit_mode_given
+    ):
+        _dispatch_cmd("cmd_deep_audit", args)
         return
 
     if active_mode in ("novelty", "novelty-refresh", "novelty_refresh") or (
