@@ -469,8 +469,9 @@ py -3.12 -u rfc_hunt_swarm.py poc --findings-json reports/combined_audit_summary
 py -3.12 -u rfc_hunt_swarm.py --all --repo . --poc --output-dir reports --plain
 py -3.12 -u rfc_hunt_swarm.py docker-doctor --plain
 py -3.12 -u rfc_hunt_swarm.py docker-doctor --fix --include-all-wsl --plain
-py -3.12 -u rfc_hunt_swarm.py deep-audit --repo . --poc --plain
-py -3.12 -u rfc_hunt_swarm.py --all --repo . --deep-audit --poc --plain
+py -3.12 -u rfc_hunt_swarm.py deep-audit --repo . --proxy --poc --plain
+py -3.12 -u rfc_hunt_swarm.py --repo . --proxy 127.0.0.1:8080 --plain
+py -3.12 -u rfc_hunt_swarm.py --all --repo . --deep-audit --proxy --poc --plain
 py -3.12 -u rfc_hunt_swarm.py oracle --docker-parser-matrix --json
 py -3.12 -u rfc_hunt_swarm.py novelty --json
 py -3.12 -u rfc_hunt_swarm.py --mode dream --dream-benchmark --dream-seeds 10 --dream-budget 40 --json

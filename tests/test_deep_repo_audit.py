@@ -14,6 +14,7 @@ from database import Database
 from engine.deep_repo_audit import (
     discover_nested_fuzz_crates,
     discover_trust_boundary_files,
+    parse_proxy_target,
     run_coverage_fuzz_orchestration,
     run_deep_repo_audit,
     run_live_proxy_fuzz,
@@ -275,11 +276,52 @@ def test_cli_deep_audit_subcommand_json_poc_and_all_flags(tmp_path, capsys):
     assert Path(payload["summary_json_path"]).is_file()
 
     all_args = parser.parse_args(
-        ["--all", "--repo", str(repo), "--deep-audit", "--live-proxy-fuzz", "--trust-boundary-review", "--coverage-fuzz", "--poc"]
+        ["--all", "--repo", str(repo), "--deep-audit", "--proxy", "--live-proxy-fuzz", "--trust-boundary-review", "--coverage-fuzz", "--poc"]
     )
     assert all_args.run_all_scans is True
     assert all_args.deep_audit is True
+    assert all_args.proxy_target == "auto"
     assert all_args.live_proxy_fuzz is True
     assert all_args.trust_boundary_review is True
     assert all_args.coverage_fuzz is True
     assert all_args.enable_poc is True
+
+
+def test_proxy_flag_parsing_loopback_guards_and_live_execution(tmp_path, capsys):
+    assert parse_proxy_target("auto") == ("127.0.0.1", None, None, True)
+    assert parse_proxy_target("8080") == ("127.0.0.1", 8080, None, False)
+    assert parse_proxy_target("127.0.0.1:3128") == ("127.0.0.1", 3128, None, False)
+    assert parse_proxy_target("http://localhost:8888") == ("localhost", 8888, None, False)
+    assert parse_proxy_target("[::1]:9090") == ("::1", 9090, None, False)
+
+    with pytest.raises(PermissionError):
+        parse_proxy_target("example.com:80")
+    with pytest.raises(PermissionError):
+        parse_proxy_target("http://169.254.169.254:80")
+
+    repo = _create_sample_repo(tmp_path / "repo")
+    port, stop_evt, th = _start_loopback_http_stub(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+    try:
+        parser = rfc_hunt_swarm.build_swarm_parser()
+        args = parser.parse_args(
+            [
+                "--repo",
+                str(repo),
+                "--proxy",
+                f"127.0.0.1:{port}",
+                "--output-dir",
+                str(tmp_path / "out_proxy"),
+                "--db",
+                str(tmp_path / "proxy_cli.db"),
+                "--json",
+            ]
+        )
+        assert args.proxy_target == f"127.0.0.1:{port}"
+        rfc_hunt_swarm.cmd_deep_audit(args)
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["live_proxy_fuzz"]["status"] == "completed"
+        assert payload["live_proxy_fuzz"]["probes_sent"] == 18
+        assert payload["live_proxy_fuzz"]["confirmed_divergences"] == []
+    finally:
+        stop_evt.set()
+        th.join(timeout=2.0)

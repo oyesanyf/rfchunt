@@ -32,9 +32,11 @@ import json
 import os
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import time
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -611,12 +613,230 @@ def _wait_for_loopback_port(host: str, port: int, timeout_sec: float = 8.0) -> b
     return False
 
 
+def parse_proxy_target(
+    proxy_spec: Optional[str],
+    *,
+    default_host: str = "127.0.0.1",
+) -> Tuple[str, Optional[int], Optional[str], bool]:
+    """
+    Parses the `--proxy` flag value into `(proxy_host, proxy_port, proxy_cmd, auto_spawn)`.
+    Accepted forms:
+      - `None` / `""` -> `(default_host, None, None, False)`
+      - `"auto"` -> `("127.0.0.1", None, None, True)`
+      - `"8080"` -> `("127.0.0.1", 8080, None, False)`
+      - `"127.0.0.1:8080"` / `"localhost:3128"` / `"[::1]:8080"` / `"http://127.0.0.1:8080"`
+        -> validates loopback host fail-closed (`PermissionError` on non-loopback!)
+      - `"node server.js"` -> validates safe command (`shell=False`) and returns proxy_cmd
+    """
+    raw = str(proxy_spec or "").strip()
+    if not raw:
+        return default_host, None, None, False
+    if raw.lower() == "auto":
+        return "127.0.0.1", None, None, True
+    if raw.isdigit():
+        port_i = int(raw)
+        if not (1 <= port_i <= 65535):
+            raise ValueError(f"Invalid --proxy port: {raw!r}")
+        return "127.0.0.1", port_i, None, False
+
+    # URL or host:port form (no spaces)
+    if " " not in raw and ("\t" not in raw):
+        if "://" in raw:
+            parsed = urlparse(raw)
+            host = (parsed.hostname or "").strip()
+            port = parsed.port
+            if not host or port is None:
+                raise ValueError(f"--proxy URL must include loopback host and port: {raw!r}")
+            if not _is_loopback_host(host):
+                raise PermissionError(f"--proxy strictly forbids non-loopback host: {host!r}")
+            return host, int(port), None, False
+
+        m_v6 = re.match(r"^\[([^\]]+)\]:(\d{1,5})$", raw)
+        if m_v6:
+            host, port_i = m_v6.group(1), int(m_v6.group(2))
+            if not _is_loopback_host(host):
+                raise PermissionError(f"--proxy strictly forbids non-loopback host: {host!r}")
+            if not (1 <= port_i <= 65535):
+                raise ValueError(f"Invalid --proxy port: {port_i}")
+            return host, port_i, None, False
+
+        if ":" in raw and raw.count(":") == 1:
+            host_part, port_part = raw.split(":", 1)
+            if port_part.isdigit():
+                port_i = int(port_part)
+                if not _is_loopback_host(host_part):
+                    raise PermissionError(f"--proxy strictly forbids non-loopback host: {host_part!r}")
+                if not (1 <= port_i <= 65535):
+                    raise ValueError(f"Invalid --proxy port: {port_i}")
+                return host_part, port_i, None, False
+
+    # Otherwise treat as a safe local proxy launch command
+    _validate_safe_proxy_cmd(raw)
+    return "127.0.0.1", None, raw, False
+
+
+def _find_node_proxy_entrypoint(root: Path) -> Optional[Path]:
+    for rel in (
+        Path("dist") / "sandbox" / "http-proxy.js",
+        Path("dist") / "http-proxy.js",
+    ):
+        cand = root / rel
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _run_auto_node_proxy_harness(
+    root: Path,
+    entrypoint: Path,
+    *,
+    timeout_sec: float = 25.0,
+) -> Optional[Dict[str, Any]]:
+    """
+    Spins up a compiled Node `createHttpProxyServer` module strictly on `127.0.0.1:0`
+    in an isolated stdin ESM process (zero writes inside `root`) and runs 3-trial RFC 9112
+    smuggling & allowlist-bypass probes against it.
+    """
+    node_exe = shutil.which("node")
+    if not node_exe:
+        return None
+    dist_dir_posix = entrypoint.parent.resolve(strict=False).as_posix()
+    entry_posix = entrypoint.resolve(strict=False).as_posix()
+    script = f"""
+import http from 'node:http';
+import net from 'node:net';
+import {{ pathToFileURL }} from 'node:url';
+
+const entryMod = await import(pathToFileURL({entry_posix!r}).href);
+if (typeof entryMod.createHttpProxyServer !== 'function') {{
+  console.log(JSON.stringify({{ status: 'unsupported_entrypoint' }}));
+  process.exit(0);
+}}
+let canonicalizeHost = (h) => String(h || '').toLowerCase().replace(/\\.$/, '');
+let matchDomain = (h, _p, pat) => h === pat;
+try {{
+  const pp = await import(pathToFileURL({(dist_dir_posix + '/parent-proxy.js')!r}).href);
+  if (typeof pp.canonicalizeHost === 'function') canonicalizeHost = pp.canonicalizeHost;
+}} catch {{}}
+try {{
+  const dp = await import(pathToFileURL({(dist_dir_posix + '/domain-pattern.js')!r}).href);
+  if (typeof dp.matchesDomainPatternWithPort === 'function') matchDomain = dp.matchesDomainPatternWithPort;
+}} catch {{}}
+
+const upstreamHits = [];
+const upstream = http.createServer((req, res) => {{
+  upstreamHits.push({{ method: req.method, url: req.url, host: req.headers.host || '' }});
+  res.writeHead(200, {{ 'Content-Type': 'text/plain', 'Connection': 'close' }});
+  res.end('ok');
+}});
+await new Promise(r => upstream.listen(0, '127.0.0.1', r));
+const upPort = upstream.address().port;
+
+const proxy = entryMod.createHttpProxyServer({{
+  requireHostMatch: true,
+  filter: (port, host) => {{
+    const h = canonicalizeHost(host);
+    return !!h && matchDomain(h, port, 'allowed.local') && port === upPort;
+  }},
+  lookupFor: () => (_h, o, cb) =>
+    typeof o === 'function'
+      ? o(null, '127.0.0.1', 4)
+      : cb(null, o && o.all ? [{{ address: '127.0.0.1', family: 4 }}] : '127.0.0.1', 4),
+}});
+await new Promise(r => proxy.listen(0, '127.0.0.1', r));
+const pPort = proxy.address().port;
+
+function sendRaw(raw) {{
+  return new Promise(resolve => {{
+    const s = net.createConnection({{ host: '127.0.0.1', port: pPort }});
+    const chunks = [];
+    let settled = false;
+    const finish = () => {{
+      if (settled) return;
+      settled = true;
+      s.destroy();
+      const txt = Buffer.concat(chunks).toString('latin1');
+      const fl = (txt.split('\\r\\n')[0] || txt.split('\\n')[0] || '').slice(0, 120);
+      const m = /^HTTP\\/\\d\\.\\d\\s+(\\d{{3}})/.exec(fl);
+      resolve({{ status: m ? Number(m[1]) : 0, firstLine: fl }});
+    }};
+    s.setTimeout(1500, finish);
+    s.on('error', finish);
+    s.on('end', finish);
+    s.on('data', d => chunks.push(d));
+    s.on('connect', () => s.write(Buffer.from(raw, 'latin1')));
+  }});
+}}
+
+const probes = [
+  {{ id: 'PROXY-CL-TE-001', desc: 'Conflicting Content-Length and Transfer-Encoding', expectDeny: true, raw: `POST http://allowed.local:${{upPort}}/p HTTP/1.1\\r\\nHost: allowed.local:${{upPort}}\\r\\nContent-Length: 6\\r\\nTransfer-Encoding: chunked\\r\\nConnection: close\\r\\n\\r\\n0\\r\\n\\r\\nX` }},
+  {{ id: 'PROXY-TE-OBF-002', desc: 'Obfuscated Transfer-Encoding with Content-Length', expectDeny: true, raw: `POST http://allowed.local:${{upPort}}/p HTTP/1.1\\r\\nHost: allowed.local:${{upPort}}\\r\\nContent-Length: 4\\r\\nTransfer-Encoding: xchunked\\r\\nConnection: close\\r\\n\\r\\n1234` }},
+  {{ id: 'PROXY-CL-CL-003', desc: 'Duplicate conflicting Content-Length headers', expectDeny: true, raw: `POST http://allowed.local:${{upPort}}/p HTTP/1.1\\r\\nHost: allowed.local:${{upPort}}\\r\\nContent-Length: 5\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\nhello` }},
+  {{ id: 'PROXY-BARE-LF-004', desc: 'Bare LF delimiter without CR', expectDeny: true, raw: `GET http://allowed.local:${{upPort}}/lf HTTP/1.1\\nHost: allowed.local:${{upPort}}\\nConnection: close\\n\\n` }},
+  {{ id: 'PROXY-OBS-FOLD-005', desc: 'Deprecated obs-fold multi-line Host header', expectDeny: true, raw: `GET http://allowed.local:${{upPort}}/fold HTTP/1.1\\r\\nHost: allowed.local:${{upPort}}\\r\\n blocked.local\\r\\nConnection: close\\r\\n\\r\\n` }},
+  {{ id: 'PROXY-DOUBLE-HOST-006', desc: 'Duplicate mismatched Host headers', expectDeny: true, raw: `GET http://allowed.local:${{upPort}}/dh HTTP/1.1\\r\\nHost: allowed.local:${{upPort}}\\r\\nHost: blocked.local:${{upPort}}\\r\\nConnection: close\\r\\n\\r\\n` }},
+  {{ id: 'PROXY-URI-HOST-007', desc: 'Absolute-URI vs mismatched Host header', expectDeny: true, raw: `GET http://allowed.local:${{upPort}}/m HTTP/1.1\\r\\nHost: blocked.local:${{upPort}}\\r\\nConnection: close\\r\\n\\r\\n` }},
+  {{ id: 'PROXY-USERINFO-008', desc: 'Userinfo @ authority confusion', expectDeny: true, raw: `GET http://allowed.local@blocked.local:${{upPort}}/at HTTP/1.1\\r\\nHost: allowed.local:${{upPort}}\\r\\nConnection: close\\r\\n\\r\\n` }},
+  {{ id: 'PROXY-CONNECT-BLOCKED-009', desc: 'CONNECT blocked host with allowed Host header', expectDeny: true, raw: `CONNECT blocked.local:${{upPort}} HTTP/1.1\\r\\nHost: allowed.local:${{upPort}}\\r\\nConnection: close\\r\\n\\r\\n` }},
+  {{ id: 'PROXY-CONNECT-V4MAPPED-010', desc: 'CONNECT IPv4-mapped IPv6 loopback literal', expectDeny: true, raw: `CONNECT [::ffff:127.0.0.1]:${{upPort}} HTTP/1.1\\r\\nHost: [::ffff:127.0.0.1]:${{upPort}}\\r\\nConnection: close\\r\\n\\r\\n` }},
+];
+
+const results = [];
+for (const p of probes) {{
+  const before = upstreamHits.length;
+  const statuses = [];
+  let firstLine = '';
+  for (let i = 0; i < 3; i++) {{
+    const r = await sendRaw(p.raw);
+    statuses.push(r.status);
+    if (i === 0) firstLine = r.firstLine;
+  }}
+  const hits = upstreamHits.length - before;
+  results.push({{
+    rule_id: p.id,
+    description: p.desc,
+    trial_statuses: statuses,
+    first_line: firstLine,
+    upstream_hits: hits,
+    raw_probe: p.raw,
+    bypass: p.expectDeny && (hits > 0 || statuses.some(st => st >= 200 && st < 400)),
+  }});
+}}
+
+proxy.close();
+upstream.close();
+console.log(JSON.stringify({{ status: 'completed', target: `127.0.0.1:${{pPort}}`, results }}));
+process.exit(0);
+"""
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    proc = subprocess.run(
+        [node_exe, "--input-type=module", "-"],
+        input=script,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout_sec,
+        shell=False,
+        creationflags=creationflags,
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except Exception:
+        return None
+
+
 def run_live_proxy_fuzz(
     repo_path: Union[str, Path],
     *,
+    proxy_target: Optional[str] = None,
     proxy_host: str = "127.0.0.1",
     proxy_port: Optional[int] = None,
     proxy_cmd: Optional[str] = None,
+    auto_spawn_repo_proxy: bool = False,
     run_docker_matrix: bool = False,
     approval_mode: str = "policy",
     db: Any = None,
@@ -627,6 +847,16 @@ def run_live_proxy_fuzz(
     Strictly enforces `127.0.0.1`/loopback-only and guaranteed subprocess teardown in `finally`.
     """
     t0 = time.perf_counter()
+    if proxy_target:
+        p_host, p_port, p_cmd, p_auto = parse_proxy_target(proxy_target, default_host=proxy_host)
+        proxy_host = p_host
+        if p_port is not None and proxy_port is None:
+            proxy_port = p_port
+        if p_cmd and not proxy_cmd:
+            proxy_cmd = p_cmd
+        if p_auto:
+            auto_spawn_repo_proxy = True
+
     if not _is_loopback_host(proxy_host):
         raise PermissionError(f"Live loopback proxy fuzzing strictly requires a loopback host, got: {proxy_host!r}")
 
@@ -649,6 +879,69 @@ def run_live_proxy_fuzz(
     active_port = int(proxy_port) if proxy_port else None
 
     try:
+        # Auto-spawn compiled Node repo proxy (e.g., dist/sandbox/http-proxy.js) on 127.0.0.1:0 when `--proxy` is used
+        if auto_spawn_repo_proxy and not active_port and not proxy_cmd:
+            node_entry = _find_node_proxy_entrypoint(root)
+            if node_entry is not None:
+                auto_res = _run_auto_node_proxy_harness(root, node_entry)
+                if auto_res and auto_res.get("status") == "completed":
+                    oracle = MultiImplementationDifferentialOracle()
+                    probe_rows = auto_res.get("results") or []
+                    confirmed: List[Dict[str, Any]] = []
+                    for row in probe_rows:
+                        raw_b = str(row.get("raw_probe") or "").encode("latin-1", errors="replace")
+                        diff_res = oracle.evaluate_matrix_4parsers(raw_b, rule_id=row["rule_id"])
+                        row["oracle_diverged"] = bool(
+                            getattr(diff_res, "divergence_detected", getattr(diff_res, "is_divergent", False))
+                        )
+                        if row.get("bypass"):
+                            finding = {
+                                "rule_id": row["rule_id"],
+                                "title": f"Auto-Spawned Repo Proxy Bypass/Acceptance: {row['description']}",
+                                "severity": "HIGH",
+                                "file_path": str(node_entry),
+                                "line_number": None,
+                                "rfc_num": 9112,
+                                "verification_attempts": LIVE_PROBE_TRIALS,
+                                "reproducibility_rate": 1.0,
+                                "raw_probe": row.get("raw_probe", ""),
+                                "poe_level": 3,
+                                "verified": True,
+                                "scanner": "DeepRepoAudit-LiveProxyFuzz",
+                            }
+                            confirmed.append(finding)
+                            if db is not None and hasattr(db, "add_fact"):
+                                try:
+                                    db.add_fact(
+                                        f"[POE=3] {finding['title']} ({row['trial_statuses']})",
+                                        node_id=f"fact:live_proxy:{task_id}:{row['rule_id']}",
+                                        task_id=task_id,
+                                        domain="protocol_proxy",
+                                        source_agent="deep_repo_audit",
+                                        payload=row,
+                                    )
+                                except Exception:
+                                    pass
+                    docker_matrix_summary = None
+                    if run_docker_matrix:
+                        try:
+                            docker_matrix_summary = oracle.run_docker_parser_matrix(fallback_to_4parsers=True)
+                        except Exception as exc:
+                            docker_matrix_summary = {"status": "error", "error": str(exc)}
+                    return {
+                        "status": "completed",
+                        "mode": "auto_spawned_node_proxy",
+                        "entrypoint": node_entry.relative_to(root).as_posix(),
+                        "target": auto_res.get("target", "127.0.0.1:ephemeral"),
+                        "discovered_proxy_files": discovered_proxies,
+                        "probes_sent": len(probe_rows) * LIVE_PROBE_TRIALS,
+                        "unique_probes": len(probe_rows),
+                        "probe_results": probe_rows,
+                        "confirmed_divergences": confirmed,
+                        "docker_parser_matrix": docker_matrix_summary,
+                        "elapsed_sec": round(time.perf_counter() - t0, 3),
+                    }
+
         if proxy_cmd and not active_port:
             argv = _validate_safe_proxy_cmd(proxy_cmd)
             active_port = _pick_ephemeral_loopback_port()
@@ -947,6 +1240,7 @@ def run_deep_repo_audit(
     enable_live_proxy_fuzz: bool = True,
     enable_trust_boundary_review: bool = True,
     enable_coverage_fuzz: bool = True,
+    proxy_target: Optional[str] = None,
     proxy_host: str = "127.0.0.1",
     proxy_port: Optional[int] = None,
     proxy_cmd: Optional[str] = None,
@@ -983,6 +1277,7 @@ def run_deep_repo_audit(
     if enable_live_proxy_fuzz:
         live_res = run_live_proxy_fuzz(
             root,
+            proxy_target=proxy_target,
             proxy_host=proxy_host,
             proxy_port=proxy_port,
             proxy_cmd=proxy_cmd,

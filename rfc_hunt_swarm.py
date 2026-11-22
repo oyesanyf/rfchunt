@@ -4076,16 +4076,23 @@ def cmd_deep_audit(args):
     task_id = str(getattr(args, "task_id", None) or "deep-audit").strip() or "deep-audit"
     approval_mode = str(getattr(args, "approval_mode", "policy") or "policy")
 
+    proxy_target_arg = getattr(args, "proxy_target", None)
+    if proxy_target_arg and os.path.isdir(str(proxy_target_arg)) and not getattr(args, "repo", None) and not getattr(args, "path", None):
+        repo_path = str(proxy_target_arg)
+        proxy_target_arg = "auto"
+
     any_pillar = any(
         bool(getattr(args, flag, False))
         for flag in ("live_proxy_fuzz", "trust_boundary_review", "coverage_fuzz")
-    )
+    ) or bool(proxy_target_arg)
     if bool(getattr(args, "deep_audit", False)) or not any_pillar:
         en_live = True
         en_tb = True
         en_cov = True
+        if not proxy_target_arg and not getattr(args, "proxy_port", None) and not getattr(args, "proxy_cmd", None):
+            proxy_target_arg = "auto"
     else:
-        en_live = bool(getattr(args, "live_proxy_fuzz", False))
+        en_live = bool(getattr(args, "live_proxy_fuzz", False)) or bool(proxy_target_arg)
         en_tb = bool(getattr(args, "trust_boundary_review", False))
         en_cov = bool(getattr(args, "coverage_fuzz", False))
 
@@ -4100,6 +4107,7 @@ def cmd_deep_audit(args):
             enable_live_proxy_fuzz=en_live,
             enable_trust_boundary_review=en_tb,
             enable_coverage_fuzz=en_cov,
+            proxy_target=proxy_target_arg,
             proxy_host=str(getattr(args, "proxy_host", "127.0.0.1") or "127.0.0.1"),
             proxy_port=getattr(args, "proxy_port", None),
             proxy_cmd=getattr(args, "proxy_cmd", None),
@@ -4538,19 +4546,22 @@ def cmd_all(args):
 
         if any(
             bool(getattr(args, flag, False))
-            for flag in ("deep_audit", "live_proxy_fuzz", "trust_boundary_review", "coverage_fuzz")
+            for flag in ("deep_audit", "live_proxy_fuzz", "trust_boundary_review", "coverage_fuzz", "proxy_target")
         ):
             deep_repo = repo or path or res.get("target_path")
             if deep_repo and os.path.isdir(str(deep_repo)):
                 try:
                     from engine.deep_repo_audit import run_deep_repo_audit
+                    p_target = getattr(args, "proxy_target", None)
                     any_p = any(
                         bool(getattr(args, fl, False))
                         for fl in ("live_proxy_fuzz", "trust_boundary_review", "coverage_fuzz")
-                    )
-                    en_live = True if (getattr(args, "deep_audit", False) or not any_p) else bool(getattr(args, "live_proxy_fuzz", False))
+                    ) or bool(p_target)
+                    en_live = True if (getattr(args, "deep_audit", False) or not any_p) else (bool(getattr(args, "live_proxy_fuzz", False)) or bool(p_target))
                     en_tb = True if (getattr(args, "deep_audit", False) or not any_p) else bool(getattr(args, "trust_boundary_review", False))
                     en_cov = True if (getattr(args, "deep_audit", False) or not any_p) else bool(getattr(args, "coverage_fuzz", False))
+                    if getattr(args, "deep_audit", False) and not p_target and not getattr(args, "proxy_port", None) and not getattr(args, "proxy_cmd", None):
+                        p_target = "auto"
                     fl_raw = getattr(args, "fuzz_languages", None)
                     fl_list = [x.strip() for x in str(fl_raw).split(",") if x.strip()] if fl_raw else None
                     deep_rep = run_deep_repo_audit(
@@ -4559,6 +4570,7 @@ def cmd_all(args):
                         enable_live_proxy_fuzz=en_live,
                         enable_trust_boundary_review=en_tb,
                         enable_coverage_fuzz=en_cov,
+                        proxy_target=p_target,
                         proxy_host=str(getattr(args, "proxy_host", "127.0.0.1") or "127.0.0.1"),
                         proxy_port=getattr(args, "proxy_port", None),
                         proxy_cmd=getattr(args, "proxy_cmd", None),
@@ -6738,6 +6750,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--include-all-wsl", dest="include_all_wsl", action="store_true", default=False, help="Also decompress non-Docker WSL2 distro VHDX files (e.g. Ubuntu) during `docker-doctor --fix`")
     parser.add_argument("--reset-docker-distro", dest="reset_docker_distro", action="store_true", default=False, help="Also unregister ONLY the stateless `docker-desktop` WSL runtime distro during `docker-doctor --fix` (preserves docker_data.vhdx)")
     parser.add_argument("--deep-audit", dest="deep_audit", action="store_true", default=False, help="Enable 3-pillar deep repo audit (live 127.0.0.1 proxy fuzzing + line-by-line trust-boundary review + root & nested-crate coverage-guided fuzzing)")
+    parser.add_argument("--proxy", dest="proxy_target", nargs="?", const="auto", default=None, help="Enable live loopback-only (127.0.0.1) proxy fuzzing; pass bare `--proxy` to auto-spawn repo proxy on 127.0.0.1:0, or pass `<port>` / `127.0.0.1:<port>` / `http://127.0.0.1:<port>` / safe launch command")
     parser.add_argument("--live-proxy-fuzz", dest="live_proxy_fuzz", action="store_true", default=False, help="Enable live loopback-only (127.0.0.1) proxy RFC 9112 fuzzing + differential parser cross-check")
     parser.add_argument("--trust-boundary-review", dest="trust_boundary_review", action="store_true", default=False, help="Enable targeted line-by-line trust-boundary security review (proxies, path resolvers, authz/ACL, shell sinks, Rust FFI)")
     parser.add_argument("--coverage-fuzz", dest="coverage_fuzz", action="store_true", default=False, help="Enable coverage-guided fuzzing across root repo parsers and nested crates (e.g. vendor/*/Cargo.toml)")
@@ -7294,7 +7307,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         return
 
     if active_mode in ("deep-audit", "deep_audit") or (
-        any(bool(getattr(args, fl, False)) for fl in ("deep_audit", "live_proxy_fuzz", "trust_boundary_review", "coverage_fuzz"))
+        any(bool(getattr(args, fl, False)) for fl in ("deep_audit", "live_proxy_fuzz", "trust_boundary_review", "coverage_fuzz", "proxy_target"))
         and not getattr(args, "run_all_scans", False)
         and not explicit_mode_given
     ):
