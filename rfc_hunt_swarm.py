@@ -4112,7 +4112,7 @@ def cmd_deep_audit(args):
             proxy_port=getattr(args, "proxy_port", None),
             proxy_cmd=getattr(args, "proxy_cmd", None),
             run_docker_matrix=bool(getattr(args, "docker_parser_matrix", False)),
-            max_trust_files=int(getattr(args, "trust_max_files", 30) or 30),
+            max_trust_files=int(getattr(args, "trust_max_files", 80) or 80),
             fuzz_dry_run=bool(getattr(args, "fuzz_dry_run", False)),
             fuzz_max_time=int(getattr(args, "fuzz_max_time", 30) or 30),
             fuzz_timeout=int(getattr(args, "fuzz_timeout", 60) or 60),
@@ -4575,7 +4575,7 @@ def cmd_all(args):
                         proxy_port=getattr(args, "proxy_port", None),
                         proxy_cmd=getattr(args, "proxy_cmd", None),
                         run_docker_matrix=bool(getattr(args, "docker_parser_matrix", False)),
-                        max_trust_files=int(getattr(args, "trust_max_files", 30) or 30),
+                        max_trust_files=int(getattr(args, "trust_max_files", 80) or 80),
                         fuzz_dry_run=bool(getattr(args, "fuzz_dry_run", False)),
                         fuzz_max_time=int(getattr(args, "fuzz_max_time", 30) or 30),
                         fuzz_timeout=int(getattr(args, "fuzz_timeout", 60) or 60),
@@ -6757,7 +6757,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--proxy-host", dest="proxy_host", type=str, default="127.0.0.1", help="Loopback-only proxy host for --live-proxy-fuzz (default: 127.0.0.1)")
     parser.add_argument("--proxy-port", dest="proxy_port", type=int, default=None, help="Existing loopback 127.0.0.1 proxy port to fuzz with --live-proxy-fuzz")
     parser.add_argument("--proxy-cmd", dest="proxy_cmd", type=str, default=None, help="Optional safe command to launch target repo proxy on 127.0.0.1:<PORT> during --live-proxy-fuzz (shell=False)")
-    parser.add_argument("--trust-max-files", dest="trust_max_files", type=int, default=30, help="Max top-ranked trust-boundary files to audit line-by-line (default: 30)")
+    parser.add_argument("--trust-max-files", dest="trust_max_files", type=int, default=80, help="Max top-ranked trust-boundary files to audit line-by-line (default: 80)")
     parser.add_argument("--enable-external-scanners", dest="enable_external_scanners", action="store_true", default=False, help="Enable external black-box scanners (httpx, katana, nuclei) — included in --all by default for live hosts; opt-in for standalone `scanner` mode")
     parser.add_argument("--no-external-scanners", dest="no_external_scanners", action="store_true", default=False, help="Disable external black-box scanners (httpx, katana, nuclei) during --all")
     parser.add_argument("--httpx-scan", dest="httpx_scan", action="store_true", default=None, help="Enable ProjectDiscovery httpx discovery (included in --all by default for live hosts)")

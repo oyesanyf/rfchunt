@@ -325,3 +325,252 @@ def test_proxy_flag_parsing_loopback_guards_and_live_execution(tmp_path, capsys)
     finally:
         stop_evt.set()
         th.join(timeout=2.0)
+
+
+def test_structural_trust_boundary_detectors_catch_real_bug_classes_with_zero_fp_on_fixes(tmp_path):
+    """
+    Verifies all 7 structural multi-token trust-boundary detectors fire on genuine
+    vulnerable patterns (even when comments mention mitigations) and emit ZERO
+    findings on remediated equivalents.
+    """
+    vuln_repo = tmp_path / "vuln_repo"
+    (vuln_repo / "src" / "proxy").mkdir(parents=True, exist_ok=True)
+    (vuln_repo / "src" / "sandbox").mkdir(parents=True, exist_ok=True)
+    (vuln_repo / "vendor" / "win-iso" / "src").mkdir(parents=True, exist_ok=True)
+
+    # 1. TB-TLS-CLIENTHELLO-VERSION-CAP + 2. TB-HTTP-ECHO-METHOD-GATED
+    (vuln_repo / "src" / "proxy" / "tls-terminate-proxy.ts").write_text(
+        "\n".join(
+            [
+                "export function looksLikeClientHello(buf: Buffer): boolean {",
+                "  return buf.length >= 3 && buf[0] === 0x16 && buf[1] === 0x03 && buf[2]! <= 0x03",
+                "}",
+                "export async function forwardUpstream(req: any, res: any, opts: any) {",
+                "  if (opts.filterRequest) { await opts.filterRequest(req) }",
+                "  const fwdHeaders: Record<string, string> = { host: 'api.example' }",
+                "  const plan = opts.planSigv4?.(req.method ?? 'GET', '/', fwdHeaders, 'api.example')",
+                "  opts.mutateHeaders?.(fwdHeaders, 'api.example')",
+                "  return plan",
+                "}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # 3. TB-WIN-REPARSE-NO-FLAG (doc comment mentions FILE_FLAG_OPEN_REPARSE_POINT, call omits it)
+    (vuln_repo / "vendor" / "win-iso" / "src" / "path_id.rs").write_text(
+        "\n".join(
+            [
+                "/// Future work: pass FILE_FLAG_OPEN_REPARSE_POINT here",
+                "fn open_meta(path: *const u16) -> isize {",
+                "    unsafe {",
+                "        CreateFileW(",
+                "            path,",
+                "            0,",
+                "            FILE_SHARE_READ,",
+                "            None,",
+                "            OPEN_EXISTING,",
+                "            FILE_FLAG_BACKUP_SEMANTICS,",
+                "            None,",
+                "        )",
+                "    }",
+                "}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # 4. TB-WIN-WFP-MISSING-INBOUND
+    (vuln_repo / "vendor" / "win-iso" / "src" / "wfp.rs").write_text(
+        "\n".join(
+            [
+                "// TODO: consider FWPM_LAYER_ALE_AUTH_LISTEN_V4 later",
+                "const OUTBOUND: [GUID; 2] = [",
+                "    FWPM_LAYER_ALE_AUTH_CONNECT_V4,",
+                "    FWPM_LAYER_ALE_AUTH_CONNECT_V6,",
+                "];",
+                "pub fn install(engine: HANDLE) -> u32 {",
+                "    let mut f = FWPM_FILTER0::default();",
+                "    unsafe { FwpmFilterAdd0(engine, &f, None, None) }",
+                "}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # 5. TB-LINUX-BWRAP-PRESECCOMP-SHELL (comment mentions BASH_ENV, code does not unset it)
+    (vuln_repo / "src" / "sandbox" / "linux-sandbox-utils.ts").write_text(
+        "\n".join(
+            [
+                "// Startup files like BASH_ENV or ZDOTDIR could run before seccomp",
+                "export function wrapLinux(shell: string, command: string, applySeccompPrefix: string) {",
+                "  const bwrapArgs: string[] = ['--unshare-net']",
+                "  bwrapArgs.push('--', shell, '-c')",
+                "  bwrapArgs.push(applySeccompPrefix + command)",
+                "  return bwrapArgs",
+                "}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # 6. TB-POSIX-ERE-BRACKET-ESCAPE
+    (vuln_repo / "src" / "sandbox" / "glob-pattern.ts").write_text(
+        "\n".join(
+            [
+                "export function setToRegex(members: string): string {",
+                "  return `[${members.replace(/[.^$+{}()|\\\\]/g, '\\\\$&')}]`",
+                "}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # 7. TB-URL-CANONICALIZE-STRIP
+    (vuln_repo / "src" / "proxy" / "host-url.ts").write_text(
+        "\n".join(
+            [
+                "export function canonicalizeHost(raw: string): string | undefined {",
+                "  try {",
+                "    const out = new URL(`http://${raw}/`).hostname",
+                "    return out.replace(/\\.$/, '')",
+                "  } catch { return undefined }",
+                "}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    vuln_res = run_trust_boundary_review(vuln_repo, max_files=60)
+    vuln_rules = {f["rule_id"] for f in vuln_res["findings"]}
+    expected_new_rules = {
+        "TB-TLS-CLIENTHELLO-VERSION-CAP",
+        "TB-HTTP-ECHO-METHOD-GATED",
+        "TB-WIN-REPARSE-NO-FLAG",
+        "TB-WIN-WFP-MISSING-INBOUND",
+        "TB-LINUX-BWRAP-PRESECCOMP-SHELL",
+        "TB-POSIX-ERE-BRACKET-ESCAPE",
+        "TB-URL-CANONICALIZE-STRIP",
+    }
+    assert expected_new_rules.issubset(vuln_rules), f"Missing rules: {expected_new_rules - vuln_rules}"
+
+    # Now build a remediated repo fixing every single one of the 7 bug classes -> ZERO of those 7 rules may fire
+    fixed_repo = tmp_path / "fixed_repo"
+    (fixed_repo / "src" / "proxy").mkdir(parents=True, exist_ok=True)
+    (fixed_repo / "src" / "sandbox").mkdir(parents=True, exist_ok=True)
+    (fixed_repo / "vendor" / "win-iso" / "src").mkdir(parents=True, exist_ok=True)
+
+    (fixed_repo / "src" / "proxy" / "tls-terminate-proxy.ts").write_text(
+        "\n".join(
+            [
+                "const ECHO_METHODS = new Set(['TRACE', 'TRACK'])",
+                "export function looksLikeClientHello(buf: Buffer): boolean {",
+                "  return buf.length >= 3 && buf[0] === 0x16 && buf[1] === 0x03",
+                "}",
+                "export async function forwardUpstream(req: any, res: any, opts: any) {",
+                "  if (ECHO_METHODS.has(String(req.method || '').toUpperCase())) { res.writeHead(405); res.end(); return }",
+                "  const fwdHeaders: Record<string, string> = { host: 'api.example' }",
+                "  opts.mutateHeaders?.(fwdHeaders, 'api.example')",
+                "}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    (fixed_repo / "vendor" / "win-iso" / "src" / "path_id.rs").write_text(
+        "\n".join(
+            [
+                "fn open_meta(path: *const u16) -> Result<isize, i32> {",
+                "    let h = unsafe {",
+                "        CreateFileW(",
+                "            path, 0, FILE_SHARE_READ, None, OPEN_EXISTING,",
+                "            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,",
+                "            None,",
+                "        )",
+                "    };",
+                "    if h == -1 { return Err(-1); }",
+                "    Ok(h)",
+                "}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    (fixed_repo / "vendor" / "win-iso" / "src" / "wfp.rs").write_text(
+        "\n".join(
+            [
+                "const LAYERS: [GUID; 4] = [",
+                "    FWPM_LAYER_ALE_AUTH_CONNECT_V4,",
+                "    FWPM_LAYER_ALE_AUTH_CONNECT_V6,",
+                "    FWPM_LAYER_ALE_AUTH_LISTEN_V4,",
+                "    FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,",
+                "];",
+                "pub fn install(engine: HANDLE) -> u32 {",
+                "    let f = FWPM_FILTER0::default();",
+                "    unsafe { FwpmFilterAdd0(engine, &f, None, None) }",
+                "}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    (fixed_repo / "src" / "sandbox" / "linux-sandbox-utils.ts").write_text(
+        "\n".join(
+            [
+                "export function wrapLinux(shell: string, command: string, applySeccompPrefix: string) {",
+                "  const bwrapArgs: string[] = ['--unshare-net', '--unsetenv', 'BASH_ENV', '--unsetenv', 'ZDOTDIR']",
+                "  bwrapArgs.push('--', shell, '-c')",
+                "  bwrapArgs.push(applySeccompPrefix + command)",
+                "  return bwrapArgs",
+                "}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    (fixed_repo / "src" / "sandbox" / "glob-pattern.ts").write_text(
+        "\n".join(
+            [
+                "export function setToRegex(members: string): string {",
+                "  const clean = members.replace(/]/g, '')",
+                "  return `[${clean}]`",
+                "}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    (fixed_repo / "src" / "proxy" / "host-url.ts").write_text(
+        "\n".join(
+            [
+                "export function canonicalizeHost(raw: string): string | undefined {",
+                "  try {",
+                "    const u = new URL(`http://${raw}/`)",
+                "    if (u.username || u.password || u.port || u.pathname !== '/' || u.search || u.hash) {",
+                "      return undefined",
+                "    }",
+                "    return u.hostname.replace(/\\.+$/, '')",
+                "  } catch { return undefined }",
+                "}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    fixed_res = run_trust_boundary_review(fixed_repo, max_files=60)
+    fixed_rules = {f["rule_id"] for f in fixed_res["findings"]}
+    unexpected = expected_new_rules.intersection(fixed_rules)
+    assert not unexpected, f"False positives on fixed repo: {unexpected}"
+
