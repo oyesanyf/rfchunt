@@ -2392,7 +2392,7 @@ def cmd_export(args):
         rfc_num = f_dict.get("rfc_num", 9112)
         n_yml = ExploitExporter.export_nuclei_template(f_dict)
         m_conf = ExploitExporter.export_modsecurity_rule(f_dict, rule_id_start=106000 + idx * 10)
-        s_rules = ExploitExporter.export_suricata_rules(f_dict, sid_start=2060000 + idx * 10)
+        s_rules = ExploitExporter.export_suricata_signature(f_dict, sid_start=2060000 + idx * 10)
 
         with open(os.path.join(out_dir, f"exploit_rfc_{rfc_num}_{idx}.yaml"), "w", encoding="utf-8") as f_out:
             f_out.write(n_yml)
@@ -3876,6 +3876,109 @@ def cmd_poe_verify(args):
     render_table("POE==3 Verification Results", ["Finding ID", "Status", "POE", "Verified", "Evidence"], rows, plain=plain)
 
 
+def cmd_poc(args):
+    """Generates strictly non-destructive PoC verification scripts & false-positive triage bundles (`--poc`)."""
+    import json as _json
+    from engine.cli_render import render_json, render_kv_panel, render_table
+    from engine.poc_generator import generate_poc_bundle
+
+    as_json = bool(getattr(args, "as_json", False))
+    plain = bool(getattr(args, "plain", False))
+    repo_path = getattr(args, "repo", None) or getattr(args, "path", None)
+    task_id = str(getattr(args, "task_id", None) or "default").strip() or "default"
+    findings_json_path = getattr(args, "findings_json", None)
+    output_base = getattr(args, "output_dir", None) or "reports"
+    poc_dir_arg = getattr(args, "poc_dir", None)
+    if poc_dir_arg:
+        poc_req = Path(str(poc_dir_arg))
+        if poc_req.is_absolute():
+            poc_out_dir = poc_req
+        else:
+            base_resolved = Path(str(output_base)).resolve(strict=False)
+            poc_out_dir = (base_resolved / poc_req).resolve(strict=False)
+            if not poc_out_dir.is_relative_to(base_resolved):
+                raise ValueError(f"--poc-dir relative path escapes output directory: {poc_dir_arg}")
+    else:
+        poc_out_dir = Path(str(output_base)) / "pocs"
+
+    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    try:
+        findings: List[Dict[str, Any]] = []
+        if findings_json_path:
+            raw_doc = _json.loads(Path(str(findings_json_path)).read_text(encoding="utf-8"))
+            if isinstance(raw_doc, list):
+                findings = [x for x in raw_doc if isinstance(x, dict)]
+            elif isinstance(raw_doc, dict):
+                if isinstance(raw_doc.get("findings"), list):
+                    findings = [x for x in raw_doc["findings"] if isinstance(x, dict)]
+                if not repo_path and raw_doc.get("target_path"):
+                    cand_target = str(raw_doc.get("target_path"))
+                    if os.path.exists(cand_target):
+                        repo_path = cand_target
+        else:
+            if hasattr(db, "get_confirmed_findings"):
+                findings.extend([dict(x) for x in (db.get_confirmed_findings() or [])])
+            if hasattr(db, "get_mantis_findings"):
+                findings.extend([dict(x) for x in (db.get_mantis_findings(limit=200) or [])])
+            if hasattr(db, "get_attack_chains"):
+                findings.extend([dict(x) for x in (db.get_attack_chains(limit=100, task_id=getattr(args, "task_id", None)) or [])])
+
+        report = generate_poc_bundle(
+            findings,
+            output_dir=poc_out_dir,
+            repo_path=str(repo_path) if repo_path and os.path.exists(str(repo_path)) else None,
+            include_rejected_scripts=bool(getattr(args, "poc_include_rejected", False)),
+            run_container_verify=bool(getattr(args, "poc_container_verify", False)),
+            max_scripts=int(getattr(args, "poc_max", 50) or 50),
+            db=db,
+            task_id=task_id,
+        )
+        payload = report.to_dict()
+    finally:
+        db.close()
+
+    if as_json:
+        render_json(payload)
+        return
+
+    vc = payload.get("verdict_counts") or {}
+    render_kv_panel(
+        "RFCHunt --poc Non-Destructive Verification & Triage",
+        {
+            "Target": payload.get("target_path") or "N/A",
+            "Findings Analyzed": payload.get("total_findings_analyzed", 0),
+            "Disclosure-Worthy (POE=3)": payload.get("disclosure_worthy_count", 0),
+            "Verdicts": (
+                f"VERIFIED={vc.get('VERIFIED_REPRODUCIBLE', 0)}, "
+                f"CANDIDATE={vc.get('UNVERIFIED_CANDIDATE', 0)}, "
+                f"HARDENING={vc.get('HARDENING_NOTE', 0)}, "
+                f"FALSE_POS={vc.get('FALSE_POSITIVE', 0)}, "
+                f"TEST_FIXTURE={vc.get('TEST_FIXTURE', 0)}"
+            ),
+            "Generated Verifiers": payload.get("generated_script_count", 0),
+            "Index Report": payload.get("index_markdown_path", ""),
+        },
+        plain=plain,
+    )
+    rows = [
+        [
+            r.get("rule_id", ""),
+            f"{r.get('original_severity', '')}->{r.get('calibrated_severity', '')}",
+            r.get("verdict", ""),
+            r.get("poe_level", 0),
+            ", ".join(r.get("generated_files") or []) or "-",
+            str(r.get("rationale", ""))[:72],
+        ]
+        for r in (payload.get("records") or [])[:30]
+    ]
+    render_table(
+        "PoC Verification & False-Positive Triage (Top 30)",
+        ["Rule", "Severity", "Verdict", "POE", "Files", "Rationale"],
+        rows,
+        plain=plain,
+    )
+
+
 def cmd_call_graph_slice(args):
     """Whole-repo multi-language call-graph & taint slicer with tiered model escalation (AIxCC #2)."""
     from engine.call_graph_slicer import slice_repository
@@ -4247,6 +4350,42 @@ def cmd_all(args):
                     _shutil.copyfile(str(src_sarif), str(dst_sarif))
                 res.setdefault("report_files", {})["exported_sarif"] = str(dst_sarif)
 
+        if getattr(args, "enable_poc", False):
+            try:
+                from engine.poc_generator import generate_poc_bundle
+                poc_dir_arg = getattr(args, "poc_dir", None)
+                if poc_dir_arg:
+                    poc_req = Path(str(poc_dir_arg))
+                    if poc_req.is_absolute():
+                        poc_out_dir = poc_req
+                    else:
+                        out_dir_resolved = Path(str(reports_dir)).resolve(strict=False)
+                        poc_out_dir = (out_dir_resolved / poc_req).resolve(strict=False)
+                        if not poc_out_dir.is_relative_to(out_dir_resolved):
+                            raise ValueError(f"--poc-dir path escapes output directory: {poc_dir_arg}")
+                else:
+                    poc_out_dir = Path(str(reports_dir)) / "pocs"
+                poc_repo = repo or path or res.get("target_path")
+                poc_report = generate_poc_bundle(
+                    res.get("findings") or [],
+                    output_dir=poc_out_dir,
+                    repo_path=str(poc_repo) if poc_repo and os.path.exists(str(poc_repo)) else None,
+                    include_rejected_scripts=bool(getattr(args, "poc_include_rejected", False)),
+                    run_container_verify=bool(getattr(args, "poc_container_verify", False)),
+                    max_scripts=int(getattr(args, "poc_max", 50) or 50),
+                    db=db,
+                    task_id=all_task_id,
+                )
+                poc_dict = poc_report.to_dict()
+                res["poc_verification"] = poc_dict
+                res.setdefault("engines", {})["poc_verification"] = poc_dict
+                res.setdefault("report_files", {})["poc_index_md"] = poc_report.index_markdown_path
+                res.setdefault("report_files", {})["poc_manifest_json"] = poc_report.manifest_json_path
+            except ValueError:
+                raise
+            except Exception as poc_exc:
+                res.setdefault("engines", {})["poc_verification"] = {"status": "error", "error": str(poc_exc)}
+
         if hasattr(db, "add_fact"):
             try:
                 total_agg = int(res.get("total_aggregated_findings", 0) or 0)
@@ -4358,9 +4497,20 @@ def cmd_all(args):
                 f"(entries={nc.get('total_entries', nc.get('entry_count', 0))}, "
                 f"threshold={nc.get('novelty_threshold', 0.72)})"
             )
+        if "poc_verification" in eng:
+            poc_info = eng.get("poc_verification") or {}
+            vc = poc_info.get("verdict_counts") or {}
+            print(
+                f"    PoC Verifier (--poc): {poc_info.get('status', 'completed')} "
+                f"(disclosure_worthy={poc_info.get('disclosure_worthy_count', 0)}, "
+                f"fp={vc.get('FALSE_POSITIVE', 0)}, fixtures={vc.get('TEST_FIXTURE', 0)}, "
+                f"scripts={poc_info.get('generated_script_count', 0)})"
+            )
         print(f"    Combined SARIF      : {res['report_files'].get('combined_sarif')}")
         if res["report_files"].get("exported_sarif"):
             print(f"    Exported SARIF      : {res['report_files'].get('exported_sarif')}")
+        if res["report_files"].get("poc_index_md"):
+            print(f"    PoC Triage Index    : {res['report_files'].get('poc_index_md')}")
         print(f"    Combined JSON       : {res['report_files'].get('combined_json')}")
         if res["report_files"].get("combined_csv"):
             print(f"    Combined CSV        : {res['report_files'].get('combined_csv')}")
@@ -5895,6 +6045,7 @@ ALL_MODES = [
     "scanner", "proxy", "retest", "chains", "traces", "coverage", "export-advisory", "archive",
     "slice", "call-graph", "call_graph", "fuzz", "fuzz-bridge", "fuzz_bridge",
     "invariants", "sandbox-invariants", "sandbox_invariants", "poe-verify", "poe_verify",
+    "poc", "poc-verify", "poc_verify",
     "novelty", "novelty-refresh", "novelty_refresh", "swarm-board", "swarm_board", "board",
 ]
 
@@ -6333,6 +6484,11 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--strict-poe", dest="strict_poe", action="store_true", default=False, help="Require POE>=2 to mark chains VERIFIED")
     parser.add_argument("--export-advisory", dest="export_advisory", action="store_true", default=False, help="Export GHSA-ready Markdown advisories")
     parser.add_argument("--export-csv", dest="export_csv", action="store_true", default=False, help="Export formula-neutralized CSV of findings & chains")
+    parser.add_argument("--poc", dest="enable_poc", action="store_true", default=False, help="Generate non-destructive PoC verification scripts, false-positive triage, and POC_INDEX.md bundle under <output-dir>/pocs/")
+    parser.add_argument("--poc-dir", dest="poc_dir", type=str, default=None, help="Optional output directory for --poc verification bundle (defaults to <output-dir>/pocs)")
+    parser.add_argument("--poc-include-rejected", dest="poc_include_rejected", action="store_true", default=False, help="Also emit verification scripts for rejected false positives and test fixtures during --poc")
+    parser.add_argument("--poc-max", dest="poc_max", type=int, default=50, help="Maximum number of verification scripts to generate during --poc (default: 50)")
+    parser.add_argument("--poc-container-verify", dest="poc_container_verify", action="store_true", default=False, help="Run isolated Docker ContainerPOEVerifier on surviving HIGH/CRITICAL candidates during --poc")
     parser.add_argument("--enable-external-scanners", dest="enable_external_scanners", action="store_true", default=False, help="Enable external black-box scanners (httpx, katana, nuclei) — included in --all by default for live hosts; opt-in for standalone `scanner` mode")
     parser.add_argument("--no-external-scanners", dest="no_external_scanners", action="store_true", default=False, help="Disable external black-box scanners (httpx, katana, nuclei) during --all")
     parser.add_argument("--httpx-scan", dest="httpx_scan", action="store_true", default=None, help="Enable ProjectDiscovery httpx discovery (included in --all by default for live hosts)")
@@ -6867,6 +7023,14 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
 
     if active_mode in ("poe-verify", "poe_verify"):
         _dispatch_cmd("cmd_poe_verify", args)
+        return
+
+    if active_mode in ("poc", "poc-verify", "poc_verify") or (
+        bool(getattr(args, "enable_poc", False))
+        and not getattr(args, "run_all_scans", False)
+        and not explicit_mode_given
+    ):
+        _dispatch_cmd("cmd_poc", args)
         return
 
     if active_mode in ("novelty", "novelty-refresh", "novelty_refresh") or (

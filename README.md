@@ -465,6 +465,8 @@ py -3.12 -u rfc_hunt_swarm.py slice --repo . --json
 py -3.12 -u rfc_hunt_swarm.py fuzz-bridge --repo . --fuzz-dry-run --json
 py -3.12 -u rfc_hunt_swarm.py sandbox-invariants --repo . --json
 py -3.12 -u rfc_hunt_swarm.py poe-verify --repo . --json
+py -3.12 -u rfc_hunt_swarm.py poc --findings-json reports/combined_audit_summary.json --repo . --output-dir reports --plain
+py -3.12 -u rfc_hunt_swarm.py --all --repo . --poc --output-dir reports --plain
 py -3.12 -u rfc_hunt_swarm.py oracle --docker-parser-matrix --json
 py -3.12 -u rfc_hunt_swarm.py novelty --json
 py -3.12 -u rfc_hunt_swarm.py --mode dream --dream-benchmark --dream-seeds 10 --dream-budget 40 --json
