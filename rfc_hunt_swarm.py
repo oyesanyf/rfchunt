@@ -3979,6 +3979,86 @@ def cmd_poc(args):
     )
 
 
+def cmd_docker_doctor(args):
+    """Diagnoses and optionally self-heals Windows Docker Desktop / WSL2 VHDX compression & bootstrap failures."""
+    from engine.cli_render import render_json, render_kv_panel, render_table
+    from engine.docker_wsl_doctor import diagnose_docker_wsl, repair_docker_wsl
+
+    as_json = bool(getattr(args, "as_json", False))
+    plain = bool(getattr(args, "plain", False))
+    do_fix = bool(getattr(args, "fix_docker", False))
+    include_all_wsl = bool(getattr(args, "include_all_wsl", False))
+    reset_distro = bool(getattr(args, "reset_docker_distro", False))
+    approval_mode = str(getattr(args, "approval_mode", "policy") or "policy")
+
+    if do_fix:
+        rep = repair_docker_wsl(
+            include_all_wsl=include_all_wsl,
+            reset_stateless_distro=reset_distro,
+            launch_docker=True,
+            approval_mode=approval_mode,
+        )
+        payload = rep.to_dict()
+        if as_json:
+            render_json(payload)
+            return
+        after = payload.get("after") or {}
+        render_kv_panel(
+            "RFCHunt Docker Desktop / WSL2 Self-Heal Report",
+            {
+                "Repair Status": payload.get("status", "unknown"),
+                "Daemon Running": after.get("daemon_running", False),
+                "Server Version": after.get("server_version") or "N/A",
+                "Backups Preserved": len(payload.get("backups_created") or []),
+                "Errors": len(payload.get("errors") or []),
+                "Elapsed": f"{payload.get('elapsed_sec', 0.0)}s",
+            },
+            plain=plain,
+        )
+        rows = [[idx + 1, act] for idx, act in enumerate(payload.get("actions_taken") or [])]
+        for err in payload.get("errors") or []:
+            rows.append(["ERR", err])
+        render_table("Repair Actions & Outcomes", ["Step", "Detail"], rows, plain=plain)
+        return
+
+    diag = diagnose_docker_wsl(include_all_wsl=True)
+    payload = diag.to_dict()
+    if as_json:
+        render_json(payload)
+        return
+
+    render_kv_panel(
+        "RFCHunt Docker Desktop / WSL2 Doctor (Read-Only Diagnosis)",
+        {
+            "Healthy": payload.get("healthy", False),
+            "Daemon Running": payload.get("daemon_running", False),
+            "Server Version": payload.get("server_version") or "N/A",
+            "Docker Binary": payload.get("docker_binary") or "not found",
+            "Docker Desktop Exe": payload.get("docker_desktop_exe") or "not found",
+            "Compressed Dirs": len(payload.get("compressed_dirs") or []),
+            "Compressed VHDXs": len(payload.get("compressed_vhdxs") or []),
+            "Log Signals": ", ".join(payload.get("log_signals") or []) or "none",
+            "Issues": ", ".join(payload.get("issues") or []) or "none",
+        },
+        plain=plain,
+    )
+    rows = [
+        [
+            v.get("role", ""),
+            f"{v.get('size_gb', 0)} GB",
+            "COMPRESSED (UNSAFE)" if v.get("compressed") else "uncompressed (ok)",
+            v.get("path", ""),
+        ]
+        for v in (payload.get("vhdx_inventory") or [])
+    ]
+    if rows:
+        render_table("WSL2 / Docker VHDX Inventory", ["Role", "Size", "NTFS Compression", "Path"], rows, plain=plain)
+    recs = payload.get("recommended_actions") or []
+    if recs:
+        for rec in recs:
+            print(f"[*] Recommended: {rec}")
+
+
 def cmd_call_graph_slice(args):
     """Whole-repo multi-language call-graph & taint slicer with tiered model escalation (AIxCC #2)."""
     from engine.call_graph_slicer import slice_repository
@@ -6045,7 +6125,7 @@ ALL_MODES = [
     "scanner", "proxy", "retest", "chains", "traces", "coverage", "export-advisory", "archive",
     "slice", "call-graph", "call_graph", "fuzz", "fuzz-bridge", "fuzz_bridge",
     "invariants", "sandbox-invariants", "sandbox_invariants", "poe-verify", "poe_verify",
-    "poc", "poc-verify", "poc_verify",
+    "poc", "poc-verify", "poc_verify", "docker-doctor", "docker_doctor", "doctor-docker",
     "novelty", "novelty-refresh", "novelty_refresh", "swarm-board", "swarm_board", "board",
 ]
 
@@ -6489,6 +6569,9 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--poc-include-rejected", dest="poc_include_rejected", action="store_true", default=False, help="Also emit verification scripts for rejected false positives and test fixtures during --poc")
     parser.add_argument("--poc-max", dest="poc_max", type=int, default=50, help="Maximum number of verification scripts to generate during --poc (default: 50)")
     parser.add_argument("--poc-container-verify", dest="poc_container_verify", action="store_true", default=False, help="Run isolated Docker ContainerPOEVerifier on surviving HIGH/CRITICAL candidates during --poc")
+    parser.add_argument("--fix", "--fix-docker", dest="fix_docker", action="store_true", default=False, help="Run non-destructive Windows Docker Desktop / WSL2 VHDX compression & bootstrap self-heal (for `docker-doctor`)")
+    parser.add_argument("--include-all-wsl", dest="include_all_wsl", action="store_true", default=False, help="Also decompress non-Docker WSL2 distro VHDX files (e.g. Ubuntu) during `docker-doctor --fix`")
+    parser.add_argument("--reset-docker-distro", dest="reset_docker_distro", action="store_true", default=False, help="Also unregister ONLY the stateless `docker-desktop` WSL runtime distro during `docker-doctor --fix` (preserves docker_data.vhdx)")
     parser.add_argument("--enable-external-scanners", dest="enable_external_scanners", action="store_true", default=False, help="Enable external black-box scanners (httpx, katana, nuclei) — included in --all by default for live hosts; opt-in for standalone `scanner` mode")
     parser.add_argument("--no-external-scanners", dest="no_external_scanners", action="store_true", default=False, help="Disable external black-box scanners (httpx, katana, nuclei) during --all")
     parser.add_argument("--httpx-scan", dest="httpx_scan", action="store_true", default=None, help="Enable ProjectDiscovery httpx discovery (included in --all by default for live hosts)")
@@ -7031,6 +7114,10 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         and not explicit_mode_given
     ):
         _dispatch_cmd("cmd_poc", args)
+        return
+
+    if active_mode in ("docker-doctor", "docker_doctor", "doctor-docker"):
+        _dispatch_cmd("cmd_docker_doctor", args)
         return
 
     if active_mode in ("novelty", "novelty-refresh", "novelty_refresh") or (

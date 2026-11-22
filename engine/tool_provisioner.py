@@ -1591,6 +1591,7 @@ class ToolProvisioner:
         tool_ids: Optional[Sequence[str]] = None,
         include_docker: bool = True,
         include_models: bool = True,
+        auto_fix_docker: bool = True,
         force: bool = False,
         max_workers: Optional[int] = None,
     ) -> Dict[str, Any]:
@@ -1623,6 +1624,28 @@ class ToolProvisioner:
                 "tools": {k: v.to_dict() for k, v in statuses.items()},
             }
 
+        docker_wsl_health: Optional[Dict[str, Any]] = None
+        if include_docker and auto_fix_docker and sys.platform.startswith("win"):
+            try:
+                from engine.docker_wsl_doctor import diagnose_docker_wsl, repair_docker_wsl
+
+                diag = diagnose_docker_wsl(include_all_wsl=False)
+                if not diag.daemon_running and (diag.docker_desktop_exe or diag.docker_binary):
+                    self._trace(
+                        "[provisioner] Windows Docker Desktop engine unavailable; running non-destructive Docker/WSL2 self-heal..."
+                    )
+                    rep = repair_docker_wsl(
+                        include_all_wsl=False,
+                        launch_docker=True,
+                        wait_timeout_sec=45.0,
+                        allow_in_tests=self.allow_in_tests,
+                    )
+                    docker_wsl_health = rep.to_dict()
+                else:
+                    docker_wsl_health = {"status": "healthy" if diag.healthy else "at_risk", "diagnosis": diag.to_dict()}
+            except Exception as exc:
+                docker_wsl_health = {"status": "error", "error": str(exc)}
+
         results: Dict[str, ToolStatus] = {}
         # Phase 1: Ensure Python dependencies & Ollama base binary first (quick / shared foundation)
         phase1 = [tid for tid in ("python_deps", "ollama") if tid in requested]
@@ -1649,7 +1672,7 @@ class ToolProvisioner:
                     )
 
         ordered = {tid: results[tid].to_dict() for tid in requested if tid in results}
-        return {
+        summary: Dict[str, Any] = {
             "offline_or_test_skipped": False,
             "elapsed_sec": round(time.monotonic() - t0, 2),
             "total": len(ordered),
@@ -1658,6 +1681,9 @@ class ToolProvisioner:
             "bin_dir": str(self.bin_dir),
             "tools": ordered,
         }
+        if docker_wsl_health is not None:
+            summary["docker_wsl_health"] = docker_wsl_health
+        return summary
 
 
 _DEFAULT_PROVISIONER: Optional[ToolProvisioner] = None
@@ -1685,6 +1711,7 @@ def ensure_all_tools(
     tool_ids: Optional[Sequence[str]] = None,
     include_docker: bool = True,
     include_models: bool = True,
+    auto_fix_docker: bool = True,
     allow_in_tests: bool = False,
     force: bool = False,
 ) -> Dict[str, Any]:
@@ -1692,6 +1719,7 @@ def ensure_all_tools(
         tool_ids=tool_ids,
         include_docker=include_docker,
         include_models=include_models,
+        auto_fix_docker=auto_fix_docker,
         force=force,
     )
 
