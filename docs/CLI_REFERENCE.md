@@ -120,6 +120,17 @@
 | `--harness2-domain` | string | `auto` | Protocol domain for Harness² experience library (`http11_framing`, `h2_translation`, etc.) | `--harness2-domain h2_translation` |
 | `--harness2-runs-dir` | string | `runs/harness2` | Directory for persisted Harness² `c1..c8` trees, `INDEX.md`, and `EXPERIENCE.md` | `--harness2-runs-dir runs/h2` |
 | `--harness2-report` | flag | `False` | Display historical Harness² runs, $R=4k/P=3k$ ledger proofs, and learned lessons | `--harness2-report` |
+| `--deep-audit` / `deep-audit` | flag / cmd | `False` | Run 3-pillar code-repo audit: live loopback proxy fuzzing, structural trust-boundary review, and root + nested-crate coverage fuzzing | `deep-audit --repo . --proxy --poc` |
+| `--proxy` | optional str | `None` (`auto` if bare) | Live loopback-only (`127.0.0.1`/`localhost`/`::1` fail-closed) 3-trial RFC 9112 proxy fuzzer: bare `--proxy` (auto-spawn), `<port>`, `127.0.0.1:<port>`, `http://localhost:<port>`, or safe launch command | `--repo . --proxy 127.0.0.1:8080` |
+| `--live-proxy-fuzz` | flag | `False` | Enable Pillar 1 live loopback proxy RFC 9112 fuzzing explicitly (auto-enabled by `--proxy`) | `deep-audit --repo . --live-proxy-fuzz --proxy-port 8080` |
+| `--proxy-host` / `--proxy-port` | str / int | `127.0.0.1` / `None` | Explicit loopback host and running proxy port for Pillar 1 fuzzing | `--proxy-host 127.0.0.1 --proxy-port 3128` |
+| `--proxy-cmd` | string | `None` | Safe local command (`shell=False`) to spawn target proxy on ephemeral `127.0.0.1:<PORT>` | `--proxy-cmd "node dist/server.js"` |
+| `--docker-parser-matrix` | flag | `False` | Cross-check proxy probes against local Docker multi-parser matrix (nginx, envoy, haproxy, undici, go, hyper) | `deep-audit --repo . --proxy 8080 --docker-parser-matrix` |
+| `--trust-boundary-review` | flag | `False` | Enable Pillar 2 line-by-line structural trust-boundary review (14+ multi-token checks incl. TLS ClientHello cap, TRACE/TRACK echo, Win32 reparse flags, WFP inbound layers, bwrap pre-seccomp, POSIX ERE brackets, URL canonicalizer) | `deep-audit --repo . --trust-boundary-review --plain` |
+| `--trust-max-files` | int | `80` | Max top-ranked production trust-boundary files to audit line-by-line | `--trust-max-files 100` |
+| `--coverage-fuzz` | flag | `False` | Enable Pillar 3 coverage-guided fuzzing across root repo and nested crates (`vendor/*/Cargo.toml`), writing artifacts strictly outside target repo | `deep-audit --repo . --coverage-fuzz --fuzz-dry-run` |
+| `--poc` / `poc` | flag / cmd | `False` | Strictly non-destructive false-positive triage & proof-of-concept verifier generator | `--all --repo . --poc --output-dir reports` |
+| `docker-doctor` | cmd | — | Diagnose & repair Windows Docker Desktop / WSL2 NTFS-compressed VHDX startup errors (`--fix`, `--include-all-wsl`) | `docker-doctor --fix --include-all-wsl --plain` |
 
 ---
 
@@ -441,4 +452,41 @@ python main.py export-advisory --out reports/advisories --csv
 # Export / decrypt & verify AES-256-GCM encrypted task archives (.rfca) with SHA-256 checksums
 python main.py archive --export reports/task_backup.rfca
 python main.py archive --import reports/task_backup.rfca
+```
+
+### 11. Deep Code-Repo Audit (`--deep-audit`), Live Loopback Proxy Fuzzing (`--proxy`), `--poc` & `docker-doctor`
+```powershell
+# Focused built-in CLI help & examples for --proxy and deep-audit:
+python -u rfc_hunt_swarm.py --proxy --help
+python -u rfc_hunt_swarm.py deep-audit --help
+
+# 1. Bare --proxy: auto-spawn compiled Node repo proxy on ephemeral 127.0.0.1:0 (zero repo writes)
+python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy --plain
+
+# 2. Fuzz an already-running local proxy by port number (assumes 127.0.0.1)
+python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy 8080 --plain
+
+# 3. Fuzz an explicit loopback host:port (IPv4 or IPv6 — non-loopback fails closed)
+python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy 127.0.0.1:3128 --plain
+python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy [::1]:8080 --plain
+
+# 4. Fuzz an explicit loopback URL with local Docker differential parser matrix
+python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy http://localhost:8888 --docker-parser-matrix --plain
+
+# 5. Spawn a custom local proxy command on ephemeral 127.0.0.1:<PORT> (shell=False, auto-cleaned)
+python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy "node dist/server.js" --plain
+
+# Targeted line-by-line structural trust-boundary review only (default top 80 production TS/Rust/Py/Go/C files)
+python -u rfc_hunt_swarm.py deep-audit --repo D:\path\to\repo --trust-boundary-review --plain
+
+# Full 3-pillar deep audit + auto-spawn loopback proxy + non-destructive --poc triage
+python -u rfc_hunt_swarm.py deep-audit --repo D:\path\to\repo --proxy --poc --output-dir reports --plain
+
+# Combined unified --all + --deep-audit + live --proxy + --poc (also works via main.py)
+python -u rfc_hunt_swarm.py --all --repo D:\path\to\repo --deep-audit --proxy --poc --plain
+python -u main.py --repo D:\path\to\repo --proxy --plain
+
+# Windows Docker Desktop & WSL2 NTFS-compression VHDX diagnostic / self-healing repair
+python -u rfc_hunt_swarm.py docker-doctor --plain
+python -u rfc_hunt_swarm.py docker-doctor --fix --include-all-wsl --plain
 ```

@@ -483,6 +483,58 @@ py -3.12 -u rfc_hunt_swarm.py swarm-board --db terminator.db --watch --interval 
 - **MCP Server Tools**: Exposes `run_all_scans`, `mantis_scan_all`, and `mantis_scan` over stdio JSON-RPC (`python main.py mcp`).
 - **GitHub Actions CI**: Automated via `.github/workflows/mantis-all-scans.yml` (executes `--all --repo .` and uploads SARIF artifacts to GitHub Code Scanning).
 
+### Deep Code-Repo Audit (`--deep-audit`) & Live Loopback Proxy Fuzzing (`--proxy`)
+
+For local code repositories containing proxies, parsers, or OS-isolation sandboxes, **`--deep-audit`** and **`--proxy`** bridge static scanning toward real, low-noise bug discovery across three strictly CLI-only, non-destructive pillars (zero mutations to the target repository):
+
+1. **Live Loopback-Only Proxy Fuzzing (`--proxy` / `--live-proxy-fuzz`)**:
+   - Strictly enforces loopback (`127.0.0.1`, `localhost`, `::1`; fails closed with `PermissionError` on non-loopback hosts).
+   - Sends 3-trial RFC 9112 framing, request-smuggling (`CL/TE`, obfuscated `TE`, `CL/CL`, bare LF, obs-fold, duplicate `Host`, absolute-URI vs. `Host`, userinfo `@` authority, `CONNECT` host & IPv4-mapped IPv6) probes cross-checked through RFCHunt's 4-parser differential matrix (plus optional `--docker-parser-matrix`).
+   - Supports **5 `--proxy` forms**:
+     ```powershell
+     # 1. Auto-spawn compiled Node repo proxy on ephemeral 127.0.0.1:0 (bare --proxy)
+     python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy --plain
+
+     # 2. Fuzz an already-running local proxy by port number (assumes 127.0.0.1)
+     python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy 8080 --plain
+
+     # 3. Fuzz an explicit loopback host:port (IPv4 or IPv6)
+     python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy 127.0.0.1:3128 --plain
+     python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy [::1]:8080 --plain
+
+     # 4. Fuzz an explicit loopback HTTP URL
+     python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy http://localhost:8888 --plain
+
+     # 5. Spawn a custom local proxy command on ephemeral 127.0.0.1:<PORT> (shell=False; auto-terminated)
+     python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy "node dist/server.js" --plain
+
+     # Print the focused --proxy / deep-audit CLI manual & examples:
+     python -u rfc_hunt_swarm.py --proxy --help
+     ```
+2. **Line-by-Line Structural Trust-Boundary Review (`--trust-boundary-review`, default `--trust-max-files 80`)**:
+   - Ranks production TS/JS, nested Rust (`vendor/*/src`), Python, Go, and C/C++ trust-boundary files (excluding tests) and runs multi-token structural invariant detectors with comment-stripping and remediation-aware FP suppression:
+     - `TB-TLS-CLIENTHELLO-VERSION-CAP` (`HIGH`): TLS sniffers capping byte 2 at `<= 0x03` / `< 4` (RFC 8446 `0x0304..0x03ff` MITM bypass).
+     - `TB-HTTP-ECHO-METHOD-GATED` (`HIGH`): Proxy credential/header injection paths lacking unconditional `TRACE`/`TRACK` refusal.
+     - `TB-WIN-REPARSE-NO-FLAG` (`HIGH`): Win32 `CreateFileW/A` with `FILE_FLAG_BACKUP_SEMANTICS` omitting `FILE_FLAG_OPEN_REPARSE_POINT` (NTFS junction following).
+     - `TB-WIN-WFP-MISSING-INBOUND` (`HIGH`): Windows WFP outbound `ALE_AUTH_CONNECT` filters without `ALE_AUTH_LISTEN` / `ALE_AUTH_RECV_ACCEPT`.
+     - `TB-LINUX-BWRAP-PRESECCOMP-SHELL` (`HIGH`): Bubblewrap (`bwrap`) running `shell -c` pre-seccomp without `--clearenv` or unsetting `BASH_ENV`/`ZDOTDIR`.
+     - `TB-POSIX-ERE-BRACKET-ESCAPE` (`HIGH`): Glob-to-regex emitters backslash-escaping metacharacters inside POSIX ERE `[...]` bracket classes.
+     - `TB-URL-CANONICALIZE-STRIP` (`MEDIUM`): Synthetic `new URL('http://' + host).hostname` canonicalizers omitting component checks or stripping only a single trailing dot.
+3. **Root + Nested-Crate Coverage-Guided Fuzzing (`--coverage-fuzz`) & Non-Destructive `--poc` Triage**:
+   - Discovers both root parsers and nested crates (`vendor/*/Cargo.toml`), writing all generated harnesses/corpora strictly under `--output-dir/deep_audit/fuzz_bridge/`.
+   - Combine with `--poc` for source-aware false-positive triage and read-only verification scripts, or run `docker-doctor --fix --include-all-wsl` on Windows to diagnose/repair NTFS-compressed Docker/WSL2 VHDX images.
+
+```powershell
+# Full 3-pillar deep audit + auto-spawn loopback proxy + non-destructive --poc triage
+python -u rfc_hunt_swarm.py deep-audit --repo D:\path\to\repo --proxy --poc --output-dir reports --plain
+
+# Fast offline line-by-line structural trust-boundary review only
+python -u rfc_hunt_swarm.py deep-audit --repo D:\path\to\repo --trust-boundary-review --plain
+
+# Combined unified --all + --deep-audit + live --proxy + --poc
+python -u rfc_hunt_swarm.py --all --repo D:\path\to\repo --deep-audit --proxy --poc --plain
+```
+
 ---
 
 ## Research Attribution & Citations

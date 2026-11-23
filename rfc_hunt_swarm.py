@@ -6583,6 +6583,34 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
                             4-baseline matched-seed empirical Dream-RSI RL benchmark with exact Student-t 95% CIs
    swarm-board [--watch --interval 1.0] [--plain] [--json]
                             Pure-CLI Swarm Overview & live terminal status board (zero GUI, Unicode icons / --plain ASCII)
+
+13. DEEP CODE-REPO AUDIT (--deep-audit), LIVE LOOPBACK PROXY FUZZING (--proxy), --poc & DOCKER DOCTOR:
+   --proxy [SPEC]           Live loopback-only (127.0.0.1/localhost/::1 fail-closed) 3-trial RFC 9112 proxy fuzzer
+                            (5 accepted forms: bare `--proxy` auto-spawns compiled repo proxy on 127.0.0.1:0,
+                            `<port>`, `127.0.0.1:<port>` / `[::1]:<port>`, `http://localhost:<port>`, or safe launch command).
+                            Examples:
+                              python -u rfc_hunt_swarm.py --repo /path/to/repo --proxy --plain
+                              python -u rfc_hunt_swarm.py deep-audit --repo /path/to/repo --proxy 8080 --plain
+                              python -u rfc_hunt_swarm.py --repo /path/to/repo --proxy 127.0.0.1:3128 --docker-parser-matrix
+                              python -u rfc_hunt_swarm.py --repo /path/to/repo --proxy "node server.js" --plain
+                              python -u rfc_hunt_swarm.py --proxy --help   (prints focused --proxy / deep-audit guide)
+   deep-audit / --deep-audit
+                            3-pillar code-repo audit: (1) live 127.0.0.1 proxy fuzzing, (2) line-by-line structural
+                            trust-boundary review (TLS ClientHello version cap, TRACE/TRACK credential echo, Win32
+                            CreateFile reparse-point flags, WFP inbound/listen layers, Linux bwrap pre-seccomp shell,
+                            POSIX ERE bracket escaping, URL host canonicalizer stripping), and (3) root + nested-crate
+                            coverage-guided fuzzing (strictly read-only against target repo).
+                            Examples:
+                              python -u rfc_hunt_swarm.py deep-audit --repo /path/to/repo --proxy --poc --plain
+                              python -u rfc_hunt_swarm.py deep-audit --repo /path/to/repo --trust-boundary-review --plain
+                              python -u rfc_hunt_swarm.py --all --repo /path/to/repo --deep-audit --proxy --poc --plain
+   --trust-boundary-review  Run Pillar 2 line-by-line structural trust-boundary review (--trust-max-files 80 default)
+   --coverage-fuzz          Run Pillar 3 coverage-guided fuzzing across root + nested crates (vendor/*/Cargo.toml)
+   poc / --poc              Strictly non-destructive false-positive triage & proof-of-concept verification generator
+                            Example: python -u rfc_hunt_swarm.py --all --repo . --poc --output-dir reports --plain
+   docker-doctor [--fix] [--include-all-wsl]
+                            Windows Docker Desktop & WSL2 NTFS-compression VHDX diagnostic and self-healing repair
+                            Example: python -u rfc_hunt_swarm.py docker-doctor --fix --include-all-wsl --plain
 ===============================================================================
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -7021,6 +7049,98 @@ def _normalize_harness2_argv(raw_args: List[str]) -> List[str]:
     return out
 
 
+def print_deep_audit_proxy_help():
+    """Prints dedicated CLI manual & copy-paste examples for `--proxy` and `deep-audit`."""
+    help_text = r"""
+===============================================================================
+  RFCHunt: LIVE LOOPBACK PROXY FUZZING (--proxy) & DEEP REPO AUDIT (deep-audit)
+===============================================================================
+
+OVERVIEW:
+  `--proxy` and `deep-audit` bridge static scanning toward real bug discovery on
+  code repositories through three strictly CLI-only, non-destructive pillars:
+    1. Live Loopback Proxy Fuzzing (`--proxy` / `--live-proxy-fuzz`):
+       Fuzzes a local HTTP/HTTPS proxy strictly on loopback (`127.0.0.1` / `localhost`
+       / `::1` — fails closed with PermissionError on any non-loopback host) using
+       3-trial RFC 9112 framing, request-smuggling, and allowlist bypass probes
+       cross-checked through RFCHunt's 4-parser differential matrix (+ optional
+       `--docker-parser-matrix`).
+    2. Line-by-Line Structural Trust-Boundary Review (`--trust-boundary-review`):
+       Audits top-ranked production trust-boundary files (TS/JS, Rust nested crates
+       under `vendor/*/src`, Python, Go, C/C++; excludes tests) for 14+ structural
+       invariant bug classes including TLS ClientHello minor-version cap, TRACE/TRACK
+       credential echo gating, Win32 CreateFile reparse-point omission, WFP missing
+       inbound/listen layers, Linux bwrap pre-seccomp shell startup, POSIX ERE
+       bracket escaping, and URL host canonicalizer stripping.
+    3. Coverage-Guided Fuzzing (`--coverage-fuzz`):
+       Runs LLMFuzzBridge (`cargo-fuzz`, `Jazzer`, `AFL++`, `Atheris`) on the root
+       repo and nested crates (`vendor/*/Cargo.toml`), writing all harnesses strictly
+       under `--output-dir` (zero mutations to the target repository).
+
+===============================================================================
+HOW TO RUN --proxy (ALL 5 SUPPORTED FORMS):
+===============================================================================
+
+  1. Auto-spawn a compiled Node repo proxy on ephemeral 127.0.0.1:0 (bare --proxy):
+     python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy --plain
+     python -u rfc_hunt_swarm.py deep-audit --repo D:\path\to\repo --proxy --plain
+
+  2. Fuzz an already-running local proxy by port number (assumes 127.0.0.1):
+     python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy 8080 --plain
+
+  3. Fuzz an explicit loopback host:port (IPv4 or IPv6):
+     python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy 127.0.0.1:3128 --plain
+     python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy [::1]:8080 --plain
+
+  4. Fuzz an explicit loopback HTTP URL:
+     python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy http://localhost:8888 --plain
+
+  5. Spawn a custom local proxy command on ephemeral 127.0.0.1:<PORT> (shell=False):
+     python -u rfc_hunt_swarm.py --repo D:\path\to\repo --proxy "node dist/server.js" --plain
+     (RFCHunt injects HOST=127.0.0.1, PORT=<ephemeral>, PROXY_PORT=<ephemeral>
+     and deterministically terminates the process when fuzzing completes.)
+
+===============================================================================
+COMBINED DEEP-AUDIT & --all WORKFLOW EXAMPLES:
+===============================================================================
+
+  # Full 3-pillar deep audit (live proxy + structural trust-boundary + coverage fuzz + PoC triage):
+  python -u rfc_hunt_swarm.py deep-audit --repo D:\path\to\repo --proxy --poc --output-dir reports --plain
+
+  # Targeted line-by-line trust-boundary review only (fast, offline, read-only):
+  python -u rfc_hunt_swarm.py deep-audit --repo D:\path\to\repo --trust-boundary-review --plain
+
+  # Live loopback proxy fuzzing + real Docker multi-parser differential matrix:
+  python -u rfc_hunt_swarm.py deep-audit --repo D:\path\to\repo --proxy 127.0.0.1:8080 --docker-parser-matrix --plain
+
+  # Unified --all multi-scanner + deep-audit + live --proxy + --poc verification:
+  python -u rfc_hunt_swarm.py --all --repo D:\path\to\repo --deep-audit --proxy --poc --plain
+
+  # JSON output for CI / automation pipelines:
+  python -u rfc_hunt_swarm.py deep-audit --repo D:\path\to\repo --proxy --fuzz-dry-run --json
+
+===============================================================================
+RELATED FLAGS:
+===============================================================================
+  --proxy [SPEC]            Auto-spawn (`--proxy`), port (`8080`), `127.0.0.1:8080`,
+                            `http://localhost:8080`, or safe launch command (loopback-only)
+  --live-proxy-fuzz         Enable Pillar 1 explicitly (auto-enabled by `--proxy`)
+  --proxy-host HOST         Loopback host override (default: 127.0.0.1)
+  --proxy-port PORT         Explicit running loopback proxy port
+  --proxy-cmd CMD           Explicit safe command to launch proxy on 127.0.0.1:<PORT>
+  --docker-parser-matrix    Cross-check probes against local Docker parser matrix
+  --trust-boundary-review   Enable Pillar 2 line-by-line structural trust-boundary review
+  --trust-max-files N       Max ranked trust-boundary files to audit (default: 80)
+  --coverage-fuzz           Enable Pillar 3 root + nested-crate coverage fuzzing
+  --fuzz-dry-run            Generate fuzz harnesses/corpora without launching containers
+  --poc                     Run strictly non-destructive false-positive triage & PoC verifier
+  --output-dir DIR          Directory for reports/harnesses (strictly outside target repo)
+  --plain / --json          Plain ASCII table output or machine-readable JSON output
+===============================================================================
+"""
+    print(help_text)
+
+
 def parse_swarm_arguments(argv=None):
     """Parses arguments using build_swarm_parser."""
     raw_args = sys.argv[1:] if argv is None else list(argv)
@@ -7030,6 +7150,12 @@ def parse_swarm_arguments(argv=None):
             sys.exit(0)
         if "harness2" in raw_args or "--harness2" in raw_args:
             print_harness2_help()
+            sys.exit(0)
+        if any(
+            tok in raw_args or any(arg.startswith(tok + "=") for arg in raw_args)
+            for tok in ("deep-audit", "deep_audit", "--deep-audit", "--proxy", "--live-proxy-fuzz", "--trust-boundary-review")
+        ):
+            print_deep_audit_proxy_help()
             sys.exit(0)
 
     parser = build_swarm_parser()
@@ -7068,6 +7194,8 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "run_all_scans", "enable_mantis", "enable_artex", "enable_aiscan", "enable_prompt_smuggle",
             "enable_rea_only", "clean_db", "raptor_status", "raptor_findings", "raptor_setup",
             "harness2_report", "mantis_report", "aiscan_report", "install_tools", "tool_status",
+            "deep_audit", "proxy_target", "live_proxy_fuzz", "trust_boundary_review",
+            "coverage_fuzz", "enable_poc",
         )
     ) and getattr(args, "hint", None) is None and not getattr(args, "dispatch", None):
         build_swarm_parser().print_help()

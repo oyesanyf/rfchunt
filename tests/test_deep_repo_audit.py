@@ -574,3 +574,23 @@ def test_structural_trust_boundary_detectors_catch_real_bug_classes_with_zero_fp
     unexpected = expected_new_rules.intersection(fixed_rules)
     assert not unexpected, f"False positives on fixed repo: {unexpected}"
 
+
+def test_cli_help_includes_proxy_and_deep_audit_examples(capsys):
+    for argv in (["--proxy", "--help"], ["deep-audit", "--help"], ["--deep-audit", "-h"]):
+        with pytest.raises(SystemExit) as exc:
+            rfc_hunt_swarm.parse_swarm_arguments(argv)
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "HOW TO RUN --proxy" in out
+        assert "127.0.0.1:3128" in out
+        assert "http://localhost:8888" in out
+        assert "--trust-boundary-review" in out
+
+    with pytest.raises(SystemExit) as exc_main:
+        rfc_hunt_swarm.parse_swarm_arguments(["--help"])
+    assert exc_main.value.code == 0
+    main_help = capsys.readouterr().out
+    assert "13. DEEP CODE-REPO AUDIT" in main_help
+    assert "--proxy [SPEC]" in main_help
+
+
