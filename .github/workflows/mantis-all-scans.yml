@@ -74,7 +74,7 @@ jobs:
           CI: "true"
           RFCHUNT_OFFLINE: "1"
         run: |
-          pytest tests/test_bounty_pentest_upgrades.py tests/test_artex_attack_chaining.py tests/test_live_chaining_and_executors.py tests/test_local_mitm_and_sessions.py tests/test_approval_encryption_and_exports.py tests/test_dual_graph_engine.py tests/test_e2e_unified_scans.py tests/test_mantis_integrator.py tests/test_abliteration_fusion.py tests/test_remote_host_and_subcommands.py tests/test_llm_governance_and_schema.py tests/test_ssrf_adversarial_challenge.py tests/test_target_auth.py tests/test_deep_repo_audit.py tests/test_poc_generator.py -v --basetemp=/tmp/pytest_rfchunt
+          pytest tests/test_verification_inversion_hunter.py tests/test_bounty_pentest_upgrades.py tests/test_artex_attack_chaining.py tests/test_live_chaining_and_executors.py tests/test_local_mitm_and_sessions.py tests/test_approval_encryption_and_exports.py tests/test_dual_graph_engine.py tests/test_e2e_unified_scans.py tests/test_mantis_integrator.py tests/test_abliteration_fusion.py tests/test_remote_host_and_subcommands.py tests/test_llm_governance_and_schema.py tests/test_ssrf_adversarial_challenge.py tests/test_target_auth.py tests/test_deep_repo_audit.py tests/test_poc_generator.py -v --basetemp=/tmp/pytest_rfchunt
 
       - name: Upload Security Reports Artifact
         if: always()

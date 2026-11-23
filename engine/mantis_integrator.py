@@ -3569,6 +3569,7 @@ def run_unified_all_scans(
     max_rps: float = 0.0,
     rate_limiter: Optional[Any] = None,
     enable_h2_desync: bool = True,
+    enable_verification_inversion: bool = True,
 ) -> Dict[str, Any]:
     """
     Execute ALL integrated RFCHunt security scanners against `--repo`, `--path`, or remote `--host` in one pass,
@@ -3902,6 +3903,20 @@ def run_unified_all_scans(
         "total_findings": 0,
         "findings": [],
     }
+    verification_inversion_res: Dict[str, Any] = {
+        "status": "disabled" if not enable_verification_inversion else "pending",
+        "findings_count": 0,
+        "findings": [],
+    }
+
+    def _run_verification_inversion_task(scan_root: str) -> Dict[str, Any]:
+        if not enable_verification_inversion:
+            return {"status": "disabled", "findings_count": 0, "findings": []}
+        try:
+            from engine.verification_inversion_hunter import run_verification_inversion_audit
+            return run_verification_inversion_audit(scan_root)
+        except Exception as exc:
+            return {"status": "error", "findings_count": 0, "findings": [], "error": str(exc)}
 
     def _run_aiscan_task(scan_root: str) -> Dict[str, Any]:
         try:
@@ -4222,7 +4237,7 @@ def run_unified_all_scans(
             }
 
     remote_probe_corpus: List[Dict[str, Any]] = _build_remote_probes() if has_remote else []
-    fut_mantis = fut_aiscan = fut_raptor_local = fut_rea = None
+    fut_mantis = fut_aiscan = fut_raptor_local = fut_rea = fut_verif_inv = None
     fut_raptor_remote = fut_prober = fut_ruler = fut_harness = fut_oracle = fut_h2_desync = None
     rea_local_root = str(rea_target) if rea_target else (local_target_path if has_local else None)
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -4230,6 +4245,8 @@ def run_unified_all_scans(
             fut_mantis = pool.submit(mantis_engine.run_scan, local_target_path, effective_depth, mantis_mode)
             fut_aiscan = pool.submit(_run_aiscan_task, local_target_path)
             fut_raptor_local = pool.submit(_run_raptor_local_task, local_target_path, candidate_files)
+            if enable_verification_inversion:
+                fut_verif_inv = pool.submit(_run_verification_inversion_task, local_target_path)
         if enable_rea and rea_local_root:
             fut_rea = pool.submit(_run_rea_local_task, rea_local_root)
         if has_remote and clean_host:
@@ -4248,6 +4265,8 @@ def run_unified_all_scans(
             aiscan_res = fut_aiscan.result()
         if fut_raptor_local is not None:
             raptor_res = fut_raptor_local.result()
+        if fut_verif_inv is not None:
+            verification_inversion_res = fut_verif_inv.result()
         if fut_rea is not None:
             rea_res = fut_rea.result()
         if fut_raptor_remote is not None:
@@ -5143,6 +5162,26 @@ def run_unified_all_scans(
                 "traffic_id": bdf.get("traffic_id"),
             })
 
+    for vif in (verification_inversion_res.get("findings") if isinstance(verification_inversion_res, dict) else []) or []:
+        if isinstance(vif, dict):
+            raw_aggregated_findings.append({
+                "rule_id": vif.get("rule_id", "INV-VERIF-001"),
+                "title": vif.get("title", "Static Verification-Inversion Finding"),
+                "severity": str(vif.get("severity", "HIGH")).upper(),
+                "cwe": vif.get("cwe", "CWE-20"),
+                "file_path": vif.get("file_path") or target_path,
+                "line_number": int(vif.get("line_number", 1) or 1),
+                "description": vif.get("description", ""),
+                "remediation": vif.get("remediation", ""),
+                "scanner": vif.get("scanner", "VerificationInversionHunter"),
+                "primitive": vif.get("primitive", ""),
+                "call_chain": list(vif.get("call_chain") or []),
+                "missing_predicates": list(vif.get("missing_predicates") or []),
+                "poe_level": 1,
+                "verification_status": "LEAD_PASSIVE_CORRELATION",
+                "finding_tier": "MANUAL_REVIEW_LEAD",
+            })
+
     for nf in (ext_nuclei_res.get("findings") or []):
         if isinstance(nf, dict):
             raw_aggregated_findings.append({
@@ -5451,6 +5490,7 @@ def run_unified_all_scans(
             "external_nuclei": ext_nuclei_res,
             "live_h2_desync": h2_desync_res,
             "two_account_authz": two_account_authz_res,
+            "verification_inversion": verification_inversion_res,
         },
         "findings": aggregated_findings,
         "chains": artex_res.get("chains") or [],

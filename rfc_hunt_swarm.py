@@ -4623,6 +4623,7 @@ def cmd_all(args):
             "user_agent": getattr(args, "user_agent", None),
             "max_rps": float(getattr(args, "max_rps", 0.0) or 0.0),
             "enable_h2_desync": bool(getattr(args, "enable_h2_desync", True)),
+            "enable_verification_inversion": bool(getattr(args, "enable_verification_inversion", True)),
         }
         try:
             _unified_sig = inspect.signature(run_unified_all_scans)
@@ -7017,7 +7018,9 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--hint-rfc", dest="hint_rfc", type=str, default="", help="Optional RFC identifier for --hint")
     parser.add_argument("--dispatch", "--dispatch-config", dest="dispatch", type=str, default=None, help="Path to unified swarm_dispatch.yaml configuration")
 
-    # AIxCC Upgrade #2: Whole-Repo Call-Graph & Taint Slicer + Tiered Model Escalation
+    # AIxCC Upgrade #2: Whole-Repo Call-Graph & Taint Slicer + Tiered Model Escalation + Static Verification-Inversion Auditor
+    parser.add_argument("--verification-inversion", dest="enable_verification_inversion", action="store_true", default=True, help="Enable 5-pass Static Verification-Inversion Auditor (DEV-* loop/panic slicer, Rule-5 trust-closure, Comparator contract diff, Refinement gap, Release/FFI elision; default-ON in --all and --deep-audit)")
+    parser.add_argument("--no-verification-inversion", dest="enable_verification_inversion", action="store_false", help="Disable 5-pass Static Verification-Inversion Auditor during --all")
     parser.add_argument("--no-call-graph-slice", dest="no_call_graph_slice", action="store_true", default=False, help="Disable whole-repo call-graph & taint slicing during --all")
     parser.add_argument("--slice-max-depth", dest="slice_max_depth", type=int, default=8, help="Maximum call-graph traversal depth for taint slicing (default: 8)")
     parser.add_argument("--slice-max-slices", dest="slice_max_slices", type=int, default=200, help="Maximum taint slices to extract (default: 200)")

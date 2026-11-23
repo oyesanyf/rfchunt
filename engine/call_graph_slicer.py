@@ -453,6 +453,19 @@ class CodeQLReport:
 
 
 @dataclass
+class CallGraphContext:
+    """In-memory parsed AST + forward/reverse call-graph context for downstream static passes."""
+
+    repo_root: Path
+    parsed_files: Dict[str, _ParsedFile]
+    symbols_by_id: Dict[str, SymbolNode]
+    adj: Dict[str, List[CallEdge]]
+    rev_adj: Dict[str, List[CallEdge]]
+    edges: List[CallEdge]
+    report: "CallGraphReport"
+
+
+@dataclass
 class CallGraphReport:
     repo_root: str
     files_scanned: int
@@ -2905,6 +2918,10 @@ class CallGraphSlicer:
             slices = slices[: self.max_slices]
 
         elapsed = time.perf_counter() - t0
+        self._last_parsed_files = parsed_files
+        self._last_symbols_by_id = symbols_by_id
+        self._last_adj = adj
+        self._last_edges = edges
         return CallGraphReport(
             repo_root=str(root),
             files_scanned=len(parsed_files),
@@ -2917,6 +2934,31 @@ class CallGraphSlicer:
             cross_file_slices_count=sum(1 for s in slices if s.is_cross_file),
             codeql=cql_report,
             elapsed_sec=elapsed,
+        )
+
+    def build_graph_context(self, repo_path: Union[str, Path]) -> CallGraphContext:
+        """
+        Builds and returns the full `CallGraphContext` (parsed files, symbol table,
+        forward adjacency `adj`, reverse adjacency `rev_adj`, and `CallGraphReport`)
+        in a single pass so static verification-inversion passes can reuse it.
+        """
+        report = self.analyze_repo(repo_path)
+        parsed_files = getattr(self, "_last_parsed_files", {})
+        symbols_by_id = getattr(self, "_last_symbols_by_id", {})
+        adj = getattr(self, "_last_adj", {})
+        edges = getattr(self, "_last_edges", [])
+        rev_adj: Dict[str, List[CallEdge]] = {}
+        for elist in adj.values():
+            for e in elist:
+                rev_adj.setdefault(e.callee_id, []).append(e)
+        return CallGraphContext(
+            repo_root=Path(report.repo_root),
+            parsed_files=parsed_files,
+            symbols_by_id=symbols_by_id,
+            adj=adj,
+            rev_adj=rev_adj,
+            edges=edges,
+            report=report,
         )
 
 
