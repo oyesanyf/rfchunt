@@ -1163,6 +1163,7 @@ class TerminatorMCPServer:
                             "default": "both",
                         },
                         "research_num": {"type": "integer", "default": 5},
+                        "skills_num": {"type": "integer", "default": 5},
                         "days": {"type": "integer", "default": 30},
                         "emit_skill_md": {"type": "boolean", "default": True},
                     },
@@ -1182,6 +1183,7 @@ class TerminatorMCPServer:
                         "sync_online": {"type": "boolean", "default": False},
                         "topic": {"type": "string", "default": ""},
                         "research_num": {"type": "integer", "default": 5},
+                        "skills_num": {"type": "integer", "default": 5},
                     },
                 },
             },
@@ -2657,13 +2659,16 @@ class TerminatorMCPServer:
             research_num = int(
                 self._parse_strict_int(args, "research_num", 5, min_val=1, max_val=25) or 5
             )
+            skills_num_arg = self._parse_strict_int(args, "skills_num", None, min_val=1, max_val=25)
+            eff_sk_num = int(skills_num_arg) if skills_num_arg is not None else research_num
             days = int(self._parse_strict_int(args, "days", 30, min_val=1, max_val=365) or 30)
             emit_skill_md = bool(self._parse_strict_bool(args, "emit_skill_md", True))
-            engine = Last30DaysSecuritySkillsEngine(research_num=research_num)
+            engine = Last30DaysSecuritySkillsEngine(research_num=eff_sk_num, skills_num=eff_sk_num)
             return engine.discover_and_build_security_skills(
                 topic=topic,
                 domain=domain,
-                research_num=research_num,
+                research_num=eff_sk_num,
+                skills_num=eff_sk_num,
                 days=days,
                 emit_skill_md=emit_skill_md,
             )
@@ -2679,13 +2684,16 @@ class TerminatorMCPServer:
             research_num = int(
                 self._parse_strict_int(args, "research_num", 5, min_val=1, max_val=25) or 5
             )
-            engine = Last30DaysSecuritySkillsEngine(research_num=research_num)
+            skills_num_arg = self._parse_strict_int(args, "skills_num", None, min_val=1, max_val=25)
+            eff_sk_num = int(skills_num_arg) if skills_num_arg is not None else research_num
+            engine = Last30DaysSecuritySkillsEngine(research_num=eff_sk_num, skills_num=eff_sk_num)
             return engine.scan_repository(
                 repo_path=repo_path,
                 domain=domain,
                 sync_online=sync_online,
                 topic=topic,
-                research_num=research_num,
+                research_num=eff_sk_num,
+                skills_num=eff_sk_num,
             )
 
         elif name == "audit_agent_skill_package":

@@ -705,6 +705,7 @@ class ArxivSecurityBridge:
                             mode="hybrid",
                             generations=2,
                             num_islands=2,
+                            elites_dir=str(target_dir / "elites"),
                         )
                         final_code = evo_report["champion_candidate"]["source_code"]
                         champ_metrics = evo_report["champion_metrics"]

@@ -28,6 +28,9 @@ keys/
 # Dynamically Provisioned Local Tool Binaries & Cloned Runtimes
 bin/
 tools/
+generated/
+engine/research_detectors/
+engine/security_skills_catalog/
 
 # Environment & Virtual Environments
 .env

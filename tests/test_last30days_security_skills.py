@@ -156,3 +156,98 @@ def test_last30days_mcp_agent_tools(tmp_path: Path) -> None:
         txt = list_resp["result"]["content"][0]["text"]
         assert '"zero_api_key_invariant_enforced": true' in txt
         assert '"total_skills": 10' in txt
+
+
+def test_six_lane_harvesting_clustering_code_synthesis_skills_num_and_unified_all(tmp_path: Path) -> None:
+    from engine.mantis_integrator import run_unified_all_scans
+    from rfc_hunt_swarm import parse_swarm_arguments
+
+    # 1. Verify --skills-num / --skill-num CLI flags
+    args_sk = parse_swarm_arguments(["--all", "--skills-num", "6", "--reseach-num", "4"])
+    assert args_sk.skills_num == 6
+    assert args_sk.research_num == 4
+
+    args_inherit = parse_swarm_arguments(["--all", "--reseach-num", "3"])
+    assert args_inherit.research_num == 3
+    assert args_inherit.skills_num == 3
+
+    # 2. Verify multi-lane harvesting, cross-platform clustering, SKILL.md + Python detector synthesis, and live execution
+    corpus_dir = tmp_path / "local_corpus"
+    corpus_dir.mkdir()
+    (corpus_dir / "custom_mcp_skill.md").write_text(
+        "# Custom MCP Token Leak Detector\nDetects `unsafe_mcp_token_passthrough(` in agent code (CWE-522).\n",
+        encoding="utf-8",
+    )
+
+    custom_sightings = [
+        {
+            "title": "Custom MCP Token Leak Detector",
+            "summary": "Detects `unsafe_mcp_token_passthrough(` across multi-agent bridges (CWE-522).",
+            "source_lane": "reddit_keyless_json",
+            "source_url": "https://www.reddit.com/r/netsec/comments/mcp_leak",
+            "engagement_score": 91.0,
+            "requires_api_key": False,
+        },
+        {
+            "title": "Custom MCP Token Leak Detector",
+            "summary": "Corroborated on Hacker News: `unsafe_mcp_token_passthrough(` in MCP server.",
+            "source_lane": "hackernews_algolia_keyless",
+            "source_url": "https://news.ycombinator.com/item?id=999999",
+            "engagement_score": 89.0,
+            "requires_api_key": False,
+        },
+    ]
+
+    eng = Last30DaysSecuritySkillsEngine(skills_dir=tmp_path / "harvested_catalog", skills_num=3)
+    disc = eng.discover_and_build_security_skills(
+        topic="MCP token leak",
+        domain="AI_SECURITY",
+        skills_num=3,
+        emit_skill_md=True,
+        corpus_dirs=[corpus_dir],
+        custom_sightings=custom_sightings,
+    )
+    assert disc["skills_num_per_domain"] == 3
+    assert disc["live_keyless_sightings_count"] >= 1
+    top_cluster = disc["harvested_clusters"][0]
+    # Corroborated across reddit_keyless_json, hackernews_algolia_keyless, and local_corpus_skillmd!
+    assert len(top_cluster["corroborating_lanes"]) >= 2
+    assert "unsafe_mcp_token_passthrough(" in top_cluster["custom_indicators"]
+
+    # Check that both SKILL.md and detector_<slug>.py (# EVOLVE-BLOCK) were generated
+    for sk in disc["skills"]:
+        assert Path(sk["skill_md_path"]).exists()
+        py_path = Path(sk["synthesized_python_path"])
+        assert py_path.exists()
+        assert "# EVOLVE-BLOCK-START" in py_path.read_text(encoding="utf-8")
+
+    # Verify the newly harvested skill actively detects `unsafe_mcp_token_passthrough(` in target repo
+    target_repo = tmp_path / "target_app"
+    target_repo.mkdir()
+    (target_repo / "app.py").write_text(
+        """
+def forward_auth(tok):
+    return unsafe_mcp_token_passthrough(tok)
+""",
+        encoding="utf-8",
+    )
+    scan_res = eng.scan_repository(target_repo, domain="AI_SECURITY", skills_num=3)
+    assert scan_res["total_findings"] >= 1
+    assert any("HARVEST" in r for r in scan_res["findings_by_rule"])
+
+    # 3. Verify unified --all executes ArXiv bridge, Last30Days skills, VerificationInversion (6 passes), Mantis, aiscan, RAPTOR, REA
+    all_res = run_unified_all_scans(
+        repo=str(target_repo),
+        reports_dir=str(tmp_path / "all_reports"),
+        research_num=2,
+        skills_num=2,
+        quiet=True,
+    )
+    engines = all_res["engines"]
+    assert "arxiv_research_detectors" in engines
+    assert "last30days_security_skills" in engines
+    assert "verification_inversion" in engines
+    assert engines["arxiv_research_detectors"]["status"] == "completed"
+    assert engines["last30days_security_skills"]["status"] == "completed"
+    assert engines["last30days_security_skills"]["zero_api_key_invariant_enforced"] is True
+
