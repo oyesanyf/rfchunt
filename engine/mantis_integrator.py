@@ -1502,8 +1502,15 @@ class MantisHypothesisGenerator:
         pass_idx: int,
     ) -> List[MantisHypothesis]:
         found: List[MantisHypothesis] = []
+        static_str_consts: Set[str] = set()
+        _const_str_re = re.compile(r"\b(?:const|final|static)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*['\"][^'\"]+['\"]")
+        for line in lines:
+            m_c = _const_str_re.search(line)
+            if m_c:
+                static_str_consts.add(m_c.group(1))
+
         patterns: List[Tuple[str, str, re.Pattern[str], str]] = [
-            ("MANTIS-CMD-001", "HIGH", re.compile(r"\b(child_process\.exec|execSync)\s*\([^\"')]"), "child_process.exec"),
+            ("MANTIS-CMD-001", "HIGH", re.compile(r"\b(child_process\.exec|execSync)\s*\(\s*([^\"')\s,]+)"), "child_process.exec"),
             ("MANTIS-EVAL-002", "HIGH", re.compile(r"\beval\s*\([^\"')]"), "eval"),
             ("MANTIS-CRYPTO-008", "LOW", re.compile(r"createHash\s*\(\s*['\"](md5|sha1)['\"]\s*\)"), "createHash(weak)"),
         ]
@@ -1512,7 +1519,14 @@ class MantisHypothesisGenerator:
             if stripped.startswith(("//", "#", "/*", "*")):
                 continue
             for rule_id, tier, rx, sink in patterns:
-                if tier in allowed_tiers and rx.search(line):
+                if tier not in allowed_tiers:
+                    continue
+                m_rx = rx.search(line)
+                if m_rx:
+                    if rule_id == "MANTIS-CMD-001" and m_rx.lastindex and m_rx.lastindex >= 2:
+                        first_arg = m_rx.group(2).strip()
+                        if first_arg in static_str_consts:
+                            continue
                     found.append(
                         self._make_hypothesis(
                             rule_id, file_path, lineno, "<script>", sink,
@@ -3385,7 +3399,8 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
                     })
 
         # 4. Weak Cryptography & Quantum Vulnerability
-        if ext in (".py", ".go", ".rs", ".js", ".ts", ".c", ".cpp", ".java"):
+        is_ts_js_unit_test = norm_fp.endswith((".test.ts", ".spec.ts", ".test.js", ".spec.js"))
+        if ext in (".py", ".go", ".rs", ".js", ".ts", ".c", ".cpp", ".java") and not is_ts_js_unit_test:
             for lineno, line in enumerate(lines, start=1):
                 low_line = line.lower()
                 if (
@@ -3426,8 +3441,8 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
                         "remediation": "Use AES-GCM, ChaCha20-Poly1305, or authenticated AEAD cipher mode.",
                     })
 
-        # 5. Hardcoded Secrets
-        for lineno, line in enumerate(lines, start=1):
+        # 5. Hardcoded Secrets (exclude .test.ts / .spec.ts unit test fixtures)
+        for lineno, line in enumerate(lines if not is_ts_js_unit_test else (), start=1):
             sline = line.strip()
             if sline.startswith("#") or sline.startswith("//"):
                 continue
@@ -3482,13 +3497,21 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
 
         # 7. Coccinelle-Style Semantic Resource Lifecycle Check (RAPTOR-COCCI-HANDLE-LEAK)
         if ext in (".rs", ".c", ".cpp", ".cc", ".py") and "mantis_integrator.py" not in norm_fp:
+            _next_fn_re = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?(?:fn|def)\s+[A-Za-z_]")
             for m_acq in _cocci_acquire_re.finditer(text):
                 acq_name = m_acq.group("acq")
                 rel_name = _cocci_release_map[acq_name]
                 lineno = text.count("\n", 0, m_acq.start()) + 1
-                window = "\n".join(lines[max(0, lineno - 1) : min(len(lines), lineno + 35)])
+                fn_lines: List[str] = [lines[lineno - 1]] if 1 <= lineno <= len(lines) else []
+                for nxt_line in lines[lineno : min(len(lines), lineno + 35)]:
+                    if _next_fn_re.match(nxt_line):
+                        break
+                    fn_lines.append(nxt_line)
+                    if nxt_line.strip() == "}":
+                        break
+                window = "\n".join(fn_lines)
                 has_early_return = bool(re.search(r"\breturn\s+(?:Err\b|FALSE\b|false\b|None\b|-1\b|NULL\b)", window))
-                if has_early_return and rel_name not in window:
+                if has_early_return and rel_name not in window and "OwnedHandle" not in window:
                     cocci_findings.append({
                         "rule_id": "RAPTOR-COCCI-HANDLE-LEAK",
                         "title": f"Acquired OS handle/SID via {acq_name} without paired {rel_name} on early-return error path",

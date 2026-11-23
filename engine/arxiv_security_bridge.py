@@ -857,6 +857,31 @@ class ArxivSecurityBridge:
                 return m.group(1)
         return "<module>"
 
+    @staticmethod
+    def _strip_comments_preserve_lines(content: str, ext: str) -> str:
+        """Replaces C/Rust/TS/JS/Go block and line comments with spaces while preserving line numbers."""
+        if ext not in (".c", ".cc", ".cpp", ".h", ".hpp", ".rs", ".ts", ".tsx", ".js", ".jsx", ".go", ".java"):
+            return content
+        # Strip /* ... */ preserving newlines
+        text = re.sub(
+            r"/\*[\s\S]*?\*/",
+            lambda m: "".join("\n" if ch == "\n" else " " for ch in m.group(0)),
+            content,
+        )
+        # Strip // ... line comments (excluding http:// or https://)
+        out_lines: List[str] = []
+        for line in text.splitlines():
+            s = line.lstrip()
+            if s.startswith("//"):
+                out_lines.append("")
+            else:
+                idx = line.find(" //")
+                if idx != -1 and "://" not in line[max(0, idx - 6) : idx + 3]:
+                    out_lines.append(line[:idx])
+                else:
+                    out_lines.append(line)
+        return "\n".join(out_lines)
+
     def _scan_single_file(
         self,
         fpath: Path,
@@ -864,7 +889,7 @@ class ArxivSecurityBridge:
         enabled_domains: Sequence[str],
     ) -> List[ResearchSecurityFinding]:
         try:
-            content = fpath.read_text(encoding="utf-8", errors="replace")
+            raw_content = fpath.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return []
 
@@ -873,8 +898,11 @@ class ArxivSecurityBridge:
         except ValueError:
             rel_path = fpath.name
 
+        ext = fpath.suffix.lower()
+        content = self._strip_comments_preserve_lines(raw_content, ext)
         findings: List[ResearchSecurityFinding] = []
         lines = content.splitlines()
+        raw_lines = raw_content.splitlines()
         run_ai = "AI_SECURITY" in enabled_domains
         run_app = "APP_CODE_SECURITY" in enabled_domains
 
@@ -899,7 +927,7 @@ class ArxivSecurityBridge:
                     title=title,
                     file=rel_path,
                     line=line_no,
-                    function_name=self._enclosing_function(content, line_no),
+                    function_name=self._enclosing_function(raw_content, line_no),
                     evidence_snippet=snippet.strip()[:240],
                     mathematical_invariant_violated=spec.mathematical_formulation,
                     remediation=remediation,
@@ -924,12 +952,21 @@ class ArxivSecurityBridge:
             for m in _AI02_SANDBOX_ESCAPE_RE.finditer(content):
                 lno = self._line_number_at(content, m.start())
                 line_txt = lines[lno - 1] if 1 <= lno <= len(lines) else m.group(0)
-                if "re.compile" not in line_txt and "ARXIV-AI-02" not in line_txt:
+                ctx_win = "\n".join(lines[max(0, lno - 4) : min(len(lines), lno + 2)])
+                is_diagnostic_msg = any(
+                    diag in ctx_win
+                    for diag in ("die(", "throw ", "logForDebugging(", "eprintln!(", "MISSING_MESSAGE", "console.warn")
+                )
+                if (
+                    "re.compile" not in line_txt
+                    and "ARXIV-AI-02" not in line_txt
+                    and not is_diagnostic_msg
+                ):
                     emit(
                         "ARXIV-AI-02-SANDBOX-ESCAPE-BENCH",
                         f"Container/agent sandbox breakout vector exposed ({m.group(0)})",
                         lno,
-                        line_txt,
+                        raw_lines[lno - 1] if 1 <= lno <= len(raw_lines) else line_txt,
                         "Remove docker.sock mounts, --privileged, CAP_SYS_ADMIN, hostPID/hostNetwork, and unconfined seccomp profiles (arXiv:2603.02277).",
                     )
             for m in _AI02_UNISOLATED_FALLBACK_RE.finditer(content):
@@ -1056,13 +1093,28 @@ class ArxivSecurityBridge:
             # 9. ARXIV-APPSEC-04: LLMSan Unchecked Arithmetic / Narrowing Allocation
             for m in _APP04_UNCHECKED_ALLOC_RE.finditer(content):
                 lno = self._line_number_at(content, m.start())
-                window = "\n".join(lines[max(0, lno - 5) : min(len(lines), lno + 2)])
-                if "checked_mul" not in window and "min(" not in window and ".clamp(" not in window:
+                window = "\n".join(lines[max(0, lno - 18) : min(len(lines), lno + 2)])
+                matched_expr = m.group(0)
+                # Skip purely compile-time constant arithmetic such as `malloc(OBS_PATH_MAX * 2)` or `4 + json.len()` after `serde_json::to_vec`
+                inner_idents = [
+                    tok
+                    for tok in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", matched_expr)
+                    if tok not in ("Vec", "with_capacity", "malloc", "calloc", "realloc", "usize", "u16", "u32", "size_t")
+                ]
+                is_const_only = bool(inner_idents) and all(tok.isupper() for tok in inner_idents)
+                has_prior_bound_or_serial = (
+                    "checked_mul" in window
+                    or "min(" in window
+                    or ".clamp(" in window
+                    or "serde_json::to_vec" in window
+                    or bool(re.search(r"if\s+[A-Za-z0-9_]+\s*>\s*[0-9A-Za-z_* ]+", window))
+                )
+                if not is_const_only and not has_prior_bound_or_serial:
                     emit(
                         "ARXIV-APPSEC-04-LLMSAN-DATAFLOW",
                         "Unchecked arithmetic or narrowing cast flows directly into buffer allocation capacity",
                         lno,
-                        m.group(0),
+                        matched_expr,
                         "Use checked_mul/checked_add and enforce a strict MAX_CAPACITY upper bound before allocation (arXiv:2409.11894).",
                     )
 
