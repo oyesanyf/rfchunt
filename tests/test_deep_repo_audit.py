@@ -143,7 +143,8 @@ def _start_loopback_http_stub(response_bytes: bytes) -> tuple[int, threading.Eve
 
 
 def test_deep_repo_audit_has_zero_gui_imports_and_no_shell_true():
-    src = Path(r"d:\harfile\rfchunt\engine\deep_repo_audit.py").read_text(encoding="utf-8")
+    repo_root = Path(__file__).resolve().parent.parent
+    src = (repo_root / "engine" / "deep_repo_audit.py").read_text(encoding="utf-8")
     tree = ast.parse(src)
     forbidden = {"tkinter", "PyQt5", "PyQt6", "PySide6", "wx", "webbrowser"}
     for node in ast.walk(tree):
@@ -601,8 +602,9 @@ def test_reusable_ci_audit_runner_emits_valid_sarif_and_respects_gates(tmp_path,
     out_dir = tmp_path / "ci_reports"
     summary_file = tmp_path / "step_summary.md"
 
+    rfchunt_root = Path(__file__).resolve().parent.parent
     argv_auto = ci_mod.build_rfchunt_cli_argv(
-        Path(r"d:\harfile\rfchunt"),
+        rfchunt_root,
         repo,
         out_dir,
         tmp_path / "ci.db",
@@ -614,7 +616,7 @@ def test_reusable_ci_audit_runner_emits_valid_sarif_and_respects_gates(tmp_path,
     assert "--proxy" in argv_auto
     assert "--poc" in argv_auto
 
-    monkeypatch.setenv("RFCHUNT_ROOT", r"d:\harfile\rfchunt")
+    monkeypatch.setenv("RFCHUNT_ROOT", str(rfchunt_root))
     monkeypatch.setenv("TARGET_REPO", str(repo))
     monkeypatch.setenv("REPORT_DIR", str(out_dir))
     monkeypatch.setenv("RFCHUNT_MODE", "trust-boundary")

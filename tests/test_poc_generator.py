@@ -105,7 +105,8 @@ def _write_sample_repo(root: Path) -> Path:
 
 
 def test_poc_module_has_zero_gui_imports():
-    src = Path(r"d:\harfile\rfchunt\engine\poc_generator.py").read_text(encoding="utf-8")
+    repo_root = Path(__file__).resolve().parent.parent
+    src = (repo_root / "engine" / "poc_generator.py").read_text(encoding="utf-8")
     tree = ast.parse(src)
     forbidden = {"tkinter", "PyQt5", "PyQt6", "PySide6", "wx", "webbrowser", "http.server"}
     for node in ast.walk(tree):
