@@ -41,7 +41,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from engine.call_graph_slicer import slice_repository
+from engine.call_graph_slicer import CallGraphSlicer, slice_repository
+from engine.verification_inversion_hunter import run_verification_inversion_audit
 from engine.differential_oracle import (
     DEFAULT_DIFFERENTIAL_PROBES,
     MultiImplementationDifferentialOracle,
@@ -900,29 +901,66 @@ def run_trust_boundary_review(
     sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
     all_findings.sort(key=lambda f: (sev_rank.get(f.severity, 9), f.file_path.lower(), f.line_number))
 
-    # Pair with whole-repo CallGraphSlicer for multi-file source->sink visibility
+    # Pair with whole-repo CallGraphSlicer and 5-pass Static Verification-Inversion Auditor
     slicer_summary: Dict[str, Any] = {}
+    vi_summary: Dict[str, Any] = {"status": "disabled", "findings_count": 0}
+    vi_findings: List[Dict[str, Any]] = []
     try:
-        cg_report = slice_repository(root, max_slices=20)
+        cg_slicer = CallGraphSlicer(max_depth=6, max_slices=20)
+        cg_context = cg_slicer.build_graph_context(root)
+        cg_report = cg_context.report
         cg_dict = cg_report.to_dict() if hasattr(cg_report, "to_dict") else dict(cg_report)
         slicer_summary = {
             "status": cg_dict.get("status", "completed"),
             "total_slices": cg_dict.get("total_slices", 0),
             "cross_file_slices_count": cg_dict.get("cross_file_slices_count", 0),
         }
+        vi_res = run_verification_inversion_audit(root, cg_context=cg_context)
+        vi_findings = list(vi_res.get("findings") or [])
+        vi_summary = {
+            "status": vi_res.get("status", "completed"),
+            "files_scanned": vi_res.get("files_scanned", 0),
+            "symbols_analyzed": vi_res.get("symbols_analyzed", 0),
+            "security_gates_audited": vi_res.get("security_gates_audited", 0),
+            "findings_count": vi_res.get("findings_count", len(vi_findings)),
+            "pass_counts": vi_res.get("pass_counts", {}),
+        }
     except Exception as exc:
         slicer_summary = {"status": "error", "error": str(exc)}
+        vi_summary = {"status": "error", "error": str(exc), "findings_count": 0}
+
+    serialized_findings: List[Dict[str, Any]] = [f.to_dict() for f in all_findings]
+    seen_tb_keys = {
+        (str(d.get("rule_id")), str(d.get("file_path", "")).replace("\\", "/").lower(), int(d.get("line_number") or 0))
+        for d in serialized_findings
+    }
+    for vif in vi_findings:
+        v_key = (
+            str(vif.get("rule_id")),
+            str(vif.get("file_path", "")).replace("\\", "/").lower(),
+            int(vif.get("line_number") or 0),
+        )
+        if v_key not in seen_tb_keys:
+            seen_tb_keys.add(v_key)
+            serialized_findings.append(vif)
+    serialized_findings.sort(
+        key=lambda d: (
+            sev_rank.get(str(d.get("severity", "INFO")).upper(), 9),
+            str(d.get("file_path", "")).lower(),
+            int(d.get("line_number") or 0),
+        )
+    )
 
     if db is not None and hasattr(db, "add_fact"):
-        for idx, f in enumerate(all_findings[:30]):
+        for idx, f_dict in enumerate(serialized_findings[:30]):
             try:
                 db.add_fact(
-                    f"[{f.severity}] {f.title}",
+                    f"[{f_dict.get('severity', 'INFO')}] {f_dict.get('title', '')}",
                     node_id=f"fact:trust_boundary:{task_id}:{idx}",
                     task_id=task_id,
                     domain="trust_boundary",
                     source_agent="deep_repo_audit",
-                    payload=f.to_dict(),
+                    payload=f_dict,
                 )
             except Exception:
                 pass
@@ -938,9 +976,10 @@ def run_trust_boundary_review(
             }
             for fp, cat, score in ranked
         ],
-        "findings_count": len(all_findings),
-        "findings": [f.to_dict() for f in all_findings],
+        "findings_count": len(serialized_findings),
+        "findings": serialized_findings,
         "call_graph_slicer": slicer_summary,
+        "verification_inversion": vi_summary,
         "elapsed_sec": round(time.perf_counter() - t0, 3),
     }
 
