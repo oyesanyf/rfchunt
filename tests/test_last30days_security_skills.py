@@ -251,3 +251,32 @@ def forward_auth(tok):
     assert engines["last30days_security_skills"]["status"] == "completed"
     assert engines["last30days_security_skills"]["zero_api_key_invariant_enforced"] is True
 
+
+def test_structural_ast_compiler_and_positive_negative_self_test_gate(tmp_path: Path) -> None:
+    """Verifies all 5 structural AST/dataflow templates pass positive/negative self-tests and ignore commented mentions."""
+    from engine.structural_detector_compiler import (
+        STRUCTURAL_TEMPLATE_IDS,
+        build_structural_template_spec,
+        execute_structural_template,
+    )
+
+    cwes = ("CWE-78", "CWE-862", "CWE-636", "CWE-362", "CWE-250")
+    seen_templates = set()
+    for cwe in cwes:
+        spec = build_structural_template_spec(cwe_id=cwe, title=f"Test {cwe}", summary="Structural test")
+        assert spec.template_id in STRUCTURAL_TEMPLATE_IDS
+        assert spec.self_test_passed is True
+        assert spec.positive_test_hits >= 1
+        assert spec.negative_test_hits == 0
+        seen_templates.add(spec.template_id)
+    assert seen_templates == set(STRUCTURAL_TEMPLATE_IDS)
+
+    # Verify comment stripping prevents false positives on commented-out code
+    taint_spec = build_structural_template_spec(cwe_id="CWE-78", title="Command Taint")
+    comment_only = (
+        "// subprocess.run(user_input, shell=True)\n"
+        "/* subprocess.Popen(req, shell=True) */\n"
+    )
+    assert len(execute_structural_template(comment_only, ".ts", taint_spec)) == 0
+
+

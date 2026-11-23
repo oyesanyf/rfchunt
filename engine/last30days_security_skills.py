@@ -76,6 +76,8 @@ class SecuritySkillSpec:
     synthesized_python_path: str = ""
     custom_indicators: List[str] = field(default_factory=list)
     corroborating_lanes: List[str] = field(default_factory=list)
+    structural_template: str = ""
+    self_test_passed: bool = True
 
 
 @dataclass
@@ -987,7 +989,9 @@ class Last30DaysSecuritySkillsEngine:
             custom_sightings=custom_sightings,
         )
 
-        # Convert harvested clusters into SecuritySkillSpec objects
+        from engine.structural_detector_compiler import build_structural_template_spec
+
+        # Convert harvested clusters into SecuritySkillSpec objects with verified structural AST templates
         harvested_specs_by_domain: Dict[str, List[SecuritySkillSpec]] = {
             "AI_SECURITY": [],
             "APP_CODE_SECURITY": [],
@@ -997,6 +1001,12 @@ class Last30DaysSecuritySkillsEngine:
             slug = re.sub(r"[^a-z0-9]+", "-", cl["cluster_key"].lower()).strip("-")[:42] or f"harvested-skill-{idx}"
             sid = f"SKILL-L30D-HARVEST-{c_dom[:3]}-{idx:02d}-{slug[:18].upper().replace('-', '_')}"
             det_name = f"detect_harvested_{slug.replace('-', '_')}"
+            tpl_spec = build_structural_template_spec(
+                cwe_id=cl["cwe_id"],
+                title=cl["title"],
+                summary=cl["summary"],
+                custom_indicators=cl["custom_indicators"],
+            )
             h_spec = SecuritySkillSpec(
                 skill_id=sid,
                 skill_slug=f"harvested-{slug}",
@@ -1012,13 +1022,17 @@ class Last30DaysSecuritySkillsEngine:
                 summary=cl["summary"],
                 detection_logic_description=(
                     f"Harvested from keyless lanes ({', '.join(cl['corroborating_lanes'])}). "
-                    f"Scans for multi-token indicators: {cl['custom_indicators']}"
+                    f"Compiled to structural AST template `{tpl_spec.template_id}` "
+                    f"(self_test_passed={tpl_spec.self_test_passed}) over indicators: {cl['custom_indicators']}"
                 ),
                 remediation=f"Remediate {cl['cwe_id']} vulnerability pattern identified in {cl['title']}.",
                 custom_indicators=list(cl["custom_indicators"]),
                 corroborating_lanes=list(cl["corroborating_lanes"]),
+                structural_template=tpl_spec.template_id,
+                self_test_passed=tpl_spec.self_test_passed,
             )
-            harvested_specs_by_domain[c_dom].append(h_spec)
+            if tpl_spec.self_test_passed:
+                harvested_specs_by_domain[c_dom].append(h_spec)
 
         selected_skills: List[Dict[str, Any]] = []
         for dom in domains_to_run:
@@ -1329,22 +1343,57 @@ class Last30DaysSecuritySkillsEngine:
                         m.group(0),
                     )
 
-        # 11. Dynamically Harvested Zero-API Skills (Custom Multi-Token Indicator Detectors)
-        for dyn_spec in list(self._active_skills.values()):
-            if not dyn_spec.custom_indicators or dyn_spec.domain not in enabled_domains:
-                continue
-            for ind in dyn_spec.custom_indicators:
-                if ind and ind in content:
-                    pos = content.find(ind)
-                    lno = self._line_at(content, pos)
-                    line_txt = lines[lno - 1] if 1 <= lno <= len(lines) else ind
+        # 11. Dynamically Harvested Zero-API Skills (Compiled Structural AST/Dataflow Templates)
+        dyn_skills = [
+            s
+            for s in self._active_skills.values()
+            if s.custom_indicators and s.domain in enabled_domains and s.self_test_passed
+        ]
+        if dyn_skills:
+            from engine.structural_detector_compiler import (
+                build_structural_template_spec,
+                execute_structural_template,
+                strip_comments_preserve_lines,
+            )
+
+            ext = fpath.suffix.lower()
+            clean_code = strip_comments_preserve_lines(content, ext)
+            for dyn_spec in dyn_skills:
+                tpl_spec = build_structural_template_spec(
+                    cwe_id=dyn_spec.cwe_id,
+                    title=dyn_spec.title,
+                    summary=dyn_spec.summary,
+                    custom_indicators=dyn_spec.custom_indicators,
+                )
+                if not tpl_spec.self_test_passed:
+                    continue
+                struct_matches = execute_structural_template(content, ext, tpl_spec)
+                if struct_matches:
+                    sm = struct_matches[0]
                     emit(
                         dyn_spec.skill_id,
-                        f"Harvested Zero-API Security Skill Match (`{ind}`): {dyn_spec.title}",
-                        lno,
-                        line_txt,
+                        f"Harvested Zero-API Structural Skill Match [{tpl_spec.template_id}]: {dyn_spec.title}",
+                        sm.line,
+                        sm.evidence_snippet,
                     )
-                    break
+                else:
+                    # Comment-stripped structural fallback for custom indicator sinks without guard
+                    has_guard = any(
+                        re.search(gp, clean_code, re.IGNORECASE) for gp in tpl_spec.guard_patterns
+                    )
+                    if not has_guard:
+                        for ind in dyn_spec.custom_indicators:
+                            if ind and ind in clean_code:
+                                pos = clean_code.find(ind)
+                                lno = self._line_at(clean_code, pos)
+                                line_txt = lines[lno - 1] if 1 <= lno <= len(lines) else ind
+                                emit(
+                                    dyn_spec.skill_id,
+                                    f"Harvested Zero-API Security Skill Match (`{ind}`): {dyn_spec.title}",
+                                    lno,
+                                    line_txt,
+                                )
+                                break
 
         return findings
 

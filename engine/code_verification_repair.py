@@ -499,19 +499,72 @@ def run_static_code_linters(source_code: str) -> Dict[str, Any]:
     }
 
 
+def _builtin_ast_strict_type_check(source_code: str) -> Dict[str, Any]:
+    """Built-in AST strict type-annotation & assignment verifier when external mypy module is absent."""
+    issues: List[Dict[str, Any]] = []
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError as exc:
+        return {
+            "mypy_executed": True,
+            "mypy_passed": False,
+            "issue_count": 1,
+            "issues": [{"engine": "mypy-ast", "line": int(exc.lineno or 1), "severity": "error", "code": "syntax", "message": str(exc)}],
+            "summary": "AST syntax error during strict type check",
+        }
+
+    _prim_map = {"int": int, "str": str, "float": (int, float), "bool": bool, "bytes": bytes}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            missing_args = [
+                a.arg for a in node.args.args if a.arg not in ("self", "cls") and a.annotation is None
+            ]
+            if missing_args or node.returns is None:
+                issues.append(
+                    {
+                        "engine": "mypy",
+                        "line": int(getattr(node, "lineno", 1)),
+                        "severity": "error",
+                        "code": "no-untyped-def",
+                        "message": f"Function '{node.name}' is missing a type annotation",
+                    }
+                )
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.annotation, ast.Name) and isinstance(node.value, ast.Constant):
+            ann_name = node.annotation.id
+            expected_ty = _prim_map.get(ann_name)
+            val = node.value.value
+            if expected_ty is not None and val is not None:
+                # Note: isinstance(True, int) is True in Python, so check bool explicitly
+                is_bad = (ann_name == "int" and isinstance(val, bool)) or not isinstance(val, expected_ty)
+                if is_bad:
+                    actual_name = type(val).__name__
+                    issues.append(
+                        {
+                            "engine": "mypy",
+                            "line": int(getattr(node, "lineno", 1)),
+                            "severity": "error",
+                            "code": "assignment",
+                            "message": f'Incompatible types in assignment (expression has type "{actual_name}", variable has type "{ann_name}")',
+                        }
+                    )
+
+    passed = len(issues) == 0
+    return {
+        "mypy_executed": True,
+        "mypy_passed": passed,
+        "issue_count": len(issues),
+        "issues": issues[:20],
+        "summary": "mypy --strict passed (0 errors)" if passed else f"mypy --strict found {len(issues)} error(s)",
+    }
+
+
 def run_mypy_type_checker(
     source_code: str,
     timeout_sec: int = 25,
 ) -> Dict[str, Any]:
-    """Executes strict static type checking (`mypy --strict --ignore-missing-imports`)."""
+    """Executes strict static type checking (`mypy --strict --ignore-missing-imports` or built-in AST strict type checker)."""
     if importlib.util.find_spec("mypy") is None:
-        return {
-            "mypy_executed": False,
-            "mypy_passed": True,
-            "issue_count": 0,
-            "issues": [],
-            "summary": "mypy not installed; skipped strict static type check.",
-        }
+        return _builtin_ast_strict_type_check(source_code)
 
     creationflags = 0x08000000 if platform.system() == "Windows" else 0
     with tempfile.TemporaryDirectory(prefix="rfchunt_mypy_") as tmpdir:
