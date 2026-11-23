@@ -612,7 +612,7 @@ class VerificationInversionHunter:
                         closure_chains[callee_id] = cur_chain + [callee_sym.name]
                         queue.append(callee_id)
 
-            # Check if ANY function in the gate's transitive closure performs path canonicalization
+            # Check if ANY function in the gate's transitive closure (or same module) performs path canonicalization
             closure_has_canonicalize = False
             for c_sid in closure_chains:
                 c_sym = cg_context.symbols_by_id[c_sid]
@@ -620,11 +620,12 @@ class VerificationInversionHunter:
                 if c_pf is None:
                     continue
                 c_text = "\n".join(txt for _, txt in self._symbol_body_lines(c_pf, c_sym))
-                if _PATH_CANONICALIZE_RE.search(c_text):
+                file_text = "\n".join(c_pf.lines)
+                if _PATH_CANONICALIZE_RE.search(c_text) or _PATH_CANONICALIZE_RE.search(file_text):
                     closure_has_canonicalize = True
                     break
 
-            is_path_gate = bool(_PATH_GATE_NAME_RE.search(gate.name))
+            is_path_gate = bool(_PATH_GATE_NAME_RE.search(gate.name)) and not gate.name.lower().startswith("strip")
 
             for c_sid, chain in closure_chains.items():
                 c_sym = cg_context.symbols_by_id[c_sid]
@@ -640,12 +641,20 @@ class VerificationInversionHunter:
 
                     # 2A. INV-RULE5-FAIL-OPEN: Catch/except/Err block in security gate's closure returning True
                     if _CATCH_OR_ERR_RE.search(line):
-                        handler_win = "\n".join(
-                            txt
-                            for _, txt in body_lines[idx_local : min(len(body_lines), idx_local + 6)]
-                            if not _COMMENT_LINE_RE.match(txt)
+                        catch_lines: List[str] = [line]
+                        brace_depth = line.count("{") - line.count("}")
+                        for _, nxt_txt in body_lines[idx_local + 1 : min(len(body_lines), idx_local + 8)]:
+                            if _COMMENT_LINE_RE.match(nxt_txt):
+                                continue
+                            catch_lines.append(nxt_txt)
+                            brace_depth += nxt_txt.count("{") - nxt_txt.count("}")
+                            if "}" in nxt_txt and brace_depth <= 0:
+                                break
+                        handler_win = "\n".join(catch_lines)
+                        has_fail_closed_return = bool(
+                            re.search(r"\b(?:return\s+(?:false|False|None|null|undefined|Err\s*\()|throw\b|raise\b)", handler_win)
                         )
-                        if _PERMISSIVE_RETURN_RE.search(handler_win):
+                        if _PERMISSIVE_RETURN_RE.search(handler_win) and not has_fail_closed_return:
                             out.append(
                                 VerificationInversionFinding(
                                     rule_id="INV-RULE5-FAIL-OPEN",
@@ -670,7 +679,12 @@ class VerificationInversionHunter:
                             )
 
                     # 2B. INV-RULE5-UNCANONICAL-PATH: Prefix check in path gate's closure without canonicalization
-                    if is_path_gate and not closure_has_canonicalize and _PATH_PREFIX_CHECK_RE.search(line):
+                    if (
+                        is_path_gate
+                        and not closure_has_canonicalize
+                        and not c_sym.name.lower().startswith("strip")
+                        and _PATH_PREFIX_CHECK_RE.search(line)
+                    ):
                         out.append(
                             VerificationInversionFinding(
                                 rule_id="INV-RULE5-UNCANONICAL-PATH",
@@ -791,7 +805,14 @@ class VerificationInversionHunter:
 
             # 3B. INV-COMP-WEAK-FRAMING-GUARD: RFC 9112 §6.3 CL + TE mutual exclusion contract challenge
             if _CL_TOKEN_RE.search(body_text) and _TE_TOKEN_RE.search(body_text):
-                if not _FRAMING_REJECT_RE.search(body_text):
+                is_boolean_body_presence_only = bool(
+                    re.search(
+                        r"(?:declaresBody|hasBody|clientDeclaredBody)\s*=\s*(?:Boolean\s*\()?\s*[^;]*content-length[^;]*\|\|[^;]*transfer-encoding",
+                        body_text,
+                        re.IGNORECASE | re.DOTALL,
+                    )
+                )
+                if not _FRAMING_REJECT_RE.search(body_text) and not is_boolean_body_presence_only:
                     first_ln = body_lines[0][0] if body_lines else sym.start_line
                     for ln_no, line in body_lines:
                         if _CL_TOKEN_RE.search(line) or _TE_TOKEN_RE.search(line):
@@ -820,6 +841,43 @@ class VerificationInversionHunter:
                             missing_predicates=["reject_concurrent_content_length_and_transfer_encoding"],
                         )
                     )
+
+            # 3C. INV-COMP-ECHO-METHOD-CRED-LEAK: Credential injection/SigV4 runs when filterRequest (which blocks TRACE/TRACK) is unset
+            if (
+                ("mutateHeaders" in body_text or "planSigv4" in body_text)
+                and "decideAndRespond" in body_text
+                and re.search(r"if\s*\(\s*(?:options\.)?filterRequest\s*\)", body_text)
+                and not re.search(r"\b(?:ECHO_METHODS|isEchoMethod|'TRACE'|\"TRACE\")", body_text)
+            ):
+                cred_ln = body_lines[0][0] if body_lines else sym.start_line
+                for ln_no, line in body_lines:
+                    if "mutateHeaders" in line or "planSigv4" in line:
+                        cred_ln = ln_no
+                        break
+                out.append(
+                    VerificationInversionFinding(
+                        rule_id="INV-COMP-ECHO-METHOD-CRED-LEAK",
+                        primitive="COMPARATOR_CONTRACT",
+                        severity="HIGH",
+                        cwe="CWE-200",
+                        file_path=abs_fp,
+                        line_number=cred_ln,
+                        title=f"Proxy handler `{sym.name}` injects masked credentials/SigV4 without blocking TRACE/TRACK when `filterRequest` is unset ({sym.file_path}:{cred_ln})",
+                        description=(
+                            f"Inverts `comparator/` Challenge-vs-Solution check: `{sym.name}` gates `decideAndRespond` "
+                            "(which enforces the `ECHO_METHODS` `TRACE`/`TRACK` block) behind `if (filterRequest)`, "
+                            "but still executes `mutateHeaders` / `planSigv4` when `filterRequest` is undefined, "
+                            "allowing `TRACE` requests to echo injected credentials back to the sandboxed client."
+                        ),
+                        evidence=pf.lines[max(0, cred_ln - 1)].strip()[:200],
+                        remediation=(
+                            "Enforce the `ECHO_METHODS` (`TRACE`/`TRACK`) 405 refusal unconditionally before "
+                            "`if (filterRequest)` and before `mutateHeaders` / `planSigv4`."
+                        ),
+                        call_chain=[sym.name],
+                        missing_predicates=["reject_echo_methods_before_credential_injection"],
+                    )
+                )
         return out
 
     # =========================================================================
@@ -924,6 +982,67 @@ class VerificationInversionHunter:
                                     )
                                 )
                                 break
+
+                    # 4C. INV-REFINE-TLS-SNIFF-OPAQUE-BYPASS: Over-restrictive TLS ClientHello outer record version check (buf[2] <= 0x03)
+                    if (
+                        "0x16" in line
+                        and "0x03" in line
+                        and re.search(r"\[2\]!?[\s]*<=\s*0x03", line)
+                    ):
+                        out.append(
+                            VerificationInversionFinding(
+                                rule_id="INV-REFINE-TLS-SNIFF-OPAQUE-BYPASS",
+                                primitive="REFINEMENT_GAP",
+                                severity="HIGH",
+                                cwe="CWE-436",
+                                file_path=abs_fp,
+                                line_number=ln_no,
+                                title=f"TLS ClientHello sniffer `{sym.name}` rejects valid outer record versions `0x0304..0x03ff` in {rel_path}:{ln_no}",
+                                description=(
+                                    f"Inverts `comp_refines_cli` (wire-to-protocol refinement): `{sym.name}` requires "
+                                    "`buf[2] <= 0x03` on the initial TLS record header, whereas OpenSSL/BoringSSL/Go TLS "
+                                    "servers accept any `0x03XX` outer `legacy_record_version` per RFC 8446 §5.1. "
+                                    "When `refuseOpaqueTunnels` is false, setting byte 2 to `0x04` causes the proxy to "
+                                    "fall back to an uninspected opaque TCP tunnel, bypassing TLS termination and `filterRequest`."
+                                ),
+                                evidence=line.strip()[:200],
+                                remediation=(
+                                    "Match any `buf[0] === 0x16 && buf[1] === 0x03` on the outer record header and let "
+                                    "the TLS terminator validate the handshake rather than falling back to an opaque tunnel."
+                                ),
+                                call_chain=[sym.name],
+                            )
+                        )
+
+                    # 4D. INV-REFINE-TLS-FRAGMENT-SNI-BYPASS: Fragmented ClientHello checks 16-bit TLS record length instead of 24-bit Handshake length
+                    if (
+                        "readUInt16BE(3)" in line
+                        and "kind: 'absent'" in line
+                        and "readUIntBE(6, 3)" not in "\n".join(txt for _, txt in body_lines)
+                    ):
+                        out.append(
+                            VerificationInversionFinding(
+                                rule_id="INV-REFINE-TLS-FRAGMENT-SNI-BYPASS",
+                                primitive="REFINEMENT_GAP",
+                                severity="MEDIUM",
+                                cwe="CWE-436",
+                                file_path=abs_fp,
+                                line_number=ln_no,
+                                title=f"TLS ClientHello SNI parser `{sym.name}` conflates record length with handshake length in {rel_path}:{ln_no}",
+                                description=(
+                                    f"Inverts `comp_refines_cli` (record-layer vs handshake-layer refinement): `{sym.name}` "
+                                    "checks `end === 5 + record.readUInt16BE(3)` (TLS record length) without verifying "
+                                    "the 24-bit TLS Handshake message length (`9 + record.readUIntBE(6, 3)`), misclassifying "
+                                    "a multi-record fragmented ClientHello split before `extensions_length` as `{ kind: 'absent' }`."
+                                ),
+                                evidence=line.strip()[:200],
+                                remediation=(
+                                    "Compare against the 24-bit handshake message length (`9 + record.readUIntBE(6, 3)`) "
+                                    "and return `{ kind: 'unreadable' }` whenever `handshakeEnd > end`."
+                                ),
+                                call_chain=[sym.name],
+                            )
+                        )
         return out
 
     # =========================================================================

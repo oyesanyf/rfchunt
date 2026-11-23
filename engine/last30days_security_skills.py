@@ -1210,13 +1210,27 @@ class Last30DaysSecuritySkillsEngine:
             # 2. SKILL-L30D-AI-02: Unconsented Browser Cookie Sidecar / Keychain Read
             for m in _L30D_AI02_COOKIE_SIDECAR_RE.finditer(content):
                 lno = self._line_at(content, m.start())
+                matched_tok = m.group(0)
                 window = "\n".join(lines[max(0, lno - 6) : min(len(lines), lno + 4)])
+                # When matching generic OS DPAPI (`CryptUnprotectData`), require browser/cookie/profile context
+                # or lack of explicit machine-store DACL documentation so standalone OS DPAPI utilities aren't misclassified.
+                if "CryptUnprotectData" in matched_tok:
+                    low_full = content.lower()
+                    has_browser_cookie_ctx = any(
+                        b_tok in low_full
+                        for b_tok in (
+                            "cookie", "login data", "local state", "chrome", "chromium",
+                            "firefox", "safari", "brave", "edge", "browser", "keychain",
+                        )
+                    )
+                    if not has_browser_cookie_ctx:
+                        continue
                 if "positive_consent" not in window and "user_consent" not in window and "require_consent" not in window:
                     emit(
                         "SKILL-L30D-AI-02-AGENT-COOKIE-SIDECAR-CONSENT",
-                        f"Browser cookie sidecar or OS keychain accessed ({m.group(0)}) without positive user consent check",
+                        f"Browser cookie sidecar or OS keychain accessed ({matched_tok}) without positive user consent check",
                         lno,
-                        lines[lno - 1] if 1 <= lno <= len(lines) else m.group(0),
+                        lines[lno - 1] if 1 <= lno <= len(lines) else matched_tok,
                     )
 
             # 3. SKILL-L30D-AI-03: Hermes SKILL.md / Plugin Supply-Chain Backdoor
