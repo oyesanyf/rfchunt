@@ -535,6 +535,35 @@ python -u rfc_hunt_swarm.py deep-audit --repo D:\path\to\repo --trust-boundary-r
 python -u rfc_hunt_swarm.py --all --repo D:\path\to\repo --deep-audit --proxy --poc --plain
 ```
 
+#### Reusable GitHub Actions Workflow (`workflow_call`)
+Any GitHub repository can invoke RFCHunt directly via `.github/workflows/rfchunt-reusable-audit.yml`:
+
+```yaml
+name: RFCHunt Security Audit
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  rfchunt:
+    uses: oyesanyf/rfchunt/.github/workflows/rfchunt-reusable-audit.yml@main
+    with:
+      mode: all-deep-audit   # all-deep-audit | deep-audit | trust-boundary
+      proxy: ""              # optional loopback target: auto | 8080 | 127.0.0.1:8080 | safe cmd
+      enable_poc: true
+      trust_max_files: 80
+      fail_on_severity: none # none | CRITICAL | HIGH
+```
+
 ---
 
 ## Research Attribution & Citations

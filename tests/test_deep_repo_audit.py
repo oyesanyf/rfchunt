@@ -594,3 +594,61 @@ def test_cli_help_includes_proxy_and_deep_audit_examples(capsys):
     assert "--proxy [SPEC]" in main_help
 
 
+def test_reusable_ci_audit_runner_emits_valid_sarif_and_respects_gates(tmp_path, monkeypatch):
+    import scripts.ci_run_reusable_audit as ci_mod
+
+    repo = _create_sample_repo(tmp_path / "target_repo")
+    out_dir = tmp_path / "ci_reports"
+    summary_file = tmp_path / "step_summary.md"
+
+    argv_auto = ci_mod.build_rfchunt_cli_argv(
+        Path(r"d:\harfile\rfchunt"),
+        repo,
+        out_dir,
+        tmp_path / "ci.db",
+        mode="deep-audit",
+        proxy="auto",
+        enable_poc=True,
+    )
+    assert "deep-audit" in argv_auto
+    assert "--proxy" in argv_auto
+    assert "--poc" in argv_auto
+
+    monkeypatch.setenv("RFCHUNT_ROOT", r"d:\harfile\rfchunt")
+    monkeypatch.setenv("TARGET_REPO", str(repo))
+    monkeypatch.setenv("REPORT_DIR", str(out_dir))
+    monkeypatch.setenv("RFCHUNT_MODE", "trust-boundary")
+    monkeypatch.setenv("RFCHUNT_PROXY", "")
+    monkeypatch.setenv("RFCHUNT_ENABLE_POC", "true")
+    monkeypatch.setenv("RFCHUNT_OFFLINE", "1")
+    monkeypatch.setenv("FAIL_ON_SEV", "none")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+
+    rc = ci_mod.main()
+    assert rc == 0
+
+    sarif_path = out_dir / "rfchunt_ci.sarif"
+    assert sarif_path.is_file()
+    sarif = json.loads(sarif_path.read_text(encoding="utf-8"))
+    assert sarif["version"] == "2.1.0"
+    assert len(sarif["runs"]) >= 1
+    results = sarif["runs"][-1]["results"]
+    assert len(results) >= 5
+    # Verify all SARIF URIs are clean repo-relative POSIX paths (no drive letters or leading slashes)
+    for r in results:
+        uri = r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+        assert not uri.startswith("/")
+        assert ":" not in uri
+
+    assert summary_file.is_file()
+    assert "## RFCHunt Security Audit Summary" in summary_file.read_text(encoding="utf-8")
+
+    # Severity gate should fail when HIGH findings exist and gate is HIGH
+    deep_sum = json.loads((out_dir / "deep_audit" / "deep_audit_summary.json").read_text(encoding="utf-8"))
+    ok_none, _ = ci_mod.evaluate_severity_gate(deep_sum, "none")
+    ok_high, _ = ci_mod.evaluate_severity_gate(deep_sum, "HIGH")
+    assert ok_none is True
+    assert ok_high is False
+
+
+

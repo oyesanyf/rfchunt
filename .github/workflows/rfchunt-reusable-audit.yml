@@ -1,0 +1,120 @@
+name: RFCHunt Reusable Security Audit
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "Audit mode: all-deep-audit | deep-audit | trust-boundary"
+        required: false
+        type: string
+        default: "all-deep-audit"
+      proxy:
+        description: "Optional loopback-only --proxy target (auto | 8080 | 127.0.0.1:8080 | safe launch command)"
+        required: false
+        type: string
+        default: ""
+      enable_poc:
+        description: "Run strictly non-destructive --poc false-positive triage"
+        required: false
+        type: boolean
+        default: true
+      trust_max_files:
+        description: "Max ranked production trust-boundary files to inspect line-by-line"
+        required: false
+        type: number
+        default: 80
+      depth:
+        description: "Google Mantis static audit depth (1-100, used in all-deep-audit mode)"
+        required: false
+        type: number
+        default: 50
+      fail_on_severity:
+        description: "Fail job on finding severity threshold: none | CRITICAL | HIGH"
+        required: false
+        type: string
+        default: "none"
+      offline:
+        description: "Set true on GitHub-hosted CPU runners (RFCHUNT_OFFLINE=1); false for self-hosted Ollama GPU runners"
+        required: false
+        type: boolean
+        default: true
+      runs_on:
+        description: "Runner label (ubuntu-latest or self-hosted)"
+        required: false
+        type: string
+        default: "ubuntu-latest"
+      rfchunt_ref:
+        description: "Git ref of oyesanyf/rfchunt to run"
+        required: false
+        type: string
+        default: "main"
+      upload_sarif:
+        description: "Upload SARIF 2.1.0 results to GitHub Code Scanning"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  rfchunt-audit:
+    name: RFCHunt Security Audit (${{ inputs.mode }})
+    runs-on: ${{ inputs.runs_on }}
+
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          path: target-repo
+
+      - name: Checkout RFCHunt engine
+        uses: actions/checkout@v4
+        with:
+          repository: oyesanyf/rfchunt
+          ref: ${{ inputs.rfchunt_ref }}
+          path: _rfchunt
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: _rfchunt/requirements.txt
+
+      - name: Install RFCHunt dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r _rfchunt/requirements.txt
+
+      - name: Run RFCHunt Security Audit
+        env:
+          CI: "true"
+          RFCHUNT_OFFLINE: ${{ inputs.offline && '1' || '0' }}
+          RFCHUNT_ROOT: ${{ github.workspace }}/_rfchunt
+          TARGET_REPO: ${{ github.workspace }}/target-repo
+          REPORT_DIR: ${{ github.workspace }}/rfchunt-reports
+          RFCHUNT_MODE: ${{ inputs.mode }}
+          RFCHUNT_PROXY: ${{ inputs.proxy }}
+          RFCHUNT_ENABLE_POC: ${{ inputs.enable_poc }}
+          RFCHUNT_TRUST_MAX: ${{ inputs.trust_max_files }}
+          RFCHUNT_DEPTH: ${{ inputs.depth }}
+          FAIL_ON_SEV: ${{ inputs.fail_on_severity }}
+        run: python -u _rfchunt/scripts/ci_run_reusable_audit.py
+
+      - name: Upload RFCHunt Security Reports Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rfchunt-security-reports
+          path: rfchunt-reports/
+          if-no-files-found: warn
+
+      - name: Upload SARIF 2.1.0 to GitHub Code Scanning
+        if: always() && inputs.upload_sarif
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: rfchunt-reports/rfchunt_ci.sarif
+          category: rfchunt-security-audit
