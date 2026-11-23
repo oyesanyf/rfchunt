@@ -42,8 +42,15 @@ class StatefulProtocolSequenceEngine:
     to uncover stateful boundary contamination and pipeline desynchronization.
     """
 
-    def __init__(self, default_timeout: float = 3.5):
+    def __init__(
+        self,
+        default_timeout: float = 3.5,
+        hygiene_config: Optional[Any] = None,
+        rate_limiter: Optional[Any] = None,
+    ):
         self.default_timeout = default_timeout
+        self.hygiene_config = hygiene_config
+        self.rate_limiter = rate_limiter
 
     def run_pipelined_canary_sequence(
         self, host: str, port: int, candidate_probe: bytes, rule_id: Optional[str] = None, use_tls: bool = False
@@ -75,13 +82,19 @@ class StatefulProtocolSequenceEngine:
             report.has_pipeline_leak = False
             report.details = f"Target '{host}' rejected by target authorization gate: {e}"
             return report
+        from engine.request_hygiene import acquire_rate_limit, resolve_hygiene
+        hyg, lim = resolve_hygiene(getattr(self, "hygiene_config", None), getattr(self, "rate_limiter", None))
+
         canary_token = f"CANARY_{random.randint(10000, 99999)}"
-        canary_request = (
-            f"GET /check_{canary_token} HTTP/1.1\r\n"
-            f"Host: {host}\r\n"
-            f"X-Canary-ID: {canary_token}\r\n"
-            f"Connection: keep-alive\r\n\r\n"
-        ).encode("latin-1")
+        canary_request = hyg.inject_raw_http1(
+            (
+                f"GET /check_{canary_token} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"X-Canary-ID: {canary_token}\r\n"
+                f"Connection: keep-alive\r\n\r\n"
+            ).encode("latin-1")
+        )
+        candidate_probe = hyg.inject_raw_http1(candidate_probe)
 
         sock = None
         try:
@@ -94,7 +107,10 @@ class StatefulProtocolSequenceEngine:
 
             # Step 1: Baseline Request
             start_t = time.time()
-            baseline_req = f"GET / HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n".encode()
+            baseline_req = hyg.inject_raw_http1(
+                f"GET / HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n".encode()
+            )
+            acquire_rate_limit(lim)
             sock.sendall(baseline_req)
             framed1 = HTTPFramingReader.read_response(sock, timeout=self.default_timeout, request_method="GET")
             resp1 = framed1.raw_response
@@ -127,6 +143,7 @@ class StatefulProtocolSequenceEngine:
 
             # Step 2: Send Candidate Probe
             start_t = time.time()
+            acquire_rate_limit(lim)
             sock.sendall(candidate_probe)
             framed2 = HTTPFramingReader.read_response(
                 sock, timeout=self.default_timeout, initial_bytes=framed1.unconsumed_bytes
@@ -198,6 +215,7 @@ class StatefulProtocolSequenceEngine:
 
             start_t = time.time()
             try:
+                acquire_rate_limit(lim)
                 sock.sendall(canary_request)
                 framed3 = HTTPFramingReader.read_response(
                     sock, timeout=self.default_timeout, initial_bytes=framed2.unconsumed_bytes
@@ -321,6 +339,8 @@ class StatefulProtocolSequenceEngine:
             report.has_pipeline_leak = False
             report.details = f"Target '{host}' rejected by target authorization gate: {e}"
             return report
+        from engine.request_hygiene import acquire_rate_limit, resolve_hygiene
+        hyg, lim = resolve_hygiene(getattr(self, "hygiene_config", None), getattr(self, "rate_limiter", None))
         sock = None
         try:
             sock = socket.create_connection((host, port), timeout=self.default_timeout)
@@ -331,19 +351,28 @@ class StatefulProtocolSequenceEngine:
                 sock = context.wrap_socket(sock, server_hostname=host)
 
             # Step 1: Baseline Request
-            sock.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n".encode())
+            acquire_rate_limit(lim)
+            sock.sendall(
+                hyg.inject_raw_http1(
+                    f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n".encode()
+                )
+            )
             framed1 = HTTPFramingReader.read_response(sock, timeout=self.default_timeout)
             if not framed1.is_complete or framed1.is_connection_closed:
                 report.details = "Target does not support persistent keep-alive on baseline GET."
                 return report
 
             # Step 2: CL.0 Probe (GET with Content-Length and nested request prefix)
-            cl0_probe = (
-                f"GET {path} HTTP/1.1\r\n"
-                f"Host: {host}\r\n"
-                f"Content-Length: {len(probe_body)}\r\n"
-                f"Connection: keep-alive\r\n\r\n"
-            ).encode() + probe_body
+            cl0_probe = hyg.inject_raw_http1(
+                (
+                    f"GET {path} HTTP/1.1\r\n"
+                    f"Host: {host}\r\n"
+                    f"Content-Length: {len(probe_body)}\r\n"
+                    f"Connection: keep-alive\r\n\r\n"
+                ).encode()
+                + probe_body
+            )
+            acquire_rate_limit(lim)
             sock.sendall(cl0_probe)
             framed2 = HTTPFramingReader.read_response(sock, timeout=self.default_timeout, initial_bytes=framed1.unconsumed_bytes)
 
@@ -352,7 +381,10 @@ class StatefulProtocolSequenceEngine:
                 return report
 
             # Step 3: Canary Request
-            canary_req = f"GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode()
+            canary_req = hyg.inject_raw_http1(
+                f"GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode()
+            )
+            acquire_rate_limit(lim)
             sock.sendall(canary_req)
             framed3 = HTTPFramingReader.read_response(sock, timeout=self.default_timeout, initial_bytes=framed2.unconsumed_bytes)
 

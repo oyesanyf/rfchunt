@@ -319,10 +319,14 @@ class TrafficCaptureSession:
         db: Optional[Any] = None,
         task_id: str = "default",
         proxy_config: Optional[ArtexProxyConfig] = None,
+        hygiene_config: Optional[Any] = None,
+        rate_limiter: Optional[Any] = None,
     ):
         self.db = db
         self.task_id = task_id
         self.proxy_config = proxy_config or ArtexProxyConfig()
+        self.hygiene_config = hygiene_config
+        self.rate_limiter = rate_limiter
         self._lock = threading.RLock()
         self.exchanges: Dict[str, CapturedExchange] = {}
 
@@ -476,9 +480,14 @@ class TrafficCaptureSession:
             )
         )
 
+        from engine.request_hygiene import acquire_rate_limit, resolve_hygiene
+        hyg, lim = resolve_hygiene(getattr(self, "hygiene_config", None), getattr(self, "rate_limiter", None))
+        acquire_rate_limit(lim)
+        effective_headers = hyg.to_headers_dict(headers)
+
         client_kwargs = self.proxy_config.httpx_client_kwargs(timeout=timeout)
         with httpx.Client(**client_kwargs) as client:
-            resp = client.request(method.upper(), url, headers=headers or {}, content=body.encode("utf-8") if body else None)
+            resp = client.request(method.upper(), url, headers=effective_headers, content=body.encode("utf-8") if body else None)
             resp_headers = dict(resp.headers)
             # httpx decodes Content-Encoding into resp.content automatically;
             # mark content_encoding="identity" so decoded_response_bytes() does not double-decompress.
@@ -489,7 +498,7 @@ class TrafficCaptureSession:
                 url=url,
                 host=host,
                 port=port,
-                request_headers=headers or {},
+                request_headers=effective_headers,
                 request_body=body,
                 status_code=resp.status_code,
                 response_headers=resp_headers,

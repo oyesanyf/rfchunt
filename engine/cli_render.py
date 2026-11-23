@@ -132,9 +132,24 @@ def render_kv_panel(
     return out
 
 
+def _truthful_chain_status(ch: Dict[str, Any]) -> str:
+    poe_i = int(ch.get("poe_level") or 0)
+    raw_st = str(ch.get("verification_status") or "").strip().upper()
+    if raw_st == "FIXED":
+        return "FIXED"
+    if poe_i >= 3:
+        return "VERIFIED"
+    if poe_i == 2:
+        return "LEAD_ACTIVE_INDICATOR"
+    if poe_i == 1:
+        return "LEAD_PASSIVE_CORRELATION"
+    return "UNVERIFIED"
+
+
 def render_chains(
     chains: Sequence[Dict[str, Any]],
     *,
+    title: str = "ARTEX Attack Chains",
     as_json: bool = False,
     plain: bool = False,
 ) -> str:
@@ -142,7 +157,7 @@ def render_chains(
     rows = []
     for ch in chains:
         poe = f"POE={ch.get('poe_level', 0)}"
-        status = ch.get("verification_status") or ("VERIFIED" if ch.get("is_verified") else "UNVERIFIED")
+        status = _truthful_chain_status(ch)
         target = f"{ch.get('target_host', '')}{ch.get('target_endpoint') or ch.get('target_route') or ''}"
         rows.append([
             ch.get("chain_id") or ch.get("node_id") or "",
@@ -153,7 +168,7 @@ def render_chains(
             target,
             ch.get("traffic_id") or "-",
         ])
-    return render_table("ARTEX Attack Chains", columns, rows, as_json=as_json, plain=plain, raw_data=list(chains))
+    return render_table(title, columns, rows, as_json=as_json, plain=plain, raw_data=list(chains))
 
 
 def render_traces(
@@ -281,38 +296,63 @@ def render_poe_summary(
     chains: Optional[Sequence[Dict[str, Any]]] = None,
     traces: Optional[Sequence[Dict[str, Any]]] = None,
     *,
+    strict_poe: bool = False,
+    include_leads: bool = False,
     as_json: bool = False,
     plain: bool = False,
 ) -> str:
     """
-    Renders POE level breakdown (POE=1 passive vs POE=3 verified exploit),
-    asset coverage %, synthesized chains, and worker traces in TTY or plain mode.
+    Renders POE level breakdown separating Verified Exploits (`POE=3`) from
+    Manual Review Leads (`POE=1-2`), asset coverage %, chains, and worker traces.
     """
     poe = dict(poe_breakdown or {})
     cov = dict(coverage or {})
+    all_chains = list(chains or [])
+    verified_chains = [c for c in all_chains if int(c.get("poe_level") or 0) >= 3]
+    lead_chains = [c for c in all_chains if int(c.get("poe_level") or 0) < 3]
+    show_leads = bool(include_leads or not strict_poe)
+
     if as_json:
         return render_json({
             "poe_breakdown": poe,
             "coverage": cov,
-            "chains": list(chains or []),
+            "verified_exploits": verified_chains,
+            "manual_review_leads": lead_chains if show_leads else [],
+            "chains": verified_chains + (lead_chains if show_leads else []),
             "traces": list(traces or []),
         })
 
     poe_line = (
-        f"POE=3 (VERIFIED_EXPLOIT)={poe.get('VERIFIED_EXPLOIT', 0)}, "
+        f"POE=3 (VERIFIED_EXPLOIT)={poe.get('VERIFIED_EXPLOIT', len(verified_chains))}, "
         f"POE=2 (ACTIVE_INDICATOR)={poe.get('ACTIVE_INDICATOR', 0)}, "
         f"POE=1 (PASSIVE_CORRELATION)={poe.get('PASSIVE_CORRELATION', 0)}, "
         f"POE=0 (NONE)={poe.get('NONE', 0)}"
     )
     summary = {
         "POE Breakdown": poe_line,
+        "Verified Exploits (POE=3)": len(verified_chains),
+        "Manual Review Leads (POE=1-2)": len(lead_chains),
         "Asset Coverage": f"{cov.get('tested_assets', 0)}/{cov.get('total_in_scope_assets', 0)} ({cov.get('coverage_pct', 0.0)}%)",
-        "Chains": len(chains or []),
         "Worker Traces": len(traces or []),
     }
-    out = render_kv_panel("ARTEX POE & Coverage Summary", summary, as_json=False, plain=plain)
-    if chains:
-        render_chains(chains, as_json=False, plain=plain)
+    parts = [render_kv_panel("ARTEX POE & Coverage Summary", summary, as_json=False, plain=plain)]
+    parts.append(
+        render_chains(
+            verified_chains,
+            title="Verified Exploits (POE=3)",
+            as_json=False,
+            plain=plain,
+        )
+    )
+    if show_leads:
+        parts.append(
+            render_chains(
+                lead_chains,
+                title="Manual Review Leads (POE=1-2)",
+                as_json=False,
+                plain=plain,
+            )
+        )
     if traces:
-        render_traces(list(traces)[:20], as_json=False, plain=plain)
-    return out
+        parts.append(render_traces(list(traces)[:20], as_json=False, plain=plain))
+    return "\n".join(parts)

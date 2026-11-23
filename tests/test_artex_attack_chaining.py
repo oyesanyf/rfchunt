@@ -352,8 +352,26 @@ def test_four_hop_chains_coverage_ledger_and_prove_goal(tmp_path):
             {"rule_id": "0DAY-1", "title": "Zero-Day Parser Divergence", "is_zero_day": True, "scanner": "MantisZeroDay"},
         ])
 
-        res = engine.run_attack_chain_cycle(round_num=1)
+        ex_proof = engine.bind_traffic_evidence(
+            method="POST",
+            url="https://staging.internal:443/api/v1/run",
+            host="staging.internal",
+            port=443,
+            status_code=200,
+            response_body=b"HTTP/1.1 200 OK\r\n\r\nPROOF_CANARY_4HOP_OK",
+        )
+
+        def _poe3_exec(attrs):
+            return (
+                True,
+                "4-hop kill chain proven against traffic receipt",
+                "POST /api/v1/run",
+                {"traffic_id": ex_proof.traffic_id, "evidence_quote": "PROOF_CANARY_4HOP_OK"},
+            )
+
+        res = engine.run_attack_chain_cycle(round_num=1, executor_fn=_poe3_exec)
         assert res["goal_proven"] is True
+        assert res["exploits_verified"] >= 1
         assert res["max_hop_count"] == 4
         assert res["coverage"]["tested_assets"] >= 1
         assert res["coverage"]["coverage_pct"] > 0.0
@@ -370,7 +388,8 @@ def test_four_hop_chains_coverage_ledger_and_prove_goal(tmp_path):
         four_hop = next(c for c in sarif_chains if c["rule_id"] == "ARTEX-4HOP_DESYNC_SSRF_AUTH_EXEC")
         assert four_hop["hop_count"] == 4
         assert four_hop["severity"] == "CRITICAL"
-        assert four_hop["poe_level"] >= 1
+        assert four_hop["poe_level"] == 3
+        assert four_hop["verification_status"] == "VERIFIED"
         assert len(four_hop["chain_steps"]) == 4
     finally:
         db.close()
@@ -638,7 +657,8 @@ def test_mcp_streamable_http_and_legacy_sse_transports(tmp_path):
         assert r_chain.status_code == 200
         chain_payload = json.loads(r_chain.json()["result"]["content"][0]["text"])
         assert chain_payload["chains_synthesized"] >= 1
-        assert chain_payload["exploits_verified"] >= 1
+        assert chain_payload["leads_recorded"] >= 1
+        assert chain_payload["exploits_verified"] == 0
 
         # Search traces over Streamable HTTP MCP
         r_search = httpx.post(
@@ -763,7 +783,8 @@ def test_unified_all_scans_full_artex_attack_chaining_integration(tmp_path, monk
         # Verify rich attack chaining telemetry in --all output
         ac = res["attack_chaining"]
         assert ac["chains_synthesized"] >= 1
-        assert ac["exploits_verified"] >= 1
+        assert ac["leads_recorded"] >= 1
+        assert ac["exploits_verified"] == 0
         assert ac["worker_traces_count"] >= 1
         assert ac["todolist_summary"]["total_steps"] >= 1
         assert ac["proxy"]["enabled"] is True
@@ -832,7 +853,8 @@ def test_db_hydration_and_cli_arg_parsing():
         assert hydrated["mantis_findings"] == 1
         assert hydrated["ai_security_findings"] == 1
         res = engine.run_attack_chain_cycle(round_num=1)
-        assert res["exploits_verified"] >= 1
+        assert res["leads_recorded"] >= 1
+        assert res["exploits_verified"] == 0
     finally:
         db.close()
 

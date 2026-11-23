@@ -1656,10 +1656,32 @@ class Database:
         source_scanners: Optional[List[str]] = None,
         remote_artex_task_id: str = "",
     ) -> None:
-        """Records a synthesized multi-step attack chain (e.g. Desynchronized Prompt Injection)."""
+        """
+        Records a synthesized multi-step attack chain while enforcing the R1
+        truthful POE invariant: `poe_level < 3` is never stored as `is_verified=1`
+        or `verification_status='VERIFIED'` / `'CONFIRMED'`.
+        """
         steps_json = json.dumps(steps)
         scanners_json = json.dumps(source_scanners or [])
-        resolved_status = verification_status or ("VERIFIED" if is_verified else "UNVERIFIED")
+        poe_i = int(poe_level or 0)
+        raw_st = str(verification_status or "").strip().upper()
+        if poe_i >= 3:
+            eff_verified = bool(is_verified) or raw_st == "VERIFIED"
+            resolved_status = "FIXED" if raw_st == "FIXED" else ("VERIFIED" if eff_verified else (verification_status or "UNVERIFIED"))
+        elif poe_i == 2:
+            eff_verified = False
+            resolved_status = "FIXED" if raw_st == "FIXED" else "LEAD_ACTIVE_INDICATOR"
+        elif poe_i == 1:
+            eff_verified = False
+            resolved_status = "FIXED" if raw_st == "FIXED" else "LEAD_PASSIVE_CORRELATION"
+        else:
+            eff_verified = False
+            resolved_status = "FIXED" if raw_st == "FIXED" else "UNVERIFIED"
+
+        clean_title = str(title or "")
+        if poe_i < 3 and clean_title.upper().startswith("CONFIRMED:"):
+            clean_title = f"LEAD [POE={poe_i}]: " + clean_title[len("CONFIRMED:") :].lstrip()
+
         resolved_hops = int(hop_count) if hop_count is not None else max(1, len(steps))
         with self._lock:
             with self._tx():
@@ -1673,9 +1695,9 @@ class Database:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        chain_id, title, attack_type, target_host, target_endpoint, framing_anomaly_id,
-                        ai_sink_id, steps_json, self._enc(raw_payload), 1 if is_verified else 0, severity,
-                        task_id, int(poe_level), resolved_status, evidence_quote or "", traffic_id or "",
+                        chain_id, clean_title, attack_type, target_host, target_endpoint, framing_anomaly_id,
+                        ai_sink_id, steps_json, self._enc(raw_payload), 1 if eff_verified else 0, severity,
+                        task_id, poe_i, resolved_status, evidence_quote or "", traffic_id or "",
                         resolved_hops, scanners_json, remote_artex_task_id or "",
                     ),
                 )

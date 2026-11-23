@@ -234,6 +234,53 @@ class _TrackExplicitStore(argparse.Action):
             explicit_set = set()
             setattr(namespace, "_explicit_cli_dests", explicit_set)
         explicit_set.add(self.dest)
+
+
+class _SingleOrMultiStoreAction(argparse.Action):
+    """Stores a single string when specified once, or a list of strings when repeated."""
+
+    def __call__(self, parser_obj, namespace, values, option_string=None):
+        explicit_set = getattr(namespace, "_explicit_cli_dests", None)
+        if explicit_set is None:
+            explicit_set = set()
+            setattr(namespace, "_explicit_cli_dests", explicit_set)
+        explicit_set.add(self.dest)
+        current = getattr(namespace, self.dest, None)
+        if current is None:
+            setattr(namespace, self.dest, values)
+        elif isinstance(current, list):
+            current.append(values)
+        else:
+            setattr(namespace, self.dest, [current, values])
+
+
+def _configure_cli_hygiene(args: Any) -> Tuple[Any, Any]:
+    """Configures process-wide active RequestHygieneConfig and TokenBucketRateLimiter from CLI args."""
+    from engine.request_hygiene import (
+        RequestHygieneConfig,
+        TokenBucketRateLimiter,
+        set_active_hygiene,
+    )
+
+    raw_headers = (
+        getattr(args, "headers", None)
+        or getattr(args, "header", None)
+        or getattr(args, "bounty_header", None)
+        or []
+    )
+    if isinstance(raw_headers, str):
+        raw_headers = [raw_headers]
+    raw_ua = getattr(args, "user_agent", None)
+    raw_rps = getattr(args, "max_rps", 0.0)
+    try:
+        rps_val = float(raw_rps or 0.0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"--max-rps must be a finite non-negative number, got {raw_rps!r}") from exc
+
+    cfg = RequestHygieneConfig.from_cli(headers=raw_headers, user_agent=raw_ua, max_rps=rps_val)
+    limiter = TokenBucketRateLimiter(rps_val) if rps_val > 0.0 else None
+    set_active_hygiene(cfg if cfg.is_active else None, limiter)
+    return cfg, limiter
 from permutator import VectorPermutator
 from probe_generator import ProbeGenerator
 from rfc_chunker import RFCChunker
@@ -2473,54 +2520,115 @@ def cmd_oracle(args):
 
 
 def cmd_h2(args):
-    """Constructs and displays binary HTTP/2 framing desynchronization streams."""
+    """Constructs and optionally live-probes binary HTTP/2 framing desynchronization streams."""
     from engine.h2_framing import H2GatewayDesyncBuilder
+
+    hygiene_cfg, rate_limiter = _configure_cli_hygiene(args)
+    extra_hdrs = hygiene_cfg.to_headers_dict() if hygiene_cfg.is_active else None
     target_host = args.host or "127.0.0.1"
+    target_port = int(getattr(args, "port", 443) or 443)
+    as_json = bool(getattr(args, "as_json", False))
+
+    h2_cl = H2GatewayDesyncBuilder.build_h2_cl_desync(
+        path="/",
+        host=target_host,
+        declared_cl=0,
+        actual_payload=b"GET /smuggled HTTP/1.1\r\nHost: " + target_host.encode() + b"\r\n\r\n",
+        extra_headers=extra_hdrs,
+    )
+    h2_te = H2GatewayDesyncBuilder.build_h2_te_desync(
+        path="/",
+        host=target_host,
+        te_value="chunked",
+        chunked_body=b"0\r\n\r\n",
+        extra_headers=extra_hdrs,
+    )
+    h2_crlf = H2GatewayDesyncBuilder.build_h2_crlf_pseudoheader_injection(
+        injected_path="/ HTTP/1.1\r\nHost: " + target_host + "\r\n\r\n",
+        host=target_host,
+        extra_headers=extra_hdrs,
+    )
+
+    live_report = None
+    if bool(getattr(args, "live", False)):
+        from engine.h2_live_authz import LiveH2DesyncProber
+        prober = LiveH2DesyncProber(
+            host=target_host,
+            port=target_port,
+            use_tls=bool(getattr(args, "tls", False) or target_port == 443),
+            authorized=bool(getattr(args, "authorized", False)),
+            hygiene_config=hygiene_cfg,
+            rate_limiter=rate_limiter,
+        )
+        live_report = prober.run_live_h2_desync_audit()
+
+    if as_json:
+        from engine.cli_render import render_json
+        render_json(
+            {
+                "host": target_host,
+                "port": target_port,
+                "h2_cl_bytes": len(h2_cl),
+                "h2_te_bytes": len(h2_te),
+                "h2_crlf_bytes": len(h2_crlf),
+                "live_probing": live_report,
+            }
+        )
+        return
+
     print(f"\n{'='*75}")
     print("[*] BINARY HTTP/2 FRAMING & GATEWAY DESYNC BUILDER")
-    print(f"    Target: {target_host}:{args.port}")
+    print(f"    Target: {target_host}:{target_port}")
     print(f"{'='*75}")
-    h2_cl = H2GatewayDesyncBuilder.build_h2_cl_desync(
-        path="/", host=target_host, declared_cl=0, actual_payload=b"GET /smuggled HTTP/1.1\r\nHost: " + target_host.encode() + b"\r\n\r\n"
-    )
     print(f"[+] Built H2.CL Desynchronization stream: {len(h2_cl)} bytes")
-    h2_te = H2GatewayDesyncBuilder.build_h2_te_desync(
-        path="/", host=target_host, te_value="chunked", chunked_body=b"0\r\n\r\n"
-    )
     print(f"[+] Built H2.TE Desynchronization stream: {len(h2_te)} bytes")
-    h2_crlf = H2GatewayDesyncBuilder.build_h2_crlf_pseudoheader_injection(
-        injected_path="/ HTTP/1.1\r\nHost: " + target_host + "\r\n\r\n", host=target_host
-    )
     print(f"[+] Built H2 Pseudo-Header CRLF Injection stream: {len(h2_crlf)} bytes")
+    if live_report is not None:
+        print(
+            f"[+] Live 3-Trial H2 Desync Audit: status={live_report.get('status')} "
+            f"findings={live_report.get('total_findings', 0)} transient={live_report.get('transient_count', 0)}"
+        )
     print(f"[*] H2 binary frames synthesized for gateway validation.")
     print(f"{'='*75}\n")
 
 
 def cmd_audit(args):
     """Computes and cryptographically verifies RFC 6962 Merkle tree root and leaf inclusion proofs."""
+    from engine.differential_oracle import MultiImplementationDifferentialOracle
     from engine.merkle_audit import MerkleAuditTrail
     from database import Database
+
     db = Database(args.db)
-    findings = db.get_confirmed_findings()
-    trail = MerkleAuditTrail()
-    for f in findings:
-        f_dict = dict(f)
-        trail.record_finding(
-            entry_id=f"VULN-{f_dict.get('eval_id', 1)}",
-            target_engine=args.host,
-            raw_probe=str(f_dict.get("raw_probe", "")).encode("latin-1", errors="replace"),
-            raw_response=str(f_dict.get("raw_evidence", "")).encode("latin-1", errors="replace"),
-            reproducibility_rate=1.0,
-            verification_attempts=3,
-            successful_reproductions=3,
-            four_parser_differential={"divergence": True},
-            status="CONFIRMED_VULNERABILITY",
-        )
+    try:
+        findings = db.get_confirmed_findings()
+        oracle = MultiImplementationDifferentialOracle()
+        trail = MerkleAuditTrail()
+        for f in findings:
+            f_dict = dict(f)
+            raw_probe_bytes = str(f_dict.get("raw_probe", "")).encode("latin-1", errors="replace")
+            raw_resp_bytes = str(f_dict.get("raw_evidence", "")).encode("latin-1", errors="replace")
+            has_div, _, matrix = oracle.evaluate_matrix_4parsers(raw_probe_bytes)
+            att = int(f_dict.get("verification_attempts") or 3)
+            succ = int(f_dict.get("successful_reproductions") or 3)
+            rate = float(f_dict.get("reproducibility_rate") if f_dict.get("reproducibility_rate") is not None else 1.0)
+            trail.record_finding(
+                entry_id=f"VULN-{f_dict.get('eval_id', 1)}",
+                target_engine=args.host,
+                raw_probe=raw_probe_bytes,
+                raw_response=raw_resp_bytes,
+                reproducibility_rate=rate,
+                verification_attempts=att,
+                successful_reproductions=succ,
+                four_parser_differential={"divergence": bool(has_div), "matrix": matrix},
+                status="CONFIRMED_VULNERABILITY",
+            )
+    finally:
+        db.close()
     print(f"\n{'='*75}")
     print("[*] CRYPTOGRAPHIC MERKLE AUDIT TRAIL (RFC 6962)")
     print(f"{'='*75}")
     print(f"  Total Findings Ingested : {len(findings)}")
-    print(f"  Total Leaves Recorded   : {len(trail.leaves)}")
+    print(f"  Total Leaves Recorded   : {len(trail.leaves)} (Confirmed: {len(trail.get_confirmed_leaves())}, Transient: {len(trail.get_transient_leaves())})")
     root = trail.get_merkle_root()
     print(f"  Merkle Tree Root        : {root}")
     if trail.leaves:
@@ -2762,6 +2870,8 @@ def cmd_artex(args):
                 )
             except Exception:
                 arbiter = None
+        _configure_cli_hygiene(args)
+        from engine.h2_live_authz import resolve_auth_profiles_from_cli
         traffic_session = TrafficCaptureSession(db=db, task_id=shared_task_id, proxy_config=proxy_cfg)
         approval_gate = (
             ApprovalGate.from_rules_file(approval_rules, mode=approval_mode, db=db, task_id=shared_task_id)
@@ -2770,7 +2880,10 @@ def cmd_artex(args):
         )
         loaded_scope = load_scope_file(scope_file) if scope_file else {"allow_hosts": [], "deny_hosts": [], "deny_routes": []}
         scope_hosts_set = set(loaded_scope.get("allow_hosts") or []) or None
-        loaded_auth_profiles = load_auth_profiles(auth_profile) if auth_profile else {}
+        if isinstance(auth_profile, str) and "," not in auth_profile:
+            loaded_auth_profiles = load_auth_profiles(auth_profile) if auth_profile else {}
+        else:
+            loaded_auth_profiles = resolve_auth_profiles_from_cli(auth_profile) if auth_profile else {}
 
         if embedded_proxy:
             from engine.local_mitm_proxy import LocalRecordingMITMProxy
@@ -4340,6 +4453,12 @@ def cmd_all(args):
 
     args.fusion = True
     args.abliteration = True
+    try:
+        _configure_cli_hygiene(args)
+    except ValueError as exc:
+        as_json_err = bool(getattr(args, "as_json", False))
+        print(f"[!] Invalid request hygiene / rate-limit configuration: {exc}", file=(sys.stderr if as_json_err else sys.stdout))
+        sys.exit(1)
     host = getattr(args, "host", None) or getattr(args, "target", None)
     targets = getattr(args, "targets", None)
     repo = getattr(args, "repo", None) or getattr(args, "raptor_target", None)
@@ -4497,14 +4616,24 @@ def cmd_all(args):
             rea_use_cli=rea_use_cli_val,
             auto_install_tools=bool(getattr(args, "auto_install", True)),
         )
+        _extra_unified = {
+            "include_models": include_models_val,
+            "include_leads": bool(getattr(args, "include_leads", False)),
+            "custom_headers": getattr(args, "headers", None) or None,
+            "user_agent": getattr(args, "user_agent", None),
+            "max_rps": float(getattr(args, "max_rps", 0.0) or 0.0),
+            "enable_h2_desync": bool(getattr(args, "enable_h2_desync", True)),
+        }
         try:
             _unified_sig = inspect.signature(run_unified_all_scans)
-            if "include_models" in _unified_sig.parameters or any(
+            _accepts_var_kw = any(
                 p.kind == inspect.Parameter.VAR_KEYWORD for p in _unified_sig.parameters.values()
-            ):
-                unified_kwargs["include_models"] = include_models_val
+            )
+            for _k, _v in _extra_unified.items():
+                if _k in _unified_sig.parameters or _accepts_var_kw:
+                    unified_kwargs[_k] = _v
         except (TypeError, ValueError):
-            unified_kwargs["include_models"] = include_models_val
+            unified_kwargs.update(_extra_unified)
 
         try:
             _stdout_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
@@ -5022,12 +5151,16 @@ def cmd_scanner(args):
         run_nuclei = bool(nc) if nc is not None else enable_all
 
     try:
+        hygiene_cfg, _ = _configure_cli_hygiene(args)
         cfg = ExternalScannerConfig(
             enabled=True,
             execution_mode=scanner_isolation,
             docker_image=getattr(args, "docker_image", None),
             docker_network=getattr(args, "docker_network", None),
             nuclei_tags=norm_tags,
+            custom_headers=list(hygiene_cfg.headers),
+            user_agent=hygiene_cfg.user_agent,
+            max_rps=float(getattr(args, "max_rps", 0.0) or 0.0),
         )
     except (ValueError, PermissionError) as exc:
         print(f"[!] Invalid external scanner configuration: {exc}", file=err_stream)
@@ -5415,6 +5548,7 @@ def cmd_export_advisory(args):
         exporter = AdvisoryExporter(reports_dir=out_dir)
         chain_id = getattr(args, "chain_id", None)
         task_id_filter = getattr(args, "task_id", None)
+        include_leads = bool(getattr(args, "include_leads", False))
         if chain_id:
             found = db.get_attack_chain(str(chain_id), task_id=task_id_filter)
             if found is None:
@@ -5422,9 +5556,12 @@ def cmd_export_advisory(args):
                 sys.exit(1)
             chains = [found]
         else:
+            req_min_poe = int(getattr(args, "min_poe", 0) or 0)
+            eff_min_poe = req_min_poe if include_leads else max(3, req_min_poe)
             chains = db.get_attack_chains(
                 limit=int(getattr(args, "limit", 50) or 50),
                 task_id=task_id_filter,
+                min_poe=eff_min_poe if eff_min_poe > 0 else None,
             )
 
         written_md: List[str] = []
@@ -6770,14 +6907,20 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--no-artex-live", dest="no_artex_live", action="store_true", default=False, help="Disable auto-live ARTEX worker verification")
     parser.add_argument("--embedded-proxy", dest="embedded_proxy", action="store_true", default=False, help="Start embedded pure-CLI recording MITM proxy during scan")
     parser.add_argument("--embedded-proxy-port", dest="embedded_proxy_port", type=int, default=0, help="Port for embedded MITM proxy (0 = ephemeral)")
-    parser.add_argument("--auth-profile", dest="auth_profile", type=str, default=None, help="Path to JSON/YAML multi-role auth profiles")
+    parser.add_argument("--auth-profile", dest="auth_profile", type=str, default=None, action=_SingleOrMultiStoreAction, help="Path(s) to JSON/YAML multi-role auth profiles (repeatable or comma-separated for 2-account BOLA/IDOR differential replay)")
+    parser.add_argument("--header", "--bounty-header", dest="headers", action="append", default=[], help="Repeatable custom HTTP header ('Name: Value', e.g. 'X-Bug-Bounty: handle') propagated across all raw sockets, HTTP/2 frames, HTTP clients, and external scanners")
+    parser.add_argument("--user-agent", dest="user_agent", type=str, default=None, help="Custom User-Agent header propagated across all raw sockets, HTTP/2 frames, HTTP clients, and external scanners")
+    parser.add_argument("--max-rps", dest="max_rps", type=float, default=0.0, help="Global shared token-bucket requests-per-second rate cap across all raw sockets, HTTP clients, and external scanners (0 = unlimited)")
+    parser.add_argument("--h2-desync", dest="enable_h2_desync", action="store_true", default=True, help="Enable live 3-trial binary HTTP/2 (ALPN h2 / h2c) desync probing (H2.CL, H2.TE, pseudo-header smuggling; default: True)")
+    parser.add_argument("--no-h2-desync", dest="enable_h2_desync", action="store_false", help="Disable live binary HTTP/2 desync probing during --all")
     parser.add_argument("--import-har", dest="import_har", type=str, default=None, help="Import HAR 1.2 recording into AssetGraph + traffic_evidence")
     parser.add_argument("--import-openapi", dest="import_openapi", type=str, default=None, help="Import OpenAPI/Swagger spec into AssetGraph")
     parser.add_argument("--scope-file", dest="scope_file", type=str, default=None, help="Path to YAML/JSON allow/deny scope rules")
     parser.add_argument("--approval-mode", dest="approval_mode", choices=["policy", "prompt", "deny"], default="policy", help="Approval gate mode (policy|prompt|deny)")
     parser.add_argument("--approval-rules", dest="approval_rules", type=str, default=None, help="Path to YAML/JSON approval rules file")
-    parser.add_argument("--strict-poe", dest="strict_poe", action="store_true", default=False, help="Require POE>=2 to mark chains VERIFIED")
-    parser.add_argument("--export-advisory", dest="export_advisory", action="store_true", default=False, help="Export GHSA-ready Markdown advisories")
+    parser.add_argument("--strict-poe", dest="strict_poe", action="store_true", default=False, help="Require POE==3 verified exploit proof (default on advisory exports unless --include-leads)")
+    parser.add_argument("--include-leads", dest="include_leads", action="store_true", default=False, help="Include POE=1-2 manual review leads in advisory exports and --strict-poe reports")
+    parser.add_argument("--export-advisory", dest="export_advisory", action="store_true", default=False, help="Export GHSA-ready Markdown advisories (defaults to POE==3 verified exploits unless --include-leads)")
     parser.add_argument("--export-csv", dest="export_csv", action="store_true", default=False, help="Export formula-neutralized CSV of findings & chains")
     parser.add_argument("--poc", dest="enable_poc", action="store_true", default=False, help="Generate non-destructive PoC verification scripts, false-positive triage, and POC_INDEX.md bundle under <output-dir>/pocs/")
     parser.add_argument("--poc-dir", dest="poc_dir", type=str, default=None, help="Optional output directory for --poc verification bundle (defaults to <output-dir>/pocs)")
@@ -7193,6 +7336,12 @@ def parse_swarm_arguments(argv=None):
 def main_swarm(argv=None, caller_profile: str = "swarm"):
     """Primary unified CLI execution entrypoint for rfc_hunt_swarm (and thin compatibility callers)."""
     args = parse_swarm_arguments(argv)
+    try:
+        _configure_cli_hygiene(args)
+    except ValueError as exc:
+        as_json_err = bool(getattr(args, "as_json", False))
+        print(f"[!] Invalid request hygiene / rate-limit configuration: {exc}", file=(sys.stderr if as_json_err else sys.stdout))
+        sys.exit(1)
 
     raw_argv = sys.argv[1:] if argv is None else list(argv)
     explicit_dests = getattr(args, "_explicit_cli_dests", set())

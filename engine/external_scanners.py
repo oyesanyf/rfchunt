@@ -502,8 +502,21 @@ class ExternalScannerConfig:
     nuclei_tags: Tuple[str, ...] = DEFAULT_NUCLEI_TAGS
     nuclei_severity: Tuple[str, ...] = ("info", "low", "medium")
     threads: Optional[int] = None
+    custom_headers: Tuple[Tuple[str, str], ...] = ()
+    user_agent: Optional[str] = None
+    max_rps: float = 0.0
 
     def __post_init__(self) -> None:
+        if self.custom_headers or self.user_agent or self.max_rps:
+            from engine.request_hygiene import RequestHygieneConfig
+            hyg = RequestHygieneConfig.from_raw(
+                headers=list(self.custom_headers),
+                user_agent=self.user_agent,
+                max_rps=self.max_rps,
+            )
+            self.custom_headers = hyg.headers
+            self.user_agent = hyg.user_agent
+            self.max_rps = hyg.max_rps
         if not self.enabled:
             return
         _validate_execution_mode(self.execution_mode)
@@ -871,20 +884,33 @@ def _validate_target_and_normalize(
 def _resolve_rate_limit(
     config: ExternalScannerConfig, noise_governor: Optional[NoiseGovernor]
 ) -> int:
+    from engine.request_hygiene import get_active_hygiene
+    active_hyg, _ = get_active_hygiene()
+    eff_max_rps = float(getattr(config, "max_rps", 0.0) or 0.0) or float(active_hyg.max_rps or 0.0)
+
     gov_rps = 0.0
     if noise_governor is not None:
         try:
             gov_rps = float(noise_governor.config().get("rps", 0.0) or 0.0)
         except Exception:
             gov_rps = 0.0
+
+    resolved = DEFAULT_SAFE_RATE_LIMIT
     if gov_rps > 0:
         gov_cap = max(1, min(MAX_RATE_LIMIT, int(gov_rps)))
         if config.rate_limit is not None:
-            return max(1, min(int(config.rate_limit), gov_cap))
-        return gov_cap
-    if config.rate_limit is not None:
-        return max(1, min(MAX_RATE_LIMIT, int(config.rate_limit)))
-    return DEFAULT_SAFE_RATE_LIMIT
+            resolved = max(1, min(int(config.rate_limit), gov_cap))
+        else:
+            resolved = gov_cap
+    elif config.rate_limit is not None:
+        resolved = max(1, min(MAX_RATE_LIMIT, int(config.rate_limit)))
+
+    if eff_max_rps > 0.0:
+        rps_cap = max(1, min(MAX_RATE_LIMIT, int(eff_max_rps)))
+        if config.rate_limit is not None or gov_rps > 0:
+            return max(1, min(resolved, rps_cap))
+        return rps_cap
+    return resolved
 
 
 def _validate_extra_flags(
@@ -1654,13 +1680,28 @@ class _BaseExternalScannerAdapter:
         approval_gate: Optional[ApprovalGate] = None,
         noise_governor: Optional[NoiseGovernor] = None,
         execution_policy: Optional[ExecutionPolicy] = None,
+        rate_limiter: Optional[Any] = None,
     ) -> None:
         self.config = config if config is not None else ExternalScannerConfig()
         self.approval_gate = approval_gate
         self.noise_governor = noise_governor
         self.execution_policy = execution_policy
+        self.rate_limiter = rate_limiter
         if self.config.enabled:
             self._validate_config_for_tool()
+
+    def _build_hygiene_header_flags(self) -> List[str]:
+        from engine.request_hygiene import RequestHygieneConfig, get_active_hygiene
+        active_hyg, _ = get_active_hygiene()
+        cfg_headers = getattr(self.config, "custom_headers", ()) or active_hyg.headers
+        cfg_ua = getattr(self.config, "user_agent", None) or active_hyg.user_agent
+        if not cfg_headers and not cfg_ua:
+            return []
+        hyg = RequestHygieneConfig.from_raw(headers=list(cfg_headers), user_agent=cfg_ua)
+        flags: List[str] = []
+        for k, v in hyg.to_cli_header_pairs():
+            flags.extend(["-H", f"{k}: {v}"])
+        return flags
 
     def _validate_config_for_tool(self) -> Tuple[str, Optional[str], Optional[int]]:
         mode = _validate_execution_mode(self.config.execution_mode)
@@ -1688,10 +1729,15 @@ class _BaseExternalScannerAdapter:
     def _build_argv(
         self,
         target_url: str,
-        rate_limit: int,
-        extra_flags: List[str],
+        rate_limit: Optional[int] = None,
+        extra_flags: Optional[List[str]] = None,
     ) -> List[str]:
-        tool_flags = self._build_tool_flags(target_url, rate_limit, extra_flags)
+        eff_rl = _resolve_rate_limit(self.config, self.noise_governor) if rate_limit is None else int(rate_limit)
+        eff_extra = list(extra_flags or [])
+        tool_flags = self._build_tool_flags(target_url, eff_rl, eff_extra)
+        hdr_flags = self._build_hygiene_header_flags()
+        if hdr_flags:
+            tool_flags = [*tool_flags, *hdr_flags]
         if self.config.execution_mode == "docker":
             docker_bin = _resolve_docker_binary()
             image = _validate_docker_image(self.config.docker_image, self.tool_name)
@@ -1792,6 +1838,9 @@ class _BaseExternalScannerAdapter:
         if self.noise_governor is not None:
             sleep_flag = getattr(self.noise_governor, "profile", "off") != "off"
             self.noise_governor.acquire_slot(host, sleep_enabled=sleep_flag)
+
+        from engine.request_hygiene import acquire_rate_limit
+        acquire_rate_limit(self.rate_limiter)
 
         if (
             self.config.execution_mode == "host"

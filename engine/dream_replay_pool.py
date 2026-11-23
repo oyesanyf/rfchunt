@@ -946,7 +946,7 @@ class ReplayTreePool:
                     is_attack_chain = True
                     chain_poe = int(chain_row.get("poe_level") or 0)
                     poe_level = max(poe_level, chain_poe)
-                    if bool(chain_row.get("is_verified")) or chain_poe >= 3:
+                    if chain_poe >= 3:
                         is_confirmed_vuln = True
                         is_anomaly = True
 
@@ -1006,7 +1006,7 @@ class ReplayTreePool:
                             parent_nid = existing.node_id
                             break
                 ch_poe = int(ch.get("poe_level") or 0)
-                ch_verified = bool(ch.get("is_verified")) or ch_poe >= 3
+                ch_verified = ch_poe >= 3
                 nodes[ch_nid] = ReplayNode(
                     node_id=ch_nid,
                     parent_node_id=parent_nid,

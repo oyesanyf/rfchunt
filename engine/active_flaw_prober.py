@@ -41,6 +41,8 @@ class ActiveFlawProber:
         timeout: float = 3.5,
         db: Optional[Database] = None,
         on_trace: Optional[Callable[[str], None]] = None,
+        hygiene_config: Optional[Any] = None,
+        rate_limiter: Optional[Any] = None,
     ):
         if host in ("0.0.0.0", "::"):
             raise ValueError(f"Target host cannot be {host} (INADDR_ANY listening address). Use 127.0.0.1 or localhost.")
@@ -50,6 +52,8 @@ class ActiveFlawProber:
         self.timeout = timeout
         self.db = db
         self.on_trace = on_trace or print
+        self.hygiene_config = hygiene_config
+        self.rate_limiter = rate_limiter
 
         is_local = host in ("127.0.0.1", "localhost", "::1", "[::1]") or host.startswith("127.")
         from engine.safe_network_validator import validate_target_host
@@ -63,7 +67,11 @@ class ActiveFlawProber:
             self._is_authorized = False
             self._auth_reason = str(e)
 
-        self.seq_engine = StatefulProtocolSequenceEngine(default_timeout=timeout)
+        self.seq_engine = StatefulProtocolSequenceEngine(
+            default_timeout=timeout,
+            hygiene_config=hygiene_config,
+            rate_limiter=rate_limiter,
+        )
         self.debugger = DeltaDebugger(target_host=host, target_port=port, default_timeout=timeout, use_tls=use_tls)
         self.classifier = CausalAnomalyClassifier()
         self.permutator = VectorPermutator(db=db)

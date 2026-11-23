@@ -35,6 +35,8 @@ class DeterministicHarness:
         db: Optional[Database] = None,
         verbose: bool = False,
         on_trace: Optional[Callable[[str], None]] = None,
+        hygiene_config: Optional[Any] = None,
+        rate_limiter: Optional[Any] = None,
     ):
         self.host = host
         self.port = port
@@ -43,6 +45,8 @@ class DeterministicHarness:
         self.db = db
         self.verbose = verbose
         self.on_trace = on_trace
+        self.hygiene_config = hygiene_config
+        self.rate_limiter = rate_limiter
 
     def _open_connection(self) -> socket.socket:
         from engine.execution_policy import ExecutionPolicy, StructuredIntentProposal, ScannerTask, ActionType
@@ -63,7 +67,10 @@ class DeterministicHarness:
         return raw_sock
 
     def _send_and_receive(self, sock: socket.socket, data: bytes, read_until_close: bool = False) -> bytes:
-        sock.sendall(data)
+        from engine.request_hygiene import acquire_rate_limit, resolve_hygiene
+        hyg, lim = resolve_hygiene(getattr(self, "hygiene_config", None), getattr(self, "rate_limiter", None))
+        acquire_rate_limit(lim)
+        sock.sendall(hyg.inject_raw_http1(data))
         if read_until_close:
             buffer = bytearray()
             sock.settimeout(self.timeout)
