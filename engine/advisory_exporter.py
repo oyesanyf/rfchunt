@@ -161,7 +161,17 @@ class AdvisoryExporter:
             3: "VERIFIED_EXPLOIT",
         }
         poe_label = str(chain.get("poe_label") or poe_labels.get(poe_level, "NONE"))
-        ver_status = str(chain.get("verification_status") or ("VERIFIED" if chain.get("is_verified") else "UNVERIFIED"))
+        raw_ver_st = str(chain.get("verification_status") or "").strip().upper()
+        if poe_level >= 3:
+            ver_status = "FIXED" if raw_ver_st == "FIXED" else "VERIFIED"
+        elif poe_level == 2:
+            ver_status = "FIXED" if raw_ver_st == "FIXED" else "LEAD_ACTIVE_INDICATOR"
+        elif poe_level == 1:
+            ver_status = "FIXED" if raw_ver_st == "FIXED" else "LEAD_PASSIVE_CORRELATION"
+        else:
+            ver_status = "UNVERIFIED"
+        if poe_level < 3 and title.upper().startswith("CONFIRMED:"):
+            title = f"LEAD [POE={poe_level}]: " + title[len("CONFIRMED:") :].lstrip()
         target_host = str(chain.get("target_host") or chain.get("host") or "target")
         target_route = str(chain.get("target_route") or chain.get("target_endpoint") or chain.get("target_path") or "/")
         hop_count = int(chain.get("hop_count") or len(chain.get("chain_steps") or []) or 1)
@@ -372,6 +382,16 @@ class AdvisoryExporter:
             writer.writerow([neutralize_csv_cell(c) for c in row])
 
         for ch in chains or []:
+            ch_poe = int(ch.get("poe_level") if ch.get("poe_level") is not None else 0)
+            ch_raw_st = str(ch.get("verification_status") or "").strip().upper()
+            if ch_poe >= 3:
+                ch_st = "FIXED" if ch_raw_st == "FIXED" else "VERIFIED"
+            elif ch_poe == 2:
+                ch_st = "FIXED" if ch_raw_st == "FIXED" else "LEAD_ACTIVE_INDICATOR"
+            elif ch_poe == 1:
+                ch_st = "FIXED" if ch_raw_st == "FIXED" else "LEAD_PASSIVE_CORRELATION"
+            else:
+                ch_st = "UNVERIFIED"
             row = [
                 "ATTACK_CHAIN",
                 ch.get("chain_id") or ch.get("node_id") or "",
@@ -380,8 +400,8 @@ class AdvisoryExporter:
                 ch.get("cwe") or "CWE-444",
                 ch.get("label") or ch.get("title") or ch.get("attack_type") or "",
                 f"{ch.get('target_host') or ''}{ch.get('target_route') or ch.get('target_endpoint') or ch.get('target_path') or ''}",
-                ch.get("poe_level") if ch.get("poe_level") is not None else 0,
-                ch.get("verification_status") or ("VERIFIED" if ch.get("is_verified") else "UNVERIFIED"),
+                ch_poe,
+                ch_st,
                 ch.get("hop_count") or 1,
                 ch.get("traffic_id") or "",
                 _redact_inline_tokens(str(ch.get("evidence_quote") or "")),

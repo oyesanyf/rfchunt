@@ -56,21 +56,24 @@ def test_asset_and_exploration_graphs_in_memory():
     candidate_types = [c.attributes.get("attack_type") for c in candidates]
     assert "DESYNC_PROMPT_INJECTION" in candidate_types or "PIPELINE_HIJACK" in candidate_types
 
-    # Execute worker
+    # Execute worker (POE=2 active indicator without live traffic receipt -> recorded as lead)
     def mock_executor(attrs):
         return True, "Mock attack verification succeeded", "RAW_SMUGGLED_CANARY"
 
     res = engine.run_attack_chain_cycle(round_num=1, executor_fn=mock_executor)
-    assert res["exploits_verified"] >= 1
+    assert res["leads_recorded"] >= 1
+    assert res["exploits_verified"] == 0
 
-    # Verify DB persistence
+    # Verify DB persistence (truthful POE=2 lead status)
     saved_nodes = db.get_dual_graph_nodes()
     assert len(saved_nodes) >= 4
     saved_edges = db.get_dual_graph_edges()
     assert len(saved_edges) >= 2
     chains = db.get_attack_chains()
     assert len(chains) >= 1
-    assert chains[0]["is_verified"] == 1
+    assert chains[0]["poe_level"] == 2
+    assert chains[0]["is_verified"] == 0
+    assert chains[0]["verification_status"] == "LEAD_ACTIVE_INDICATOR"
 
     db.close()
 
@@ -273,10 +276,11 @@ def test_multihop_3hop_compound_chain_generation():
     assert len(p1_cand.attributes["chain_steps"]) >= 3
     assert len(p1_cand.attributes["source_scanners"]) >= 2
 
-    # Verify execution cycle confirms exploits
+    # Verify execution cycle records passive correlation leads truthfully (POE=1 -> leads_recorded, not exploits_verified)
     res = engine.run_attack_chain_cycle(round_num=1)
     assert res["candidates_planned"] >= 4
-    assert res["exploits_verified"] >= 4
+    assert res["leads_recorded"] >= 4
+    assert res["exploits_verified"] == 0
 
 
 def test_export_attack_chains_to_sarif_findings():

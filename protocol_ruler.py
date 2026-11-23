@@ -98,6 +98,8 @@ class ProtocolRuler:
         verbose: bool = False,
         debug: bool = False,
         on_trace: Optional[Callable[[str], None]] = None,
+        hygiene_config: Optional[Any] = None,
+        rate_limiter: Optional[Any] = None,
     ):
         if host in ("0.0.0.0", "::"):
             raise ValueError(f"Target host cannot be {host} (INADDR_ANY listening address). Use 127.0.0.1 or localhost.")
@@ -115,6 +117,8 @@ class ProtocolRuler:
         self.verbose = verbose
         self.debug = debug
         self.on_trace = on_trace
+        self.hygiene_config = hygiene_config
+        self.rate_limiter = rate_limiter
 
     def _log(self, msg: str) -> None:
         if self.on_trace:
@@ -157,8 +161,12 @@ class ProtocolRuler:
         response_bytes = b""
         sock = None
         try:
+            from engine.request_hygiene import acquire_rate_limit, resolve_hygiene
+            hyg, lim = resolve_hygiene(getattr(self, "hygiene_config", None), getattr(self, "rate_limiter", None))
+            acquire_rate_limit(lim)
+            wire_bytes = hyg.inject_raw_http1(request_bytes)
             sock = self._open_socket()
-            sock.sendall(request_bytes)
+            sock.sendall(wire_bytes)
             framed = HTTPFramingReader.read_response(sock, timeout=self.timeout)
             status_code = framed.status_code
             response_bytes = framed.raw_response
@@ -522,9 +530,16 @@ USAGE EXAMPLES:
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--sequence", type=str, default=None, help="Custom byte sequence to test (e.g. '\\xc0\\x8a' or hex 'c08a')")
     parser.add_argument("--name", type=str, default="Custom Probe", help="Name for custom sequence")
+    parser.add_argument("--header", "--bounty-header", dest="headers", action="append", default=[], help="Custom HTTP header in 'Name: Value' format (repeatable)")
+    parser.add_argument("--user-agent", dest="user_agent", type=str, default=None, help="Custom User-Agent header")
+    parser.add_argument("--max-rps", dest="max_rps", type=float, default=0.0, help="Maximum requests-per-second rate limit (default: 0 = unlimited)")
     args = parser.parse_args()
 
     use_tls = args.tls or (args.port == 443)
+    from engine.request_hygiene import RequestHygieneConfig, TokenBucketRateLimiter, set_active_hygiene
+    hyg = RequestHygieneConfig.from_raw(headers=args.headers, user_agent=args.user_agent, max_rps=args.max_rps)
+    lim = TokenBucketRateLimiter(hyg.max_rps) if hyg.max_rps > 0 else None
+    set_active_hygiene(hyg, lim)
 
     ruler = ProtocolRuler(
         host=args.host,
@@ -533,6 +548,8 @@ USAGE EXAMPLES:
         timeout=args.timeout,
         verbose=args.verbose,
         debug=args.debug,
+        hygiene_config=hyg,
+        rate_limiter=lim,
     )
 
     custom = []

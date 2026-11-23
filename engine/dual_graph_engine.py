@@ -112,14 +112,14 @@ class POEVerifier:
         if active_indicator:
             return (
                 POELevel.ACTIVE_INDICATOR,
-                "VERIFIED" if has_structural_prereqs else "UNVERIFIED",
-                "Active indicator recorded during worker execution.",
+                "LEAD_ACTIVE_INDICATOR" if has_structural_prereqs else "UNVERIFIED",
+                "Active indicator recorded during worker execution (manual review lead; requires POE=3 verbatim traffic proof).",
             )
         if has_structural_prereqs:
             return (
                 POELevel.PASSIVE_CORRELATION,
-                "VERIFIED",
-                "Structural prerequisite findings correlated across dual-graph assets.",
+                "LEAD_PASSIVE_CORRELATION",
+                "Structural prerequisite findings correlated across dual-graph assets (passive lead; not POE=3 verified exploit).",
             )
         return (POELevel.NONE, "UNVERIFIED", "No corroborating evidence or traffic bound.")
 
@@ -3852,7 +3852,7 @@ class ArtexWorker:
                 has_structural_prereqs=bool(success),
                 active_indicator=active_indicator,
             )
-            if ver_status != "VERIFIED":
+            if ver_status == "UNVERIFIED":
                 success = False
             # Under --strict-poe, static structural correlations (POE=1) remain UNVERIFIED candidates
             if self.strict_poe and poe_level < POELevel.ACTIVE_INDICATOR:
@@ -3860,9 +3860,21 @@ class ArtexWorker:
                 ver_status = "UNVERIFIED"
                 poe_note = f"Strict POE enforced: requires POE>=2 (active/verbatim traffic), got {poe_level.name}."
 
+            is_poe3_verified = bool(
+                success
+                and int(poe_level) >= int(POELevel.VERIFIED_EXPLOIT)
+                and ver_status == "VERIFIED"
+            )
+            is_lead_recorded = bool(
+                success
+                and not is_poe3_verified
+                and int(poe_level) in (int(POELevel.PASSIVE_CORRELATION), int(POELevel.ACTIVE_INDICATOR))
+            )
+
             # Frame raw observation through UntrustedOutputBoundary for trace persistence
+            trace_verdict_str = "VERIFIED" if is_poe3_verified else (ver_status if is_lead_recorded else "FAILED")
             framed_obs = self.boundary.frame(
-                f"target={target_host}{target_route} status={'VERIFIED' if success else 'FAILED'} "
+                f"target={target_host}{target_route} status={trace_verdict_str} "
                 f"poe={poe_level.name} evidence={evidence}",
                 source_label=f"worker_{w_id}",
             )
@@ -3872,10 +3884,10 @@ class ArtexWorker:
                     worker_id=w_id,
                     intent_id=candidate.node_id,
                     tool_name=str(attrs.get("attack_type") or "artex_chain_worker"),
-                    summary=f"{candidate.label} -> {'VERIFIED' if success else 'FAILED'} (POE={poe_level.value})",
+                    summary=f"{candidate.label} -> {trace_verdict_str} (POE={poe_level.value})",
                     raw_observation=framed_obs,
                     target_asset_id=candidate.anchored_asset_id,
-                    status="COMPLETED" if success else "FAILED",
+                    status="COMPLETED" if (is_poe3_verified or is_lead_recorded) else "FAILED",
                     extracted_facts=yielded_facts,
                     traffic_id=traffic_id or None,
                 )
@@ -4025,9 +4037,23 @@ class ArtexWorker:
                     except Exception:
                         pass
 
-        if success:
-            candidate.status = "VERIFIED"
-            exploit_id = f"EXPLOIT-{candidate.node_id}"
+        if is_poe3_verified or is_lead_recorded:
+            clean_base_label = candidate.label.replace("CONFIRMED: ", "", 1)
+            if is_poe3_verified:
+                candidate.status = "VERIFIED"
+                chain_node_id = f"EXPLOIT-{candidate.node_id}"
+                chain_node_type = "CONFIRMED_EXPLOIT"
+                chain_label = f"CONFIRMED: {clean_base_label}"
+                chain_status = "VERIFIED"
+                finding_tier = "VERIFIED_EXPLOIT"
+            else:
+                candidate.status = ver_status
+                chain_node_id = f"LEAD-{candidate.node_id}"
+                chain_node_type = "MANUAL_REVIEW_LEAD"
+                chain_label = f"LEAD [POE={int(poe_level)}]: {clean_base_label}"
+                chain_status = ver_status
+                finding_tier = "MANUAL_REVIEW_LEAD"
+
             hop_count = int(attrs.get("hop_count") or 1)
             source_scanners = list(attrs.get("source_scanners") or [])
             severity = "CRITICAL" if (
@@ -4042,9 +4068,9 @@ class ArtexWorker:
             _batch_win = self.db.batch_writes() if (self.db is not None and hasattr(self.db, "batch_writes")) else contextlib.nullcontext()
             with _batch_win:
                 self.exploration_graph.add_intent(
-                    node_id=exploit_id,
-                    node_type="CONFIRMED_EXPLOIT",
-                    label=f"CONFIRMED: {candidate.label}",
+                    node_id=chain_node_id,
+                    node_type=chain_node_type,
+                    label=chain_label,
                     anchored_asset_id=candidate.anchored_asset_id,
                     attributes={
                         **attrs,
@@ -4053,7 +4079,8 @@ class ArtexWorker:
                         "poe_level": int(poe_level),
                         "poe_label": poe_level.name,
                         "poe_note": poe_note,
-                        "verification_status": ver_status,
+                        "verification_status": chain_status,
+                        "finding_tier": finding_tier,
                         "traffic_id": traffic_id,
                         "worker_id": w_id,
                         "worker_trace_id": trace.trace_id,
@@ -4061,21 +4088,26 @@ class ArtexWorker:
                         "llm_profile_id": selected_profile,
                         "raw_payload": payload,
                         "severity": severity,
-                        "verified_at": datetime.now(timezone.utc).isoformat(),
+                        "verified_at": datetime.now(timezone.utc).isoformat() if is_poe3_verified else "",
                     },
-                    status="VERIFIED",
+                    status=chain_status,
                 )
-                self.exploration_graph.add_relation(exploit_id, candidate.node_id, "PROVES")
-                self.exploration_graph.add_relation(exploit_id, candidate.node_id, "proves")
+                rel_verb = "PROVES" if is_poe3_verified else "CORRELATES"
+                self.exploration_graph.add_relation(chain_node_id, candidate.node_id, rel_verb)
+                self.exploration_graph.add_relation(chain_node_id, candidate.node_id, rel_verb.lower())
                 if candidate.anchored_asset_id:
-                    self.exploration_graph.anchor_asset(exploit_id, candidate.anchored_asset_id, anchor_kind="PROVES_ON")
+                    self.exploration_graph.anchor_asset(
+                        chain_node_id,
+                        candidate.anchored_asset_id,
+                        anchor_kind="PROVES_ON" if is_poe3_verified else "CORRELATES_ON",
+                    )
 
-                # Persist attack chain in terminator.db
+                # Persist attack chain in terminator.db (preserving both POE=3 verified and POE=1-2 leads)
                 if self.db and hasattr(self.db, "save_attack_chain"):
                     try:
                         self.db.save_attack_chain(
-                            chain_id=exploit_id,
-                            title=candidate.label,
+                            chain_id=chain_node_id,
+                            title=chain_label if not is_poe3_verified else clean_base_label,
                             attack_type=attrs.get("attack_type", "GENERIC_CHAIN"),
                             target_host=target_host,
                             target_endpoint=target_route,
@@ -4083,14 +4115,14 @@ class ArtexWorker:
                             ai_sink_id=None,
                             steps=attrs.get("chain_steps") or [
                                 {"step": 1, "desc": "Wire framing desync established"},
-                                {"step": 2, "desc": candidate.label, "evidence": evidence},
+                                {"step": 2, "desc": clean_base_label, "evidence": evidence},
                             ],
                             raw_payload=payload,
-                            is_verified=True,
+                            is_verified=is_poe3_verified,
                             severity=severity,
                             task_id=self.exploration_graph.task_id,
                             poe_level=int(poe_level),
-                            verification_status=ver_status,
+                            verification_status=chain_status,
                             evidence_quote=evidence_quote,
                             traffic_id=traffic_id,
                             hop_count=hop_count,
@@ -4098,7 +4130,7 @@ class ArtexWorker:
                         )
                     except Exception as e:
                         logger.debug("Failed to persist attack chain: %s", e)
-            return True
+            return is_poe3_verified
         else:
             candidate.status = "FAILED"
             if self.todolist is not None:
@@ -6153,11 +6185,12 @@ class DualGraphAttackEngine:
             for ch in stored_chains[:25]:
                 retest_results.append(self.retester.retest_chain(ch, verifier_fn=retest_verifier_fn))
 
-        # POE distribution across confirmed exploits
+        # POE distribution across both verified exploits (POE=3) and manual review leads (POE=1-2)
         poe_breakdown: Dict[str, int] = {lvl.name: 0 for lvl in POELevel}
         max_hop = 0
+        leads_count = 0
         for n in explore_snap:
-            if n.node_type == "CONFIRMED_EXPLOIT":
+            if n.node_type in ("CONFIRMED_EXPLOIT", "MANUAL_REVIEW_LEAD"):
                 lvl_int = int(n.attributes.get("poe_level", int(POELevel.PASSIVE_CORRELATION)))
                 try:
                     lvl_name = POELevel(lvl_int).name
@@ -6165,6 +6198,8 @@ class DualGraphAttackEngine:
                     lvl_name = POELevel.PASSIVE_CORRELATION.name
                 poe_breakdown[lvl_name] = poe_breakdown.get(lvl_name, 0) + 1
                 max_hop = max(max_hop, int(n.attributes.get("hop_count") or 1))
+                if n.node_type == "MANUAL_REVIEW_LEAD":
+                    leads_count += 1
 
         report_files = self.generate_reports()
 
@@ -6176,6 +6211,7 @@ class DualGraphAttackEngine:
             "total_intents": len(explore_snap),
             "candidates_planned": len(total_planned),
             "exploits_verified": verified_count,
+            "leads_recorded": leads_count,
             "max_hop_count": max_hop,
             "goal_proven": goal_status["proven"],
             "goal_status": goal_status,
@@ -6322,52 +6358,73 @@ class DualGraphAttackEngine:
 
     def export_attack_chains_to_sarif_findings(self) -> List[Dict[str, Any]]:
         """
-        Exports planned attack candidates and confirmed exploits as normalized
-        finding dictionaries compatible with `build_sarif_document`.
+        Exports planned attack candidates, manual review leads (POE=1-2), and confirmed
+        exploits (POE=3) as normalized finding dictionaries compatible with `build_sarif_document`.
+        Never labels `poe_level < 3` as `"CONFIRMED"` or `"VERIFIED"`.
         """
         findings: List[Dict[str, Any]] = []
-        # Prefer CONFIRMED_EXPLOIT entries over raw ATTACK_CANDIDATE duplicates
         with self.exploration_graph._lock:
             explore_snap = list(self.exploration_graph.nodes.values())
+        type_rank = {"CONFIRMED_EXPLOIT": 0, "MANUAL_REVIEW_LEAD": 1, "ATTACK_CANDIDATE": 2}
         ordered_nodes = sorted(
             [
                 n
                 for n in explore_snap
-                if n.node_type in ("ATTACK_CANDIDATE", "CONFIRMED_EXPLOIT")
+                if n.node_type in ("CONFIRMED_EXPLOIT", "MANUAL_REVIEW_LEAD", "ATTACK_CANDIDATE")
             ],
-            key=lambda n: 0 if n.node_type == "CONFIRMED_EXPLOIT" else 1,
+            key=lambda n: type_rank.get(n.node_type, 9),
         )
         seen_keys: Set[Tuple[str, str]] = set()
         for cand in ordered_nodes:
             attack_type = cand.attributes.get("attack_type", "CHAIN")
             rule_id = f"ARTEX-{attack_type}"
             norm_label = cand.label.replace("CONFIRMED: ", "", 1)
+            for pfx in ("LEAD [POE=1]: ", "LEAD [POE=2]: ", "LEAD: "):
+                if norm_label.startswith(pfx):
+                    norm_label = norm_label[len(pfx) :]
             key = (rule_id, norm_label)
             if key in seen_keys:
                 continue
             seen_keys.add(key)
 
             hop_count = int(cand.attributes.get("hop_count") or 1)
-            poe_level = int(cand.attributes.get("poe_level") or (1 if cand.node_type == "CONFIRMED_EXPLOIT" else 0))
-            ver_status = str(cand.attributes.get("verification_status") or ("VERIFIED" if cand.node_type == "CONFIRMED_EXPLOIT" else "UNVERIFIED"))
+            poe_level = int(cand.attributes.get("poe_level") or (3 if cand.node_type == "CONFIRMED_EXPLOIT" else (1 if cand.node_type == "MANUAL_REVIEW_LEAD" else 0)))
+            if poe_level >= 3:
+                ver_status = "VERIFIED"
+                finding_tier = "VERIFIED_EXPLOIT"
+                title_out = cand.label
+            elif poe_level == 2:
+                ver_status = "LEAD_ACTIVE_INDICATOR"
+                finding_tier = "MANUAL_REVIEW_LEAD"
+                title_out = f"LEAD [POE=2]: {norm_label}"
+            elif poe_level == 1:
+                ver_status = "LEAD_PASSIVE_CORRELATION"
+                finding_tier = "MANUAL_REVIEW_LEAD"
+                title_out = f"LEAD [POE=1]: {norm_label}"
+            else:
+                ver_status = "UNVERIFIED"
+                finding_tier = "HYPOTHESIS"
+                title_out = f"HYPOTHESIS: {norm_label}"
 
             finding = {
                 "rule_id": rule_id,
-                "title": cand.label,
+                "title": title_out,
                 "severity": (
                     "CRITICAL"
-                    if ("EXPLOIT" in cand.node_type or cand.attributes.get("has_ai_sink") or hop_count >= 3)
+                    if (poe_level >= 3 or cand.attributes.get("has_ai_sink") or hop_count >= 3)
                     else "HIGH"
                 ),
                 "cwe": cand.attributes.get("cwe", "CWE-444"),
                 "file_path": cand.attributes.get("target_path", "network-target"),
                 "line_number": 1,
-                "description": cand.attributes.get("description", cand.label),
+                "description": cand.attributes.get("description", norm_label),
                 "scanner": "Module-17-ARTEX-DualGraph",
                 "chain_steps": cand.attributes.get("chain_steps", []),
                 "hop_count": hop_count,
                 "poe_level": poe_level,
                 "verification_status": ver_status,
+                "finding_tier": finding_tier,
+                "verified": poe_level >= 3,
                 "source_scanners": cand.attributes.get("source_scanners", []),
                 "evidence_quote": cand.attributes.get("evidence_quote", ""),
                 "traffic_id": cand.attributes.get("traffic_id", ""),

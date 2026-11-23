@@ -168,8 +168,20 @@ def parse_simple_argv(command: Union[str, List[str]]) -> Optional[List[str]]:
         return None
 
     # Reject shell metacharacters, command substitutions, or redirections inside tokens
-    for tok in tokens:
-        if tok in SHELL_META_TOKENS or any(s in tok for s in SHELL_META_SUBSTRINGS):
+    _hdr_val_meta = ("$(", "`", "${", "\n", "\r", "\x00", "|", "&", ">", "<")
+    _has_scanner_tok = any(
+        any(stem in t.lower() for stem in ("httpx", "katana", "nuclei"))
+        for t in tokens[:14]
+    )
+    for idx, tok in enumerate(tokens):
+        is_scanner_hdr_val = (
+            _has_scanner_tok
+            and idx > 0
+            and tokens[idx - 1] in ("-H", "-header", "-headers")
+            and ":" in tok
+        )
+        meta_list = _hdr_val_meta if is_scanner_hdr_val else SHELL_META_SUBSTRINGS
+        if tok in SHELL_META_TOKENS or any(s in tok for s in meta_list):
             return None
 
     # Reject prefix environment assignments like FOO=bar cmd
@@ -623,8 +635,20 @@ class ApprovalGate:
             if t0_raw != t0:
                 return f"Subprocess execution blocked by ExecutionPolicy: whitespace obfuscation in executable '{t0_raw}'."
 
-            for tok in tokens:
-                if tok in SHELL_META_TOKENS or any(s in tok for s in SHELL_META_SUBSTRINGS):
+            _hdr_val_meta = ("$(", "`", "${", "\n", "\r", "\x00", "|", "&", ">", "<")
+            _has_scanner_tok = any(
+                any(stem in t.lower() for stem in ("httpx", "katana", "nuclei"))
+                for t in tokens[:14]
+            )
+            for idx, tok in enumerate(tokens):
+                is_scanner_hdr_val = (
+                    _has_scanner_tok
+                    and idx > 0
+                    and tokens[idx - 1] in ("-H", "-header", "-headers")
+                    and ":" in tok
+                )
+                meta_list = _hdr_val_meta if is_scanner_hdr_val else SHELL_META_SUBSTRINGS
+                if tok in SHELL_META_TOKENS or any(s in tok for s in meta_list):
                     return f"Subprocess execution blocked by ExecutionPolicy: shell metacharacter in token '{tok}'."
 
             if "=" in t0 and not t0.startswith("-"):
@@ -760,9 +784,15 @@ class ApprovalGate:
             ssrf_err = _validate_command_ssrf_tokens(tokens)
             if ssrf_err:
                 return ssrf_err
-            for tok in tokens[1:]:
+            for idx, tok in enumerate(tokens[1:], start=1):
                 tok_s = str(tok).strip()
                 if not tok_s:
+                    continue
+                if (
+                    _has_scanner_tok
+                    and tokens[idx - 1] in ("-H", "-header", "-headers")
+                    and ":" in tok_s
+                ):
                     continue
                 if "://" in tok_s:
                     tok_host, _ = _extract_token_host_candidate(tok_s)

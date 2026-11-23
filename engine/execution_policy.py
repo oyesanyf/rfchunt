@@ -626,6 +626,13 @@ def _validate_command_ssrf_tokens(tokens: Sequence[str]) -> Optional[str]:
         is_flag_eq = tok_s.startswith("-") and "=" in tok_s
         eq_flag_l = tok_s.split("=", 1)[0].strip().lower() if is_flag_eq else ""
         prev_l = str(tokens[idx - 1]).strip().lower() if idx >= 1 else ""
+        if (
+            not is_flag_eq
+            and prev_l in ("-h", "-header", "-headers")
+            and ":" in tok_s
+            and bin_family in ("httpx", "katana", "nuclei")
+        ):
+            continue
 
         is_docker_user_flag_val = (
             bin_family == "docker"
@@ -1619,8 +1626,20 @@ class ExecutionPolicy:
                 f"Unrequested host OS command execution blocked: prefix env assignment '{tokens[0]}' is forbidden.",
             )
 
-        for tok in tokens:
-            if any(meta in tok for meta in self.SHELL_META_SUBSTRINGS):
+        _HEADER_VALUE_META = ("$(", "`", "${", "\n", "\r", "\x00", "|", "&", ">", "<")
+        _has_scanner_tok = any(
+            any(stem in t.lower() for stem in ("httpx", "katana", "nuclei"))
+            for t in tokens[:14]
+        )
+        for idx, tok in enumerate(tokens):
+            is_scanner_hdr_val = (
+                _has_scanner_tok
+                and idx > 0
+                and tokens[idx - 1] in ("-H", "-header", "-headers")
+                and ":" in tok
+            )
+            meta_set = _HEADER_VALUE_META if is_scanner_hdr_val else self.SHELL_META_SUBSTRINGS
+            if any(meta in tok for meta in meta_set):
                 return (
                     False,
                     f"Unrequested host OS command execution blocked: shell metacharacter forbidden in token '{tok}'.",

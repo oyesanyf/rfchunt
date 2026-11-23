@@ -451,7 +451,7 @@ class TestTier1FeatureCoverage:
         candidates = engine.planner.plan_next_round(round_num=1)
         assert len(candidates) >= 1
         res = engine.run_attack_chain_cycle(round_num=1)
-        assert res["exploits_verified"] >= 1
+        assert res["leads_recorded"] >= 1
 
     def test_f03_artex_2hop_chain_secret_to_admin_exec(self, mem_db: Database):
         """Feature 3: 2-Hop attack chain: Leaked secret -> Authenticated command execution."""
@@ -491,7 +491,7 @@ class TestTier1FeatureCoverage:
         candidates = engine.planner.plan_next_round(round_num=1)
         assert len(candidates) >= 1
         res = engine.run_attack_chain_cycle(round_num=1)
-        assert res["exploits_verified"] >= 1
+        assert res["leads_recorded"] >= 1
 
     def test_f03_artex_3hop_chain_desync_to_waf_bypass_to_ai_injection(self, mem_db: Database):
         """Feature 3: 3-Hop chain: Desync (1) -> WAF Header Injection (2) -> Unfiltered LLM Prompt (3)."""
@@ -511,7 +511,7 @@ class TestTier1FeatureCoverage:
         )
         engine.exploration_graph.add_relation(prim.node_id, waf_node.node_id, "ENABLES")
         res = engine.run_attack_chain_cycle(round_num=1)
-        assert res["exploits_verified"] >= 1
+        assert res["leads_recorded"] >= 1
 
     def test_f03_artex_candidate_execution_cycle_and_persistence(self, mem_db: Database):
         """Feature 3: Verify candidate execution lifecycle and database persistence."""
@@ -526,7 +526,8 @@ class TestTier1FeatureCoverage:
         assert res["round"] == 1
         chains = mem_db.get_attack_chains()
         assert len(chains) >= 1
-        assert chains[0]["is_verified"] == 1
+        assert chains[0]["is_verified"] == 0
+        assert chains[0]["verification_status"] == "LEAD_PASSIVE_CORRELATION"
 
     # --------------------------------------------------------------------------
     # Feature 4: Combined SARIF Export of attack chains & findings
@@ -1561,7 +1562,7 @@ class TestTier3CrossFeatureCombinations:
         )
         res = engine.run_attack_chain_cycle(round_num=1)
         assert res["candidates_planned"] >= 1
-        assert res["exploits_verified"] >= 1
+        assert res["leads_recorded"] >= 1
 
     def test_t3_pairwise_aiscan_raptor_and_protocol_ruler_into_artex(self, mem_db: Database):
         """T3.2: Ingest aiscan prompt sink + RAPTOR credential + ProtocolRuler cliff into ARTEX."""
@@ -1691,9 +1692,9 @@ class TestTier4RealWorldScenarios:
         )
         engine.exploration_graph.add_relation(prim.node_id, sec.node_id, "ENABLES")
 
-        # Hop 3: Execute cycle and verify exploit
+        # Hop 3: Execute cycle and verify exploit lead recorded
         res = engine.run_attack_chain_cycle(round_num=1)
-        assert res["exploits_verified"] >= 1
+        assert res["leads_recorded"] >= 1
 
         # Verify reports generated
         assert Path(res["report_files"]["json"]).exists()

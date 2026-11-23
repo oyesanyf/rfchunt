@@ -79,7 +79,12 @@ def load_auth_profiles(path: Union[str, Path]) -> Dict[str, AuthProfile]:
     data = yaml.safe_load(raw_text) if p.suffix.lower() in (".yml", ".yaml") else json.loads(raw_text)
 
     profiles: Dict[str, AuthProfile] = {}
-    if isinstance(data, dict) and isinstance(data.get("profiles"), list):
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and item.get("name"):
+                name = str(item["name"])
+                profiles[name] = _build_auth_profile(name, item)
+    elif isinstance(data, dict) and isinstance(data.get("profiles"), list):
         for item in data["profiles"]:
             if isinstance(item, dict) and item.get("name"):
                 name = str(item["name"])
@@ -88,6 +93,11 @@ def load_auth_profiles(path: Union[str, Path]) -> Dict[str, AuthProfile]:
         for name, item in data["profiles"].items():
             if isinstance(item, dict):
                 profiles[str(name)] = _build_auth_profile(str(name), item)
+    elif isinstance(data, dict) and isinstance(data.get("name"), str) and any(
+        k in data for k in ("role", "headers", "cookies", "bearer_token", "token", "auth_type")
+    ):
+        name = str(data["name"])
+        profiles[name] = _build_auth_profile(name, data)
     elif isinstance(data, dict):
         for name, item in data.items():
             if isinstance(item, dict):

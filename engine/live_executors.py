@@ -402,12 +402,19 @@ class LiveWorkerExecutorRegistry:
         asset_graph: Optional[Any] = None,
         arbiter: Optional[Any] = None,
         surface_provider: Optional[Callable[..., Any]] = None,
+        hygiene_config: Optional[Any] = None,
+        rate_limiter: Optional[Any] = None,
     ):
         self.host = host
         self.port = int(port)
         self.use_tls = bool(use_tls)
         self.authorized = bool(authorized)
-        self.traffic_session = traffic_session or TrafficCaptureSession()
+        self.hygiene_config = hygiene_config
+        self.rate_limiter = rate_limiter
+        self.traffic_session = traffic_session or TrafficCaptureSession(
+            hygiene_config=hygiene_config,
+            rate_limiter=rate_limiter,
+        )
         self._has_custom_approval_gate = approval_gate is not None
         self.approval_gate = approval_gate or ApprovalGate(mode="policy")
         self.noise_governor = noise_governor

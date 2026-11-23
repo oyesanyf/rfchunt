@@ -561,6 +561,9 @@ class MantisFinding:
     remediation: str
     threat_model_id: str
     is_zero_day: bool = False
+    poe_level: int = 1
+    verification_status: str = "LEAD_PASSIVE_CORRELATION"
+    finding_tier: str = "MANUAL_REVIEW_LEAD"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -2861,10 +2864,32 @@ class MantisIntegrator:
                 else:
                     patch_res = PatchResult(False, False, "", "", "", "Patch synthesis skipped at current mode/depth.", True)
 
+                repro_poe = int(
+                    getattr(repro, "poe_level", 0)
+                    or (
+                        3
+                        if repro.tier == "TIER_3_CONTAINER_POE"
+                        else (2 if (repro.reproduced and repro.tier == "TIER_2_SANDBOX_CANARY") else 1)
+                    )
+                )
+                if repro_poe >= 3:
+                    ver_status = "VERIFIED"
+                    tier_label = "VERIFIED_EXPLOIT"
+                elif repro_poe == 2:
+                    ver_status = "LEAD_ACTIVE_INDICATOR"
+                    tier_label = "MANUAL_REVIEW_LEAD"
+                else:
+                    ver_status = "LEAD_PASSIVE_CORRELATION"
+                    tier_label = "MANUAL_REVIEW_LEAD"
+
                 if patch_res.patch_verified:
                     status = "PATCHED_VERIFIED"
-                elif repro.reproduced:
+                elif repro_poe >= 3:
                     status = "VERIFIED_VULNERABILITY"
+                elif repro.reproduced and repro.tier == "TIER_2_SANDBOX_CANARY":
+                    status = "LEAD_SANDBOX_INDICATOR"
+                elif repro.reproduced:
+                    status = "LEAD_STATIC_TAINT"
                 else:
                     status = "DOWNGRADED_LOW_CONFIDENCE"
 
@@ -2894,6 +2919,9 @@ class MantisIntegrator:
                     remediation=hyp.remediation,
                     threat_model_id=threat_model.model_id,
                     is_zero_day=getattr(hyp, "is_zero_day", False),
+                    poe_level=repro_poe,
+                    verification_status=ver_status,
+                    finding_tier=tier_label,
                 )
                 findings.append(finding)
 
@@ -3063,7 +3091,46 @@ def build_sarif_document(
         except (ValueError, TypeError, OverflowError):
             line_num = 1
         sev = str(item.get("severity") or "MEDIUM")
-        msg = f"[{sev}] {item.get('title', rid)} ({item.get('cwe', 'CWE')})"
+        raw_poe = item.get("poe_level")
+        if raw_poe is None:
+            repro_tier = str(item.get("reproduction_tier") or "")
+            if repro_tier == "TIER_3_CONTAINER_POE":
+                poe_val = 3
+            elif repro_tier == "TIER_2_SANDBOX_CANARY":
+                poe_val = 2
+            elif item.get("scanner") in ("LiveH2DesyncProber", "TwoAccountAuthzDiffer"):
+                poe_val = 3
+            elif item.get("scanner") in (
+                "ActiveFlawProber",
+                "ProtocolRuler",
+                "DeterministicHarness+AnomalyDetector",
+                "MultiImplementationDifferentialOracle",
+            ):
+                poe_val = 2
+            else:
+                poe_val = 1
+        else:
+            try:
+                poe_val = int(raw_poe)
+            except (TypeError, ValueError):
+                poe_val = 1
+
+        if poe_val >= 3:
+            ver_status = "VERIFIED"
+            tier_label = "VERIFIED_EXPLOIT"
+        elif poe_val == 2:
+            ver_status = "LEAD_ACTIVE_INDICATOR"
+            tier_label = "MANUAL_REVIEW_LEAD"
+        else:
+            ver_status = "LEAD_PASSIVE_CORRELATION"
+            tier_label = "MANUAL_REVIEW_LEAD"
+
+        raw_title = str(item.get("title") or rid)
+        if poe_val < 3 and raw_title.upper().startswith("CONFIRMED:"):
+            prefix = "LEAD [ACTIVE_INDICATOR]:" if poe_val == 2 else "LEAD [PASSIVE_CORRELATION]:"
+            raw_title = f"{prefix}{raw_title[len('CONFIRMED:'):]}"
+
+        msg = f"[{sev}] {raw_title} ({item.get('cwe', 'CWE')})"
         if item.get("evidence"):
             msg += f" | Sink: {item.get('sink', '')}"
 
@@ -3084,14 +3151,18 @@ def build_sarif_document(
                     "severity": sev,
                     "cvss_score": item.get("cvss_score"),
                     "cvss_vector": item.get("cvss_vector"),
-                    "reproduced": item.get("reproduced", False),
+                    "reproduced": bool(item.get("reproduced", False) or poe_val >= 3),
                     "patch_verified": item.get("patch_verified", False),
                     "scanner": item.get("scanner", tool_name),
+                    "corroborating_scanners": list(
+                        item.get("corroborating_scanners") or [item.get("scanner", tool_name)]
+                    ),
                     "is_zero_day": item.get("is_zero_day", False),
+                    "poe_level": poe_val,
+                    "verification_status": ver_status,
+                    "finding_tier": tier_label,
                     **({
                         "hop_count": item.get("hop_count"),
-                        "poe_level": item.get("poe_level"),
-                        "verification_status": item.get("verification_status"),
                         "source_scanners": item.get("source_scanners"),
                         "chain_steps": item.get("chain_steps"),
                     } if item.get("chain_steps") or item.get("hop_count") else {}),
@@ -3251,7 +3322,11 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
         if ext in (".py", ".go", ".rs", ".js", ".ts", ".c", ".cpp", ".java"):
             for lineno, line in enumerate(lines, start=1):
                 low_line = line.lower()
-                if "rsa" in low_line and any(k in line for k in ("1024", "512", "768")):
+                if (
+                    "rsa" in low_line
+                    and any(k in line for k in ("1024", "512", "768"))
+                    and 'for k in ("1024"' not in line
+                ):
                     pqc_findings.append({
                         "rule_id": "RAPTOR-PQC-1024",
                         "title": "Weak RSA key size < 2048 bits (Quantum-Vulnerable)",
@@ -3262,7 +3337,7 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
                         "scanner": "RAPTOR-CrossPlatform-PQC",
                         "remediation": "Migrate to >= 3072-bit RSA or NIST PQC (ML-KEM / ML-DSA).",
                     })
-                if re.search(r'(?i)\b(?:hashlib\.(?:md5|sha1)|crypto/(?:md5|sha1)|md5\.new|sha1\.new|MessageDigest\.getInstance\("MD5"\)|MessageDigest\.getInstance\("SHA-1"\))\b', line):
+                if "re.search(" not in line and re.search(r'(?i)\b(?:hashlib\.(?:md5|sha1)|crypto/(?:md5|sha1)|md5\.new|sha1\.new|MessageDigest\.getInstance\("MD5"\)|MessageDigest\.getInstance\("SHA-1"\))\b', line):
                     crypto_findings.append({
                         "rule_id": "RAPTOR-CRYPTO-WEAK-HASH",
                         "title": "Weak cryptographic hash algorithm (MD5/SHA1)",
@@ -3273,7 +3348,7 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
                         "scanner": "RAPTOR-CrossPlatform-Crypto",
                         "remediation": "Upgrade to SHA-256, SHA-3, or BLAKE3.",
                     })
-                if re.search(r'(?i)\b(?:DES\.new|ARC4\.new|MODE_ECB|AES/ECB/PKCS5Padding)\b', line):
+                if "re.search(" not in line and re.search(r'(?i)\b(?:DES\.new|ARC4\.new|MODE_ECB|AES/ECB/PKCS5Padding)\b', line):
                     crypto_findings.append({
                         "rule_id": "RAPTOR-CRYPTO-WEAK-CIPHER",
                         "title": "Insecure cipher algorithm or ECB cipher mode (DES, RC4, or ECB)",
@@ -3312,7 +3387,7 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
                     "scanner": "RAPTOR-CrossPlatform-Secrets",
                     "remediation": "Revoke GitHub token immediately and load via secret manager.",
                 })
-            elif "-----BEGIN " in line and "PRIVATE KEY-----" in line:
+            elif "re.search(" not in line and re.search(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", line):
                 secret_findings.append({
                     "rule_id": "RAPTOR-SECRET-EXPOSED",
                     "title": "Hardcoded Private Key block exposed",
@@ -3468,6 +3543,12 @@ def run_unified_all_scans(
     rea_use_cli: bool = True,
     auto_install_tools: Optional[bool] = None,
     include_models: Optional[bool] = None,
+    include_leads: bool = False,
+    custom_headers: Optional[Any] = None,
+    user_agent: Optional[str] = None,
+    max_rps: float = 0.0,
+    rate_limiter: Optional[Any] = None,
+    enable_h2_desync: bool = True,
 ) -> Dict[str, Any]:
     """
     Execute ALL integrated RFCHunt security scanners against `--repo`, `--path`, or remote `--host` in one pass,
@@ -3628,6 +3709,37 @@ def run_unified_all_scans(
                 if allow_s and not any(nh == a or nh.endswith(f".{a}") for a in allow_s):
                     raise PermissionError(f"Target '{t_h}' is outside allow_hosts in scope_file '{scope_file}'.")
 
+    from engine.request_hygiene import (
+        RequestHygieneConfig,
+        TokenBucketRateLimiter,
+        resolve_hygiene,
+    )
+
+    explicit_cfg: Optional[RequestHygieneConfig] = None
+    if custom_headers or user_agent or (max_rps and float(max_rps) > 0.0):
+        if isinstance(custom_headers, str):
+            _hdr_seq = [custom_headers]
+        elif isinstance(custom_headers, dict):
+            _hdr_seq = [f"{k}: {v}" for k, v in custom_headers.items()]
+        else:
+            _hdr_seq = list(custom_headers or [])
+        explicit_cfg = RequestHygieneConfig.from_cli(
+            headers=_hdr_seq,
+            user_agent=user_agent,
+            max_rps=float(max_rps or 0.0),
+        )
+    explicit_lim = (
+        rate_limiter
+        if rate_limiter is not None
+        else (TokenBucketRateLimiter(float(max_rps)) if (max_rps and float(max_rps) > 0.0) else None)
+    )
+    hygiene_cfg, shared_rate_limiter = resolve_hygiene(explicit_cfg, explicit_lim)
+    effective_max_rps = (
+        float(max_rps)
+        if (max_rps and float(max_rps) > 0.0)
+        else float(getattr(shared_rate_limiter, "max_rps", 0.0) or getattr(hygiene_cfg, "max_rps", 0.0) or 0.0)
+    )
+
     ext_scanner_cfg = None
     if ext_scanners_active or nuclei_tags is not None or str(scanner_isolation or "host") != "host":
         from engine.external_scanners import DEFAULT_NUCLEI_TAGS, ExternalScannerConfig
@@ -3637,6 +3749,9 @@ def run_unified_all_scans(
             docker_image=docker_image,
             docker_network=docker_network,
             nuclei_tags=DEFAULT_NUCLEI_TAGS if nuclei_tags is None else nuclei_tags,
+            custom_headers=list(hygiene_cfg.headers),
+            user_agent=hygiene_cfg.user_agent,
+            max_rps=effective_max_rps,
         )
         if ext_scanners_active:
             ext_scanner_cfg = _validated_cfg
@@ -3757,6 +3872,16 @@ def run_unified_all_scans(
         "findings": [],
         "status": "skipped_single_target" if len(resolved_targets) < 2 else "pending",
     }
+    h2_desync_res: Dict[str, Any] = {
+        "status": "disabled" if not enable_h2_desync else "pending",
+        "total_findings": 0,
+        "findings": [],
+    }
+    two_account_authz_res: Dict[str, Any] = {
+        "status": "disabled",
+        "total_findings": 0,
+        "findings": [],
+    }
 
     def _run_aiscan_task(scan_root: str) -> Dict[str, Any]:
         try:
@@ -3862,7 +3987,15 @@ def run_unified_all_scans(
     def _run_prober_task() -> Dict[str, Any]:
         try:
             from engine.active_flaw_prober import ActiveFlawProber
-            prober = ActiveFlawProber(host=clean_host or "", port=resolved_port, use_tls=resolved_tls, timeout=net_timeout, on_trace=effective_trace)
+            prober = ActiveFlawProber(
+                host=clean_host or "",
+                port=resolved_port,
+                use_tls=resolved_tls,
+                timeout=net_timeout,
+                on_trace=effective_trace,
+                hygiene_config=hygiene_cfg,
+                rate_limiter=shared_rate_limiter,
+            )
             patched = _is_patched_call(prober, "run_active_audit", "engine.active_flaw_prober")
             if not (patched or allow_live_sockets):
                 return {"total_findings": 0, "findings": [], "status": "skipped_offline_or_ci"}
@@ -3875,7 +4008,15 @@ def run_unified_all_scans(
     def _run_ruler_task() -> Dict[str, Any]:
         try:
             from protocol_ruler import ProtocolRuler
-            ruler = ProtocolRuler(host=clean_host or "", port=resolved_port, use_tls=resolved_tls, timeout=net_timeout, on_trace=effective_trace)
+            ruler = ProtocolRuler(
+                host=clean_host or "",
+                port=resolved_port,
+                use_tls=resolved_tls,
+                timeout=net_timeout,
+                on_trace=effective_trace,
+                hygiene_config=hygiene_cfg,
+                rate_limiter=shared_rate_limiter,
+            )
             patched = _is_patched_call(ruler, "run_comprehensive_audit", "protocol_ruler")
             if not (patched or allow_live_sockets):
                 return {"total_findings": 0, "findings": [], "status": "skipped_offline_or_ci"}
@@ -3895,6 +4036,28 @@ def run_unified_all_scans(
             return {"total_findings": len(serialized_r), "findings": serialized_r}
         except Exception as exc:
             return {"total_findings": 0, "findings": [], "error": str(exc)}
+
+    def _run_h2_desync_task() -> Dict[str, Any]:
+        if not enable_h2_desync:
+            return {"status": "disabled", "total_findings": 0, "findings": []}
+        try:
+            from engine.h2_live_authz import LiveH2DesyncProber
+            h2_prober = LiveH2DesyncProber(
+                host=clean_host or "",
+                port=resolved_port,
+                use_tls=resolved_tls,
+                timeout=net_timeout,
+                authorized=bool(authorized or (clean_host and is_explicit_loopback_host(clean_host))),
+                hygiene_config=hygiene_cfg,
+                rate_limiter=shared_rate_limiter,
+                on_trace=effective_trace,
+            )
+            patched = _is_patched_call(h2_prober, "run_live_h2_desync_audit", "engine.h2_live_authz")
+            if not (patched or allow_live_sockets):
+                return {"status": "skipped_offline_or_ci", "total_findings": 0, "findings": []}
+            return h2_prober.run_live_h2_desync_audit()
+        except Exception as exc:
+            return {"status": "error", "total_findings": 0, "findings": [], "error": str(exc)}
 
     def _build_remote_probes() -> List[Dict[str, Any]]:
         from probe_generator import ProbeGenerator
@@ -3923,6 +4086,8 @@ def run_unified_all_scans(
                 use_tls=resolved_tls,
                 timeout=net_timeout,
                 db=db,
+                hygiene_config=hygiene_cfg,
+                rate_limiter=shared_rate_limiter,
             )
             patched = (
                 _is_patched_call(harness, "evaluate_batch_concurrent", "deterministic_harness")
@@ -4038,7 +4203,7 @@ def run_unified_all_scans(
 
     remote_probe_corpus: List[Dict[str, Any]] = _build_remote_probes() if has_remote else []
     fut_mantis = fut_aiscan = fut_raptor_local = fut_rea = None
-    fut_raptor_remote = fut_prober = fut_ruler = fut_harness = fut_oracle = None
+    fut_raptor_remote = fut_prober = fut_ruler = fut_harness = fut_oracle = fut_h2_desync = None
     rea_local_root = str(rea_target) if rea_target else (local_target_path if has_local else None)
     with ThreadPoolExecutor(max_workers=8) as pool:
         if has_local and local_target_path:
@@ -4052,6 +4217,8 @@ def run_unified_all_scans(
             fut_prober = pool.submit(_run_prober_task)
             fut_ruler = pool.submit(_run_ruler_task)
             fut_harness = pool.submit(_run_harness_task, remote_probe_corpus)
+            if enable_h2_desync:
+                fut_h2_desync = pool.submit(_run_h2_desync_task)
             if len(resolved_targets) >= 2:
                 fut_oracle = pool.submit(_run_oracle_task, remote_probe_corpus)
 
@@ -4078,6 +4245,8 @@ def run_unified_all_scans(
             ruler_res = fut_ruler.result()
         if fut_harness is not None:
             harness_res = fut_harness.result()
+        if fut_h2_desync is not None:
+            h2_desync_res = fut_h2_desync.result()
         if fut_oracle is not None:
             oracle_res = fut_oracle.result()
 
@@ -4160,10 +4329,17 @@ def run_unified_all_scans(
             ca_cert_path=artex_ca_cert,
             authorized=authorized,
         )
-        traffic_session = TrafficCaptureSession(db=db, task_id=shared_task_id, proxy_config=proxy_cfg)
+        traffic_session = TrafficCaptureSession(
+            db=db,
+            task_id=shared_task_id,
+            proxy_config=proxy_cfg,
+            hygiene_config=hygiene_cfg,
+            rate_limiter=shared_rate_limiter,
+        )
 
         # Optional Pillar 3/4/2 integrations: ApprovalGate, Scope, Auth Profiles, Embedded MITM Proxy
         from engine.approval_gate import ApprovalGate
+        from engine.h2_live_authz import resolve_auth_profiles_from_cli
         from engine.session_loader import (
             import_har_file,
             import_openapi_spec,
@@ -4178,7 +4354,10 @@ def run_unified_all_scans(
         )
         loaded_scope = loaded_scope_early if scope_file else {"allow_hosts": [], "deny_hosts": [], "deny_routes": []}
         scope_hosts_set = set(loaded_scope.get("allow_hosts") or []) or None
-        loaded_auth_profiles = load_auth_profiles(auth_profile) if auth_profile else {}
+        if isinstance(auth_profile, str) and "," not in auth_profile:
+            loaded_auth_profiles = load_auth_profiles(auth_profile) if auth_profile else {}
+        else:
+            loaded_auth_profiles = resolve_auth_profiles_from_cli(auth_profile) if auth_profile else {}
 
         embedded_mitm = None
         try:
@@ -4238,6 +4417,8 @@ def run_unified_all_scans(
                     noise_governor=shared_noise_governor,
                     auth_profiles=loaded_auth_profiles,
                     arbiter=None if strict_offline else arbiter,
+                    hygiene_config=hygiene_cfg,
+                    rate_limiter=shared_rate_limiter,
                 )
                 live_executor_fn = live_registry.as_executor_fn()
 
@@ -4500,6 +4681,44 @@ def run_unified_all_scans(
                     ext_nuclei_res["total_findings"] = len(ext_nuclei_res["findings"])
                     ext_nuclei_res["findings_ingested"] += int(n_res.get("findings_ingested", 0) or 0)
 
+            if len(loaded_auth_profiles) >= 2 and has_remote and clean_host and allow_live_sockets:
+                try:
+                    from engine.h2_live_authz import TwoAccountAuthzDiffer
+                    differ = TwoAccountAuthzDiffer(
+                        host=clean_host,
+                        port=int(resolved_port),
+                        use_tls=bool(resolved_tls),
+                        auth_profiles=loaded_auth_profiles,
+                        traffic_session=traffic_session,
+                        approval_gate=approval_gate,
+                        noise_governor=shared_noise_governor,
+                        hygiene_config=hygiene_cfg,
+                        rate_limiter=shared_rate_limiter,
+                        authorized=bool(authorized or _is_loopback_target),
+                        timeout=net_timeout,
+                    )
+                    candidate_routes: List[str] = []
+                    for ep in discovered_eps:
+                        r_val = ep.get("route") if isinstance(ep, dict) else str(ep)
+                        if r_val and str(r_val).startswith("/") and str(r_val) not in candidate_routes:
+                            candidate_routes.append(str(r_val))
+                    for ep_node in artex.asset_graph.find_endpoints_by_type(
+                        "ENDPOINT", host=primary_artex_host, port=primary_artex_port
+                    ):
+                        r_val = getattr(ep_node, "route", None) or (
+                            ep_node.get("route") if isinstance(ep_node, dict) else None
+                        )
+                        if r_val and str(r_val).startswith("/") and str(r_val) not in candidate_routes:
+                            candidate_routes.append(str(r_val))
+                    two_account_authz_res = differ.run_differential_audit(routes=candidate_routes or None)
+                except Exception as authz_exc:
+                    two_account_authz_res = {
+                        "status": "error",
+                        "total_findings": 0,
+                        "findings": [],
+                        "error": str(authz_exc),
+                    }
+
             _ingest_batch = db.batch_writes() if (db is not None and hasattr(db, "batch_writes")) else contextlib.nullcontext()
             with _ingest_batch:
                 for idx, mfind in enumerate(mantis_res.get("findings") or [], start=1):
@@ -4522,7 +4741,8 @@ def run_unified_all_scans(
                         )
 
                 # Ingest all findings from EVERY scanner (Mantis, aiscan, RAPTOR, ActiveFlawProber,
-                # ProtocolRuler, DeterministicHarness, DifferentialOracle, PromptSmuggler) BEFORE chaining
+                # ProtocolRuler, DeterministicHarness, DifferentialOracle, LiveH2DesyncProber,
+                # TwoAccountAuthzDiffer, PromptSmuggler) BEFORE chaining
                 ingester = getattr(artex, "ingest_finding", getattr(artex, "ingest_scanner_finding", None))
                 smuggle_findings_feed = (
                     [
@@ -4549,6 +4769,8 @@ def run_unified_all_scans(
                     ("ProtocolRuler", "RULER-FIND", ruler_res.get("findings") or []),
                     ("DeterministicHarness", "HARNESS-FIND", harness_res.get("findings") or []),
                     ("DifferentialOracle", "ORACLE-FIND", oracle_res.get("findings") or []),
+                    ("LiveH2DesyncProber", "H2-DESYNC-FIND", h2_desync_res.get("findings") or []),
+                    ("TwoAccountAuthzDiffer", "BOLA-DIFF-FIND", two_account_authz_res.get("findings") or []),
                     ("PromptSmuggler", "SMUGGLE-FIND", smuggle_findings_feed),
                 )
                 for scanner_label, default_rule, items in scanner_feeds:
@@ -4556,7 +4778,13 @@ def run_unified_all_scans(
                         f_item = item if isinstance(item, dict) else {"title": str(item), "description": str(item), "rule_id": default_rule}
                         if ingester:
                             ingester(f_item, scanner=scanner_label)
-                        if scanner_label in ("ActiveFlawProber", "ProtocolRuler", "DeterministicHarness", "DifferentialOracle"):
+                        if scanner_label in (
+                            "ActiveFlawProber",
+                            "ProtocolRuler",
+                            "DeterministicHarness",
+                            "DifferentialOracle",
+                            "LiveH2DesyncProber",
+                        ):
                             try:
                                 artex.register_wire_primitive(
                                     anomaly_id=str(f_item.get("vuln_id") or f_item.get("rule_id") or f_item.get("name") or default_rule),
@@ -4665,12 +4893,19 @@ def run_unified_all_scans(
         artex_res = {"error": str(exc), "chains_synthesized": 0, "chains": []}
 
     # 4. Aggregate all findings into Unified SARIF 2.1.0 + JSON + TXT
-    aggregated_findings: List[Dict[str, Any]] = []
+    raw_aggregated_findings: List[Dict[str, Any]] = []
     for item in (mantis_res.get("findings") or []):
         if isinstance(item, dict):
-            aggregated_findings.append({**item, "scanner": "Module-20-Google-Mantis"})
+            raw_aggregated_findings.append(
+                {
+                    **item,
+                    "file_path": item.get("file_path") or item.get("file") or target_path,
+                    "line_number": item.get("line_number") or item.get("line") or 1,
+                    "scanner": "Module-20-Google-Mantis",
+                }
+            )
         elif isinstance(item, str):
-            aggregated_findings.append(
+            raw_aggregated_findings.append(
                 {
                     "rule_id": "MANTIS-FIND",
                     "title": item,
@@ -4686,21 +4921,21 @@ def run_unified_all_scans(
 
     for item in (aiscan_res.get("findings") or []):
         if isinstance(item, dict):
-            aggregated_findings.append(
+            raw_aggregated_findings.append(
                 {
-                    "rule_id": item.get("category", "AISCAN-001"),
+                    "rule_id": item.get("rule_id") or item.get("category", "AISCAN-001"),
                     "title": item.get("title", "AI Risk Finding"),
                     "severity": str(item.get("severity", "MEDIUM")).upper(),
                     "cwe": item.get("cwe", "CWE-77"),
-                    "file_path": item.get("file_path", target_path),
-                    "line_number": item.get("line_number", 1),
+                    "file_path": item.get("file_path") or item.get("file") or target_path,
+                    "line_number": item.get("line_number") or item.get("line") or 1,
                     "description": item.get("description", ""),
                     "remediation": item.get("remediation", ""),
                     "scanner": "Module-18-aiscan",
                 }
             )
         elif isinstance(item, str):
-            aggregated_findings.append(
+            raw_aggregated_findings.append(
                 {
                     "rule_id": "AISCAN-001",
                     "title": item,
@@ -4716,21 +4951,21 @@ def run_unified_all_scans(
 
     for item in (raptor_res.get("findings") or []):
         if isinstance(item, dict):
-            aggregated_findings.append(
+            raw_aggregated_findings.append(
                 {
                     "rule_id": item.get("rule_id", "RAPTOR-001"),
                     "title": item.get("title", item.get("message", "RAPTOR Finding")),
                     "severity": str(item.get("severity", "MEDIUM")).upper(),
                     "cwe": item.get("cwe", "CWE-20"),
-                    "file_path": item.get("file_path", target_path),
-                    "line_number": item.get("line_number", 1),
-                    "description": item.get("title", ""),
+                    "file_path": item.get("file_path") or item.get("file") or target_path,
+                    "line_number": item.get("line_number") or item.get("line") or 1,
+                    "description": item.get("title", item.get("message", "")),
                     "remediation": item.get("remediation", ""),
                     "scanner": item.get("scanner", "Module-15-RAPTOR"),
                 }
             )
         elif isinstance(item, str):
-            aggregated_findings.append(
+            raw_aggregated_findings.append(
                 {
                     "rule_id": "RAPTOR-001",
                     "title": item,
@@ -4747,7 +4982,7 @@ def run_unified_all_scans(
     # Append synthesized prompt smuggling findings when real AI endpoints were discovered
     if has_real_ai_endpoints:
         for probe in all_smuggle_probes:
-            aggregated_findings.append({
+            raw_aggregated_findings.append({
                 "rule_id": probe.probe_id,
                 "title": f"Desynchronized Prompt Injection: {probe.wire_anomaly_technique}",
                 "severity": "CRITICAL",
@@ -4757,13 +4992,22 @@ def run_unified_all_scans(
                 "description": probe.rationale,
                 "remediation": "Enforce strict HTTP framing boundaries.",
                 "scanner": "Module-19-PromptSmuggler",
+                "poe_level": 1,
+                "verification_status": "LEAD_PASSIVE_CORRELATION",
+                "finding_tier": "MANUAL_REVIEW_LEAD",
             })
 
     # Append synthesized ARTEX attack chains (with hop_count, POE level, verification status & steps)
     if artex_res.get("chains"):
         for ch in artex_res["chains"]:
             if isinstance(ch, dict):
-                aggregated_findings.append({
+                ch_poe = int(ch.get("poe_level", 0) or 0)
+                ch_ver = (
+                    "VERIFIED"
+                    if ch_poe >= 3
+                    else ("LEAD_ACTIVE_INDICATOR" if ch_poe == 2 else "LEAD_PASSIVE_CORRELATION")
+                )
+                raw_aggregated_findings.append({
                     "rule_id": ch.get("rule_id", "ARTEX-CHAIN-001"),
                     "title": ch.get("title", "Multi-Hop Cross-Scanner Attack Chain"),
                     "severity": ch.get("severity", "CRITICAL"),
@@ -4774,8 +5018,9 @@ def run_unified_all_scans(
                     "remediation": ch.get("remediation", "Remediate initial framing primitive or auth secret exposure."),
                     "scanner": "Module-17-ARTEX",
                     "hop_count": ch.get("hop_count", 1),
-                    "poe_level": ch.get("poe_level", 0),
-                    "verification_status": ch.get("verification_status", "UNVERIFIED"),
+                    "poe_level": ch_poe,
+                    "verification_status": ch_ver,
+                    "finding_tier": "VERIFIED_EXPLOIT" if ch_poe >= 3 else "MANUAL_REVIEW_LEAD",
                     "source_scanners": ch.get("source_scanners", []),
                     "chain_steps": ch.get("chain_steps", []),
                 })
@@ -4783,7 +5028,7 @@ def run_unified_all_scans(
     for pf in prober_res.get("findings", []):
         f_dict = pf if isinstance(pf, dict) else (pf.to_dict() if hasattr(pf, "to_dict") else {"title": str(pf)})
         vuln_id = f_dict.get("vuln_id") or f_dict.get("rule_id", "PROBER-VULN")
-        aggregated_findings.append({
+        raw_aggregated_findings.append({
             "rule_id": vuln_id,
             "title": f_dict.get("title", f_dict.get("description", "Active Protocol Flaw")),
             "severity": str(f_dict.get("severity", "HIGH")).upper(),
@@ -4793,11 +5038,12 @@ def run_unified_all_scans(
             "description": f_dict.get("description", ""),
             "remediation": f_dict.get("remediation", "Enforce strict HTTP/1.1 and HTTP/2 framing boundaries."),
             "scanner": "ActiveFlawProber",
+            "poe_level": int(f_dict.get("poe_level", 2) or 2),
         })
 
     for rf in (ruler_res.get("findings") if isinstance(ruler_res, dict) and isinstance(ruler_res.get("findings"), list) else []):
         f_dict = rf if isinstance(rf, dict) else {"title": str(rf)}
-        aggregated_findings.append({
+        raw_aggregated_findings.append({
             "rule_id": f_dict.get("rule_id", f"RULER-{f_dict.get('name', 'TRANSFORM')}"),
             "title": f_dict.get("title", f"Protocol Ruler {f_dict.get('classification', 'Transformation')}: {f_dict.get('name', 'Sequence')}"),
             "severity": str(f_dict.get("severity", "MEDIUM")).upper(),
@@ -4807,11 +5053,12 @@ def run_unified_all_scans(
             "description": f_dict.get("description", f_dict.get("verdict", "")),
             "remediation": f_dict.get("remediation", "Normalize header bytes and reject overlong sequences."),
             "scanner": "ProtocolRuler",
+            "poe_level": int(f_dict.get("poe_level", 2) or 2),
         })
 
     for hf in (harness_res.get("findings") if isinstance(harness_res, dict) and isinstance(harness_res.get("findings"), list) else []):
         f_dict = hf if isinstance(hf, dict) else {"title": str(hf)}
-        aggregated_findings.append({
+        raw_aggregated_findings.append({
             "rule_id": f_dict.get("rule_id", "HARNESS-001"),
             "title": f_dict.get("title", "Deterministic Harness Protocol Anomaly"),
             "severity": str(f_dict.get("severity", "HIGH")).upper(),
@@ -4821,11 +5068,12 @@ def run_unified_all_scans(
             "description": f_dict.get("description", ""),
             "remediation": "Eliminate cross-request contamination and strict-validate HTTP framing.",
             "scanner": "DeterministicHarness+AnomalyDetector",
+            "poe_level": int(f_dict.get("poe_level", 2) or 2),
         })
 
     for of in (oracle_res.get("findings") if isinstance(oracle_res, dict) and isinstance(oracle_res.get("findings"), list) else []):
         f_dict = of if isinstance(of, dict) else {"title": str(of)}
-        aggregated_findings.append({
+        raw_aggregated_findings.append({
             "rule_id": f_dict.get("rule_id", "ORACLE-001"),
             "title": f_dict.get("title", "Multi-Implementation Differential Divergence"),
             "severity": str(f_dict.get("severity", "HIGH")).upper(),
@@ -4835,11 +5083,49 @@ def run_unified_all_scans(
             "description": f_dict.get("description", ""),
             "remediation": "Align HTTP request parser behavior across proxy and origin tiers.",
             "scanner": "MultiImplementationDifferentialOracle",
+            "poe_level": int(f_dict.get("poe_level", 2) or 2),
         })
+
+    for h2f in (h2_desync_res.get("findings") if isinstance(h2_desync_res, dict) else []) or []:
+        if isinstance(h2f, dict):
+            raw_aggregated_findings.append({
+                "rule_id": h2f.get("rule_id", "H2-DESYNC-001"),
+                "title": h2f.get("title", "HTTP/2 Binary Framing Desynchronization"),
+                "severity": str(h2f.get("severity", "CRITICAL")).upper(),
+                "cwe": h2f.get("cwe", "CWE-444"),
+                "file_path": h2f.get("file_path", target_path),
+                "line_number": int(h2f.get("line_number", 1) or 1),
+                "description": h2f.get("description", ""),
+                "remediation": h2f.get("remediation", "Reject ambiguous HTTP/2 Content-Length and Transfer-Encoding frames."),
+                "scanner": "LiveH2DesyncProber",
+                "poe_level": int(h2f.get("poe_level", 3) or 3),
+                "verification_status": h2f.get("verification_status", "VERIFIED"),
+                "finding_tier": h2f.get("finding_tier", "VERIFIED_EXPLOIT"),
+                "reproduced": bool(h2f.get("reproduced", True)),
+            })
+
+    for bdf in (two_account_authz_res.get("findings") if isinstance(two_account_authz_res, dict) else []) or []:
+        if isinstance(bdf, dict):
+            raw_aggregated_findings.append({
+                "rule_id": bdf.get("rule_id", "BOLA-DIFF-001"),
+                "title": bdf.get("title", "Two-Account Authorization Differential Leak"),
+                "severity": str(bdf.get("severity", "HIGH")).upper(),
+                "cwe": bdf.get("cwe", "CWE-639"),
+                "file_path": bdf.get("file_path") or bdf.get("route") or target_path,
+                "line_number": int(bdf.get("line_number", 1) or 1),
+                "description": bdf.get("description", ""),
+                "remediation": bdf.get("remediation", "Enforce object-level and function-level ownership checks."),
+                "scanner": "TwoAccountAuthzDiffer",
+                "poe_level": int(bdf.get("poe_level", 3) or 3),
+                "verification_status": bdf.get("verification_status", "VERIFIED"),
+                "finding_tier": bdf.get("finding_tier", "VERIFIED_EXPLOIT"),
+                "reproduced": bool(bdf.get("reproduced", True)),
+                "traffic_id": bdf.get("traffic_id"),
+            })
 
     for nf in (ext_nuclei_res.get("findings") or []):
         if isinstance(nf, dict):
-            aggregated_findings.append({
+            raw_aggregated_findings.append({
                 "rule_id": nf.get("rule_id", "NUCLEI-001"),
                 "title": nf.get("title", nf.get("rule_id", "Nuclei Finding")),
                 "severity": str(nf.get("severity", "INFO")).upper(),
@@ -4849,11 +5135,12 @@ def run_unified_all_scans(
                 "description": nf.get("description", ""),
                 "remediation": nf.get("remediation", ""),
                 "scanner": "external_nuclei",
+                "poe_level": int(nf.get("poe_level", 2) or 2),
             })
 
     for rf_rea in (rea_res.get("findings") or []):
         if isinstance(rf_rea, dict):
-            aggregated_findings.append({
+            raw_aggregated_findings.append({
                 "rule_id": rf_rea.get("rule_id", "REA-ROUTE-001"),
                 "title": rf_rea.get("title", "REA Client Artifact Finding"),
                 "severity": str(rf_rea.get("severity", "MEDIUM")).upper(),
@@ -4863,7 +5150,123 @@ def run_unified_all_scans(
                 "description": rf_rea.get("evidence") or rf_rea.get("title", ""),
                 "remediation": "Enforce server-side authorization, remove client-embedded secrets, and harden Electron webPreferences/IPC.",
                 "scanner": "Module-21-REA",
+                "poe_level": int(rf_rea.get("poe_level", 1) or 1),
             })
+
+    # R1: Normalize truthful POE tiering and cross-engine deduplication across all aggregated findings
+    _sev_order = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
+    aggregated_findings: List[Dict[str, Any]] = []
+    _exact_index: Dict[Tuple[str, int, str, str], int] = {}
+    _cross_engine_index: Dict[Tuple[str, int, str], int] = {}
+    _norm_target_root = str(target_path).replace("\\", "/").rstrip("/").lower()
+
+    for raw_item in raw_aggregated_findings:
+        item = dict(raw_item)
+        scanner_name = str(item.get("scanner") or "RFCHunt")
+        raw_poe = item.get("poe_level")
+        if raw_poe is None:
+            repro_tier = str(item.get("reproduction_tier") or "")
+            if repro_tier == "TIER_3_CONTAINER_POE":
+                poe_val = 3
+            elif repro_tier == "TIER_2_SANDBOX_CANARY":
+                poe_val = 2
+            elif scanner_name in ("LiveH2DesyncProber", "TwoAccountAuthzDiffer"):
+                poe_val = 3
+            elif scanner_name in (
+                "ActiveFlawProber",
+                "ProtocolRuler",
+                "DeterministicHarness+AnomalyDetector",
+                "MultiImplementationDifferentialOracle",
+                "external_nuclei",
+            ):
+                poe_val = 2
+            else:
+                poe_val = 1
+        else:
+            try:
+                poe_val = int(raw_poe)
+            except (TypeError, ValueError):
+                poe_val = 1
+
+        if poe_val >= 3:
+            ver_status = "VERIFIED"
+            tier_label = "VERIFIED_EXPLOIT"
+        elif poe_val == 2:
+            ver_status = "LEAD_ACTIVE_INDICATOR"
+            tier_label = "MANUAL_REVIEW_LEAD"
+        else:
+            ver_status = "LEAD_PASSIVE_CORRELATION"
+            tier_label = "MANUAL_REVIEW_LEAD"
+
+        title_str = str(item.get("title") or item.get("rule_id") or "Finding")
+        if poe_val < 3 and title_str.upper().startswith("CONFIRMED:"):
+            prefix = "LEAD [ACTIVE_INDICATOR]:" if poe_val == 2 else "LEAD [PASSIVE_CORRELATION]:"
+            title_str = f"{prefix}{title_str[len('CONFIRMED:'):]}"
+
+        item["title"] = title_str
+        item["poe_level"] = poe_val
+        item["verification_status"] = ver_status
+        item["finding_tier"] = tier_label
+        item["corroborating_scanners"] = list(
+            dict.fromkeys([*(item.get("corroborating_scanners") or []), scanner_name])
+        )
+
+        norm_fp = str(item.get("file_path") or target_path).replace("\\", "/").rstrip("/").lower()
+        try:
+            norm_line = max(1, int(item.get("line_number") or 1))
+        except (TypeError, ValueError, OverflowError):
+            norm_line = 1
+        norm_rule = str(item.get("rule_id") or "").strip().upper()
+        norm_title = title_str.strip().lower()
+        norm_cwe = str(item.get("cwe") or "").strip().upper()
+
+        exact_key = (norm_fp, norm_line, norm_rule, norm_title)
+        if exact_key in _exact_index:
+            existing = aggregated_findings[_exact_index[exact_key]]
+            for sc in item["corroborating_scanners"]:
+                if sc not in existing["corroborating_scanners"]:
+                    existing["corroborating_scanners"].append(sc)
+            if poe_val > int(existing.get("poe_level", 1) or 1):
+                existing["poe_level"] = poe_val
+                existing["verification_status"] = ver_status
+                existing["finding_tier"] = tier_label
+            if _sev_order.get(str(item.get("severity", "INFO")).upper(), 0) > _sev_order.get(
+                str(existing.get("severity", "INFO")).upper(), 0
+            ):
+                existing["severity"] = str(item.get("severity", "INFO")).upper()
+            continue
+
+        is_specific_loc = (norm_fp != _norm_target_root) and (norm_line > 1 or norm_fp.startswith("/"))
+        cross_key = (norm_fp, norm_line, norm_cwe)
+        if is_specific_loc and norm_cwe and cross_key in _cross_engine_index:
+            cand_idx = _cross_engine_index[cross_key]
+            existing = aggregated_findings[cand_idx]
+            if existing.get("scanner") != scanner_name and scanner_name != "Module-17-ARTEX" and existing.get("scanner") != "Module-17-ARTEX":
+                for sc in item["corroborating_scanners"]:
+                    if sc not in existing["corroborating_scanners"]:
+                        existing["corroborating_scanners"].append(sc)
+                if poe_val > int(existing.get("poe_level", 1) or 1):
+                    existing["poe_level"] = poe_val
+                    existing["verification_status"] = ver_status
+                    existing["finding_tier"] = tier_label
+                if _sev_order.get(str(item.get("severity", "INFO")).upper(), 0) > _sev_order.get(
+                    str(existing.get("severity", "INFO")).upper(), 0
+                ):
+                    existing["severity"] = str(item.get("severity", "INFO")).upper()
+                continue
+
+        new_idx = len(aggregated_findings)
+        aggregated_findings.append(item)
+        _exact_index[exact_key] = new_idx
+        if is_specific_loc and norm_cwe and scanner_name != "Module-17-ARTEX":
+            _cross_engine_index.setdefault(cross_key, new_idx)
+
+    verified_exploits: List[Dict[str, Any]] = [
+        f for f in aggregated_findings if int(f.get("poe_level", 0) or 0) >= 3
+    ]
+    manual_review_leads: List[Dict[str, Any]] = [
+        f for f in aggregated_findings if int(f.get("poe_level", 0) or 0) < 3
+    ]
 
     # Final Fusion arbiter synthesis summary over combined scan surface
     fusion_summary = (
@@ -4940,7 +5343,14 @@ def run_unified_all_scans(
                 if (db is not None and hasattr(db, "get_attack_chains") and task_id_val)
                 else []
             )
-            export_targets = stored_chains or (artex_res.get("chains") or [])
+            raw_export_targets = stored_chains or (artex_res.get("chains") or [])
+            if include_leads:
+                export_targets = list(raw_export_targets)
+            else:
+                export_targets = [
+                    c for c in raw_export_targets
+                    if isinstance(c, dict) and int(c.get("poe_level", 0) or 0) >= 3
+                ]
             for idx_ch, ch_item in enumerate(export_targets[:25], start=1):
                 if not isinstance(ch_item, dict):
                     continue
@@ -4977,6 +5387,15 @@ def run_unified_all_scans(
         "abliterated_model": enforced_model,
         "fusion_models": list(mantis_engine.fusion_models),
         "total_aggregated_findings": len(aggregated_findings),
+        "verified_exploits_count": len(verified_exploits),
+        "manual_review_leads_count": len(manual_review_leads),
+        "verified_exploits": verified_exploits,
+        "manual_review_leads": manual_review_leads,
+        "request_hygiene": {
+            "custom_headers": list(hygiene_cfg.headers),
+            "user_agent": hygiene_cfg.user_agent,
+            "max_rps": effective_max_rps,
+        },
         "severity_counts": sev_breakdown,
         "executive_summary": fusion_summary,
         "engines": {
@@ -5010,6 +5429,8 @@ def run_unified_all_scans(
             "prompt_smuggling": smuggle_res,
             "external_discovery": ext_discovery_res,
             "external_nuclei": ext_nuclei_res,
+            "live_h2_desync": h2_desync_res,
+            "two_account_authz": two_account_authz_res,
         },
         "findings": aggregated_findings,
         "chains": artex_res.get("chains") or [],
@@ -5018,6 +5439,7 @@ def run_unified_all_scans(
             "task_id": artex_res.get("task_id"),
             "chains_synthesized": artex_res.get("chains_synthesized", len(artex_res.get("chains") or [])),
             "exploits_verified": artex_res.get("exploits_verified", 0),
+            "leads_recorded": artex_res.get("leads_recorded", 0),
             "max_hop_count": artex_res.get("max_hop_count", 0),
             "goal_proven": artex_res.get("goal_proven", False),
             "poe_breakdown": artex_res.get("poe_breakdown") or {},

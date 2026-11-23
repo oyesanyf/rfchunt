@@ -78,6 +78,30 @@ class MerkleAuditTrail:
         self.leaves: List[AuditLeaf] = []
         self._leaf_hashes: List[str] = []
 
+    @staticmethod
+    def _is_differential_verified(four_parser_differential: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(four_parser_differential, dict):
+            return False
+        if any(
+            bool(four_parser_differential.get(k))
+            for k in ("divergence", "divergence_detected", "is_divergent", "verified")
+        ):
+            return True
+        matrix = (
+            four_parser_differential.get("matrix")
+            if isinstance(four_parser_differential.get("matrix"), dict)
+            else four_parser_differential
+        )
+        if isinstance(matrix, dict) and len(matrix) >= 2:
+            statuses = {
+                int(v.get("status", 0))
+                for v in matrix.values()
+                if isinstance(v, dict) and "status" in v
+            }
+            if len(statuses) > 1:
+                return True
+        return False
+
     def record_finding(
         self,
         entry_id: str,
@@ -90,10 +114,27 @@ class MerkleAuditTrail:
         four_parser_differential: Dict[str, Any],
         status: str,
     ) -> AuditLeaf:
-        """Appends a new verified protocol finding to the cryptographic audit trail."""
+        """
+        Appends a protocol finding to the cryptographic audit trail after enforcing
+        the mandatory 3-trial reproducibility + 4-parser differential oracle gate.
+        Unstable jitter or <3-trial findings are automatically downgraded to
+        `'NON_REPRODUCIBLE_TRANSIENT'`.
+        """
         index = len(self.leaves)
         probe_hash = hashlib.sha256(raw_probe).hexdigest()
         resp_hash = hashlib.sha256(raw_response).hexdigest()
+
+        attempts = int(verification_attempts or 0)
+        successes = int(successful_reproductions or 0)
+        rate = float(reproducibility_rate or 0.0)
+        diff_ok = self._is_differential_verified(four_parser_differential)
+
+        passes_gate = attempts >= 3 and successes >= 2 and rate >= 0.66 and diff_ok
+        resolved_status = (
+            str(status or "CONFIRMED_VULNERABILITY")
+            if passes_gate and str(status or "") in ("CONFIRMED_VULNERABILITY", "ANOMALY_VERIFIED")
+            else "NON_REPRODUCIBLE_TRANSIENT"
+        )
 
         leaf = AuditLeaf(
             index=index,
@@ -101,17 +142,23 @@ class MerkleAuditTrail:
             target_engine=target_engine,
             probe_sha256=probe_hash,
             response_sha256=resp_hash,
-            reproducibility_rate=reproducibility_rate,
-            verification_attempts=verification_attempts,
-            successful_reproductions=successful_reproductions,
-            four_parser_differential=four_parser_differential,
-            status=status,
+            reproducibility_rate=rate,
+            verification_attempts=attempts,
+            successful_reproductions=successes,
+            four_parser_differential=four_parser_differential if isinstance(four_parser_differential, dict) else {},
+            status=resolved_status,
             timestamp=time.time(),
         )
 
         self.leaves.append(leaf)
         self._leaf_hashes.append(leaf.compute_leaf_hash())
         return leaf
+
+    def get_confirmed_leaves(self) -> List[AuditLeaf]:
+        return [l for l in self.leaves if l.status in ("CONFIRMED_VULNERABILITY", "ANOMALY_VERIFIED")]
+
+    def get_transient_leaves(self) -> List[AuditLeaf]:
+        return [l for l in self.leaves if l.status == "NON_REPRODUCIBLE_TRANSIENT"]
 
     def get_merkle_root(self) -> str:
         """

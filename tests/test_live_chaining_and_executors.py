@@ -124,7 +124,8 @@ def test_graph_event_bus_and_concurrent_worker_pool_no_duplicate_claims(tmp_path
 
         res = engine.run_attack_chain_cycle(round_num=1, executor_fn=_concurrent_exec)
         assert res["candidates_planned"] >= 3
-        assert res["exploits_verified"] == res["candidates_planned"]
+        assert res["leads_recorded"] == res["candidates_planned"]
+        assert res["exploits_verified"] == 0
         # Ensure zero duplicate execution of the exact same todolist step
         step_ids = [s.step_id for s in engine.todolist.steps.values()]
         assert len(step_ids) == len(set(step_ids))
@@ -294,7 +295,7 @@ def test_live_auth_boundary_ghsa_797p_end_to_end_and_live_retest_fix(tmp_path):
 def test_strict_poe_rejects_static_poe1_and_preserves_default_compat(tmp_path):
     db = Database(":memory:")
     try:
-        # 1. Default strict_poe=False keeps static correlated chains verified (backward compat)
+        # 1. Default strict_poe=False records static correlated chains as POE=1 leads (never falsely verified)
         eng_default = DualGraphAttackEngine(db=db, reports_dir=tmp_path / "r_def", strict_poe=False, workers=1)
         eng_default.ingest_target_infrastructure(host="127.0.0.1", port=8080, endpoints=["/internal/service"])
         eng_default.ingest_finding(
@@ -302,10 +303,14 @@ def test_strict_poe_rejects_static_poe1_and_preserves_default_compat(tmp_path):
             scanner="mantis",
         )
         res_def = eng_default.run_attack_chain_cycle(round_num=1)
-        assert res_def["exploits_verified"] >= 1
+        assert res_def["leads_recorded"] >= 1
+        assert res_def["exploits_verified"] == 0
         # Verify honest static correlation payload (never fake smuggled canary string)
         def_chains = db.get_attack_chains(task_id=eng_default.task_id)
         assert def_chains
+        assert def_chains[0]["poe_level"] == 1
+        assert def_chains[0]["is_verified"] == 0
+        assert def_chains[0]["verification_status"] == "LEAD_PASSIVE_CORRELATION"
         assert "SMUGGLED-CANARY-PAYLOAD" not in def_chains[0]["raw_payload"]
         assert "STRUCTURAL_CORRELATION" in def_chains[0]["raw_payload"]
 
@@ -715,8 +720,9 @@ def test_six_worker_concurrent_traffic_session_exchanges(tmp_path):
             stop_bg.set()
             bg.join(timeout=5.0)
         assert not errors, f"Concurrency errors: {errors}"
-        assert res["exploits_verified"] == res["candidates_planned"]
-        assert res["exploits_verified"] >= 10
+        assert res["leads_recorded"] == res["candidates_planned"]
+        assert res["leads_recorded"] >= 10
+        assert res["exploits_verified"] == 0
     finally:
         db.close()
 
