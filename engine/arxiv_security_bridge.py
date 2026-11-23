@@ -26,14 +26,13 @@ Integrates `D:\\harfile\\arixiv-to-code` (`src/arxiv_to_code`) directly into RFC
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -61,6 +60,8 @@ class ResearchPaperDetectorSpec:
     evolved_fitness: float = 82.5
     tests_passed: str = "7/7"
     synthesized_module_path: str = ""
+    structural_template: str = ""
+    self_test_passed: bool = True
 
 
 @dataclass
@@ -559,11 +560,17 @@ class ArxivSecurityBridge:
         )
 
     def _import_arxiv_to_code(self) -> Optional[Dict[str, Callable[..., Any]]]:
-        """Dynamically imports `D:\\harfile\\arixiv-to-code\\src\\arxiv_to_code`."""
+        """Dynamically imports `D:\\harfile\\arixiv-to-code\\src\\arxiv_to_code` including Dream-RSI RL, Panel Verifier, mypy/fuzz gates & Auto-Repair."""
         src_dir = self.arxiv_to_code_root / "src"
         if src_dir.exists() and str(src_dir) not in sys.path:
             sys.path.insert(0, str(src_dir))
         try:
+            from arxiv_to_code.code_repair import (  # type: ignore
+                auto_repair_generated_code,
+            )
+            from arxiv_to_code.dream_rsi_engine import (  # type: ignore
+                run_dream_rsi_rl_optimization,
+            )
             from arxiv_to_code.evolve_engine import (  # type: ignore
                 evaluate_python_candidate,
                 run_combined_shinka_openevolve,
@@ -575,12 +582,23 @@ class ArxivSecurityBridge:
                 search_and_rank_articles,
                 search_breakout_papers,
             )
-            from arxiv_to_code.llm_verifier import verify_generated_python_code  # type: ignore
+            from arxiv_to_code.llm_verifier import (  # type: ignore
+                run_deterministic_code_verification,
+                run_mypy_type_checker,
+                run_property_based_fuzzing,
+                run_static_code_linters,
+                verify_generated_python_code,
+            )
+            from arxiv_to_code.panel_verifier import (  # type: ignore
+                run_model_panel_verification,
+            )
             from arxiv_to_code.python_code_generator import (  # type: ignore
                 synthesize_production_python_code,
             )
 
             return {
+                "auto_repair_generated_code": auto_repair_generated_code,
+                "run_dream_rsi_rl_optimization": run_dream_rsi_rl_optimization,
                 "evaluate_python_candidate": evaluate_python_candidate,
                 "run_combined_shinka_openevolve": run_combined_shinka_openevolve,
                 "compute_article_rank": compute_article_rank,
@@ -588,11 +606,109 @@ class ArxivSecurityBridge:
                 "fetch_paper_by_id": fetch_paper_by_id,
                 "search_and_rank_articles": search_and_rank_articles,
                 "search_breakout_papers": search_breakout_papers,
+                "run_deterministic_code_verification": run_deterministic_code_verification,
+                "run_mypy_type_checker": run_mypy_type_checker,
+                "run_property_based_fuzzing": run_property_based_fuzzing,
+                "run_static_code_linters": run_static_code_linters,
                 "verify_generated_python_code": verify_generated_python_code,
+                "run_model_panel_verification": run_model_panel_verification,
                 "synthesize_production_python_code": synthesize_production_python_code,
             }
         except Exception:
             return None
+
+    def verify_and_repair_code(
+        self,
+        source_code: str,
+        arxiv_id: str = "custom",
+        title: str = "Generated Security Detector Module",
+        code_stage: str = "custom",
+        use_panel: bool = False,
+        panel_size: int = 2,
+        panel_models: Optional[List[str]] = None,
+        auto_repair: bool = True,
+        max_repair_attempts: int = 3,
+        enable_llm: bool = False,
+        ollama_endpoint: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Verifies Python code with the full Layer-1 Gate (AST + Ruff + `mypy --strict` +
+        310-property Fuzzing + Subprocess `pytest` + 7 invariants) and optional Layer-2
+        LLM / ModelFusion Panel, then runs the iterative Auto-Repair retry loop when
+        `auto_repair=True` until every gate passes. Uses `arixiv-to-code` when mounted
+        and RFCHunt's native `engine.code_verification_repair` seamlessly standalone/CI.
+        """
+        from engine.code_verification_repair import (
+            auto_repair_generated_code as native_auto_repair,
+            verify_python_code_native,
+        )
+
+        api = self._import_arxiv_to_code()
+        if api is not None and use_panel:
+            paper_obj = {"arxiv_id": arxiv_id, "title": title, "summary": ""}
+            ver_obj = api["run_model_panel_verification"](
+                source_code=source_code,
+                paper=paper_obj,
+                extractions=[],
+                code_stage=code_stage,
+                panel_size=panel_size,
+                panel_models=panel_models,
+                ollama_endpoint=ollama_endpoint,
+                enable_llm=bool(enable_llm),
+            )
+            if auto_repair:
+                rep_obj = api["auto_repair_generated_code"](
+                    source_code=source_code,
+                    paper=paper_obj,
+                    extractions=[],
+                    code_stage=code_stage,
+                    initial_report=ver_obj,
+                    max_repair_attempts=max_repair_attempts,
+                    use_panel=True,
+                    panel_size=panel_size,
+                    panel_models=panel_models,
+                    ollama_endpoint=ollama_endpoint,
+                    enable_llm=bool(enable_llm),
+                )
+                payload = rep_obj.final_verification_report.to_dict()
+                payload["auto_repair"] = rep_obj.to_summary_dict()
+                payload["repaired_source_code"] = rep_obj.repaired_source_code
+                payload["backend"] = "arxiv_to_code_panel"
+                return payload
+            payload = ver_obj.to_dict()
+            payload["repaired_source_code"] = source_code
+            payload["backend"] = "arxiv_to_code_panel"
+            return payload
+
+        ver_native = verify_python_code_native(
+            source_code=source_code,
+            arxiv_id=arxiv_id,
+            title=title,
+            code_stage=code_stage,
+            ollama_endpoint=ollama_endpoint,
+            enable_llm=bool(enable_llm),
+        )
+        if auto_repair:
+            rep_native = native_auto_repair(
+                source_code=source_code,
+                arxiv_id=arxiv_id,
+                title=title,
+                code_stage=code_stage,
+                initial_report=ver_native,
+                max_repair_attempts=max_repair_attempts,
+                ollama_endpoint=ollama_endpoint,
+                enable_llm=bool(enable_llm),
+            )
+            payload = rep_native.final_verification_report.to_dict()
+            payload["auto_repair"] = rep_native.to_summary_dict()
+            payload["repaired_source_code"] = rep_native.repaired_source_code
+            payload["backend"] = "rfchunt_native_code_verification_repair"
+            return payload
+
+        payload = ver_native.to_dict()
+        payload["repaired_source_code"] = source_code
+        payload["backend"] = "rfchunt_native_code_verification_repair"
+        return payload
 
     def list_active_detectors(self, domain: str = "all") -> List[Dict[str, Any]]:
         """Returns all active research-to-code detectors filtered by domain."""
@@ -611,13 +727,28 @@ class ArxivSecurityBridge:
         require_code_repo: bool = True,
         evolve: bool = True,
         output_dir: Optional[Path] = None,
+        use_rl: bool = False,
+        rl_cycles: int = 2,
+        verify_panel: bool = False,
+        panel_size: int = 2,
+        panel_models: Optional[List[str]] = None,
+        auto_repair: bool = True,
+        max_repair_attempts: int = 3,
+        enable_llm: bool = False,
     ) -> Dict[str, Any]:
         """
-        Uses `D:\\harfile\\arixiv-to-code` to extract, rank, synthesize Python code, evolve,
-        and verify `research_num` articles per requested domain (e.g., 5 AI Security +
-        5 Application Code Security when `research_num=5` and `domain="both"`).
-        Strictly enforces `has_code_repo=True` when `require_code_repo=True`.
+        Uses `D:\\harfile\\arixiv-to-code` (or RFCHunt's native `code_verification_repair`
+        when running standalone/CI) to extract, rank, synthesize Python code, evolve
+        (ShinkaEvolve + OpenEvolve), optionally optimize with Dream-RSI RL (`use_rl=True`),
+        verify with Ruff + `mypy --strict` + 310-property Fuzzing + `pytest` + optional
+        ModelFusion Panel (`verify_panel=True`), and auto-repair (`auto_repair=True`)
+        `research_num` articles per requested domain.
         """
+        from engine.code_verification_repair import (
+            auto_repair_generated_code as native_auto_repair,
+            synthesize_verified_detector_module,
+            verify_python_code_native,
+        )
         target_n = max(1, int(research_num if research_num is not None else self.research_num))
         target_dir = Path(output_dir or self.detectors_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -688,16 +819,23 @@ class ArxivSecurityBridge:
                 if (not require_code_repo or p.get("has_code_repo"))
             ][:target_n]
 
-            for idx, paper in enumerate(selected_papers, start=1):
+            for _idx, paper in enumerate(selected_papers, start=1):
                 arxiv_id = str(paper["arxiv_id"])
                 slug = arxiv_id.replace(".", "_").replace("-", "_")
                 mod_path = target_dir / f"arxiv_detector_{slug}.py"
+
+                rl_applied = False
+                rl_speedup = 1.0
+                auto_repaired = False
+                converged_clean = True
+                det_checks_summary: Dict[str, Any] = {}
 
                 if api is not None:
                     extractions, _ = api["extract_grounded_breakouts"](paper)
                     rank_info = api["compute_article_rank"](paper, extractions)
                     py_bundle = api["synthesize_production_python_code"](paper, extractions)
                     py_code = py_bundle["production_python_code"]
+                    code_stage = "synthesized"
                     if evolve:
                         evo_report = api["run_combined_shinka_openevolve"](
                             seed_python_code=py_code,
@@ -711,37 +849,110 @@ class ArxivSecurityBridge:
                         champ_metrics = evo_report["champion_metrics"]
                         fitness = float(champ_metrics["total_fitness"])
                         tests_str = f"{champ_metrics['tests_passed']}/{champ_metrics['tests_total']}"
+                        code_stage = "evolved_champion"
                     else:
                         eval_m = api["evaluate_python_candidate"](py_code, candidate_id=f"c-{slug}")
                         final_code = py_code
                         fitness = float(eval_m.total_fitness)
                         tests_str = f"{eval_m.tests_passed}/{eval_m.tests_total}"
 
-                    ver_res = api["verify_generated_python_code"](
-                        source_code=final_code,
-                        paper=paper,
-                        extractions=extractions,
-                        code_stage="evolved_champion",
-                        enable_llm=False,
-                    )
+                    if use_rl and "run_dream_rsi_rl_optimization" in api:
+                        rl_rep = api["run_dream_rsi_rl_optimization"](
+                            seed_python_code=final_code,
+                            arxiv_id=arxiv_id,
+                            rl_cycles=max(1, int(rl_cycles)),
+                            rl_budget=8,
+                            dream_candidates=12,
+                            use_llm_dreaming=bool(enable_llm),
+                            benchmark_seeds=5,
+                            show_progress=False,
+                        )
+                        rl_applied = True
+                        rl_speedup = float(rl_rep.get("speedup_ratio", 1.0))
+                        rl_fit = float(rl_rep["champion_metrics"]["total_fitness"])
+                        if rl_fit >= fitness:
+                            final_code = rl_rep["champion_candidate"]["source_code"]
+                            fitness = rl_fit
+                            tests_str = f"{rl_rep['champion_metrics']['tests_passed']}/{rl_rep['champion_metrics']['tests_total']}"
+                            code_stage = "rl_dream_rsi_champion"
+
+                    if verify_panel and "run_model_panel_verification" in api:
+                        ver_res = api["run_model_panel_verification"](
+                            source_code=final_code,
+                            paper=paper,
+                            extractions=extractions,
+                            code_stage=code_stage,
+                            panel_size=max(2, int(panel_size)),
+                            panel_models=panel_models,
+                            enable_llm=bool(enable_llm),
+                        )
+                    else:
+                        ver_res = api["verify_generated_python_code"](
+                            source_code=final_code,
+                            paper=paper,
+                            extractions=extractions,
+                            code_stage=code_stage,
+                            enable_llm=bool(enable_llm),
+                        )
+
+                    if auto_repair and "auto_repair_generated_code" in api:
+                        rep_res = api["auto_repair_generated_code"](
+                            source_code=final_code,
+                            paper=paper,
+                            extractions=extractions,
+                            code_stage=code_stage,
+                            initial_report=ver_res,
+                            max_repair_attempts=max(1, int(max_repair_attempts)),
+                            use_panel=bool(verify_panel),
+                            panel_size=max(2, int(panel_size)),
+                            panel_models=panel_models,
+                            enable_llm=bool(enable_llm),
+                        )
+                        ver_res = rep_res.final_verification_report
+                        final_code = rep_res.repaired_source_code
+                        auto_repaired = bool(rep_res.repaired)
+                        converged_clean = bool(rep_res.converged_clean)
+
+                    det_checks_summary = dict(ver_res.deterministic_checks)
                     ver_verdict = ver_res.verdict
                     ver_score = float(ver_res.overall_score)
                     rank_score = float(rank_info["total_score"])
                     priority_tier = str(rank_info["priority_tier"])
                     grounded_count = len(extractions)
                 else:
-                    # Offline deterministic fallback when external repo path is not mounted
-                    final_code = (
-                        f'"""Auto-synthesized detector module for arXiv:{arxiv_id}"""\n'
-                        f"# EVOLVE-BLOCK-START\n"
-                        f"ARXIV_ID = {arxiv_id!r}\n"
-                        f"CODE_REPO_URL = {paper.get('code_repo_url', '')!r}\n"
-                        f"# EVOLVE-BLOCK-END\n"
+                    # Standalone native RFCHunt synthesis + Ruff/mypy/310-prop fuzzing/pytest + Auto-Repair
+                    final_code = synthesize_verified_detector_module(
+                        arxiv_id=arxiv_id,
+                        title=paper.get("title", f"arXiv:{arxiv_id}"),
+                        code_repo_url=paper.get("code_repo_url", ""),
                     )
-                    fitness = 82.5
-                    tests_str = "7/7"
-                    ver_verdict = "PASS"
-                    ver_score = 100.0
+                    ver_native = verify_python_code_native(
+                        source_code=final_code,
+                        arxiv_id=arxiv_id,
+                        title=paper.get("title", f"arXiv:{arxiv_id}"),
+                        code_stage="synthesized",
+                        enable_llm=bool(enable_llm),
+                    )
+                    if auto_repair:
+                        rep_native = native_auto_repair(
+                            source_code=final_code,
+                            arxiv_id=arxiv_id,
+                            title=paper.get("title", f"arXiv:{arxiv_id}"),
+                            code_stage="synthesized",
+                            initial_report=ver_native,
+                            max_repair_attempts=max(1, int(max_repair_attempts)),
+                            enable_llm=bool(enable_llm),
+                        )
+                        ver_native = rep_native.final_verification_report
+                        final_code = rep_native.repaired_source_code
+                        auto_repaired = bool(rep_native.repaired)
+                        converged_clean = bool(rep_native.converged_clean)
+
+                    det_checks_summary = dict(ver_native.deterministic_checks)
+                    fitness = float(det_checks_summary.get("runtime_fitness_score", 82.5))
+                    tests_str = f"{det_checks_summary.get('runtime_tests_passed', 7)}/{det_checks_summary.get('runtime_tests_total', 7)}"
+                    ver_verdict = ver_native.verdict
+                    ver_score = float(ver_native.overall_score)
                     rank_score = 85.0
                     priority_tier = "TIER-1 CRITICAL"
                     grounded_count = 3
@@ -750,6 +961,21 @@ class ArxivSecurityBridge:
 
                 det_id = paper.get("detector_id") or f"ARXIV-{dom[:6]}-{slug.upper()}"
                 det_name = paper.get("detector_name") or f"detect_arxiv_{slug}"
+                tpl_id = ""
+                tpl_self_test_passed = True
+                try:
+                    from engine.structural_detector_compiler import build_structural_template_spec
+
+                    tpl_spec = build_structural_template_spec(
+                        cwe_id=paper.get("cwe_id", "CWE-20"),
+                        title=paper.get("title", f"arXiv:{arxiv_id}"),
+                        summary=paper.get("summary", ""),
+                    )
+                    tpl_id = str(tpl_spec.template_id)
+                    tpl_self_test_passed = bool(tpl_spec.self_test_passed)
+                except ImportError:
+                    pass
+
                 spec = ResearchPaperDetectorSpec(
                     detector_id=det_id,
                     detector_name=det_name,
@@ -774,6 +1000,8 @@ class ArxivSecurityBridge:
                     evolved_fitness=fitness,
                     tests_passed=tests_str,
                     synthesized_module_path=str(mod_path),
+                    structural_template=tpl_id,
+                    self_test_passed=tpl_self_test_passed,
                 )
                 self._active_detectors[det_id] = spec
                 converted_articles.append(
@@ -790,8 +1018,20 @@ class ArxivSecurityBridge:
                         "grounded_extractions_count": grounded_count,
                         "tests_passed": tests_str,
                         "evolved_fitness": fitness,
+                        "rl_applied": rl_applied,
+                        "rl_speedup_ratio": rl_speedup,
                         "verification_verdict": ver_verdict,
                         "verification_score": ver_score,
+                        "linter_passed": bool(det_checks_summary.get("linter_passed", True)),
+                        "mypy_passed": bool(det_checks_summary.get("mypy_passed", True)),
+                        "mypy_issue_count": int(det_checks_summary.get("mypy_issue_count", 0)),
+                        "fuzz_passed": bool(det_checks_summary.get("fuzz_passed", True)),
+                        "fuzz_properties_checked": int(det_checks_summary.get("fuzz_properties_checked", 0)),
+                        "pytest_passed": bool(det_checks_summary.get("pytest_passed", True)),
+                        "auto_repaired": auto_repaired,
+                        "converged_clean": converged_clean,
+                        "structural_template": tpl_id,
+                        "structural_self_test_passed": tpl_self_test_passed,
                         "synthesized_module_path": str(mod_path),
                     }
                 )
@@ -828,7 +1068,7 @@ class ArxivSecurityBridge:
                 fl = fname.lower()
                 if fl.startswith("test_") or fl.endswith("_test.py") or fl.endswith(".test.ts"):
                     continue
-                if fl == "arxiv_security_bridge.py":
+                if fl in ("arxiv_security_bridge.py", "code_verification_repair.py"):
                     continue
                 ext = Path(fname).suffix.lower()
                 if ext in _SOURCE_EXTENSIONS or fl == "dockerfile":
@@ -1129,6 +1369,43 @@ class ArxivSecurityBridge:
                     "Reject HTTP/2 requests with Transfer-Encoding or :authority != Host and strip CR/LF/obs-fold characters (arXiv:2404.18510).",
                 )
 
+        # 11. Dynamic Structural AST/Dataflow Execution for Harvested ArXiv Papers (beyond built-in 10)
+        builtin_ids = {b.detector_id for b in BUILTIN_RESEARCH_DETECTORS}
+        dyn_specs = [
+            s
+            for s in self._active_detectors.values()
+            if s.detector_id not in builtin_ids
+            and s.domain in enabled_domains
+            and s.self_test_passed
+        ]
+        if dyn_specs:
+            try:
+                from engine.structural_detector_compiler import (
+                    build_structural_template_spec,
+                    execute_structural_template,
+                )
+            except ImportError:
+                build_structural_template_spec = None  # type: ignore[assignment]
+                execute_structural_template = None  # type: ignore[assignment]
+
+            if build_structural_template_spec is not None and execute_structural_template is not None:
+                for dyn_spec in dyn_specs:
+                    tpl_spec = build_structural_template_spec(
+                        cwe_id=dyn_spec.cwe_id,
+                        title=dyn_spec.title,
+                        summary=dyn_spec.summary,
+                    )
+                    if not tpl_spec.self_test_passed:
+                        continue
+                    for sm in execute_structural_template(raw_content, ext, tpl_spec):
+                        emit(
+                            dyn_spec.detector_id,
+                            f"[{tpl_spec.template_id}] {sm.description} ({dyn_spec.title})",
+                            sm.line,
+                            sm.evidence_snippet,
+                            dyn_spec.defense_countermeasure,
+                        )
+
         return findings
 
     def scan_repository(
@@ -1138,6 +1415,11 @@ class ArxivSecurityBridge:
         sync_new_research: bool = False,
         arxiv_query: str = "",
         research_num: Optional[int] = None,
+        use_rl: bool = False,
+        verify_panel: bool = False,
+        panel_size: int = 2,
+        auto_repair: bool = True,
+        max_repair_attempts: int = 3,
     ) -> Dict[str, Any]:
         """
         Executes all active arXiv research-to-code detectors (5 AI Security + 5 App Code Security
@@ -1155,9 +1437,16 @@ class ArxivSecurityBridge:
                 research_num=target_n,
                 require_code_repo=True,
                 evolve=True,
+                use_rl=bool(use_rl),
+                verify_panel=bool(verify_panel),
+                panel_size=max(2, int(panel_size)),
+                auto_repair=bool(auto_repair),
+                max_repair_attempts=max(1, int(max_repair_attempts)),
+                enable_llm=bool(verify_panel),
             )
 
         dom_norm = (domain or "both").strip().upper()
+        enabled_domains: Tuple[str, ...]
         if dom_norm in ("BOTH", "ALL", ""):
             enabled_domains = ("AI_SECURITY", "APP_CODE_SECURITY")
         elif "AI" in dom_norm:

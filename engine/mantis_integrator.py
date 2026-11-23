@@ -3704,6 +3704,11 @@ def run_unified_all_scans(
     enable_arxiv_detect: bool = True,
     arxiv_sync: bool = False,
     arxiv_query: str = "",
+    arxiv_rl: bool = False,
+    arxiv_verify_panel: bool = False,
+    arxiv_panel_size: int = 2,
+    arxiv_auto_repair: bool = True,
+    arxiv_max_repairs: int = 3,
     enable_last30days_skills: bool = True,
     last30days_sync: bool = False,
     last30days_topic: str = "",
@@ -4078,6 +4083,11 @@ def run_unified_all_scans(
                 sync_new_research=bool(arxiv_sync) and not offline_or_ci,
                 arxiv_query=arxiv_query if not offline_or_ci else "",
                 research_num=max(1, int(research_num or 5)),
+                use_rl=bool(arxiv_rl),
+                verify_panel=bool(arxiv_verify_panel) and not offline_or_ci,
+                panel_size=max(2, int(arxiv_panel_size or 2)),
+                auto_repair=bool(arxiv_auto_repair),
+                max_repair_attempts=max(1, int(arxiv_max_repairs or 3)),
             )
         except Exception as exc:
             return {"status": "error", "total_findings": 0, "findings": [], "error": str(exc)}

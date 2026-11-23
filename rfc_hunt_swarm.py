@@ -4632,6 +4632,11 @@ def cmd_all(args):
             "enable_arxiv_detect": bool(getattr(args, "enable_arxiv_detect", True)),
             "arxiv_sync": bool(getattr(args, "arxiv_sync", False)),
             "arxiv_query": getattr(args, "arxiv_query", None) or "",
+            "arxiv_rl": bool(getattr(args, "arxiv_rl", False)),
+            "arxiv_verify_panel": bool(getattr(args, "arxiv_verify_panel", False)),
+            "arxiv_panel_size": int(getattr(args, "arxiv_panel_size", 2) or 2),
+            "arxiv_auto_repair": bool(getattr(args, "arxiv_auto_repair", True)),
+            "arxiv_max_repairs": int(getattr(args, "arxiv_max_repairs", 3) or 3),
             "enable_last30days_skills": bool(getattr(args, "enable_last30days_skills", True)),
             "last30days_sync": bool(getattr(args, "last30days_sync", False)),
             "last30days_topic": getattr(args, "last30days_topic", None) or "",
@@ -7038,6 +7043,12 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--no-arxiv-detect", dest="enable_arxiv_detect", action="store_false", help="Disable ArXiv-to-Code research detectors during --all")
     parser.add_argument("--arxiv-sync", dest="arxiv_sync", action="store_true", default=False, help="Sync and synthesize --reseach-num new research papers with code & GitHub repos from D:\\harfile\\arixiv-to-code")
     parser.add_argument("--arxiv-query", dest="arxiv_query", type=str, default=None, help="Custom arXiv search query for --arxiv-sync research-to-code synthesis")
+    parser.add_argument("--arxiv-rl", dest="arxiv_rl", action="store_true", default=False, help="Optimize synthesized ArXiv-to-Code detector modules using Dream-RSI RL (arXiv:2609.14858)")
+    parser.add_argument("--arxiv-verify-panel", dest="arxiv_verify_panel", action="store_true", default=False, help="Run ModelFusion Panel-of-Models verification (glm4:9b + qwen2.5:7b -> Judge glm4:9b) on synthesized ArXiv detectors")
+    parser.add_argument("--arxiv-panel-size", dest="arxiv_panel_size", type=int, default=2, help="Number of panelists for --arxiv-verify-panel (default: 2)")
+    parser.add_argument("--arxiv-auto-repair", dest="arxiv_auto_repair", action="store_true", default=True, help="Enable iterative Auto-Repair retry loop (Ruff + mypy --strict + 310-property fuzzing + pytest + Ollama patcher; default-ON)")
+    parser.add_argument("--no-arxiv-auto-repair", dest="arxiv_auto_repair", action="store_false", help="Disable iterative Auto-Repair retry loop during --arxiv-sync")
+    parser.add_argument("--arxiv-max-repairs", dest="arxiv_max_repairs", type=int, default=3, help="Maximum auto-repair retry attempts for generated ArXiv detector modules (default: 3)")
     parser.add_argument("--last30days-skills", dest="enable_last30days_skills", action="store_true", default=True, help="Enable 10 zero-API last30days-skill security & pentesting detectors (5 AI/Agent Security + 5 App/Web Bug-Bounty; default-ON in --all and --deep-audit)")
     parser.add_argument("--no-last30days-skills", dest="enable_last30days_skills", action="store_false", help="Disable zero-API last30days-skill security detectors during --all")
     parser.add_argument("--last30days-sync", dest="last30days_sync", action="store_true", default=False, help="Harvest and synthesize --reseach-num zero-API last-30-days security skills from keyless sources (Reddit, HN, GitHub, arXiv, dev.to)")
