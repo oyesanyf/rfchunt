@@ -2682,11 +2682,42 @@ class CallGraphSlicer:
             sl.prompt_context = sl.to_prompt_block(max_chars=self.max_prompt_chars)
             return sl
 
-        # Bounded DFS from each entry point
+        # Precompute reverse reachability from all sink-bearing symbols in O(V + E)
+        # so the forward DFS never explores dead-end subgraphs that cannot reach a sink.
+        rev_adj: Dict[str, List[str]] = {}
+        for caller_id, elist in adj.items():
+            for e in elist:
+                rev_adj.setdefault(e.callee_id, []).append(caller_id)
+
+        dist_to_sink: Dict[str, int] = {}
+        bfs_queue: List[str] = []
+        for sid, sym in symbols_by_id.items():
+            if sym.sink_matches:
+                dist_to_sink[sid] = 0
+                bfs_queue.append(sid)
+        q_idx = 0
+        while q_idx < len(bfs_queue):
+            cur_sid = bfs_queue[q_idx]
+            q_idx += 1
+            cur_d = dist_to_sink[cur_sid]
+            if cur_d + 1 >= self.max_depth:
+                continue
+            for prev_sid in rev_adj.get(cur_sid, ()):
+                if prev_sid not in dist_to_sink:
+                    dist_to_sink[prev_sid] = cur_d + 1
+                    bfs_queue.append(prev_sid)
+
+        # Bounded DFS from each entry point that can reach at least one sink
         for entry in entry_nodes:
+            if entry.symbol_id not in dist_to_sink:
+                continue
             stack: List[Tuple[List[SymbolNode], List[CallEdge], Set[str]]] = [([entry], [], {entry.symbol_id})]
-            while stack:
+            seen_at_depth: Dict[str, int] = {entry.symbol_id: 1}
+            expansions = 0
+            entry_slices = 0
+            while stack and expansions < 512 and entry_slices < 16:
                 cur_nodes, cur_edges, visited = stack.pop()
+                expansions += 1
                 tail = cur_nodes[-1]
 
                 if tail.sink_matches:
@@ -2694,19 +2725,30 @@ class CallGraphSlicer:
                         sl = _build_slice(cur_nodes, cur_edges, sm)
                         if sl is not None:
                             slices.append(sl)
+                            entry_slices += 1
                             if len(slices) >= self.max_slices:
                                 return slices
 
-                if len(cur_nodes) >= self.max_depth:
+                cur_len = len(cur_nodes)
+                if cur_len >= self.max_depth:
                     continue
+                rem_budget = self.max_depth - cur_len
 
                 for edge in adj.get(tail.symbol_id, []):
-                    if edge.callee_id in visited:
+                    cid = edge.callee_id
+                    if cid in visited:
                         continue
-                    nxt = symbols_by_id.get(edge.callee_id)
+                    rem_dist = dist_to_sink.get(cid)
+                    if rem_dist is None or rem_dist >= rem_budget:
+                        continue
+                    prev_best = seen_at_depth.get(cid)
+                    if prev_best is not None and prev_best <= cur_len + 1:
+                        continue
+                    seen_at_depth[cid] = cur_len + 1
+                    nxt = symbols_by_id.get(cid)
                     if nxt is None:
                         continue
-                    stack.append((cur_nodes + [nxt], cur_edges + [edge], visited | {nxt.symbol_id}))
+                    stack.append((cur_nodes + [nxt], cur_edges + [edge], visited | {cid}))
 
         return slices
 
