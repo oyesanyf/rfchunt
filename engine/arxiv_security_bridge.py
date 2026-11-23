@@ -959,15 +959,23 @@ class ArxivSecurityBridge:
 
                 mod_path.write_text(final_code, encoding="utf-8")
 
-                from engine.structural_detector_compiler import build_structural_template_spec
-
                 det_id = paper.get("detector_id") or f"ARXIV-{dom[:6]}-{slug.upper()}"
                 det_name = paper.get("detector_name") or f"detect_arxiv_{slug}"
-                tpl_spec = build_structural_template_spec(
-                    cwe_id=paper.get("cwe_id", "CWE-20"),
-                    title=paper.get("title", f"arXiv:{arxiv_id}"),
-                    summary=paper.get("summary", ""),
-                )
+                tpl_id = ""
+                tpl_self_test_passed = True
+                try:
+                    from engine.structural_detector_compiler import build_structural_template_spec
+
+                    tpl_spec = build_structural_template_spec(
+                        cwe_id=paper.get("cwe_id", "CWE-20"),
+                        title=paper.get("title", f"arXiv:{arxiv_id}"),
+                        summary=paper.get("summary", ""),
+                    )
+                    tpl_id = str(tpl_spec.template_id)
+                    tpl_self_test_passed = bool(tpl_spec.self_test_passed)
+                except ImportError:
+                    pass
+
                 spec = ResearchPaperDetectorSpec(
                     detector_id=det_id,
                     detector_name=det_name,
@@ -992,8 +1000,8 @@ class ArxivSecurityBridge:
                     evolved_fitness=fitness,
                     tests_passed=tests_str,
                     synthesized_module_path=str(mod_path),
-                    structural_template=tpl_spec.template_id,
-                    self_test_passed=tpl_spec.self_test_passed,
+                    structural_template=tpl_id,
+                    self_test_passed=tpl_self_test_passed,
                 )
                 self._active_detectors[det_id] = spec
                 converted_articles.append(
@@ -1022,8 +1030,8 @@ class ArxivSecurityBridge:
                         "pytest_passed": bool(det_checks_summary.get("pytest_passed", True)),
                         "auto_repaired": auto_repaired,
                         "converged_clean": converged_clean,
-                        "structural_template": tpl_spec.template_id,
-                        "structural_self_test_passed": tpl_spec.self_test_passed,
+                        "structural_template": tpl_id,
+                        "structural_self_test_passed": tpl_self_test_passed,
                         "synthesized_module_path": str(mod_path),
                     }
                 )
@@ -1371,27 +1379,32 @@ class ArxivSecurityBridge:
             and s.self_test_passed
         ]
         if dyn_specs:
-            from engine.structural_detector_compiler import (
-                build_structural_template_spec,
-                execute_structural_template,
-            )
-
-            for dyn_spec in dyn_specs:
-                tpl_spec = build_structural_template_spec(
-                    cwe_id=dyn_spec.cwe_id,
-                    title=dyn_spec.title,
-                    summary=dyn_spec.summary,
+            try:
+                from engine.structural_detector_compiler import (
+                    build_structural_template_spec,
+                    execute_structural_template,
                 )
-                if not tpl_spec.self_test_passed:
-                    continue
-                for sm in execute_structural_template(raw_content, ext, tpl_spec):
-                    emit(
-                        dyn_spec.detector_id,
-                        f"[{tpl_spec.template_id}] {sm.description} ({dyn_spec.title})",
-                        sm.line,
-                        sm.evidence_snippet,
-                        dyn_spec.defense_countermeasure,
+            except ImportError:
+                build_structural_template_spec = None  # type: ignore[assignment]
+                execute_structural_template = None  # type: ignore[assignment]
+
+            if build_structural_template_spec is not None and execute_structural_template is not None:
+                for dyn_spec in dyn_specs:
+                    tpl_spec = build_structural_template_spec(
+                        cwe_id=dyn_spec.cwe_id,
+                        title=dyn_spec.title,
+                        summary=dyn_spec.summary,
                     )
+                    if not tpl_spec.self_test_passed:
+                        continue
+                    for sm in execute_structural_template(raw_content, ext, tpl_spec):
+                        emit(
+                            dyn_spec.detector_id,
+                            f"[{tpl_spec.template_id}] {sm.description} ({dyn_spec.title})",
+                            sm.line,
+                            sm.evidence_snippet,
+                            dyn_spec.defense_countermeasure,
+                        )
 
         return findings
 

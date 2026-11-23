@@ -513,7 +513,7 @@ def _builtin_ast_strict_type_check(source_code: str) -> Dict[str, Any]:
             "summary": "AST syntax error during strict type check",
         }
 
-    _prim_map = {"int": int, "str": str, "float": (int, float), "bool": bool, "bytes": bytes}
+    _prim_map: Dict[str, Any] = {"int": int, "str": str, "float": (int, float), "bool": bool, "bytes": bytes}
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             missing_args = [
