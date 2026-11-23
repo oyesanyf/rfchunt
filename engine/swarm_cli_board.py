@@ -174,7 +174,58 @@ ASCII_STATUS_ICONS: Dict[str, str] = {
     "Now": ">",
 }
 
+EMOJI_STATUS_ICONS: Dict[str, str] = {
+    "Running": "\u26a1",       # ⚡
+    "Moving": "\u26a1",        # ⚡
+    "In review": "\U0001f50d", # 🔍
+    "Done": "\u2705",          # ✅
+    "Waiting": "\u23f3",       # ⏳
+    "Not started": "\u23f3",   # ⏳
+    "Skipped": "\u23ed\ufe0f", # ⏭️
+    "Failed": "\u274c",        # ❌
+    "Now": "\u25b8",           # ▸
+}
+
+AGENT_ROLE_EMOJIS: Dict[str, str] = {
+    "coordinator": "\U0001f9ed",      # 🧭
+    "bootstrap": "\U0001f4e6",        # 📦
+    "reasoner": "\U0001f9e0",         # 🧠
+    "explorer": "\U0001f6f0\ufe0f",   # 🛰️
+    "triager": "\U0001f52c",          # 🔬
+    "dream-rsi": "\U0001f9ec",        # 🧬
+    "dream_rsi": "\U0001f9ec",        # 🧬
+    "dual-graph": "\U0001f578\ufe0f", # 🕸️
+    "artex": "\U0001f578\ufe0f",      # 🕸️
+    "publisher": "\U0001f6e1\ufe0f",  # 🛡️
+    "provisioner": "\U0001f9f0",      # 🧰
+    "fusion-arbiter": "\u2697\ufe0f", # ⚗️
+    "mantis": "\U0001f997",           # 🦗
+    "raptor": "\U0001f996",           # 🦖
+    "aiscan": "\U0001f916",           # 🤖
+    "rea-agents": "\U0001f9e9",       # 🧩
+    "slicer": "\U0001f52a",           # 🔪
+    "scanners": "\U0001f4e1",         # 📡
+    "diff-oracle": "\u2696\ufe0f",    # ⚖️
+    "invariant-runner": "\U0001f512", # 🔒
+    "fuzzer": "\U0001f4a5",           # 💥
+    "poe-verifier": "\U0001f9ea",     # 🧪
+    "novelty-triage": "\u2728",       # ✨
+    "blackboard": "\U0001f4cb",       # 📋
+    "deep_repo_audit": "\U0001f50e",  # 🔎
+}
+
+EVENT_KIND_EMOJIS: Dict[str, str] = {
+    "FACT": "\U0001f4cc",   # 📌
+    "INTENT": "\U0001f3af", # 🎯
+    "HINT": "\U0001f4a1",   # 💡
+    "VULN": "\U0001f525",   # 🔥
+    "EVENT": "\U0001f514",  # 🔔
+}
+
+_WIN_VT_ENABLED: Optional[bool] = None
+
 _UNICODE_PROBE_SAMPLE = "".join(SPINNER_FRAMES_UNICODE) + "".join(UNICODE_STATUS_ICONS.values()) + "\u2500\u2502\u256d\u256e\u2570\u256f"
+_EMOJI_PROBE_SAMPLE = "\U0001f41d\u26a1\u2705\u23f3\U0001f9e0\U0001f6e1\ufe0f"
 
 # ANSI SGR escape sequences (emitted at runtime ONLY when ansi=True and plain=False)
 _SGR_RESET = "\x1b[0m"
@@ -265,6 +316,51 @@ def _utc_hms() -> str:
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 
+def enable_windows_console_vt(*, configure_utf8: bool = False) -> bool:
+    """
+    Enables Windows Console Virtual Terminal Processing (ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    = 0x0004) on stdout/stderr so ANSI SGR colors render properly in cmd.exe / PowerShell
+    instead of printing literal `\\x1b[36m` (`<-[36m`) escape characters.
+    Returns True when VT ANSI rendering is supported (always True on POSIX).
+    """
+    global _WIN_VT_ENABLED
+    if os.name != "nt":
+        return True
+    if configure_utf8:
+        for stream_obj in (sys.stdout, sys.stderr):
+            try:
+                if hasattr(stream_obj, "reconfigure") and getattr(stream_obj, "isatty", lambda: False)():
+                    stream_obj.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+    if _WIN_VT_ENABLED is not None:
+        return _WIN_VT_ENABLED
+    if any(os.environ.get(v) for v in ("WT_SESSION", "ANSICON", "ConEmuANSI", "TERM_PROGRAM")):
+        _WIN_VT_ENABLED = True
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        ok_any = False
+        for std_id in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            handle = kernel32.GetStdHandle(std_id)
+            if not handle or handle == -1:
+                continue
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                if (mode.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING) or kernel32.SetConsoleMode(
+                    handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                ):
+                    ok_any = True
+        _WIN_VT_ENABLED = ok_any
+        return ok_any
+    except Exception:
+        _WIN_VT_ENABLED = False
+        return False
+
+
 def _supports_unicode(stream: Optional[Any] = None, *, plain: bool = False) -> bool:
     """Returns True iff target stream encoding can cleanly encode Unicode CLI icons."""
     if plain:
@@ -276,6 +372,35 @@ def _supports_unicode(stream: Optional[Any] = None, *, plain: bool = False) -> b
         return True
     except (UnicodeEncodeError, LookupError, TypeError, AttributeError):
         return False
+
+
+def _supports_emoji(stream: Optional[Any] = None, *, plain: bool = False, emoji: Optional[bool] = None) -> bool:
+    """Returns True when color emoji icons can be safely encoded on the target stream."""
+    if plain or emoji is False:
+        return False
+    if os.environ.get("RFCHUNT_NO_EMOJI", "").strip() in ("1", "true", "TRUE", "yes"):
+        return False
+    if emoji is True:
+        return _supports_unicode(stream=stream, plain=False)
+    target = stream if stream is not None else sys.stdout
+    encoding = getattr(target, "encoding", None) or locale.getpreferredencoding(False) or "utf-8"
+    try:
+        _EMOJI_PROBE_SAMPLE.encode(encoding, errors="strict")
+        return True
+    except (UnicodeEncodeError, LookupError, TypeError, AttributeError):
+        return False
+
+
+def _agent_emoji(handle: Optional[str], *, use_emoji: bool) -> str:
+    if not use_emoji:
+        return ""
+    norm = _normalize_handle(handle).lower()
+    if norm in AGENT_ROLE_EMOJIS:
+        return AGENT_ROLE_EMOJIS[norm]
+    for key, icon in AGENT_ROLE_EMOJIS.items():
+        if key in norm:
+            return icon
+    return "\U0001f916"  # 🤖
 
 
 def _is_interactive_tty(stream: Optional[Any] = None, *, plain: bool = False) -> bool:
@@ -702,6 +827,63 @@ def _format_team_line(
     return f"{prefix}{', '.join(shown)}"
 
 
+def _render_pipeline_graph_lines(
+    tasks: Sequence[BoardTask],
+    *,
+    width: int,
+    use_unicode: bool,
+    use_emoji: bool,
+    use_ansi: bool,
+    tick: int,
+) -> List[str]:
+    """
+    Renders a compact visual Swarm Agent Pipeline Graph across up to 8 tracked tasks:
+      Emoji mode:  🗺️ [ ✅ 📦 Bootstrap ] ──▶ [ ⚡ 🧠 Reason ] ──▶ [ ⏳ 🛰️ Explore ] ...
+      Plain mode:  Pipeline: [+] Bootstrap -> [*] Reason -> [ ] Explore ...
+    """
+    if not tasks:
+        return []
+    arrow = " \u2500\u2500\u25b6 " if use_unicode else " -> "
+    prefix = "  \U0001f5fa\ufe0f " if use_emoji else "  Pipeline: "
+    shown_tasks = list(tasks[:8])
+    nodes: List[Tuple[str, str]] = []
+    for t in shown_tasks:
+        label = _sanitize_text(t.name, max_len=16, ascii_only=not use_unicode) or "task"
+        sgr = _state_sgr(t.state)
+        if use_emoji:
+            st_em = EMOJI_STATUS_ICONS.get(t.state, "\u23f3")
+            role_em = _agent_emoji(t.worker or t.name, use_emoji=True)
+            spin = f" {_spinner_frame(tick, use_unicode=True)}" if t.state == "Running" else ""
+            raw_node = f"[ {st_em} {role_em} {label}{spin} ]"
+        elif use_unicode:
+            st_ic = _task_icon(t.state, tick=tick, use_unicode=True)
+            raw_node = f"[{st_ic} {label}]"
+        else:
+            st_ic = ASCII_STATUS_ICONS.get(t.state, "[ ]")
+            raw_node = f"{st_ic} {label}"
+        nodes.append((raw_node, _style(raw_node, sgr, use_ansi=use_ansi)))
+
+    out_lines: List[str] = []
+    cur_raw = prefix
+    cur_styled = prefix
+    for idx, (raw_node, styled_node) in enumerate(nodes):
+        sep = arrow if idx > 0 else ""
+        # Approximate display width conservatively
+        if idx > 0 and len(cur_raw) + len(sep) + len(raw_node) > max(48, width - 2):
+            out_lines.append(cur_styled)
+            cur_raw = "    " + sep.lstrip() + raw_node
+            cur_styled = "    " + _style(sep.lstrip(), _SGR_DIM, use_ansi=use_ansi) + styled_node
+        else:
+            cur_raw += sep + raw_node
+            cur_styled += (_style(sep, _SGR_DIM, use_ansi=use_ansi) if sep else "") + styled_node
+    if cur_styled.strip():
+        out_lines.append(cur_styled)
+    if len(tasks) > len(shown_tasks):
+        extra = f"    (+{len(tasks) - len(shown_tasks)} more stages)"
+        out_lines.append(_style(extra, _SGR_DIM, use_ansi=use_ansi))
+    return out_lines
+
+
 def render_swarm_cli_board(
     board_or_snapshot: Union["SwarmCLIBoard", BoardSnapshot, Dict[str, Any]],
     *,
@@ -709,6 +891,7 @@ def render_swarm_cli_board(
     width: int = 100,
     ansi: Optional[bool] = None,
     unicode_icons: Optional[bool] = None,
+    emoji: Optional[bool] = None,
     spinner_tick: Optional[int] = None,
     limit_events: int = 10,
     max_tasks: int = 50,
@@ -720,9 +903,10 @@ def render_swarm_cli_board(
 
     - When `plain=True`: strictly pure ASCII borders and ASCII status icons
       (`[*]`, `[~]`, `[+]`, `[ ]`, `[-]`, `[!]`, `>`), and ZERO `\\x1b[` ANSI codes.
-    - When `plain=False`: crisp Unicode live status icons + rotating braille spinner
-      (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`, `●`, `◐`, `✓`, `○`, `⊘`, `✗`, `▸`) with automatic
-      pure-ASCII icon fallback on non-UTF8 terminals.
+    - When `plain=False`: rich color emoji swarm graphics + agent pipeline graph +
+      Unicode live status icons & rotating braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`,
+      `●`, `◐`, `✓`, `○`, `⊘`, `✗`, `▸`) with automatic Windows VT100 console
+      enabling and pure-ASCII fallback on non-UTF8 terminals.
     """
     if isinstance(board_or_snapshot, SwarmCLIBoard):
         snap = board_or_snapshot.snapshot()
@@ -737,12 +921,25 @@ def render_swarm_cli_board(
     use_unicode = False if plain else (
         bool(unicode_icons) if unicode_icons is not None else _supports_unicode(stream=stream, plain=False)
     )
+    use_emoji = bool(use_unicode) and _supports_emoji(stream=stream, plain=plain, emoji=emoji)
     if plain:
         use_ansi = False
     elif ansi is not None:
         use_ansi = bool(ansi)
+        if use_ansi and os.name == "nt":
+            enable_windows_console_vt(configure_utf8=False)
     else:
-        use_ansi = not bool(os.environ.get("NO_COLOR"))
+        if os.environ.get("NO_COLOR"):
+            use_ansi = False
+        elif os.name == "nt":
+            target_s = stream if stream is not None else sys.stdout
+            is_real_console = target_s in (sys.stdout, sys.stderr)
+            if is_real_console:
+                use_ansi = enable_windows_console_vt(configure_utf8=False)
+            else:
+                use_ansi = True
+        else:
+            use_ansi = True
 
     tick = snap.spinner_tick if spinner_tick is None else int(spinner_tick)
     ascii_sanitize = bool(plain or not use_unicode)
@@ -756,17 +953,30 @@ def render_swarm_cli_board(
 
     lines: List[str] = []
 
-    # 1. GOAL BLOCK
+    # 1. GOAL BLOCK + VISUAL SWARM PIPELINE GRAPH
     title_clean = _sanitize_text(snap.title or "RFCHunt Swarm Overview", ascii_only=ascii_sanitize)
     goal_clean = _sanitize_text(snap.goal, ascii_only=ascii_sanitize)
     task_id_clean = _sanitize_text(snap.task_id or "default", ascii_only=ascii_sanitize)
 
     lines.append(_style(top_rule, _SGR_CYAN, use_ansi=use_ansi))
-    goal_hdr = f"GOAL: {title_clean}  [task:{task_id_clean}]"
+    goal_prefix = "\U0001f41d " if use_emoji else ""
+    goal_hdr = f"{goal_prefix}GOAL: {title_clean}  [task:{task_id_clean}]"
     lines.append(_style(goal_hdr, _SGR_BOLD_CYAN, use_ansi=use_ansi))
     if goal_clean:
         for wrapped in textwrap.wrap(goal_clean, width=max(32, w - 2)):
             lines.append(f"  {wrapped}")
+
+    if snap.tasks:
+        lines.extend(
+            _render_pipeline_graph_lines(
+                snap.tasks,
+                width=w,
+                use_unicode=use_unicode,
+                use_emoji=use_emoji,
+                use_ansi=use_ansi,
+                tick=tick,
+            )
+        )
 
     # Progress summary counters
     progress_line = (
@@ -781,8 +991,10 @@ def render_swarm_cli_board(
         bar = "\u2588" * filled + "\u2591" * (bar_w - filled)
     else:
         bar = "#" * filled + "-" * (bar_w - filled)
+    prog_prefix = "\U0001f4ca " if use_emoji else ""
     lines.append(
         "  "
+        + prog_prefix
         + _style(progress_line, _SGR_BOLD, use_ansi=use_ansi)
         + f"  [{bar}] {pct}%"
     )
@@ -794,8 +1006,11 @@ def render_swarm_cli_board(
     ) if use_unicode else (
         ASCII_STATUS_ICONS["Running"] if ctr["running"] > 0 else ASCII_STATUS_ICONS["Waiting"]
     )
+    run_em = (
+        (EMOJI_STATUS_ICONS["Running"] + " ") if ctr["running"] > 0 else (EMOJI_STATUS_ICONS["Waiting"] + " ")
+    ) if use_emoji else ""
     run_spin_suffix = f" {_spinner_frame(tick, use_unicode=True)}" if (use_unicode and ctr["running"] > 0) else ""
-    running_header = f"{run_icon} Running ({ctr['running']}){run_spin_suffix}"
+    running_header = f"{run_em}{run_icon} Running ({ctr['running']}){run_spin_suffix}"
     lines.append(_style(running_header, _SGR_BOLD_CYAN if ctr["running"] > 0 else _SGR_BOLD, use_ansi=use_ansi))
 
     if not snap.tasks:
@@ -810,9 +1025,15 @@ def render_swarm_cli_board(
 
         for task in visible_tasks:
             t_icon = _task_icon(task.state, tick=tick, use_unicode=use_unicode)
+            role_em = _agent_emoji(task.worker or task.name, use_emoji=use_emoji)
+            st_em = EMOJI_STATUS_ICONS.get(task.state, "") if use_emoji else ""
             desc = _sanitize_text(task.description, ascii_only=ascii_sanitize)
             worker_str = f"@{_sanitize_text(task.worker, ascii_only=ascii_sanitize)}" if task.worker else ""
-            if use_unicode and task.state == "Running":
+            if use_emoji and task.state == "Running":
+                badge_text = f"[{st_em} {UNICODE_STATUS_ICONS['Running']} {task.state}]"
+            elif use_emoji and st_em:
+                badge_text = f"[{st_em} {task.state}]"
+            elif use_unicode and task.state == "Running":
                 badge_text = f"[{UNICODE_STATUS_ICONS['Running']} {task.state}]"
             else:
                 badge_text = f"[{task.state}]"
@@ -822,7 +1043,8 @@ def render_swarm_cli_board(
             badge_styled = _style(badge_text, sgr, use_ansi=use_ansi)
             worker_styled = _style(worker_str, _SGR_DIM, use_ansi=use_ansi) if worker_str else ""
 
-            row_parts = [f"  {icon_styled}", desc, badge_styled]
+            lead = f"  {icon_styled} {role_em}" if role_em else f"  {icon_styled}"
+            row_parts = [lead, desc, badge_styled]
             if worker_styled:
                 row_parts.append(worker_styled)
             lines.append("  ".join(row_parts))
@@ -842,7 +1064,8 @@ def render_swarm_cli_board(
     lines.append(_style(h_rule, _SGR_DIM, use_ansi=use_ansi))
 
     # 3. THREADS SECTION (GROUPED BY OUTCOME)
-    threads_header = f"Threads ({ctr['open_threads']} open / {ctr['total_threads']} total)"
+    th_prefix = "\U0001f9f5 " if use_emoji else ""
+    threads_header = f"{th_prefix}Threads ({ctr['open_threads']} open / {ctr['total_threads']} total)"
     lines.append(_style(threads_header, _SGR_BOLD, use_ansi=use_ansi))
 
     if not th_summaries:
@@ -851,9 +1074,14 @@ def render_swarm_cli_board(
         for th in th_summaries:
             th_status = th["status"]
             th_icon = _thread_icon(th_status, tick=tick, use_unicode=use_unicode)
+            th_em = EMOJI_STATUS_ICONS.get(th_status, "") if use_emoji else ""
             th_title = _sanitize_text(th["title"], ascii_only=ascii_sanitize)
             th_frac = th["fraction"]
-            if use_unicode and th_status == "Moving":
+            if use_emoji and th_status == "Moving":
+                th_badge = f"[{th_em} {UNICODE_STATUS_ICONS['Moving']} {th_status}]"
+            elif use_emoji and th_em:
+                th_badge = f"[{th_em} {th_status}]"
+            elif use_unicode and th_status == "Moving":
                 th_badge = f"[{UNICODE_STATUS_ICONS['Moving']} {th_status}]"
             else:
                 th_badge = f"[{th_status}]"
@@ -876,25 +1104,47 @@ def render_swarm_cli_board(
     lines.append(_style(h_rule, _SGR_DIM, use_ansi=use_ansi))
 
     # 4. THE TEAM & BOARD
-    lines.append(_style("The team & board", _SGR_BOLD, use_ansi=use_ansi))
-    team_line = _format_team_line(
-        snap.coordinator,
-        team_handles,
-        width=w,
-        prefix="  Team: ",
-        max_handles=max_team_handles,
-    )
-    lines.append("  " + _sanitize_text(team_line.lstrip(), ascii_only=ascii_sanitize))
+    team_hdr_prefix = "\U0001f465 " if use_emoji else ""
+    lines.append(_style(f"{team_hdr_prefix}The team & board", _SGR_BOLD, use_ansi=use_ansi))
+    if use_emoji:
+        coord_lbl = f"{_agent_emoji('coordinator', use_emoji=True)} {_sanitize_text(snap.coordinator or 'Coordinator', max_len=32)}"
+        emoji_handles = [f"{_agent_emoji(h, use_emoji=True)} @{_normalize_handle(h)}" for h in team_handles if _normalize_handle(h)]
+        all_tokens = [coord_lbl] + emoji_handles
+        cap = len(all_tokens) if max_team_handles is None else min(len(all_tokens), max(1, int(max_team_handles) + 1))
+        shown: List[str] = [all_tokens[0]]
+        for t_idx in range(1, cap):
+            rem = len(all_tokens) - (t_idx + 1)
+            cand = ", ".join(shown + [all_tokens[t_idx]])
+            suf = f" +{rem}" if rem > 0 else ""
+            if len(cand) + len(suf) <= max(24, w - 10):
+                shown.append(all_tokens[t_idx])
+            else:
+                break
+        ovf = len(all_tokens) - len(shown)
+        team_rendered = "  Team: " + ", ".join(shown) + (f" +{ovf}" if ovf > 0 else "")
+        lines.append(team_rendered)
+    else:
+        team_line = _format_team_line(
+            snap.coordinator,
+            team_handles,
+            width=w,
+            prefix="  Team: ",
+            max_handles=max_team_handles,
+        )
+        lines.append("  " + _sanitize_text(team_line.lstrip(), ascii_only=ascii_sanitize))
 
     ev_limit = max(0, int(limit_events))
     recent_events = snap.events[-ev_limit:] if ev_limit > 0 else []
+    board_prefix = "\U0001f4cb " if use_emoji else ""
     if not recent_events:
-        lines.append("  Board: (no messages yet)")
+        lines.append(f"  {board_prefix}Board: (no messages yet)")
     else:
-        lines.append("  Board:")
+        lines.append(f"  {board_prefix}Board:")
         for ev in recent_events:
             ts = _sanitize_text(ev.timestamp, ascii_only=ascii_sanitize)
-            kind_badge = f"[{_sanitize_text(ev.kind, ascii_only=ascii_sanitize)}]"
+            ev_kind_clean = _sanitize_text(ev.kind, ascii_only=ascii_sanitize)
+            kind_em = (EVENT_KIND_EMOJIS.get(ev_kind_clean.upper(), "\U0001f514") + " ") if use_emoji else ""
+            kind_badge = f"[{ev_kind_clean}]"
             agent_handle = f"@{_sanitize_text(ev.agent, ascii_only=ascii_sanitize)}"
             status_tag = f" ({_sanitize_text(ev.status, ascii_only=ascii_sanitize)})" if ev.status else ""
             prefix_plain = f"    #{ev.seq} {ts} {kind_badge} {agent_handle}{status_tag}: "
@@ -902,7 +1152,7 @@ def render_swarm_cli_board(
             msg_text = _sanitize_text(ev.text, max_len=msg_budget, ascii_only=ascii_sanitize)
             lines.append(
                 f"    #{ev.seq} {_style(ts, _SGR_DIM, use_ansi=use_ansi)} "
-                f"{_style(kind_badge, _event_kind_sgr(ev.kind), use_ansi=use_ansi)} "
+                f"{kind_em}{_style(kind_badge, _event_kind_sgr(ev.kind), use_ansi=use_ansi)} "
                 f"{_style(agent_handle, _SGR_BOLD, use_ansi=use_ansi)}{status_tag}: {msg_text}"
             )
 
@@ -937,6 +1187,7 @@ class SwarmCLIBoard:
         max_events: int = 50,
         plain: bool = False,
         json_mode: bool = False,
+        emoji: Optional[bool] = None,
         width: int = 100,
         refresh_interval: float = 0.25,
         stream: Optional[Any] = None,
@@ -948,6 +1199,7 @@ class SwarmCLIBoard:
         self.coordinator = _sanitize_text(coordinator or "Coordinator", max_len=40) or "Coordinator"
         self.plain = bool(plain)
         self.json_mode = bool(json_mode)
+        self.emoji = emoji
         self.width = max(48, min(200, int(width or 100)))
         self.refresh_interval = max(0.05, float(refresh_interval))
         self._stream = stream
@@ -1226,6 +1478,7 @@ class SwarmCLIBoard:
         *,
         ansi: Optional[bool] = None,
         unicode_icons: Optional[bool] = None,
+        emoji: Optional[bool] = None,
         spinner_tick: Optional[int] = None,
         limit_events: int = 10,
         max_tasks: int = 50,
@@ -1233,18 +1486,80 @@ class SwarmCLIBoard:
     ) -> str:
         eff_plain = self.plain if plain is None else bool(plain)
         eff_width = self.width if width is None else int(width)
+        eff_emoji = self.emoji if emoji is None else emoji
         return render_swarm_cli_board(
             self.snapshot(),
             plain=eff_plain,
             width=eff_width,
             ansi=ansi,
             unicode_icons=unicode_icons,
+            emoji=eff_emoji,
             spinner_tick=spinner_tick,
             limit_events=limit_events,
             max_tasks=max_tasks,
             max_team_handles=max_team_handles,
             stream=self._out_stream(),
         )
+
+    def render_pipeline_banner(
+        self,
+        *,
+        plain: Optional[bool] = None,
+        width: Optional[int] = None,
+        ansi: Optional[bool] = None,
+        emoji: Optional[bool] = None,
+        active_note: str = "",
+    ) -> str:
+        """
+        Renders a compact 3-4 line live Swarm Pipeline Banner for real-time phase
+        updates during long-running OODA / ModelFusion / probe execution loops.
+        """
+        snap = self.snapshot()
+        eff_plain = self.plain if plain is None else bool(plain)
+        eff_width = max(48, min(200, int(self.width if width is None else width)))
+        eff_emoji = self.emoji if emoji is None else emoji
+        stream_obj = self._out_stream()
+        use_unicode = False if eff_plain else _supports_unicode(stream=stream_obj, plain=False)
+        use_emoji = bool(use_unicode) and _supports_emoji(stream=stream_obj, plain=eff_plain, emoji=eff_emoji)
+        if eff_plain:
+            use_ansi = False
+        elif ansi is not None:
+            use_ansi = bool(ansi)
+        elif os.environ.get("NO_COLOR"):
+            use_ansi = False
+        elif os.name == "nt":
+            use_ansi = enable_windows_console_vt(configure_utf8=False) if stream_obj in (sys.stdout, sys.stderr) else True
+        else:
+            use_ansi = True
+
+        ctr = snap.counters()
+        pct = int(round((100.0 * ctr["done"] / ctr["total"]))) if ctr["total"] > 0 else 0
+        bar_w = 14
+        filled = int(round((bar_w * pct) / 100.0))
+        bar = ("\u2588" * filled + "\u2591" * (bar_w - filled)) if use_unicode else ("#" * filled + "-" * (bar_w - filled))
+        rule = ("\u2500" * eff_width) if use_unicode else ("-" * eff_width)
+        hdr_em = "\U0001f41d " if use_emoji else ""
+        hdr = f"{hdr_em}{_sanitize_text(snap.title, ascii_only=not use_unicode)}  [{bar}] {pct}% ({ctr['done']}/{ctr['total']})"
+        out = [
+            _style(rule, _SGR_DIM, use_ansi=use_ansi),
+            _style(hdr, _SGR_BOLD_CYAN, use_ansi=use_ansi),
+        ]
+        out.extend(
+            _render_pipeline_graph_lines(
+                snap.tasks,
+                width=eff_width,
+                use_unicode=use_unicode,
+                use_emoji=use_emoji,
+                use_ansi=use_ansi,
+                tick=snap.spinner_tick,
+            )
+        )
+        if active_note:
+            now_ic = UNICODE_STATUS_ICONS["Now"] if use_unicode else ASCII_STATUS_ICONS["Now"]
+            note_clean = _sanitize_text(active_note, max_len=max(24, eff_width - 8), ascii_only=not use_unicode)
+            out.append("  " + _style(f"{now_ic} {note_clean}", _SGR_CYAN, use_ansi=use_ansi))
+        out.append(_style(rule, _SGR_DIM, use_ansi=use_ansi))
+        return "\n".join(out)
 
     def _write_stream_line(self, text: str) -> None:
         if self.json_mode:
@@ -1426,6 +1741,7 @@ def create_all_scan_board(
     *,
     plain: bool = False,
     json_mode: bool = False,
+    emoji: Optional[bool] = None,
     width: int = 100,
     stream: Optional[Any] = None,
 ) -> SwarmCLIBoard:
@@ -1440,6 +1756,7 @@ def create_all_scan_board(
         task_id=task_id,
         plain=plain,
         json_mode=json_mode,
+        emoji=emoji,
         width=width,
         stream=stream,
     )
@@ -1507,6 +1824,7 @@ def create_swarm_ooda_board(
     *,
     plain: bool = False,
     json_mode: bool = False,
+    emoji: Optional[bool] = None,
     width: int = 100,
     stream: Optional[Any] = None,
 ) -> SwarmCLIBoard:
@@ -1524,6 +1842,7 @@ def create_swarm_ooda_board(
         task_id=task_id,
         plain=plain,
         json_mode=json_mode,
+        emoji=emoji,
         width=width,
         stream=stream,
     )
@@ -1946,6 +2265,7 @@ def watch_board_from_db(
     limit_events: int = 15,
     plain: bool = False,
     as_json: bool = False,
+    emoji: Optional[bool] = None,
     width: int = 100,
     watch: bool = False,
     max_iterations: Optional[int] = None,
@@ -1961,8 +2281,12 @@ def watch_board_from_db(
     """
     target = stream if stream is not None else sys.stdout
     poll_interval = max(0.1, float(interval or 1.0))
+    vt_ok = True
+    if not plain and not as_json and os.name == "nt" and target in (sys.stdout, sys.stderr):
+        vt_ok = enable_windows_console_vt(configure_utf8=True)
     is_tty = _is_interactive_tty(target, plain=plain)
     eff_plain = True if (plain or not is_tty) else False
+    eff_ansi = (not eff_plain) and vt_ok
 
     def _emit_line(payload_str: str) -> None:
         target.write(payload_str + "\n")
@@ -1979,7 +2303,8 @@ def watch_board_from_db(
                     snap,
                     plain=eff_plain,
                     width=width,
-                    ansi=not eff_plain,
+                    ansi=eff_ansi,
+                    emoji=emoji,
                     limit_events=limit_events,
                     stream=target,
                 )
@@ -2011,7 +2336,8 @@ def watch_board_from_db(
                         snap,
                         plain=False,
                         width=width,
-                        ansi=True,
+                        ansi=eff_ansi,
+                        emoji=emoji,
                         spinner_tick=snap.spinner_tick,
                         limit_events=limit_events,
                         stream=target,
@@ -2033,12 +2359,13 @@ def watch_board_from_db(
                         snap,
                         plain=eff_plain,
                         width=width,
-                        ansi=not eff_plain,
+                        ansi=eff_ansi,
+                        emoji=emoji,
                         spinner_tick=snap.spinner_tick,
                         limit_events=limit_events,
                         stream=target,
                     )
-                    if is_tty and not eff_plain:
+                    if is_tty and eff_ansi:
                         target.write("\x1b[2J\x1b[H" + rendered + "\n")
                         target.flush()
                     else:
@@ -2058,6 +2385,10 @@ __all__ = [
     "SPINNER_FRAMES_UNICODE",
     "UNICODE_STATUS_ICONS",
     "ASCII_STATUS_ICONS",
+    "EMOJI_STATUS_ICONS",
+    "AGENT_ROLE_EMOJIS",
+    "EVENT_KIND_EMOJIS",
+    "enable_windows_console_vt",
     "normalize_task_state",
     "BoardTask",
     "BoardThread",

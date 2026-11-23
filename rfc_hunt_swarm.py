@@ -3737,6 +3737,7 @@ def cmd_swarm_board(args):
     width = max(60, int(getattr(args, "board_width", 100) or 100))
     plain = bool(getattr(args, "plain", False))
     as_json = bool(getattr(args, "as_json", False))
+    emoji = getattr(args, "board_emoji", None)
 
     watch_board_from_db(
         db_path,
@@ -3745,6 +3746,7 @@ def cmd_swarm_board(args):
         limit_events=limit_events,
         plain=plain,
         as_json=as_json,
+        emoji=emoji,
         width=width,
         watch=watch,
     )
@@ -4782,18 +4784,26 @@ def cmd_all(args):
         )
         if bool(getattr(args, "swarm_board", False)):
             try:
-                from engine.swarm_cli_board import create_all_scan_board, update_all_board_from_result
+                from engine.swarm_cli_board import (
+                    create_all_scan_board,
+                    enable_windows_console_vt,
+                    update_all_board_from_result,
+                )
 
+                eff_plain = bool(getattr(args, "plain", False))
+                if not eff_plain and not as_json:
+                    enable_windows_console_vt(configure_utf8=True)
                 target_disp_board = str(res.get("target_path") or host or repo or ".")
                 cli_board = create_all_scan_board(
                     target_disp_board,
                     task_id=all_task_id,
-                    plain=bool(getattr(args, "plain", False)),
+                    plain=eff_plain,
                     json_mode=as_json,
+                    emoji=getattr(args, "board_emoji", None),
                     width=max(60, int(getattr(args, "board_width", 100) or 100)),
                 )
                 update_all_board_from_result(cli_board, res)
-                print(cli_board.render(plain=bool(getattr(args, "plain", False)), width=max(60, int(getattr(args, "board_width", 100) or 100))))
+                print(cli_board.render(plain=eff_plain, width=max(60, int(getattr(args, "board_width", 100) or 100))))
             except Exception:
                 pass
     finally:
@@ -6903,8 +6913,10 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--novelty-export", dest="novelty_export", type=str, default=None, help="Optional output JSON path to export the merged novelty corpus catalog")
 
     # Pure-CLI Swarm Overview & Live Terminal Status Board (Zero GUI)
-    parser.add_argument("--swarm-board", dest="swarm_board", action="store_true", default=False, help="Render pure-CLI Swarm Overview board during --all and OODA Swarm runs (Unicode live icons / --plain ASCII fallback, zero GUI)")
+    parser.add_argument("--swarm-board", dest="swarm_board", action="store_true", default=False, help="Render live pure-CLI Swarm Overview board with color emojis & pipeline graph during --all and OODA Swarm runs (--plain for ASCII, zero GUI)")
     parser.add_argument("--no-swarm-board", dest="swarm_board", action="store_false", help="Disable pure-CLI Swarm Overview board rendering")
+    parser.add_argument("--emoji", dest="board_emoji", action="store_true", default=None, help="Explicitly enable color emoji icons on the Swarm Overview board (auto-enabled on UTF-8 terminals)")
+    parser.add_argument("--no-emoji", dest="board_emoji", action="store_false", help="Use geometric Unicode icons instead of color emojis on the Swarm Overview board")
     parser.add_argument("--watch", dest="watch", action="store_true", default=False, help="Continuously refresh `swarm-board` from SQLite DB until interrupted")
     parser.add_argument("--interval", dest="interval", type=float, default=1.0, help="Refresh interval in seconds for `swarm-board --watch` (default: 1.0)")
     parser.add_argument("--board-width", dest="board_width", type=int, default=100, help="Column width for pure-CLI Swarm Overview board (default: 100)")
@@ -7678,6 +7690,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         return
 
     # Iterate through target list for Hunt or Swarm
+    last_ooda_board = None
     for idx, (t_host, t_port, t_tls) in enumerate(target_list, 1):
         if len(target_list) > 1:
             proto = "https" if t_tls else "http"
@@ -7967,22 +7980,39 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
                 }
 
                 ooda_board = None
+                board_width_eff = max(60, int(getattr(args, "board_width", 100) or 100))
+                board_plain_eff = bool(getattr(args, "plain", False))
+                board_emoji_eff = getattr(args, "board_emoji", None)
                 if bool(getattr(args, "swarm_board", False)) and not bool(getattr(args, "as_json", False)):
                     try:
-                        from engine.swarm_cli_board import create_swarm_ooda_board
+                        from engine.swarm_cli_board import create_swarm_ooda_board, enable_windows_console_vt
 
+                        if not board_plain_eff:
+                            enable_windows_console_vt(configure_utf8=True)
                         ooda_board = create_swarm_ooda_board(
                             rfc_num_str,
                             t_host,
                             t_port,
                             task_id=run_task_id,
-                            plain=bool(getattr(args, "plain", False)),
+                            plain=board_plain_eff,
                             json_mode=False,
-                            width=max(60, int(getattr(args, "board_width", 100) or 100)),
+                            emoji=board_emoji_eff,
+                            width=board_width_eff,
                         )
+                        ooda_board.set_task_state("Bootstrap", "Running", action=f"Fetching & chunking RFC {rfc_num_str}")
+                        print(
+                            ooda_board.render_pipeline_banner(
+                                plain=board_plain_eff,
+                                width=board_width_eff,
+                                emoji=board_emoji_eff,
+                                active_note=f"Phase: Bootstrap (RFC {rfc_num_str} -> {t_host}:{t_port})",
+                            )
+                        )
+                        last_ooda_board = ooda_board
                     except Exception:
                         ooda_board = None
 
+                last_rendered_phase = "Bootstrap"
                 try:
                     for event in graph.stream(initial_state, {"recursion_limit": 5000}):
                         for node_name, state_update in event.items():
@@ -7999,20 +8029,41 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
                                         "dream_rsi_agent": "DreamRSI",
                                     }
                                     t_key = node_to_task.get(node_name)
+                                    phase_changed = False
+                                    active_phase_label = ""
                                     if t_key:
                                         ooda_board.set_task_state(t_key, "Done", action=str(last_hist)[:90])
+                                        if t_key != last_rendered_phase:
+                                            phase_changed = True
+                                            last_rendered_phase = t_key
+                                            active_phase_label = f"Completed {t_key}: {str(last_hist)[:80]}"
                                     elif node_name == "blackboard_router":
                                         nxt = str(state_update.get("ooda_phase") or "")
                                         if nxt in node_to_task.values():
                                             ooda_board.set_task_state(nxt, "Running", action=str(last_hist)[:90])
-                                    ooda_board.post_event(node_name, str(last_hist)[:120], kind="EVENT")
+                                            if nxt != last_rendered_phase:
+                                                phase_changed = True
+                                                last_rendered_phase = nxt
+                                                active_phase_label = f"Active phase -> {nxt} ({str(last_hist)[:70]})"
+                                    ev_kind = "VULN" if ("current_vuln" in state_update and state_update["current_vuln"]) else "EVENT"
+                                    ooda_board.post_event(node_name, str(last_hist)[:120], kind=ev_kind)
+                                    if phase_changed:
+                                        ooda_board.advance_spinner(1)
+                                        print(
+                                            ooda_board.render_pipeline_banner(
+                                                plain=board_plain_eff,
+                                                width=board_width_eff,
+                                                emoji=board_emoji_eff,
+                                                active_note=active_phase_label,
+                                            )
+                                        )
                                 except Exception:
                                     pass
                             if "current_vuln" in state_update and state_update["current_vuln"]:
                                 print(f"    !!! VULNERABILITY CONFIRMED: {state_update['current_vuln'].vuln_id}")
                     if ooda_board is not None:
                         try:
-                            print(ooda_board.render(plain=bool(getattr(args, "plain", False)), width=max(60, int(getattr(args, "board_width", 100) or 100))))
+                            print(ooda_board.render(plain=board_plain_eff, width=board_width_eff, emoji=board_emoji_eff))
                         except Exception:
                             pass
                     with swarm.stats_lock:
@@ -8075,11 +8126,21 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             )
             hydrated_counts = artex_eng.ingest_from_database(chain_db)
             if sum(hydrated_counts.values()) > 0 or getattr(args, "enable_artex", False):
+                if last_ooda_board is not None:
+                    last_ooda_board.set_task_state("DualGraph", "Running", action="Synthesizing ARTEX Dual-Graph chains")
                 c_res = artex_eng.run_attack_chain_cycle(round_num=max(1, int(getattr(args, "artex_rounds", 1) or 1)))
                 print(
                     f"[+] [ARTEX Attack Chainer] Synthesized {c_res.get('candidates_planned', 0)} candidates | "
                     f"Verified {c_res.get('exploits_verified', 0)} chains (Max Hops: {c_res.get('max_hop_count', 0)})"
                 )
+                if last_ooda_board is not None:
+                    last_ooda_board.set_task_state(
+                        "DualGraph",
+                        "Done",
+                        note=f"Synthesized {c_res.get('candidates_planned', 0)} candidates ({c_res.get('exploits_verified', 0)} chains)",
+                    )
+            elif last_ooda_board is not None:
+                last_ooda_board.set_task_state("DualGraph", "Done", note="No anomalies to chain")
         finally:
             if post_arbiter is not None and hasattr(post_arbiter, "close"):
                 try:
@@ -8099,6 +8160,26 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         res = bridge.export_plugin(output_dir=caldera_dir)
         bridge.export_plugin(output_dir=".")
         print(f"[+] Caldera Auto-Sync Complete: {res['abilities_count']} abilities and {res['adversaries_count']} adversaries ready.")
+        if last_ooda_board is not None:
+            last_ooda_board.set_task_state(
+                "Publish",
+                "Done",
+                note=f"Caldera exported {res['abilities_count']} abilities, {res['adversaries_count']} adversaries",
+            )
+    elif last_ooda_board is not None:
+        last_ooda_board.set_task_state("Publish", "Skipped", note="--no-caldera enabled")
+
+    if last_ooda_board is not None:
+        try:
+            print(
+                last_ooda_board.render(
+                    plain=bool(getattr(args, "plain", False)),
+                    width=max(60, int(getattr(args, "board_width", 100) or 100)),
+                    emoji=getattr(args, "board_emoji", None),
+                )
+            )
+        except Exception:
+            pass
 
     if args.caldera_url:
         from engine.caldera_bridge import CalderaBridge

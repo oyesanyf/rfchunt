@@ -557,3 +557,59 @@ def test_live_tty_stdlib_fallback_and_spinner_advancement(monkeypatch):
     assert UNICODE_STATUS_ICONS["Done"] in out
     assert any(frame in out for frame in SPINNER_FRAMES_UNICODE)
 
+
+def test_emoji_swarm_graphics_pipeline_graph_and_windows_vt_guard(monkeypatch):
+    import engine.swarm_cli_board as mod
+
+    board = create_swarm_ooda_board("RFC 9112", "127.0.0.1", 8080, task_id="emoji-test")
+    board.set_task_state("Bootstrap", "Done", note="Chunked 214 fragments")
+    board.set_task_state("Reason", "Done", note="Synthesized 11 candidates")
+    board.set_task_state("Explore", "Running", action="Probing CL.TE framing")
+    board.set_task_state("Triage", "In review", action="Running 3-trial check")
+    board.set_task_state("Publish", "Skipped", note="Skipped")
+    board.set_task_state("DreamRSI", "Failed", note="Timeout")
+    board.post_event("explorer", "Anomaly observed", kind="FACT")
+
+    # 1. Default UTF-8 mode renders rich color emojis + visual Swarm Pipeline Graph
+    utf8_stream = _EncodingStringIO(encoding="utf-8", tty=True)
+    rendered_emoji = render_swarm_cli_board(board, plain=False, width=110, ansi=False, stream=utf8_stream)
+    assert "\U0001f41d GOAL:" in rendered_emoji          # 🐝
+    assert "\U0001f5fa\ufe0f" in rendered_emoji          # 🗺️ pipeline graph
+    assert "\u2500\u2500\u25b6" in rendered_emoji        # ──▶ pipeline arrows
+    assert "\U0001f4ca" in rendered_emoji                # 📊 progress
+    assert "\u26a1" in rendered_emoji                    # ⚡ running
+    assert "\u2705" in rendered_emoji                    # ✅ done
+    assert "\U0001f50d" in rendered_emoji                # 🔍 in review
+    assert "\u23f3" in rendered_emoji                    # ⏳ waiting
+    assert "\u23ed\ufe0f" in rendered_emoji              # ⏭️ skipped
+    assert "\u274c" in rendered_emoji                    # ❌ failed
+    assert "\U0001f9f5" in rendered_emoji                # 🧵 threads
+    assert "\U0001f465" in rendered_emoji                # 👥 team
+    assert "\U0001f9ed Coordinator" in rendered_emoji    # 🧭 Coordinator
+    assert "\U0001f4cc" in rendered_emoji                # 📌 FACT event
+
+    # 2. Compact live pipeline banner works in both emoji and pure-ASCII plain modes
+    banner_emoji = board.render_pipeline_banner(plain=False, width=100, ansi=False, emoji=True, active_note="Active phase -> Explore")
+    assert "\U0001f41d" in banner_emoji
+    assert "\u26a1" in banner_emoji
+    assert "Active phase -> Explore" in banner_emoji
+
+    banner_plain = board.render_pipeline_banner(plain=True, width=100, active_note="Active phase -> Explore")
+    assert banner_plain.isascii()
+    assert "\x1b[" not in banner_plain
+    assert "Pipeline:" in banner_plain
+    assert " -> " in banner_plain
+
+    # 3. --no-emoji disables color emojis while preserving geometric Unicode icons
+    rendered_no_emoji = render_swarm_cli_board(board, plain=False, width=110, ansi=False, emoji=False, stream=utf8_stream)
+    assert "\U0001f41d" not in rendered_no_emoji
+    assert "\u2705" not in rendered_no_emoji
+    assert UNICODE_STATUS_ICONS["Done"] in rendered_no_emoji
+
+    # 4. Windows VT100 guard: if VT enabling fails on real sys.stdout with ansi=None, never emit raw \x1b[
+    monkeypatch.setattr(mod.os, "name", "nt")
+    monkeypatch.setattr(mod, "enable_windows_console_vt", lambda **kw: False)
+    rendered_no_vt = render_swarm_cli_board(board, plain=False, width=100, ansi=None, stream=sys.stdout)
+    assert "\x1b[" not in rendered_no_vt
+
+
