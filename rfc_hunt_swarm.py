@@ -4624,6 +4624,13 @@ def cmd_all(args):
             "max_rps": float(getattr(args, "max_rps", 0.0) or 0.0),
             "enable_h2_desync": bool(getattr(args, "enable_h2_desync", True)),
             "enable_verification_inversion": bool(getattr(args, "enable_verification_inversion", True)),
+            "research_num": int(getattr(args, "research_num", 5) or 5),
+            "enable_arxiv_detect": bool(getattr(args, "enable_arxiv_detect", True)),
+            "arxiv_sync": bool(getattr(args, "arxiv_sync", False)),
+            "arxiv_query": getattr(args, "arxiv_query", None) or "",
+            "enable_last30days_skills": bool(getattr(args, "enable_last30days_skills", True)),
+            "last30days_sync": bool(getattr(args, "last30days_sync", False)),
+            "last30days_topic": getattr(args, "last30days_topic", None) or "",
         }
         try:
             _unified_sig = inspect.signature(run_unified_all_scans)
@@ -7019,8 +7026,17 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--dispatch", "--dispatch-config", dest="dispatch", type=str, default=None, help="Path to unified swarm_dispatch.yaml configuration")
 
     # AIxCC Upgrade #2: Whole-Repo Call-Graph & Taint Slicer + Tiered Model Escalation + Static Verification-Inversion Auditor
-    parser.add_argument("--verification-inversion", dest="enable_verification_inversion", action="store_true", default=True, help="Enable 5-pass Static Verification-Inversion Auditor (DEV-* loop/panic slicer, Rule-5 trust-closure, Comparator contract diff, Refinement gap, Release/FFI elision; default-ON in --all and --deep-audit)")
-    parser.add_argument("--no-verification-inversion", dest="enable_verification_inversion", action="store_false", help="Disable 5-pass Static Verification-Inversion Auditor during --all")
+    parser.add_argument("--verification-inversion", dest="enable_verification_inversion", action="store_true", default=True, help="Enable 6-pass Static Verification-Inversion Auditor (DEV-* loop/panic slicer, Rule-5 trust-closure, Comparator contract diff, Refinement gap, Release/FFI elision, State-machine epoch rollback; default-ON in --all and --deep-audit)")
+    parser.add_argument("--no-verification-inversion", dest="enable_verification_inversion", action="store_false", help="Disable Static Verification-Inversion Auditor during --all")
+    parser.add_argument("--reseach-num", "--research-num", dest="research_num", type=int, default=5, help="Number of research articles (ArXiv-to-Code) and last-30-days zero-API security skills to extract and convert per domain (default: 5)")
+    parser.add_argument("--arxiv-detect", dest="enable_arxiv_detect", action="store_true", default=True, help="Enable 10 ArXiv-to-Code research-backed security detectors (5 AI Security + 5 App Code Security; default-ON in --all and --deep-audit)")
+    parser.add_argument("--no-arxiv-detect", dest="enable_arxiv_detect", action="store_false", help="Disable ArXiv-to-Code research detectors during --all")
+    parser.add_argument("--arxiv-sync", dest="arxiv_sync", action="store_true", default=False, help="Sync and synthesize --reseach-num new research papers with code & GitHub repos from D:\\harfile\\arixiv-to-code")
+    parser.add_argument("--arxiv-query", dest="arxiv_query", type=str, default=None, help="Custom arXiv search query for --arxiv-sync research-to-code synthesis")
+    parser.add_argument("--last30days-skills", dest="enable_last30days_skills", action="store_true", default=True, help="Enable 10 zero-API last30days-skill security & pentesting detectors (5 AI/Agent Security + 5 App/Web Bug-Bounty; default-ON in --all and --deep-audit)")
+    parser.add_argument("--no-last30days-skills", dest="enable_last30days_skills", action="store_false", help="Disable zero-API last30days-skill security detectors during --all")
+    parser.add_argument("--last30days-sync", dest="last30days_sync", action="store_true", default=False, help="Harvest and synthesize --reseach-num zero-API last-30-days security skills from keyless sources (Reddit, HN, GitHub, arXiv, dev.to)")
+    parser.add_argument("--last30days-topic", dest="last30days_topic", type=str, default=None, help="Custom topic for --last30days-sync zero-API security skill discovery")
     parser.add_argument("--no-call-graph-slice", dest="no_call_graph_slice", action="store_true", default=False, help="Disable whole-repo call-graph & taint slicing during --all")
     parser.add_argument("--slice-max-depth", dest="slice_max_depth", type=int, default=8, help="Maximum call-graph traversal depth for taint slicing (default: 8)")
     parser.add_argument("--slice-max-slices", dest="slice_max_slices", type=int, default=200, help="Maximum taint slices to extract (default: 200)")

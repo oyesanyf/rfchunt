@@ -109,17 +109,91 @@ class PythonAIScanner:
         r'(?i)/(?:api/)?(?:v\d+/)?(?:chat|generate|prompt|llm|ai|rag|completion|predict|embeddings?|infer)'
     )
 
+    MCP_TOOL_POISONING_PATTERNS = [
+        (
+            re.compile(
+                r'(?i)(?:<IMPORTANT>|<!--\s*HIDDEN_INSTRUCTION|ignore\s+all\s+previous\s+instructions|do\s+not\s+mention\s+this\s+to\s+the\s+user|silently\s+read\s+~/.ssh|exfiltrate\s+to\s+https?://)'
+            ),
+            "AISCAN-MCP-POISON-001",
+            "CRITICAL",
+            "MCP Tool-Description Prompt-Poisoning / Hidden Instruction Directive (CWE-77)",
+        ),
+    ]
+
+    _FAST_AI_KEYWORDS: Tuple[bytes, ...] = (
+        b"openai",
+        b"anthropic",
+        b"hf_",
+        b"sk-",
+        b"aizasy",
+        b"gsk_",
+        b"pplx-",
+        b"cohere",
+        b"mistral",
+        b"replicate",
+        b"bedrock",
+        b"pickle",
+        b"torch",
+        b"joblib",
+        b"numpy",
+        b"np.load",
+        b"yaml",
+        b"prompt",
+        b"system",
+        b"instruction",
+        b"messages",
+        b"langchain",
+        b"llamaindex",
+        b"ollama",
+        b"transformers",
+        b"@app.",
+        b"@router.",
+        b"@bp.",
+        b"<important>",
+        b"ignore all previous",
+        b"do not mention",
+        b"silently read",
+        b"exfiltrate",
+        b"mcpservers",
+    )
+
     def scan_file(self, file_path: Path) -> Tuple[List[AIFinding], List[DiscoveredAIEndpoint]]:
         findings: List[AIFinding] = []
         endpoints: List[DiscoveredAIEndpoint] = []
 
         try:
-            content = file_path.read_text(encoding="utf-8", errors="replace")
+            raw_bytes = file_path.read_bytes()
         except Exception as e:
             logger.warning("Error reading file %s: %s", file_path, e)
             return findings, endpoints
 
+        if len(raw_bytes) > 2_000_000:
+            return findings, endpoints
+
+        raw_lower = raw_bytes.lower()
+        if not any(kw in raw_lower for kw in self._FAST_AI_KEYWORDS):
+            return findings, endpoints
+
+        content = raw_bytes.decode("utf-8", errors="replace")
         lines = content.splitlines()
+
+        # 0. MCP Tool-Description Prompt-Poisoning (AISCAN-MCP-POISON-001)
+        for line_num, line in enumerate(lines, 1):
+            if "re.compile(" in line or "AISCAN-MCP-POISON-001" in line:
+                continue
+            for pat, rule_id, severity, desc in self.MCP_TOOL_POISONING_PATTERNS:
+                if pat.search(line):
+                    findings.append(
+                        AIFinding(
+                            finding_type=rule_id,
+                            severity=severity,
+                            file_path=str(file_path),
+                            line_number=line_num,
+                            model_or_api="MCP Tool Schema / Agent Skill",
+                            description=desc,
+                            snippet=line.strip()[:200],
+                        )
+                    )
 
         # 1. API Keys & Credentials
         for line_num, line in enumerate(lines, 1):
@@ -194,6 +268,8 @@ class PythonAIScanner:
         return findings, endpoints
 
     def scan_directory(self, root_dir: Path) -> Tuple[List[AIFinding], List[DiscoveredAIEndpoint]]:
+        from concurrent.futures import ThreadPoolExecutor
+
         all_findings: List[AIFinding] = []
         all_endpoints: List[DiscoveredAIEndpoint] = []
 
@@ -204,10 +280,11 @@ class PythonAIScanner:
         }
         valid_exts = {
             ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".json", ".yaml", ".yml", ".env",
-            ".rego", ".cedar", ".tf", ".hcl", ".sh", ".ps1", ".toml",
+            ".rego", ".cedar", ".tf", ".hcl", ".sh", ".ps1", ".toml", ".md",
         }
         data_exts = {".json", ".yaml", ".yml", ".toml"}
         data_files_scanned = 0
+        candidate_files: List[Path] = []
 
         for root, dirs, files in os.walk(root_dir):
             dirs[:] = [d for d in dirs if d not in skip_dirs]
@@ -219,12 +296,55 @@ class PythonAIScanner:
                         data_files_scanned += 1
                         if data_files_scanned > 150:
                             continue
-                    fp = Path(root) / file
-                    f_list, e_list = self.scan_file(fp)
+                    candidate_files.append(Path(root) / file)
+
+        if candidate_files:
+            max_workers = min(16, max(4, (os.cpu_count() or 4) * 2))
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                for f_list, e_list in pool.map(self.scan_file, candidate_files):
                     all_findings.extend(f_list)
                     all_endpoints.extend(e_list)
 
         return all_findings, all_endpoints
+
+    def build_ai_bom(
+        self,
+        target_path: Path,
+        findings: List[AIFinding],
+        endpoints: List[DiscoveredAIEndpoint],
+    ) -> Dict[str, Any]:
+        """Builds a CycloneDX 1.6 ML/AI Bill of Materials (AI-BOM) cataloging models, weights, MCP servers, and endpoints."""
+        weights_exts = {".safetensors", ".gguf", ".onnx", ".pt", ".pth", ".bin"}
+        weights_files: List[str] = []
+        mcp_servers: List[str] = []
+        models = sorted({f.model_or_api for f in findings if f.model_or_api})
+
+        root = target_path if target_path.is_dir() else target_path.parent
+        skip_dirs = {".git", "node_modules", "target", "venv", ".venv", "__pycache__"}
+        try:
+            for r_dir, dirs, files in os.walk(root):
+                dirs[:] = [d for d in dirs if d not in skip_dirs]
+                for fname in files:
+                    fl = fname.lower()
+                    ext = Path(fname).suffix.lower()
+                    fp = Path(r_dir) / fname
+                    if ext in weights_exts:
+                        weights_files.append(str(fp))
+                    elif fl in ("mcp.json", ".mcp.json", "claude_desktop_config.json"):
+                        mcp_servers.append(str(fp))
+        except OSError:
+            pass
+
+        poisoning_count = sum(1 for f in findings if f.finding_type == "AISCAN-MCP-POISON-001")
+        return {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.6",
+            "models": models,
+            "weights_files": weights_files[:50],
+            "mcp_servers": mcp_servers[:50],
+            "ai_endpoints": [e.to_dict() for e in endpoints],
+            "mcp_poisoning_findings_count": poisoning_count,
+        }
 
 
 DEFAULT_REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
@@ -410,6 +530,7 @@ class AiscanIntegrator:
 
         # Generate reports in reports/ folder (No UI!)
         report_files = self.generate_reports(tp, findings, endpoints, engine_used)
+        ai_bom = self.python_scanner.build_ai_bom(tp, findings, endpoints)
 
         return {
             "target_path": str(tp),
@@ -418,6 +539,7 @@ class AiscanIntegrator:
             "total_endpoints": len(endpoints),
             "findings": [f.to_dict() for f in findings],
             "endpoints": [e.to_dict() for e in endpoints],
+            "ai_bom": ai_bom,
             "report_files": report_files,
         }
 

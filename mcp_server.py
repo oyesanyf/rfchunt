@@ -1050,6 +1050,169 @@ class TerminatorMCPServer:
                     "required": ["hint_text"],
                 },
             },
+            {
+                "name": "arxiv_discover_and_convert_security_research",
+                "description": (
+                    "[ArXiv-to-Code Security Bridge] Uses D:\\harfile\\arixiv-to-code to discover, extract 3-class "
+                    "Google LangExtract character-interval spans, synthesize # EVOLVE-BLOCK Python detector modules, "
+                    "evolve via ShinkaEvolve + OpenEvolve, verify 7/7 tests, and register --reseach-num / --research-num "
+                    "new AI Security and Application Code Security research articles with verified code & GitHub repositories."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "default": "LLM agent sandbox escape prompt injection static taint analysis",
+                        },
+                        "domain": {
+                            "type": "string",
+                            "enum": ["both", "AI_SECURITY", "APP_CODE_SECURITY"],
+                            "default": "both",
+                        },
+                        "research_num": {
+                            "type": "integer",
+                            "default": 5,
+                            "description": "Number of research articles with code & GitHub repos to extract and convert per domain (--reseach-num / --research-num).",
+                        },
+                        "require_code_repo": {"type": "boolean", "default": True},
+                        "evolve": {"type": "boolean", "default": True},
+                    },
+                },
+            },
+            {
+                "name": "run_arxiv_ai_security_detectors",
+                "description": (
+                    "[ArXiv-to-Code AI Security Detectors] Runs the 5 research-derived AI Security detectors "
+                    "(ARXIV-AI-01..05: Bounded Agents APC delegation, SandboxEscapeBench container breakout, "
+                    "Adaptive IPI tool hijack, PISanitizer long-context splitting, GuardReasoner drift) "
+                    "plus any newly ingested AI security detectors on a target repository or path."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo_path": {"type": "string", "default": "."},
+                        "research_num": {"type": "integer", "default": 5},
+                    },
+                },
+            },
+            {
+                "name": "run_arxiv_appsec_code_detectors",
+                "description": (
+                    "[ArXiv-to-Code Application Code Security Detectors] Runs the 5 research-derived Application "
+                    "Code Security detectors (ARXIV-APPSEC-01..05: IRIS neuro-symbolic taint, ACFix RBAC/BOLA "
+                    "sibling-route consistency, Rudra unsafe Rust panic/Send/Sync, LLMSan unchecked allocation "
+                    "dataflow, H2-to-H1 reverse-proxy downgrade desync) on a target repository or path."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo_path": {"type": "string", "default": "."},
+                        "research_num": {"type": "integer", "default": 5},
+                    },
+                },
+            },
+            {
+                "name": "run_all_arxiv_research_detectors",
+                "description": (
+                    "[ArXiv-to-Code Unified Scanner] Runs all 10 built-in + dynamically ingested arXiv security "
+                    "research detectors (5 AI Security + 5 App Code Security) and optionally syncs new papers "
+                    "from D:\\harfile\\arixiv-to-code."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo_path": {"type": "string", "default": "."},
+                        "sync_new_query": {"type": "string", "default": ""},
+                        "research_num": {"type": "integer", "default": 5},
+                    },
+                },
+            },
+            {
+                "name": "list_active_arxiv_research_detectors",
+                "description": (
+                    "[ArXiv-to-Code Catalog] Lists all active research-backed security detectors with their "
+                    "arXiv IDs, verified GitHub repository URLs, CWEs, mathematical formulations, and evolved fitness scores."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "domain": {"type": "string", "default": "all"},
+                    },
+                },
+            },
+            {
+                "name": "last30days_discover_security_skills",
+                "description": (
+                    "[Zero-API Last30Days Security Skills Discovery] Adapts mvanhorn/last30days-skill using "
+                    "STRICTLY ZERO-API-KEY public sources (Reddit public JSON, Hacker News Algolia keyless API, "
+                    "GitHub keyless public search, arXiv keyless Atom API, dev.to keyless API, local corpus) "
+                    "to harvest, engagement-score, and build --reseach-num / --research-num security & pentesting "
+                    "skills (SKILL.md + executable Python detectors)."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "default": "AI security prompt injection bug bounty pentesting",
+                        },
+                        "domain": {
+                            "type": "string",
+                            "enum": ["both", "AI_SECURITY", "APP_CODE_SECURITY"],
+                            "default": "both",
+                        },
+                        "research_num": {"type": "integer", "default": 5},
+                        "days": {"type": "integer", "default": 30},
+                        "emit_skill_md": {"type": "boolean", "default": True},
+                    },
+                },
+            },
+            {
+                "name": "run_last30days_security_skills",
+                "description": (
+                    "[Zero-API Last30Days Security Skill Scanner] Executes all 10 zero-API last-30-days security "
+                    "& hacking detection skills (5 AI/Agent Security + 5 App/Web Bug-Bounty Skills) against a repository."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo_path": {"type": "string", "default": "."},
+                        "domain": {"type": "string", "default": "both"},
+                        "sync_online": {"type": "boolean", "default": False},
+                        "topic": {"type": "string", "default": ""},
+                        "research_num": {"type": "integer", "default": 5},
+                    },
+                },
+            },
+            {
+                "name": "audit_agent_skill_package",
+                "description": (
+                    "[Hermes & Cookie-Consent Skill Package Auditor] Audits a SKILL.md, .claude-plugin, "
+                    ".codex-plugin, .grok-plugin, or agent repository for remote piped shell backdoors, "
+                    "unconsented browser cookie sidecar/keychain reads (PR #1440), and MCP tool rug-pulls."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "skill_or_repo_path": {"type": "string", "default": "."},
+                    },
+                    "required": ["skill_or_repo_path"],
+                },
+            },
+            {
+                "name": "list_active_last30days_security_skills",
+                "description": (
+                    "[Zero-API Last30Days Skills Catalog] Lists all active zero-API security & pentesting "
+                    "skills with their keyless source lanes, engagement scores, CWEs, and SKILL.md paths."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "domain": {"type": "string", "default": "all"},
+                    },
+                },
+            },
         ]
 
     @staticmethod
@@ -2391,6 +2554,163 @@ class TerminatorMCPServer:
                 "domain": domain,
                 "priority": priority,
                 "active": active,
+            }
+
+        elif name == "arxiv_discover_and_convert_security_research":
+            self._reject_shell_execution(args)
+            from engine.arxiv_security_bridge import ArxivSecurityBridge
+
+            query = self._parse_strict_str(
+                args,
+                "query",
+                "LLM agent sandbox escape prompt injection static taint analysis",
+                allow_empty=True,
+            ) or "LLM agent sandbox escape prompt injection static taint analysis"
+            domain = self._parse_strict_str(args, "domain", "both", allow_empty=False) or "both"
+            research_num = int(
+                self._parse_strict_int(args, "research_num", 5, min_val=1, max_val=25) or 5
+            )
+            require_code_repo = bool(self._parse_strict_bool(args, "require_code_repo", True))
+            evolve = bool(self._parse_strict_bool(args, "evolve", True))
+            bridge = ArxivSecurityBridge(research_num=research_num)
+            return bridge.discover_and_convert_research(
+                query=query,
+                domain=domain,
+                research_num=research_num,
+                require_code_repo=require_code_repo,
+                evolve=evolve,
+            )
+
+        elif name == "run_arxiv_ai_security_detectors":
+            self._reject_shell_execution(args)
+            from engine.arxiv_security_bridge import ArxivSecurityBridge
+
+            repo_path = self._parse_strict_str(args, "repo_path", ".", allow_empty=False) or "."
+            research_num = int(
+                self._parse_strict_int(args, "research_num", 5, min_val=1, max_val=25) or 5
+            )
+            bridge = ArxivSecurityBridge(research_num=research_num)
+            return bridge.scan_repository(
+                repo_path=repo_path,
+                domain="AI_SECURITY",
+                research_num=research_num,
+            )
+
+        elif name == "run_arxiv_appsec_code_detectors":
+            self._reject_shell_execution(args)
+            from engine.arxiv_security_bridge import ArxivSecurityBridge
+
+            repo_path = self._parse_strict_str(args, "repo_path", ".", allow_empty=False) or "."
+            research_num = int(
+                self._parse_strict_int(args, "research_num", 5, min_val=1, max_val=25) or 5
+            )
+            bridge = ArxivSecurityBridge(research_num=research_num)
+            return bridge.scan_repository(
+                repo_path=repo_path,
+                domain="APP_CODE_SECURITY",
+                research_num=research_num,
+            )
+
+        elif name == "run_all_arxiv_research_detectors":
+            self._reject_shell_execution(args)
+            from engine.arxiv_security_bridge import ArxivSecurityBridge
+
+            repo_path = self._parse_strict_str(args, "repo_path", ".", allow_empty=False) or "."
+            sync_new_query = self._parse_strict_str(args, "sync_new_query", "", allow_empty=True) or ""
+            research_num = int(
+                self._parse_strict_int(args, "research_num", 5, min_val=1, max_val=25) or 5
+            )
+            bridge = ArxivSecurityBridge(research_num=research_num)
+            return bridge.scan_repository(
+                repo_path=repo_path,
+                domain="both",
+                sync_new_research=bool(sync_new_query.strip()),
+                arxiv_query=sync_new_query,
+                research_num=research_num,
+            )
+
+        elif name == "list_active_arxiv_research_detectors":
+            self._reject_shell_execution(args)
+            from engine.arxiv_security_bridge import ArxivSecurityBridge
+
+            domain = self._parse_strict_str(args, "domain", "all", allow_empty=True) or "all"
+            bridge = ArxivSecurityBridge()
+            detectors = bridge.list_active_detectors(domain=domain)
+            return {
+                "status": "completed",
+                "domain": domain,
+                "total_detectors": len(detectors),
+                "detectors": detectors,
+            }
+
+        elif name == "last30days_discover_security_skills":
+            self._reject_shell_execution(args)
+            from engine.last30days_security_skills import Last30DaysSecuritySkillsEngine
+
+            topic = self._parse_strict_str(
+                args,
+                "topic",
+                "AI security prompt injection bug bounty pentesting",
+                allow_empty=True,
+            ) or "AI security prompt injection bug bounty pentesting"
+            domain = self._parse_strict_str(args, "domain", "both", allow_empty=False) or "both"
+            research_num = int(
+                self._parse_strict_int(args, "research_num", 5, min_val=1, max_val=25) or 5
+            )
+            days = int(self._parse_strict_int(args, "days", 30, min_val=1, max_val=365) or 30)
+            emit_skill_md = bool(self._parse_strict_bool(args, "emit_skill_md", True))
+            engine = Last30DaysSecuritySkillsEngine(research_num=research_num)
+            return engine.discover_and_build_security_skills(
+                topic=topic,
+                domain=domain,
+                research_num=research_num,
+                days=days,
+                emit_skill_md=emit_skill_md,
+            )
+
+        elif name == "run_last30days_security_skills":
+            self._reject_shell_execution(args)
+            from engine.last30days_security_skills import Last30DaysSecuritySkillsEngine
+
+            repo_path = self._parse_strict_str(args, "repo_path", ".", allow_empty=False) or "."
+            domain = self._parse_strict_str(args, "domain", "both", allow_empty=False) or "both"
+            sync_online = bool(self._parse_strict_bool(args, "sync_online", False))
+            topic = self._parse_strict_str(args, "topic", "", allow_empty=True) or ""
+            research_num = int(
+                self._parse_strict_int(args, "research_num", 5, min_val=1, max_val=25) or 5
+            )
+            engine = Last30DaysSecuritySkillsEngine(research_num=research_num)
+            return engine.scan_repository(
+                repo_path=repo_path,
+                domain=domain,
+                sync_online=sync_online,
+                topic=topic,
+                research_num=research_num,
+            )
+
+        elif name == "audit_agent_skill_package":
+            self._reject_shell_execution(args)
+            from engine.last30days_security_skills import Last30DaysSecuritySkillsEngine
+
+            skill_path = self._parse_strict_str(
+                args, "skill_or_repo_path", ".", allow_empty=False
+            ) or "."
+            engine = Last30DaysSecuritySkillsEngine()
+            return engine.audit_agent_skill_package(skill_path)
+
+        elif name == "list_active_last30days_security_skills":
+            self._reject_shell_execution(args)
+            from engine.last30days_security_skills import Last30DaysSecuritySkillsEngine
+
+            domain = self._parse_strict_str(args, "domain", "all", allow_empty=True) or "all"
+            engine = Last30DaysSecuritySkillsEngine()
+            skills = engine.list_active_skills(domain=domain)
+            return {
+                "status": "completed",
+                "zero_api_key_invariant_enforced": True,
+                "domain": domain,
+                "total_skills": len(skills),
+                "skills": skills,
             }
 
         raise ValueError(f"Unknown tool: {name}")

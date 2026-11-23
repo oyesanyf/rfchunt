@@ -221,6 +221,7 @@ class VerificationInversionFinding:
     remediation: str
     call_chain: List[str] = field(default_factory=list)
     missing_predicates: List[str] = field(default_factory=list)
+    counterexample_witness: str = ""
     poe_level: int = 1
     verification_status: str = "LEAD_PASSIVE_CORRELATION"
     finding_tier: str = "MANUAL_REVIEW_LEAD"
@@ -229,6 +230,45 @@ class VerificationInversionFinding:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def _synthesize_counterexample_witness(f: VerificationInversionFinding) -> str:
+    """
+    Synthesizes a deterministic counterexample witness expression `x` satisfying
+    `Challenge(x) = Deny/Safe` while `Solution(x) = Allow/Unsafe`.
+    """
+    if f.counterexample_witness:
+        return f.counterexample_witness
+    rid = f.rule_id
+    if rid == "INV-DEV-UNBOUNDED-LOOP":
+        return '{"stream_input": "infinite_non_terminating_byte_sequence", "step_bound": null}'
+    if rid == "INV-DEV-REACHABLE-PANIC":
+        return f'{{"entry_chain": {f.call_chain!r}, "input": "malformed_or_oversized_payload_triggering_panic"}}'
+    if rid == "INV-DEV-CRYPTO-DOMAIN-SEP":
+        return '{"kdf_info": "", "collision": "Subkey(ctx_A, info=\'\') == Subkey(ctx_B, info=\'\')"}'
+    if rid == "INV-RULE5-FAIL-OPEN":
+        return f'{{"closure_chain": {f.call_chain!r}, "fault_injected": "Exception/Err", "solution_decision": true, "challenge_decision": false}}'
+    if rid == "INV-RULE5-UNCANONICAL-PATH":
+        return '{"raw_path": "/sandbox/allowed/../../etc/shadow", "prefix_match": true, "canonical_inside_root": false}'
+    if rid == "INV-RULE5-UNCHECKED-FFI":
+        return '{"syscall_return": "ERROR_ACCESS_DENIED (-1)", "checked": false}'
+    if rid == "INV-COMP-MISSING-CLAIM":
+        return f'{{"jwt_claims": {{"sub": "attacker", "omitted_or_unverified": {f.missing_predicates!r}}}, "challenge_decision": "Reject", "solution_decision": "Accept"}}'
+    if rid == "INV-COMP-WEAK-FRAMING-GUARD":
+        return '{"headers": {"Content-Length": "12", "Transfer-Encoding": "chunked"}, "rfc9112_challenge": "400 Bad Request", "solution_decision": "Accepted"}'
+    if rid == "INV-REFINE-PATH-DECODE-SPLIT":
+        return '{"wire_path": "/public/%2e%2e/admin", "pre_decode_filter": "ALLOW", "post_decode_target": "/admin"}'
+    if rid == "INV-REFINE-DUPLICATE-KEY":
+        return '{"wire_headers": [["Host", "allowed.local"], ["Host", "internal.local"]], "map_folded_value": "internal.local"}'
+    if rid == "INV-ELISION-DEBUG-ASSERT":
+        return '{"build_profile": "release (-O / NDEBUG)", "assert_evaluated": false}'
+    if rid == "INV-ELISION-NON-CT-SECRET":
+        return '{"lhs_prefix": "secret[0..k]", "timing_oracle_delta_ns": "proportional_to_matching_prefix_length_k"}'
+    if rid == "INV-ELISION-DEAD-STORE-ZERO":
+        return '{"optimizer_pass": "DeadStoreElimination (DSE)", "residual_heap_stack_bytes": "non_zero_secret"}'
+    if rid == "INV-STATE-EPOCH-ROLLBACK":
+        return '{"current_epoch": 5, "replayed_epoch": 2, "monotonic_check_present": false, "resulting_epoch": 2}'
+    return f'{{"rule_id": "{rid}", "primitive": "{f.primitive}"}}'
 
 
 @dataclass
@@ -289,6 +329,7 @@ class VerificationInversionHunter:
             "COMPARATOR_CONTRACT": 0,
             "REFINEMENT_GAP": 0,
             "RELEASE_ELISION": 0,
+            "STATE_MACHINE_ORDERING": 0,
         }
 
         p1 = self._run_pass1_dev_inversion(root, cg_context)
@@ -296,6 +337,7 @@ class VerificationInversionHunter:
         p3 = self._run_pass3_comparator_contract(root, cg_context)
         p4 = self._run_pass4_refinement_gap(root, cg_context)
         p5 = self._run_pass5_release_elision(root, cg_context)
+        p6 = self._run_pass6_state_machine_ordering(root, cg_context)
 
         for batch, key in (
             (p1, "DEV_INVERSION"),
@@ -303,14 +345,17 @@ class VerificationInversionHunter:
             (p3, "COMPARATOR_CONTRACT"),
             (p4, "REFINEMENT_GAP"),
             (p5, "RELEASE_ELISION"),
+            (p6, "STATE_MACHINE_ORDERING"),
         ):
             pass_counts[key] = len(batch)
             findings.extend(batch)
 
-        # Deduplicate by (rule_id, normalized file_path, line_number)
+        # Deduplicate by (rule_id, normalized file_path, line_number) and synthesize counterexample witnesses
         deduped: List[VerificationInversionFinding] = []
         seen: Set[Tuple[str, str, int]] = set()
         for f in findings:
+            if not f.counterexample_witness:
+                f.counterexample_witness = _synthesize_counterexample_witness(f)
             key = (f.rule_id, f.file_path.replace("\\", "/").lower(), int(f.line_number))
             if key not in seen:
                 seen.add(key)
@@ -1065,6 +1110,74 @@ class VerificationInversionHunter:
                                 ),
                             )
                         )
+        return out
+
+    # =========================================================================
+    # Pass 6: State-Machine Epoch & Ratchet Monotonicity Auditor
+    # =========================================================================
+    def _run_pass6_state_machine_ordering(
+        self,
+        root: Path,
+        cg_context: CallGraphContext,
+    ) -> List[VerificationInversionFinding]:
+        out: List[VerificationInversionFinding] = []
+        epoch_fn_re = re.compile(
+            r"(?:set_epoch|update_epoch|apply_epoch|sync_epoch|ratchet_step|set_generation|update_sequence)",
+            re.IGNORECASE,
+        )
+        epoch_assign_re = re.compile(
+            r"\b(?:self|this|state)\.(?:epoch|generation_epoch|ratchet_epoch|seq_num)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)"
+        )
+        monotonic_guard_re = re.compile(
+            r"(?:>\s*(?:self|this|state)\.|>=\s*(?:self|this|state)\.|<\s*(?:self|this|state)\.|<=\s*(?:self|this|state)\.|\+\s*1\b|checked_add)"
+        )
+
+        for _, sym in cg_context.symbols_by_id.items():
+            if not self.include_tests and _is_test_rel_path(sym.file_path):
+                continue
+            if not epoch_fn_re.search(sym.name):
+                continue
+            pf = cg_context.parsed_files.get(sym.file_path)
+            if pf is None:
+                continue
+            abs_fp = str((root / sym.file_path).resolve(strict=False))
+            body_lines = self._symbol_body_lines(pf, sym)
+            body_text = "\n".join(txt for _, txt in body_lines if not _COMMENT_LINE_RE.match(txt))
+            if monotonic_guard_re.search(body_text):
+                continue
+            for ln_no, line in body_lines:
+                if _COMMENT_LINE_RE.match(line):
+                    continue
+                m_asgn = epoch_assign_re.search(line)
+                if m_asgn:
+                    rhs = m_asgn.group(1)
+                    if rhs.isdigit():
+                        continue
+                    out.append(
+                        VerificationInversionFinding(
+                            rule_id="INV-STATE-EPOCH-ROLLBACK",
+                            primitive="STATE_MACHINE_ORDERING",
+                            severity="HIGH",
+                            cwe="CWE-362",
+                            file_path=abs_fp,
+                            line_number=ln_no,
+                            title=f"State-machine mutator `{sym.name}` overwrites epoch without monotonic guard in {sym.file_path}:{ln_no}",
+                            description=(
+                                f"Inverts temporal state-machine transition invariant (`N -> N + 1`): `{sym.name}` "
+                                f"assigns `{line.strip()}` directly from `{rhs}` without verifying `new_epoch > current_epoch`, "
+                                "allowing stale or compromised handles to roll back the generation epoch."
+                            ),
+                            evidence=line.strip()[:200],
+                            remediation=(
+                                "Enforce strict monotonic epoch progression (`if new_epoch <= self.epoch: raise ValueError(...)`) "
+                                "before updating generation or ratchet state."
+                            ),
+                            call_chain=[sym.name],
+                            missing_predicates=["new_epoch > current_epoch"],
+                            counterexample_witness='{"current_epoch": 5, "replayed_epoch": 2, "monotonic_check_present": false, "resulting_epoch": 2}',
+                        )
+                    )
+                    break
         return out
 
 

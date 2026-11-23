@@ -2945,6 +2945,23 @@ class MantisIntegrator:
                 )
                 findings.append(finding)
 
+            # Gap 7: Source-Aware Triage Engine filtering (suppresses test fixtures & static constant FPs offline)
+            triage_filtered_count = 0
+            try:
+                from engine.poc_generator import SourceAwareTriageEngine, TriageVerdict
+
+                triage_engine = SourceAwareTriageEngine(repo_path=resolved)
+                surviving_findings: List[MantisFinding] = []
+                for f_item in findings:
+                    tr_rec = triage_engine.triage_finding(f_item.to_dict(), idx=1)
+                    if tr_rec.verdict in (TriageVerdict.FALSE_POSITIVE.value, TriageVerdict.TEST_FIXTURE.value):
+                        triage_filtered_count += 1
+                        continue
+                    surviving_findings.append(f_item)
+                findings = surviving_findings
+            except Exception:
+                pass
+
             if self.db is not None and hasattr(self.db, "save_mantis_finding") and findings:
                 _batch_ctx = self.db.batch_writes() if hasattr(self.db, "batch_writes") else contextlib.nullcontext()
                 with _batch_ctx:
@@ -3222,7 +3239,10 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
 
     req_files = [
         fp for fp in files
-        if os.path.basename(fp).lower() in ("requirements.txt", "pyproject.toml", "package.json", "cargo.toml")
+        if os.path.basename(fp).lower() in (
+            "requirements.txt", "pyproject.toml", "package.json", "package-lock.json",
+            "cargo.toml", "cargo.lock", "go.mod",
+        )
     ]
     for rfile in req_files:
         text = _read_text_safe(rfile)
@@ -3243,6 +3263,32 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
                         "remediation": "Upgrade PyYAML >= 6.0 and always use yaml.safe_load().",
                     }
                 )
+            if "git+http://" in low or re.search(r"""["'][A-Za-z0-9_.-]+["']\s*:\s*["']\*["']""", low):
+                sca_findings.append(
+                    {
+                        "rule_id": "RAPTOR-SCA-LOCKFILE",
+                        "title": "Unpinned wildcard (*) or insecure git+http:// dependency in manifest/lockfile",
+                        "severity": "HIGH",
+                        "cwe": "CWE-1395",
+                        "file_path": rfile,
+                        "line_number": lineno,
+                        "scanner": "RAPTOR-CrossPlatform-SCA",
+                        "remediation": "Pin dependency versions explicitly and use HTTPS/hash-pinned registries.",
+                    }
+                )
+
+    cocci_findings: List[Dict[str, Any]] = []
+    pqc_algorithms_detected: List[str] = []
+    classical_asymmetric_detected: List[str] = []
+    _cocci_acquire_re = re.compile(
+        r"\b(?P<acq>AllocateAndInitializeSid|ConvertStringSidToSidW|OpenProcessToken|CreateFileW)\s*\("
+    )
+    _cocci_release_map = {
+        "AllocateAndInitializeSid": "FreeSid",
+        "ConvertStringSidToSidW": "LocalFree",
+        "OpenProcessToken": "CloseHandle",
+        "CreateFileW": "CloseHandle",
+    }
 
     valid_exts = (
         ".rego", ".cedar", ".tf", ".hcl", ".yaml", ".yml", ".json", ".toml",
@@ -3434,7 +3480,65 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
                         "remediation": "Download script, verify cryptographic hash/signature, then execute.",
                     })
 
-    combined = sca_findings + pqc_findings + policy_findings + workflow_findings + crypto_findings + secret_findings
+        # 7. Coccinelle-Style Semantic Resource Lifecycle Check (RAPTOR-COCCI-HANDLE-LEAK)
+        if ext in (".rs", ".c", ".cpp", ".cc", ".py") and "mantis_integrator.py" not in norm_fp:
+            for m_acq in _cocci_acquire_re.finditer(text):
+                acq_name = m_acq.group("acq")
+                rel_name = _cocci_release_map[acq_name]
+                lineno = text.count("\n", 0, m_acq.start()) + 1
+                window = "\n".join(lines[max(0, lineno - 1) : min(len(lines), lineno + 35)])
+                has_early_return = bool(re.search(r"\breturn\s+(?:Err\b|FALSE\b|false\b|None\b|-1\b|NULL\b)", window))
+                if has_early_return and rel_name not in window:
+                    cocci_findings.append({
+                        "rule_id": "RAPTOR-COCCI-HANDLE-LEAK",
+                        "title": f"Acquired OS handle/SID via {acq_name} without paired {rel_name} on early-return error path",
+                        "severity": "HIGH",
+                        "cwe": "CWE-404",
+                        "file_path": fp,
+                        "line_number": lineno,
+                        "scanner": "RAPTOR-CrossPlatform-Coccinelle",
+                        "remediation": f"Ensure {rel_name} is invoked on every early-return and scope-exit path after {acq_name}.",
+                    })
+
+        # 8. NIST FIPS 203/204/205 PQC vs. Classical Asymmetric Inventory
+        if ext in (".py", ".go", ".rs", ".js", ".ts", ".c", ".cpp", ".java") and "mantis_integrator.py" not in norm_fp:
+            low_text = text.lower()
+            for pqc_tok, pqc_label in (
+                ("ml-kem", "ML-KEM (FIPS 203)"),
+                ("ml_kem", "ML-KEM (FIPS 203)"),
+                ("kyber", "Kyber/ML-KEM (FIPS 203)"),
+                ("ml-dsa", "ML-DSA (FIPS 204)"),
+                ("ml_dsa", "ML-DSA (FIPS 204)"),
+                ("dilithium", "Dilithium/ML-DSA (FIPS 204)"),
+                ("slh-dsa", "SLH-DSA (FIPS 205)"),
+                ("sphincs", "SPHINCS+/SLH-DSA (FIPS 205)"),
+            ):
+                if pqc_tok in low_text and pqc_label not in pqc_algorithms_detected:
+                    pqc_algorithms_detected.append(pqc_label)
+            for cls_tok, cls_label in (
+                ("x25519", "X25519"),
+                ("ed25519", "Ed25519"),
+                ("ecdsa", "ECDSA"),
+                ("rsa", "RSA"),
+            ):
+                if cls_tok in low_text and cls_label not in classical_asymmetric_detected:
+                    classical_asymmetric_detected.append(cls_label)
+
+    combined = (
+        sca_findings
+        + pqc_findings
+        + policy_findings
+        + workflow_findings
+        + crypto_findings
+        + secret_findings
+        + cocci_findings
+    )
+    pqc_readiness_summary = {
+        "nist_pqc_algorithms_detected": pqc_algorithms_detected,
+        "classical_asymmetric_detected": classical_asymmetric_detected,
+        "hybrid_pqc_ready": bool(pqc_algorithms_detected),
+        "quantum_vulnerable_findings_count": len(pqc_findings),
+    }
     return {
         "mode": "cross_platform_static_sast_pqc_sca",
         "available_docker": False,
@@ -3445,6 +3549,8 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
         "workflow_findings": workflow_findings,
         "crypto_findings": crypto_findings,
         "secret_findings": secret_findings,
+        "cocci_findings": cocci_findings,
+        "pqc_readiness_summary": pqc_readiness_summary,
         "findings": combined,
     }
 
@@ -3570,6 +3676,13 @@ def run_unified_all_scans(
     rate_limiter: Optional[Any] = None,
     enable_h2_desync: bool = True,
     enable_verification_inversion: bool = True,
+    research_num: int = 5,
+    enable_arxiv_detect: bool = True,
+    arxiv_sync: bool = False,
+    arxiv_query: str = "",
+    enable_last30days_skills: bool = True,
+    last30days_sync: bool = False,
+    last30days_topic: str = "",
 ) -> Dict[str, Any]:
     """
     Execute ALL integrated RFCHunt security scanners against `--repo`, `--path`, or remote `--host` in one pass,
@@ -3908,6 +4021,17 @@ def run_unified_all_scans(
         "findings_count": 0,
         "findings": [],
     }
+    arxiv_research_res: Dict[str, Any] = {
+        "status": "disabled" if not enable_arxiv_detect else "pending",
+        "total_findings": 0,
+        "findings": [],
+    }
+    last30days_skills_res: Dict[str, Any] = {
+        "status": "disabled" if not enable_last30days_skills else "pending",
+        "zero_api_key_invariant_enforced": True,
+        "total_findings": 0,
+        "findings": [],
+    }
 
     def _run_verification_inversion_task(scan_root: str) -> Dict[str, Any]:
         if not enable_verification_inversion:
@@ -3917,6 +4041,38 @@ def run_unified_all_scans(
             return run_verification_inversion_audit(scan_root)
         except Exception as exc:
             return {"status": "error", "findings_count": 0, "findings": [], "error": str(exc)}
+
+    def _run_arxiv_detect_task(scan_root: str) -> Dict[str, Any]:
+        if not enable_arxiv_detect:
+            return {"status": "disabled", "total_findings": 0, "findings": []}
+        try:
+            from engine.arxiv_security_bridge import ArxivSecurityBridge
+            bridge = ArxivSecurityBridge(research_num=max(1, int(research_num or 5)))
+            return bridge.scan_repository(
+                scan_root,
+                domain="both",
+                sync_new_research=bool(arxiv_sync) and not offline_or_ci,
+                arxiv_query=arxiv_query if not offline_or_ci else "",
+                research_num=max(1, int(research_num or 5)),
+            )
+        except Exception as exc:
+            return {"status": "error", "total_findings": 0, "findings": [], "error": str(exc)}
+
+    def _run_last30days_skills_task(scan_root: str) -> Dict[str, Any]:
+        if not enable_last30days_skills:
+            return {"status": "disabled", "zero_api_key_invariant_enforced": True, "total_findings": 0, "findings": []}
+        try:
+            from engine.last30days_security_skills import Last30DaysSecuritySkillsEngine
+            eng = Last30DaysSecuritySkillsEngine(research_num=max(1, int(research_num or 5)))
+            return eng.scan_repository(
+                scan_root,
+                domain="both",
+                sync_online=bool(last30days_sync) and not offline_or_ci,
+                topic=last30days_topic if not offline_or_ci else "",
+                research_num=max(1, int(research_num or 5)),
+            )
+        except Exception as exc:
+            return {"status": "error", "zero_api_key_invariant_enforced": True, "total_findings": 0, "findings": [], "error": str(exc)}
 
     def _run_aiscan_task(scan_root: str) -> Dict[str, Any]:
         try:
@@ -4237,16 +4393,20 @@ def run_unified_all_scans(
             }
 
     remote_probe_corpus: List[Dict[str, Any]] = _build_remote_probes() if has_remote else []
-    fut_mantis = fut_aiscan = fut_raptor_local = fut_rea = fut_verif_inv = None
+    fut_mantis = fut_aiscan = fut_raptor_local = fut_rea = fut_verif_inv = fut_arxiv_detect = fut_last30days = None
     fut_raptor_remote = fut_prober = fut_ruler = fut_harness = fut_oracle = fut_h2_desync = None
     rea_local_root = str(rea_target) if rea_target else (local_target_path if has_local else None)
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=10) as pool:
         if has_local and local_target_path:
             fut_mantis = pool.submit(mantis_engine.run_scan, local_target_path, effective_depth, mantis_mode)
             fut_aiscan = pool.submit(_run_aiscan_task, local_target_path)
             fut_raptor_local = pool.submit(_run_raptor_local_task, local_target_path, candidate_files)
             if enable_verification_inversion:
                 fut_verif_inv = pool.submit(_run_verification_inversion_task, local_target_path)
+            if enable_arxiv_detect:
+                fut_arxiv_detect = pool.submit(_run_arxiv_detect_task, local_target_path)
+            if enable_last30days_skills:
+                fut_last30days = pool.submit(_run_last30days_skills_task, local_target_path)
         if enable_rea and rea_local_root:
             fut_rea = pool.submit(_run_rea_local_task, rea_local_root)
         if has_remote and clean_host:
@@ -4267,6 +4427,10 @@ def run_unified_all_scans(
             raptor_res = fut_raptor_local.result()
         if fut_verif_inv is not None:
             verification_inversion_res = fut_verif_inv.result()
+        if fut_arxiv_detect is not None:
+            arxiv_research_res = fut_arxiv_detect.result()
+        if fut_last30days is not None:
+            last30days_skills_res = fut_last30days.result()
         if fut_rea is not None:
             rea_res = fut_rea.result()
         if fut_raptor_remote is not None:
@@ -5177,8 +5341,46 @@ def run_unified_all_scans(
                 "primitive": vif.get("primitive", ""),
                 "call_chain": list(vif.get("call_chain") or []),
                 "missing_predicates": list(vif.get("missing_predicates") or []),
+                "counterexample_witness": vif.get("counterexample_witness", ""),
                 "poe_level": 1,
                 "verification_status": "LEAD_PASSIVE_CORRELATION",
+                "finding_tier": "MANUAL_REVIEW_LEAD",
+            })
+
+    for axf in (arxiv_research_res.get("findings") if isinstance(arxiv_research_res, dict) else []) or []:
+        if isinstance(axf, dict):
+            raw_aggregated_findings.append({
+                "rule_id": axf.get("rule_id", "ARXIV-SEC-001"),
+                "title": axf.get("title", "ArXiv Research-to-Code Security Finding"),
+                "severity": str(axf.get("severity", "HIGH")).upper(),
+                "cwe": axf.get("cwe_id") or axf.get("cwe", "CWE-20"),
+                "file_path": axf.get("file") or axf.get("file_path") or target_path,
+                "line_number": int(axf.get("line") or axf.get("line_number") or 1),
+                "description": axf.get("mathematical_invariant_violated") or axf.get("title", ""),
+                "remediation": axf.get("remediation", ""),
+                "scanner": "ArxivSecurityBridge",
+                "arxiv_id": axf.get("arxiv_id", ""),
+                "code_repo_url": axf.get("code_repo_url", ""),
+                "poe_level": int(axf.get("poe_level", 2) or 2),
+                "verification_status": "LEAD_ACTIVE_INDICATOR",
+                "finding_tier": "MANUAL_REVIEW_LEAD",
+            })
+
+    for skf in (last30days_skills_res.get("findings") if isinstance(last30days_skills_res, dict) else []) or []:
+        if isinstance(skf, dict):
+            raw_aggregated_findings.append({
+                "rule_id": skf.get("rule_id", "SKILL-L30D-001"),
+                "title": skf.get("title", "Zero-API Last30Days Security Skill Finding"),
+                "severity": str(skf.get("severity", "HIGH")).upper(),
+                "cwe": skf.get("cwe_id") or skf.get("cwe", "CWE-20"),
+                "file_path": skf.get("file") or skf.get("file_path") or target_path,
+                "line_number": int(skf.get("line") or skf.get("line_number") or 1),
+                "description": f"Source lane: {skf.get('source_lane', '')} ({skf.get('source_url', '')})",
+                "remediation": skf.get("remediation", ""),
+                "scanner": "Last30DaysSecuritySkills",
+                "source_lane": skf.get("source_lane", ""),
+                "poe_level": int(skf.get("poe_level", 2) or 2),
+                "verification_status": "LEAD_ACTIVE_INDICATOR",
                 "finding_tier": "MANUAL_REVIEW_LEAD",
             })
 
@@ -5491,6 +5693,8 @@ def run_unified_all_scans(
             "live_h2_desync": h2_desync_res,
             "two_account_authz": two_account_authz_res,
             "verification_inversion": verification_inversion_res,
+            "arxiv_research_detectors": arxiv_research_res,
+            "last30days_security_skills": last30days_skills_res,
         },
         "findings": aggregated_findings,
         "chains": artex_res.get("chains") or [],
