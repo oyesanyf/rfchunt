@@ -1077,7 +1077,35 @@ class TerminatorMCPServer:
                         },
                         "require_code_repo": {"type": "boolean", "default": True},
                         "evolve": {"type": "boolean", "default": True},
+                        "use_rl": {"type": "boolean", "default": False, "description": "Optimize synthesized detectors with Dream-RSI RL (arXiv:2609.14858)."},
+                        "verify_panel": {"type": "boolean", "default": False, "description": "Run ModelFusion Panel-of-Models verification (glm4:9b + qwen2.5:7b -> Judge glm4:9b)."},
+                        "panel_size": {"type": "integer", "default": 2},
+                        "auto_repair": {"type": "boolean", "default": True, "description": "Run iterative Auto-Repair retry loop (Ruff + mypy --strict + 310-property fuzzing + pytest + Ollama patcher)."},
+                        "max_repair_attempts": {"type": "integer", "default": 3},
                     },
+                },
+            },
+            {
+                "name": "verify_and_auto_repair_python_code",
+                "description": (
+                    "[ArXiv-to-Code Verification & Auto-Repair Gate] Verifies generated or custom Python code "
+                    "using concurrent Layer-1 gates (AST security + Ruff/AST lint + mypy --strict + 310-property "
+                    "randomized fuzzing + isolated subprocess pytest + 7 runtime invariants) plus optional ModelFusion "
+                    "Panel-of-Models (glm4:9b + qwen2.5:7b -> Judge glm4:9b) and iterative monotonic Auto-Repair retry loop."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "python_source_code": {"type": "string", "description": "Complete Python source code to verify and optionally auto-repair."},
+                        "arxiv_id": {"type": "string", "default": "custom"},
+                        "title": {"type": "string", "default": "Generated Security Detector Module"},
+                        "use_panel": {"type": "boolean", "default": False},
+                        "panel_size": {"type": "integer", "default": 2},
+                        "auto_repair": {"type": "boolean", "default": True},
+                        "max_repair_attempts": {"type": "integer", "default": 3},
+                        "enable_llm": {"type": "boolean", "default": False},
+                    },
+                    "required": ["python_source_code"],
                 },
             },
             {
@@ -2574,6 +2602,13 @@ class TerminatorMCPServer:
             )
             require_code_repo = bool(self._parse_strict_bool(args, "require_code_repo", True))
             evolve = bool(self._parse_strict_bool(args, "evolve", True))
+            use_rl = bool(self._parse_strict_bool(args, "use_rl", False))
+            verify_panel = bool(self._parse_strict_bool(args, "verify_panel", False))
+            panel_size = int(self._parse_strict_int(args, "panel_size", 2, min_val=2, max_val=7) or 2)
+            auto_repair = bool(self._parse_strict_bool(args, "auto_repair", True))
+            max_repair_attempts = int(
+                self._parse_strict_int(args, "max_repair_attempts", 3, min_val=1, max_val=10) or 3
+            )
             bridge = ArxivSecurityBridge(research_num=research_num)
             return bridge.discover_and_convert_research(
                 query=query,
@@ -2581,6 +2616,41 @@ class TerminatorMCPServer:
                 research_num=research_num,
                 require_code_repo=require_code_repo,
                 evolve=evolve,
+                use_rl=use_rl,
+                verify_panel=verify_panel,
+                panel_size=panel_size,
+                auto_repair=auto_repair,
+                max_repair_attempts=max_repair_attempts,
+                enable_llm=verify_panel,
+            )
+
+        elif name == "verify_and_auto_repair_python_code":
+            self._reject_shell_execution(args)
+            from engine.arxiv_security_bridge import ArxivSecurityBridge
+
+            src_code = self._parse_strict_str(args, "python_source_code", "", allow_empty=False) or ""
+            arxiv_id = self._parse_strict_str(args, "arxiv_id", "custom", allow_empty=True) or "custom"
+            title = (
+                self._parse_strict_str(args, "title", "Generated Security Detector Module", allow_empty=True)
+                or "Generated Security Detector Module"
+            )
+            use_panel = bool(self._parse_strict_bool(args, "use_panel", False))
+            panel_size = int(self._parse_strict_int(args, "panel_size", 2, min_val=2, max_val=7) or 2)
+            auto_repair = bool(self._parse_strict_bool(args, "auto_repair", True))
+            max_repair_attempts = int(
+                self._parse_strict_int(args, "max_repair_attempts", 3, min_val=1, max_val=10) or 3
+            )
+            enable_llm = bool(self._parse_strict_bool(args, "enable_llm", False))
+            bridge = ArxivSecurityBridge()
+            return bridge.verify_and_repair_code(
+                source_code=src_code,
+                arxiv_id=arxiv_id,
+                title=title,
+                use_panel=use_panel,
+                panel_size=panel_size,
+                auto_repair=auto_repair,
+                max_repair_attempts=max_repair_attempts,
+                enable_llm=enable_llm,
             )
 
         elif name == "run_arxiv_ai_security_detectors":
