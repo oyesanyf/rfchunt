@@ -232,8 +232,14 @@ EXCLUDED_DIRS: Set[str] = {
     ".pytest_cache",
     "dist",
     "build",
+    "target",
     "out",
     "reports",
+    "runs",
+    "caldera_export",
+    "caldera_plugin",
+    "coverage",
+    ".ruff_cache",
     ".tox",
     ".mypy_cache",
     ".idea",
@@ -643,6 +649,20 @@ def discover_candidate_files(target_path: str, max_bytes: int = 1_500_000) -> Li
                     discovered.append(full_path)
             except OSError:
                 continue
+    if len(discovered) > 600:
+        _MANIFEST_NAMES = {"package.json", "cargo.toml", "pyproject.toml", "requirements.txt", "tsconfig.json"}
+        _DATA_EXTS = {".yml", ".yaml", ".toml", ".json"}
+        code_or_wf: List[str] = []
+        bulk_data: List[str] = []
+        for fp in discovered:
+            norm_p = fp.replace("\\", "/").lower()
+            bname = os.path.basename(norm_p)
+            ext_p = os.path.splitext(bname)[1]
+            if ext_p in _DATA_EXTS and "/.github/" not in norm_p and bname not in _MANIFEST_NAMES:
+                bulk_data.append(fp)
+            else:
+                code_or_wf.append(fp)
+        discovered = code_or_wf + bulk_data[:120]
     return discovered
 
 

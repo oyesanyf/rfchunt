@@ -197,11 +197,17 @@ class PythonAIScanner:
         all_findings: List[AIFinding] = []
         all_endpoints: List[DiscoveredAIEndpoint] = []
 
-        skip_dirs = {".git", "node_modules", "target", "venv", ".venv", "__pycache__", "out", "reports"}
+        skip_dirs = {
+            ".git", "node_modules", "target", "venv", ".venv", "__pycache__",
+            "out", "reports", "runs", "caldera_export", "caldera_plugin",
+            "yara", "rules", "coverage", ".pytest_cache", ".mypy_cache",
+        }
         valid_exts = {
             ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".json", ".yaml", ".yml", ".env",
             ".rego", ".cedar", ".tf", ".hcl", ".sh", ".ps1", ".toml",
         }
+        data_exts = {".json", ".yaml", ".yml", ".toml"}
+        data_files_scanned = 0
 
         for root, dirs, files in os.walk(root_dir):
             dirs[:] = [d for d in dirs if d not in skip_dirs]
@@ -209,6 +215,10 @@ class PythonAIScanner:
                 ext = Path(file).suffix.lower()
                 is_dockerfile = file.lower() in ("dockerfile", "containerfile") or file.lower().startswith("dockerfile.")
                 if ext in valid_exts or is_dockerfile:
+                    if ext in data_exts:
+                        data_files_scanned += 1
+                        if data_files_scanned > 150:
+                            continue
                     fp = Path(root) / file
                     f_list, e_list = self.scan_file(fp)
                     all_findings.extend(f_list)
