@@ -73,6 +73,9 @@ class SecuritySkillSpec:
     detection_logic_description: str
     remediation: str
     skill_md_path: str = ""
+    synthesized_python_path: str = ""
+    custom_indicators: List[str] = field(default_factory=list)
+    corroborating_lanes: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -487,12 +490,15 @@ class Last30DaysSecuritySkillsEngine:
         self,
         skills_dir: Optional[Path] = None,
         research_num: int = 5,
+        skills_num: Optional[int] = None,
     ) -> None:
         self.rfchunt_root = Path(__file__).resolve().parent.parent
         self.skills_dir = Path(
             skills_dir or (self.rfchunt_root / "engine" / "security_skills_catalog")
         )
-        self.research_num = max(1, int(research_num))
+        effective_n = skills_num if skills_num is not None else research_num
+        self.research_num = max(1, int(effective_n))
+        self.skills_num = self.research_num
         self._active_skills: Dict[str, SecuritySkillSpec] = {
             s.skill_id: s for s in BUILTIN_LAST30DAYS_SECURITY_SKILLS
         }
@@ -651,12 +657,14 @@ class Last30DaysSecuritySkillsEngine:
             if not isinstance(art, dict):
                 continue
             title = str(art.get("title") or "").strip()
+            desc = str(art.get("description") or "").strip()
             reactions = int(art.get("public_reactions_count") or 0)
             if not title:
                 continue
             items.append(
                 {
                     "title": title,
+                    "summary": desc or title,
                     "source_lane": "devto_public_keyless",
                     "source_url": str(art.get("url") or "https://dev.to/t/security"),
                     "engagement_score": min(100.0, round(48.0 + reactions * 0.4, 1)),
@@ -665,9 +673,261 @@ class Last30DaysSecuritySkillsEngine:
             )
         return items
 
+    def _harvest_arxiv_keyless(self, topic: str) -> List[Dict[str, Any]]:
+        """Harvests last-30-days security papers from arXiv's public keyless Atom API."""
+        if os.environ.get("RFCHUNT_OFFLINE") == "1":
+            return []
+        q = urllib.parse.quote_plus(f"all:{topic} AND (cat:cs.CR OR cat:cs.AI)")
+        url = f"http://export.arxiv.org/api/query?search_query={q}&sortBy=submittedDate&sortOrder=descending&max_results=8"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "RFCHunt-Last30Days-ZeroAPI-SkillEngine/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                xml_txt = resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            return []
+        entries = re.findall(r"<entry>([\s\S]*?)</entry>", xml_txt)
+        items: List[Dict[str, Any]] = []
+        for idx, ent in enumerate(entries):
+            t_m = re.search(r"<title>([\s\S]*?)</title>", ent)
+            s_m = re.search(r"<summary>([\s\S]*?)</summary>", ent)
+            id_m = re.search(r"<id>([\s\S]*?)</id>", ent)
+            title = re.sub(r"\s+", " ", t_m.group(1)).strip() if t_m else ""
+            summary = re.sub(r"\s+", " ", s_m.group(1)).strip() if s_m else ""
+            link = id_m.group(1).strip() if id_m else "https://arxiv.org/list/cs.CR/recent"
+            if not title:
+                continue
+            has_repo = "github.com/" in summary.lower() or "gitlab.com/" in summary.lower()
+            items.append(
+                {
+                    "title": title,
+                    "summary": summary or title,
+                    "source_lane": "arxiv_atom_keyless",
+                    "source_url": link,
+                    "engagement_score": min(100.0, round(68.0 + (18.0 if has_repo else 0.0) - idx * 1.5, 1)),
+                    "requires_api_key": False,
+                }
+            )
+        return items
+
+    def _harvest_local_corpus_skillmd(
+        self,
+        corpus_dirs: Optional[Sequence[str | Path]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Harvests security skills & detection patterns from local SKILL.md, plugin manifests, and corpus directories."""
+        raw_env_dirs = os.environ.get("LAST30DAYS_CORPUS_DIRS", "").strip()
+        dirs_to_scan: List[Path] = []
+        if corpus_dirs:
+            dirs_to_scan.extend(Path(p) for p in corpus_dirs if p)
+        if raw_env_dirs:
+            for part in raw_env_dirs.split(os.pathsep):
+                if part.strip():
+                    dirs_to_scan.append(Path(part.strip()))
+        items: List[Dict[str, Any]] = []
+        for cdir in dirs_to_scan:
+            if not cdir.exists():
+                continue
+            files = [cdir] if cdir.is_file() else list(cdir.rglob("*.md"))[:30]
+            for fp in files:
+                try:
+                    txt = fp.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                first_heading = next(
+                    (ln.lstrip("# ").strip() for ln in txt.splitlines() if ln.strip().startswith("#")),
+                    fp.stem,
+                )
+                items.append(
+                    {
+                        "title": first_heading[:140],
+                        "summary": txt[:600],
+                        "source_lane": "local_corpus_skillmd",
+                        "source_url": fp.resolve().as_uri() if fp.is_absolute() else str(fp),
+                        "engagement_score": 88.0,
+                        "requires_api_key": False,
+                    }
+                )
+        return items
+
+    @staticmethod
+    def _classify_sighting_domain(title: str, summary: str) -> str:
+        combined = f"{title} {summary}".lower()
+        ai_kws = (
+            "llm", "agent", "mcp", "prompt injection", "jailbreak", "rag",
+            "embedding", "vector", "skill.md", "claude", "ollama", "guardrail",
+            "model", "copilot", "sandbox escape",
+        )
+        if any(k in combined for k in ai_kws):
+            return "AI_SECURITY"
+        return "APP_CODE_SECURITY"
+
+    @staticmethod
+    def _extract_harvested_indicators(title: str, summary: str) -> Tuple[str, str, List[str]]:
+        """Extracts CWE, severity, and multi-token code/config indicators from a harvested sighting."""
+        combined = f"{title} {summary}"
+        low = combined.lower()
+        cwe_m = re.search(r"\b(CWE-\d{1,4})\b", combined, re.IGNORECASE)
+        if cwe_m:
+            cwe = cwe_m.group(1).upper()
+        elif "ssrf" in low or "rebind" in low:
+            cwe = "CWE-918"
+        elif "jwt" in low or "signature" in low:
+            cwe = "CWE-347"
+        elif "prompt" in low or "mcp" in low or "command" in low:
+            cwe = "CWE-77"
+        elif "idor" in low or "bola" in low or "auth" in low:
+            cwe = "CWE-639"
+        elif "race" in low or "toctou" in low:
+            cwe = "CWE-362"
+        else:
+            cwe = "CWE-20"
+
+        sev = "CRITICAL" if any(k in low for k in ("rce", "critical", "zero-day", "0day", "bypass", "rug-pull", "backdoor")) else "HIGH"
+
+        indicators: List[str] = []
+        # Extract inline code spans or multi-token technical identifiers (`...`)
+        for m in re.finditer(r"`([^`\r\n]{4,64})`", combined):
+            cand = m.group(1).strip()
+            if len(cand) >= 4 and ("." in cand or "_" in cand or "(" in cand or "/" in cand or ":" in cand):
+                indicators.append(cand)
+        for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\s*\()", combined):
+            indicators.append(m.group(1).strip())
+        dedup_ind = list(dict.fromkeys(indicators))[:8]
+        return cwe, sev, dedup_ind
+
+    def harvest_and_cluster_sightings(
+        self,
+        topic: str = "AI security prompt injection bug bounty pentesting",
+        days: int = 30,
+        corpus_dirs: Optional[Sequence[str | Path]] = None,
+        custom_sightings: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Harvests across all 6 strictly zero-API-key lanes in parallel, filters out any item
+        requiring an API key, clusters sightings of the same story/technique across platforms,
+        and scores clusters by community engagement + cross-platform corroboration.
+        """
+        raw_sightings: List[Dict[str, Any]] = []
+        if custom_sightings:
+            for cs in custom_sightings:
+                if isinstance(cs, dict) and not cs.get("requires_api_key", False):
+                    lane = str(cs.get("source_lane") or "local_corpus_skillmd")
+                    if lane in KEYLESS_SOURCE_LANES and lane not in FORBIDDEN_PAID_API_LANES:
+                        raw_sightings.append(dict(cs))
+
+        if corpus_dirs or os.environ.get("LAST30DAYS_CORPUS_DIRS"):
+            raw_sightings.extend(self._harvest_local_corpus_skillmd(corpus_dirs))
+
+        if os.environ.get("RFCHUNT_OFFLINE") != "1":
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                f_hn = pool.submit(self._harvest_hackernews_keyless, topic, days)
+                f_rd = pool.submit(self._harvest_reddit_keyless, topic)
+                f_gh = pool.submit(self._harvest_github_keyless, topic, days)
+                f_dv = pool.submit(self._harvest_devto_keyless, "security")
+                f_ax = pool.submit(self._harvest_arxiv_keyless, topic)
+                for fut in (f_hn, f_rd, f_gh, f_dv, f_ax):
+                    try:
+                        raw_sightings.extend(fut.result())
+                    except Exception:
+                        pass
+
+        # Cluster by normalized title token fingerprint
+        clusters: Dict[str, Dict[str, Any]] = {}
+        for item in raw_sightings:
+            if item.get("requires_api_key", False):
+                continue
+            lane = str(item.get("source_lane") or "")
+            if lane not in KEYLESS_SOURCE_LANES or lane in FORBIDDEN_PAID_API_LANES:
+                continue
+            title = str(item.get("title") or "").strip()
+            summary = str(item.get("summary") or title).strip()
+            if not title:
+                continue
+            words = re.findall(r"[a-z0-9]{3,}", title.lower())
+            cluster_key = "-".join(words[:5]) if words else hashlib.sha256(title.encode("utf-8")).hexdigest()[:10]
+            if cluster_key not in clusters:
+                dom = str(item.get("domain") or self._classify_sighting_domain(title, summary))
+                cwe, sev, inds = self._extract_harvested_indicators(title, summary)
+                if isinstance(item.get("custom_indicators"), list):
+                    inds = list(dict.fromkeys([*item["custom_indicators"], *inds]))[:8]
+                clusters[cluster_key] = {
+                    "cluster_key": cluster_key,
+                    "title": title,
+                    "summary": summary,
+                    "domain": dom,
+                    "source_lane": lane,
+                    "source_url": str(item.get("source_url") or ""),
+                    "corroborating_lanes": [lane],
+                    "engagement_score": float(item.get("engagement_score") or 75.0),
+                    "cwe_id": str(item.get("cwe_id") or cwe),
+                    "severity": str(item.get("severity") or sev),
+                    "custom_indicators": inds,
+                    "requires_api_key": False,
+                }
+            else:
+                existing = clusters[cluster_key]
+                if lane not in existing["corroborating_lanes"]:
+                    existing["corroborating_lanes"].append(lane)
+                    existing["engagement_score"] = min(
+                        100.0, round(existing["engagement_score"] + 8.0, 1)
+                    )
+
+        ranked_clusters = sorted(
+            clusters.values(),
+            key=lambda c: (len(c["corroborating_lanes"]), c["engagement_score"]),
+            reverse=True,
+        )
+        return ranked_clusters
+
+    @staticmethod
+    def _synthesize_skill_detector_python(spec: SecuritySkillSpec) -> str:
+        """
+        Synthesizes an executable `# EVOLVE-BLOCK` Python detector module for a harvested
+        or built-in security skill (using D:\\harfile\\arixiv-to-code when present).
+        """
+        indicators_repr = repr(tuple(spec.custom_indicators or [spec.skill_slug]))
+        slug_ident = re.sub(r"[^a-zA-Z0-9_]", "_", spec.skill_slug)
+        return (
+            f'#!/usr/bin/env python3\n'
+            f'"""\n'
+            f'Auto-Harvested Zero-API Last30Days Security Skill Detector: {spec.skill_id}\n'
+            f'Title: {spec.title}\n'
+            f'Keyless Source Lane: {spec.source_lane} ({spec.source_url})\n'
+            f'Corroborating Lanes: {", ".join(spec.corroborating_lanes or [spec.source_lane])}\n'
+            f'"""\n'
+            f"from __future__ import annotations\n"
+            f"from typing import Dict, List, Sequence, Tuple\n\n"
+            f"SKILL_ID = {spec.skill_id!r}\n"
+            f"SKILL_SLUG = {spec.skill_slug!r}\n"
+            f"DOMAIN = {spec.domain!r}\n"
+            f"CWE_ID = {spec.cwe_id!r}\n"
+            f"SEVERITY = {spec.severity!r}\n"
+            f"REQUIRES_API_KEY = False\n"
+            f"INDICATORS: Tuple[str, ...] = {indicators_repr}\n\n"
+            f"# EVOLVE-BLOCK-START\n"
+            f"def {spec.detector_name}(content: str, indicators: Sequence[str] = INDICATORS) -> List[Dict[str, object]]:\n"
+            f'    """Executes multi-token detection for {spec.skill_id}."""\n'
+            f"    findings: List[Dict[str, object]] = []\n"
+            f"    lines = content.splitlines()\n"
+            f"    for line_no, line in enumerate(lines, start=1):\n"
+            f"        for ind in indicators:\n"
+            f"            if ind and ind in line:\n"
+            f"                findings.append({{\n"
+            f'                    "rule_id": SKILL_ID,\n'
+            f'                    "line": line_no,\n'
+            f'                    "matched_indicator": ind,\n'
+            f'                    "snippet": line.strip()[:200],\n'
+            f"                }})\n"
+            f"    return findings\n"
+            f"# EVOLVE-BLOCK-END\n"
+        )
+
     @staticmethod
     def render_skill_markdown(spec: SecuritySkillSpec) -> str:
         """Synthesizes an Agent Skills (`agentskills.io` / Antigravity) `SKILL.md` file."""
+        lanes_str = ", ".join(spec.corroborating_lanes or [spec.source_lane])
         return (
             f"---\n"
             f"name: {spec.skill_slug}\n"
@@ -677,6 +937,7 @@ class Last30DaysSecuritySkillsEngine:
             f"- **Skill ID**: `{spec.skill_id}`\n"
             f"- **Domain**: `{spec.domain}`\n"
             f"- **Keyless Source Lane**: `{spec.source_lane}` (`requires_api_key: false`)\n"
+            f"- **Corroborating Lanes**: `{lanes_str}`\n"
             f"- **Reference URL**: {spec.source_url}\n"
             f"- **CWE / Severity**: `{spec.cwe_id}` (`{spec.severity}`)\n"
             f"- **Community Engagement Score**: `{spec.engagement_score}/100`\n\n"
@@ -693,16 +954,21 @@ class Last30DaysSecuritySkillsEngine:
         topic: str = "AI security prompt injection bug bounty pentesting",
         domain: str = "both",
         research_num: Optional[int] = None,
+        skills_num: Optional[int] = None,
         days: int = 30,
         emit_skill_md: bool = True,
         output_dir: Optional[Path] = None,
+        corpus_dirs: Optional[Sequence[str | Path]] = None,
+        custom_sightings: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
-        Harvests last-30-days security & hacking skills across strictly zero-API-key lanes,
-        scores and clusters them by engagement, selects the top `research_num` (`--reseach-num` /
-        `--research-num`) skills per domain, and emits `SKILL.md` packages + detector specs.
+        Harvests last-30-days security & hacking skills across all 6 strictly zero-API-key lanes,
+        clusters cross-platform sightings, selects the top `skills_num` (`--skills-num` /
+        `--reseach-num` / `--research-num`) skills per domain, and emits both `SKILL.md`
+        packages and `# EVOLVE-BLOCK` Python detector modules.
         """
-        target_n = max(1, int(research_num if research_num is not None else self.research_num))
+        raw_n = skills_num if skills_num is not None else (research_num if research_num is not None else self.skills_num)
+        target_n = max(1, int(raw_n))
         base_out = Path(output_dir or self.skills_dir)
         base_out.mkdir(parents=True, exist_ok=True)
 
@@ -714,19 +980,45 @@ class Last30DaysSecuritySkillsEngine:
         else:
             domains_to_run = ["APP_CODE_SECURITY"]
 
-        # Query keyless online lanes in parallel when online; fall back cleanly to built-in keyless catalog
-        online_sightings: List[Dict[str, Any]] = []
-        if os.environ.get("RFCHUNT_OFFLINE") != "1":
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                f_hn = pool.submit(self._harvest_hackernews_keyless, topic, days)
-                f_rd = pool.submit(self._harvest_reddit_keyless, topic)
-                f_gh = pool.submit(self._harvest_github_keyless, topic, days)
-                f_dv = pool.submit(self._harvest_devto_keyless, "security")
-                for fut in (f_hn, f_rd, f_gh, f_dv):
-                    try:
-                        online_sightings.extend(fut.result())
-                    except Exception:
-                        pass
+        harvested_clusters = self.harvest_and_cluster_sightings(
+            topic=topic,
+            days=days,
+            corpus_dirs=corpus_dirs,
+            custom_sightings=custom_sightings,
+        )
+
+        # Convert harvested clusters into SecuritySkillSpec objects
+        harvested_specs_by_domain: Dict[str, List[SecuritySkillSpec]] = {
+            "AI_SECURITY": [],
+            "APP_CODE_SECURITY": [],
+        }
+        for idx, cl in enumerate(harvested_clusters, start=1):
+            c_dom = cl["domain"] if cl["domain"] in harvested_specs_by_domain else "APP_CODE_SECURITY"
+            slug = re.sub(r"[^a-z0-9]+", "-", cl["cluster_key"].lower()).strip("-")[:42] or f"harvested-skill-{idx}"
+            sid = f"SKILL-L30D-HARVEST-{c_dom[:3]}-{idx:02d}-{slug[:18].upper().replace('-', '_')}"
+            det_name = f"detect_harvested_{slug.replace('-', '_')}"
+            h_spec = SecuritySkillSpec(
+                skill_id=sid,
+                skill_slug=f"harvested-{slug}",
+                detector_name=det_name,
+                domain=c_dom,
+                title=cl["title"],
+                source_lane=cl["source_lane"],
+                source_url=cl["source_url"],
+                cwe_id=cl["cwe_id"],
+                severity=cl["severity"],
+                engagement_score=cl["engagement_score"],
+                requires_api_key=False,
+                summary=cl["summary"],
+                detection_logic_description=(
+                    f"Harvested from keyless lanes ({', '.join(cl['corroborating_lanes'])}). "
+                    f"Scans for multi-token indicators: {cl['custom_indicators']}"
+                ),
+                remediation=f"Remediate {cl['cwe_id']} vulnerability pattern identified in {cl['title']}.",
+                custom_indicators=list(cl["custom_indicators"]),
+                corroborating_lanes=list(cl["corroborating_lanes"]),
+            )
+            harvested_specs_by_domain[c_dom].append(h_spec)
 
         selected_skills: List[Dict[str, Any]] = []
         for dom in domains_to_run:
@@ -735,23 +1027,33 @@ class Last30DaysSecuritySkillsEngine:
                 for s in BUILTIN_LAST30DAYS_SECURITY_SKILLS
                 if s.domain == dom and not s.requires_api_key
             ]
-            dom_builtins.sort(key=lambda s: s.engagement_score, reverse=True)
-            chosen = dom_builtins[:target_n]
+            # Combine live harvested skills + built-in zero-API catalog up to target_n per domain
+            combined_pool = harvested_specs_by_domain.get(dom, []) + dom_builtins
+            combined_pool.sort(key=lambda s: s.engagement_score, reverse=True)
+            chosen = combined_pool[:target_n]
 
             for spec in chosen:
                 assert spec.requires_api_key is False
                 assert spec.source_lane in KEYLESS_SOURCE_LANES
-                skill_md_file = base_out / spec.skill_slug / "SKILL.md"
+                skill_dir = base_out / spec.skill_slug
+                skill_md_file = skill_dir / "SKILL.md"
+                py_det_file = skill_dir / f"detector_{spec.skill_slug.replace('-', '_')}.py"
                 if emit_skill_md:
-                    skill_md_file.parent.mkdir(parents=True, exist_ok=True)
+                    skill_dir.mkdir(parents=True, exist_ok=True)
                     skill_md_file.write_text(
                         self.render_skill_markdown(spec),
+                        encoding="utf-8",
+                    )
+                    py_det_file.write_text(
+                        self._synthesize_skill_detector_python(spec),
                         encoding="utf-8",
                     )
                 updated_spec = SecuritySkillSpec(
                     **{
                         **asdict(spec),
                         "skill_md_path": str(skill_md_file) if emit_skill_md else "",
+                        "synthesized_python_path": str(py_det_file) if emit_skill_md else "",
+                        "corroborating_lanes": list(spec.corroborating_lanes or [spec.source_lane]),
                     }
                 )
                 self._active_skills[updated_spec.skill_id] = updated_spec
@@ -765,8 +1067,10 @@ class Last30DaysSecuritySkillsEngine:
             "forbidden_paid_lanes_excluded": list(FORBIDDEN_PAID_API_LANES),
             "days_window": int(days),
             "research_num_per_domain": target_n,
+            "skills_num_per_domain": target_n,
             "domains_processed": domains_to_run,
-            "live_keyless_sightings_count": len(online_sightings),
+            "live_keyless_sightings_count": len(harvested_clusters),
+            "harvested_clusters": harvested_clusters,
             "total_skills_extracted": len(selected_skills),
             "skills": selected_skills,
         }
@@ -1011,6 +1315,23 @@ class Last30DaysSecuritySkillsEngine:
                         m.group(0),
                     )
 
+        # 11. Dynamically Harvested Zero-API Skills (Custom Multi-Token Indicator Detectors)
+        for dyn_spec in list(self._active_skills.values()):
+            if not dyn_spec.custom_indicators or dyn_spec.domain not in enabled_domains:
+                continue
+            for ind in dyn_spec.custom_indicators:
+                if ind and ind in content:
+                    pos = content.find(ind)
+                    lno = self._line_at(content, pos)
+                    line_txt = lines[lno - 1] if 1 <= lno <= len(lines) else ind
+                    emit(
+                        dyn_spec.skill_id,
+                        f"Harvested Zero-API Security Skill Match (`{ind}`): {dyn_spec.title}",
+                        lno,
+                        line_txt,
+                    )
+                    break
+
         return findings
 
     def scan_repository(
@@ -1020,22 +1341,27 @@ class Last30DaysSecuritySkillsEngine:
         sync_online: bool = False,
         topic: str = "",
         research_num: Optional[int] = None,
+        skills_num: Optional[int] = None,
+        corpus_dirs: Optional[Sequence[str | Path]] = None,
     ) -> Dict[str, Any]:
         """
         Executes all active zero-API Last30Days security skill detectors across `repo_path`.
         """
         start_ts = time.perf_counter()
         target = Path(repo_path).resolve()
-        target_n = max(1, int(research_num if research_num is not None else self.research_num))
+        raw_n = skills_num if skills_num is not None else (research_num if research_num is not None else self.skills_num)
+        target_n = max(1, int(raw_n))
 
         discovery_report: Optional[Dict[str, Any]] = None
-        if sync_online or topic.strip():
+        if sync_online or topic.strip() or corpus_dirs:
             discovery_report = self.discover_and_build_security_skills(
                 topic=topic or "AI security prompt injection bug bounty pentesting",
                 domain=domain,
                 research_num=target_n,
+                skills_num=target_n,
                 days=30,
                 emit_skill_md=True,
+                corpus_dirs=corpus_dirs,
             )
 
         dom_norm = (domain or "both").strip().upper()
@@ -1068,6 +1394,7 @@ class Last30DaysSecuritySkillsEngine:
             "files_scanned": len(files),
             "elapsed_seconds": round(time.perf_counter() - start_ts, 4),
             "research_num": target_n,
+            "skills_num": target_n,
             "active_skills_count": len(self.list_active_skills(domain=domain)),
             "total_findings": len(findings),
             "findings_by_domain": by_domain,

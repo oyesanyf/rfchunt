@@ -4616,6 +4616,9 @@ def cmd_all(args):
             rea_use_cli=rea_use_cli_val,
             auto_install_tools=bool(getattr(args, "auto_install", True)),
         )
+        _res_n = int(getattr(args, "research_num", 5) or 5)
+        _sk_n_raw = getattr(args, "skills_num", None)
+        _sk_n = int(_sk_n_raw) if _sk_n_raw is not None else _res_n
         _extra_unified = {
             "include_models": include_models_val,
             "include_leads": bool(getattr(args, "include_leads", False)),
@@ -4624,7 +4627,8 @@ def cmd_all(args):
             "max_rps": float(getattr(args, "max_rps", 0.0) or 0.0),
             "enable_h2_desync": bool(getattr(args, "enable_h2_desync", True)),
             "enable_verification_inversion": bool(getattr(args, "enable_verification_inversion", True)),
-            "research_num": int(getattr(args, "research_num", 5) or 5),
+            "research_num": _res_n,
+            "skills_num": _sk_n,
             "enable_arxiv_detect": bool(getattr(args, "enable_arxiv_detect", True)),
             "arxiv_sync": bool(getattr(args, "arxiv_sync", False)),
             "arxiv_query": getattr(args, "arxiv_query", None) or "",
@@ -7028,7 +7032,8 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     # AIxCC Upgrade #2: Whole-Repo Call-Graph & Taint Slicer + Tiered Model Escalation + Static Verification-Inversion Auditor
     parser.add_argument("--verification-inversion", dest="enable_verification_inversion", action="store_true", default=True, help="Enable 6-pass Static Verification-Inversion Auditor (DEV-* loop/panic slicer, Rule-5 trust-closure, Comparator contract diff, Refinement gap, Release/FFI elision, State-machine epoch rollback; default-ON in --all and --deep-audit)")
     parser.add_argument("--no-verification-inversion", dest="enable_verification_inversion", action="store_false", help="Disable Static Verification-Inversion Auditor during --all")
-    parser.add_argument("--reseach-num", "--research-num", dest="research_num", type=int, default=5, help="Number of research articles (ArXiv-to-Code) and last-30-days zero-API security skills to extract and convert per domain (default: 5)")
+    parser.add_argument("--reseach-num", "--research-num", dest="research_num", type=int, default=5, help="Number of research articles (ArXiv-to-Code) to extract and convert per domain (default: 5)")
+    parser.add_argument("--skills-num", "--skill-num", dest="skills_num", type=int, default=None, help="Number of zero-API last-30-days security & pentesting skills to harvest and convert per domain (defaults to --reseach-num / 5)")
     parser.add_argument("--arxiv-detect", dest="enable_arxiv_detect", action="store_true", default=True, help="Enable 10 ArXiv-to-Code research-backed security detectors (5 AI Security + 5 App Code Security; default-ON in --all and --deep-audit)")
     parser.add_argument("--no-arxiv-detect", dest="enable_arxiv_detect", action="store_false", help="Disable ArXiv-to-Code research detectors during --all")
     parser.add_argument("--arxiv-sync", dest="arxiv_sync", action="store_true", default=False, help="Sync and synthesize --reseach-num new research papers with code & GitHub repos from D:\\harfile\\arixiv-to-code")
@@ -7348,6 +7353,8 @@ def parse_swarm_arguments(argv=None):
         args.raptor_target = getattr(args, "repo", None) or getattr(args, "path", None)
     if not getattr(args, "repo", None) and getattr(args, "raptor_target", None):
         args.repo = args.raptor_target
+    if getattr(args, "skills_num", None) is None:
+        args.skills_num = int(getattr(args, "research_num", 5) or 5)
     return args
 
 

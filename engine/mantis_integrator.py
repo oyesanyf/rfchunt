@@ -3677,6 +3677,7 @@ def run_unified_all_scans(
     enable_h2_desync: bool = True,
     enable_verification_inversion: bool = True,
     research_num: int = 5,
+    skills_num: Optional[int] = None,
     enable_arxiv_detect: bool = True,
     arxiv_sync: bool = False,
     arxiv_query: str = "",
@@ -4063,13 +4064,15 @@ def run_unified_all_scans(
             return {"status": "disabled", "zero_api_key_invariant_enforced": True, "total_findings": 0, "findings": []}
         try:
             from engine.last30days_security_skills import Last30DaysSecuritySkillsEngine
-            eng = Last30DaysSecuritySkillsEngine(research_num=max(1, int(research_num or 5)))
+            eff_sk_n = max(1, int(skills_num if skills_num is not None else (research_num or 5)))
+            eng = Last30DaysSecuritySkillsEngine(research_num=eff_sk_n, skills_num=eff_sk_n)
             return eng.scan_repository(
                 scan_root,
                 domain="both",
                 sync_online=bool(last30days_sync) and not offline_or_ci,
                 topic=last30days_topic if not offline_or_ci else "",
-                research_num=max(1, int(research_num or 5)),
+                research_num=eff_sk_n,
+                skills_num=eff_sk_n,
             )
         except Exception as exc:
             return {"status": "error", "zero_api_key_invariant_enforced": True, "total_findings": 0, "findings": [], "error": str(exc)}
@@ -4232,13 +4235,18 @@ def run_unified_all_scans(
         if not enable_h2_desync:
             return {"status": "disabled", "total_findings": 0, "findings": []}
         try:
-            from engine.h2_live_authz import LiveH2DesyncProber
+            from engine.h2_live_authz import (
+                H2SinglePacketRaceProber,
+                LiveH2DesyncProber,
+                StatefulBusinessLogicProber,
+            )
+            is_auth_target = bool(authorized or (clean_host and is_explicit_loopback_host(clean_host)))
             h2_prober = LiveH2DesyncProber(
                 host=clean_host or "",
                 port=resolved_port,
                 use_tls=resolved_tls,
                 timeout=net_timeout,
-                authorized=bool(authorized or (clean_host and is_explicit_loopback_host(clean_host))),
+                authorized=is_auth_target,
                 hygiene_config=hygiene_cfg,
                 rate_limiter=shared_rate_limiter,
                 on_trace=effective_trace,
@@ -4246,7 +4254,46 @@ def run_unified_all_scans(
             patched = _is_patched_call(h2_prober, "run_live_h2_desync_audit", "engine.h2_live_authz")
             if not (patched or allow_live_sockets):
                 return {"status": "skipped_offline_or_ci", "total_findings": 0, "findings": []}
-            return h2_prober.run_live_h2_desync_audit()
+            base_h2 = dict(h2_prober.run_live_h2_desync_audit() or {})
+            if allow_live_sockets and not patched:
+                try:
+                    race_p = H2SinglePacketRaceProber(
+                        host=clean_host or "",
+                        port=resolved_port,
+                        use_tls=resolved_tls,
+                        authorized=is_auth_target,
+                        timeout=net_timeout,
+                        hygiene_config=hygiene_cfg,
+                        rate_limiter=shared_rate_limiter,
+                    )
+                    h3_info = race_p.discover_h3_alt_svc_and_coalescing("/")
+                    race_info = race_p.run_single_packet_race_probe()
+                    base_h2["h3_alt_svc"] = h3_info
+                    base_h2["single_packet_race"] = race_info
+                    for rf_item in race_info.get("findings") or []:
+                        base_h2.setdefault("findings", []).append(rf_item)
+
+                    biz_p = StatefulBusinessLogicProber(
+                        host=clean_host or "",
+                        port=resolved_port,
+                        use_tls=resolved_tls,
+                        authorized=is_auth_target,
+                        timeout=net_timeout,
+                        hygiene_config=hygiene_cfg,
+                        rate_limiter=shared_rate_limiter,
+                    )
+                    oauth_info = biz_p.run_oauth2_state_machine_audit()
+                    gql_info = biz_p.run_graphql_bola_and_batch_audit()
+                    base_h2["stateful_business_logic"] = {
+                        "oauth2": oauth_info,
+                        "graphql": gql_info,
+                    }
+                    for bf_item in [*(oauth_info.get("findings") or []), *(gql_info.get("findings") or [])]:
+                        base_h2.setdefault("findings", []).append(bf_item)
+                    base_h2["total_findings"] = len(base_h2.get("findings") or [])
+                except Exception:
+                    pass
+            return base_h2
         except Exception as exc:
             return {"status": "error", "total_findings": 0, "findings": [], "error": str(exc)}
 
