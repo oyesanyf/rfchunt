@@ -653,4 +653,80 @@ def test_reusable_ci_audit_runner_emits_valid_sarif_and_respects_gates(tmp_path,
     assert ok_high is False
 
 
+def test_enterprise_proxy_isolation_env_scrubbing_ephemeral_sink_and_repo_exec_guard(tmp_path, monkeypatch):
+    """
+    Verifies all 4 enterprise proxy security & operational safeguards:
+      1. Refuses to import/execute target repository `dist/*.js` code unless `allow_repo_exec=True` (`--allow-repo-exec`).
+      2. Scrubs `os.environ` credentials (`AWS_*`, `GITHUB_TOKEN`, `KUBECONFIG`) and corporate `HTTP_PROXY`/`HTTPS_PROXY` while enforcing `NO_PROXY=*`.
+      3. Binds probes strictly to `127.0.0.1:<ephemeral_sink_port>` (zero bare port 80/443 or `.invalid` alerts) and blocks Zscaler/corporate proxy ports.
+      4. Blocks relative repository binary/script traversal (`./`, `node_modules/`, `dist/`) in `--proxy-cmd` when `allow_repo_exec=False`.
+    """
+    from engine.deep_repo_audit import (
+        _assert_not_corporate_or_system_proxy_port,
+        _validate_safe_proxy_cmd,
+        build_live_proxy_probes,
+        build_scrubbed_enterprise_env,
+    )
+
+    repo = _create_sample_repo(tmp_path / "ent_repo")
+    dist_dir = repo / "dist" / "sandbox"
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    marker_file = tmp_path / "pwned_marker.txt"
+    (dist_dir / "http-proxy.js").write_text(
+        f"import fs from 'node:fs'; fs.writeFileSync({marker_file.as_posix()!r}, 'EXECUTED');\n"
+        "export function createHttpProxyServer() { return {}; }\n",
+        encoding="utf-8",
+    )
+
+    # 1. Default allow_repo_exec=False MUST refuse to import/execute dist/sandbox/http-proxy.js
+    res_blocked = run_live_proxy_fuzz(repo, proxy_target="auto", allow_repo_exec=False)
+    assert res_blocked["status"] == "skipped_repo_exec_disabled"
+    assert not marker_file.exists()
+
+    # 2. Environment scrubbing MUST strip enterprise secrets & corporate HTTP_PROXY and set NO_PROXY=*
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "AKIA_TOP_SECRET_ENTERPRISE")
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret_enterprise_token")
+    monkeypatch.setenv("KUBECONFIG", "/home/corp/.kube/config")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9000")
+    monkeypatch.setenv("HTTPS_PROXY", "http://corp-zscaler.internal:9443")
+
+    scrubbed = build_scrubbed_enterprise_env({"PORT": "18080"})
+    assert "AWS_SECRET_ACCESS_KEY" not in scrubbed
+    assert "GITHUB_TOKEN" not in scrubbed
+    assert "KUBECONFIG" not in scrubbed
+    assert scrubbed["HTTP_PROXY"] == ""
+    assert scrubbed["HTTPS_PROXY"] == ""
+    assert scrubbed["NO_PROXY"] == "*"
+    assert scrubbed["no_proxy"] == "*"
+    assert scrubbed["PORT"] == "18080"
+
+    # 3. Ephemeral sink probes & corporate proxy port protection
+    probes = build_live_proxy_probes(54321)
+    for _rid, _desc, raw_b in probes:
+        txt = raw_b.decode("latin-1")
+        assert "127.0.0.1:54321" in txt
+        assert "127.0.0.1:443" not in txt
+        assert "evil.invalid" not in txt
+        assert "blocked.invalid" not in txt
+
+    with pytest.raises(PermissionError):
+        _assert_not_corporate_or_system_proxy_port(80)
+    with pytest.raises(PermissionError):
+        _assert_not_corporate_or_system_proxy_port(443)
+    with pytest.raises(PermissionError):
+        _assert_not_corporate_or_system_proxy_port(9000)  # Zscaler Client Connector
+
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:13128")
+    with pytest.raises(PermissionError):
+        _assert_not_corporate_or_system_proxy_port(13128)
+
+    # 4. _validate_safe_proxy_cmd blocks repo-relative paths unless allow_repo_exec=True
+    with pytest.raises(PermissionError):
+        _validate_safe_proxy_cmd("node ./dist/server.js", allow_repo_exec=False)
+    with pytest.raises(PermissionError):
+        _validate_safe_proxy_cmd("node_modules/.bin/http-server", allow_repo_exec=False)
+    assert _validate_safe_proxy_cmd("node ./dist/server.js", allow_repo_exec=True) == ["node", "./dist/server.js"]
+
+
+
 

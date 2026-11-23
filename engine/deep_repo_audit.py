@@ -35,6 +35,8 @@ import shlex
 import shutil
 import socket
 import subprocess
+import tempfile
+import threading
 import time
 from urllib.parse import urlparse
 from dataclasses import dataclass, field
@@ -192,38 +194,48 @@ _URL_USERINFO_CHECK_RE = re.compile(r"\.(username|password)\b")
 _URL_STRUCT_CHECK_RE = re.compile(r"\.(pathname|port|search|hash)\b")
 _SINGLE_TRAILING_DOT_RE = re.compile(r"""\.replace\s*\(\s*/\\\.\$/\s*,\s*['"]['"]\s*\)""")
 
-_LIVE_PROXY_PROBES: Tuple[Tuple[str, str, bytes], ...] = (
-    (
-        "PROXY-CL-TE-001",
-        "Conflicting Content-Length and Transfer-Encoding: chunked",
-        b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\nX",
-    ),
-    (
-        "PROXY-TE-OBF-002",
-        "Obfuscated Transfer-Encoding header with Content-Length",
-        b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\nTransfer-Encoding: xchunked\r\nConnection: close\r\n\r\n1234",
-    ),
-    (
-        "PROXY-CL-CL-003",
-        "Duplicate conflicting Content-Length headers",
-        b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\nContent-Length: 0\r\nConnection: close\r\n\r\nhello",
-    ),
-    (
-        "PROXY-BARE-LF-004",
-        "Bare LF header line delimiter without CR",
-        b"GET / HTTP/1.1\nHost: 127.0.0.1\nConnection: close\n\n",
-    ),
-    (
-        "PROXY-OBS-FOLD-005",
-        "Deprecated obs-fold multi-line Host header",
-        b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n evil.invalid\r\nConnection: close\r\n\r\n",
-    ),
-    (
-        "PROXY-CONNECT-AMBIG-006",
-        "CONNECT request-target vs mismatched Host header authority",
-        b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: blocked.invalid:443\r\nConnection: close\r\n\r\n",
-    ),
-)
+def build_live_proxy_probes(sink_port: int = 65535) -> Tuple[Tuple[str, str, bytes], ...]:
+    """
+    Builds the 6 RFC 9112 smuggling & authority-confusion probes bound strictly to
+    RFCHunt's ephemeral loopback upstream sink (`127.0.0.1:<sink_port>`), never targeting
+    bare `127.0.0.1` (ports 80/443) or EDR/SIEM-triggering `.invalid` domains.
+    """
+    sp = int(sink_port)
+    return (
+        (
+            "PROXY-CL-TE-001",
+            "Conflicting Content-Length and Transfer-Encoding: chunked",
+            f"POST / HTTP/1.1\r\nHost: 127.0.0.1:{sp}\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\nX".encode("latin-1"),
+        ),
+        (
+            "PROXY-TE-OBF-002",
+            "Obfuscated Transfer-Encoding header with Content-Length",
+            f"POST / HTTP/1.1\r\nHost: 127.0.0.1:{sp}\r\nContent-Length: 4\r\nTransfer-Encoding: xchunked\r\nConnection: close\r\n\r\n1234".encode("latin-1"),
+        ),
+        (
+            "PROXY-CL-CL-003",
+            "Duplicate conflicting Content-Length headers",
+            f"POST / HTTP/1.1\r\nHost: 127.0.0.1:{sp}\r\nContent-Length: 5\r\nContent-Length: 0\r\nConnection: close\r\n\r\nhello".encode("latin-1"),
+        ),
+        (
+            "PROXY-BARE-LF-004",
+            "Bare LF header line delimiter without CR",
+            f"GET / HTTP/1.1\nHost: 127.0.0.1:{sp}\nConnection: close\n\n".encode("latin-1"),
+        ),
+        (
+            "PROXY-OBS-FOLD-005",
+            "Deprecated obs-fold multi-line Host header",
+            f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{sp}\r\n obs-fold.localhost\r\nConnection: close\r\n\r\n".encode("latin-1"),
+        ),
+        (
+            "PROXY-CONNECT-AMBIG-006",
+            "CONNECT request-target vs mismatched Host header authority",
+            f"CONNECT 127.0.0.1:{sp} HTTP/1.1\r\nHost: mismatch.localhost:{sp}\r\nConnection: close\r\n\r\n".encode("latin-1"),
+        ),
+    )
+
+
+_LIVE_PROXY_PROBES: Tuple[Tuple[str, str, bytes], ...] = build_live_proxy_probes(65535)
 
 
 @dataclass
@@ -295,7 +307,78 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
-def _validate_safe_proxy_cmd(cmd_str: str) -> List[str]:
+_SAFE_ENV_ALLOWLIST: Tuple[str, ...] = (
+    "PATH",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "HOME",
+    "USERPROFILE",
+    "LANG",
+    "LC_ALL",
+)
+
+_PROTECTED_ENTERPRISE_PROXY_PORTS: Tuple[int, ...] = (
+    80,
+    443,
+    9000,  # Zscaler Client Connector local listener
+    9080,  # Zscaler local proxy
+    9099,  # Netskope local agent
+)
+
+
+def build_scrubbed_enterprise_env(extra_vars: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """
+    Builds a scrubbed subprocess environment that strips all enterprise credentials
+    (AWS_*, GITHUB_TOKEN, KUBECONFIG, API keys) and strips corporate HTTP_PROXY /
+    HTTPS_PROXY / ALL_PROXY variables while setting NO_PROXY='*' so a spawned local
+    proxy can never chain outbound to a corporate upstream proxy.
+    """
+    scrubbed: Dict[str, str] = {}
+    for k in _SAFE_ENV_ALLOWLIST:
+        val = os.environ.get(k)
+        if val is not None:
+            scrubbed[k] = val
+    scrubbed["NO_PROXY"] = "*"
+    scrubbed["no_proxy"] = "*"
+    scrubbed["HTTP_PROXY"] = ""
+    scrubbed["HTTPS_PROXY"] = ""
+    scrubbed["ALL_PROXY"] = ""
+    scrubbed["http_proxy"] = ""
+    scrubbed["https_proxy"] = ""
+    scrubbed["all_proxy"] = ""
+    if extra_vars:
+        scrubbed.update(extra_vars)
+    return scrubbed
+
+
+def _assert_not_corporate_or_system_proxy_port(port: int) -> None:
+    """
+    Refuses to send raw smuggling probes to privileged ports (80/443), well-known
+    corporate proxy agent ports (Zscaler 9000/9080, Netskope 9099), or any loopback
+    port currently configured in the host's HTTP_PROXY / HTTPS_PROXY / ALL_PROXY.
+    """
+    p = int(port)
+    if p in _PROTECTED_ENTERPRISE_PROXY_PORTS:
+        raise PermissionError(
+            f"Refusing to fuzz protected system or enterprise proxy agent port {p} on 127.0.0.1."
+        )
+    for env_key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        raw_url = (os.environ.get(env_key) or "").strip()
+        if not raw_url:
+            continue
+        parsed = urlparse(raw_url if "://" in raw_url else f"http://{raw_url}")
+        if parsed.port and int(parsed.port) == p:
+            raise PermissionError(
+                f"Refusing to fuzz port {p} because it matches the host's configured {env_key} corporate proxy."
+            )
+
+
+def _validate_safe_proxy_cmd(cmd_str: str, *, allow_repo_exec: bool = False) -> List[str]:
     if not cmd_str or not str(cmd_str).strip():
         raise ValueError("Empty --proxy-cmd")
     for tok in _FORBIDDEN_CMD_META:
@@ -304,6 +387,18 @@ def _validate_safe_proxy_cmd(cmd_str: str) -> List[str]:
     argv = shlex.split(cmd_str, posix=(os.name != "nt"))
     if not argv:
         raise ValueError("Empty parsed --proxy-cmd")
+    if not allow_repo_exec:
+        for arg in argv:
+            norm_a = arg.replace("\\", "/").lower()
+            if (
+                norm_a.startswith(("./", "../", ".\\", "..\\"))
+                or "node_modules" in norm_a
+                or "/dist/" in norm_a
+                or norm_a.startswith("dist/")
+            ):
+                raise PermissionError(
+                    f"--proxy-cmd references repository path {arg!r} without explicit --allow-repo-exec opt-in."
+                )
     return argv
 
 
@@ -1171,17 +1266,61 @@ def _find_node_proxy_entrypoint(root: Path) -> Optional[Path]:
     return None
 
 
+def _start_ephemeral_loopback_sink() -> Tuple[int, socket.socket, threading.Event, threading.Thread]:
+    """
+    Binds an ephemeral loopback sink server on `127.0.0.1:0` so any request forwarded
+    by a permissive proxy lands strictly on RFCHunt's own ephemeral sink listener
+    instead of hitting local enterprise services on ports 80/443.
+    """
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    sink_port = int(srv.getsockname()[1])
+    srv.listen(32)
+    srv.settimeout(0.2)
+    stop_evt = threading.Event()
+
+    def _serve() -> None:
+        try:
+            while not stop_evt.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                with conn:
+                    conn.settimeout(0.4)
+                    try:
+                        conn.recv(2048)
+                        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                    except OSError:
+                        pass
+        finally:
+            try:
+                srv.close()
+            except OSError:
+                pass
+
+    th = threading.Thread(target=_serve, daemon=True)
+    th.start()
+    return sink_port, srv, stop_evt, th
+
+
 def _run_auto_node_proxy_harness(
     root: Path,
     entrypoint: Path,
     *,
+    allow_repo_exec: bool = False,
     timeout_sec: float = 25.0,
 ) -> Optional[Dict[str, Any]]:
     """
     Spins up a compiled Node `createHttpProxyServer` module strictly on `127.0.0.1:0`
-    in an isolated stdin ESM process (zero writes inside `root`) and runs 3-trial RFC 9112
-    smuggling & allowlist-bypass probes against it.
+    in an isolated stdin ESM process (zero writes inside `root`, scrubbed enterprise env,
+    and isolated temporary working directory) ONLY when `allow_repo_exec=True`.
     """
+    if not allow_repo_exec and os.environ.get("RFCHUNT_ALLOW_REPO_EXEC") != "1":
+        return None
     node_exe = shutil.which("node")
     if not node_exe:
         return None
@@ -1294,18 +1433,22 @@ console.log(JSON.stringify({{ status: 'completed', target: `127.0.0.1:${{pPort}}
 process.exit(0);
 """
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-    proc = subprocess.run(
-        [node_exe, "--input-type=module", "-"],
-        input=script,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout_sec,
-        shell=False,
-        creationflags=creationflags,
-        check=False,
-    )
+    scrubbed_env = build_scrubbed_enterprise_env()
+    with tempfile.TemporaryDirectory(prefix="rfchunt_node_sandbox_") as isolated_cwd:
+        proc = subprocess.run(
+            [node_exe, "--input-type=module", "-"],
+            input=script,
+            cwd=isolated_cwd,
+            env=scrubbed_env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_sec,
+            shell=False,
+            creationflags=creationflags,
+            check=False,
+        )
     if proc.returncode != 0 or not proc.stdout.strip():
         return None
     try:
@@ -1322,6 +1465,7 @@ def run_live_proxy_fuzz(
     proxy_port: Optional[int] = None,
     proxy_cmd: Optional[str] = None,
     auto_spawn_repo_proxy: bool = False,
+    allow_repo_exec: bool = False,
     run_docker_matrix: bool = False,
     approval_mode: str = "policy",
     db: Any = None,
@@ -1329,9 +1473,12 @@ def run_live_proxy_fuzz(
 ) -> Dict[str, Any]:
     """
     Runs Pillar 1: Live loopback-only proxy fuzzing + 3-trial RFC 9112 differential verification.
-    Strictly enforces `127.0.0.1`/loopback-only and guaranteed subprocess teardown in `finally`.
+    Strictly enforces `127.0.0.1`/loopback-only, scrubbed enterprise environment (`NO_PROXY=*`),
+    isolated temporary working directory, ephemeral loopback upstream sink, and opt-in
+    `allow_repo_exec` before importing/executing any target repository code.
     """
     t0 = time.perf_counter()
+    effective_allow_repo_exec = bool(allow_repo_exec or os.environ.get("RFCHUNT_ALLOW_REPO_EXEC") == "1")
     if proxy_target:
         p_host, p_port, p_cmd, p_auto = parse_proxy_target(proxy_target, default_host=proxy_host)
         proxy_host = p_host
@@ -1361,14 +1508,31 @@ def run_live_proxy_fuzz(
     ][:10]
 
     spawned_proc: Optional[subprocess.Popen] = None
+    isolated_tmp_dir: Optional[tempfile.TemporaryDirectory] = None
+    sink_stop_evt: Optional[threading.Event] = None
+    sink_thread: Optional[threading.Thread] = None
     active_port = int(proxy_port) if proxy_port else None
 
     try:
-        # Auto-spawn compiled Node repo proxy (e.g., dist/sandbox/http-proxy.js) on 127.0.0.1:0 when `--proxy` is used
+        # Auto-spawn compiled Node repo proxy (e.g., dist/sandbox/http-proxy.js) ONLY when allow_repo_exec is explicitly enabled
         if auto_spawn_repo_proxy and not active_port and not proxy_cmd:
             node_entry = _find_node_proxy_entrypoint(root)
-            if node_entry is not None:
-                auto_res = _run_auto_node_proxy_harness(root, node_entry)
+            if node_entry is not None and not effective_allow_repo_exec:
+                return {
+                    "status": "skipped_repo_exec_disabled",
+                    "reason": (
+                        "Enterprise safety guard: refusing to dynamically import or execute target "
+                        f"repository code ({node_entry.relative_to(root).as_posix()}) on host without "
+                        "explicit --allow-repo-exec opt-in."
+                    ),
+                    "entrypoint": node_entry.relative_to(root).as_posix(),
+                    "discovered_proxy_files": discovered_proxies,
+                    "probes_sent": 0,
+                    "confirmed_divergences": [],
+                    "elapsed_sec": round(time.perf_counter() - t0, 3),
+                }
+            if node_entry is not None and effective_allow_repo_exec:
+                auto_res = _run_auto_node_proxy_harness(root, node_entry, allow_repo_exec=True)
                 if auto_res and auto_res.get("status") == "completed":
                     oracle = MultiImplementationDifferentialOracle()
                     probe_rows = auto_res.get("results") or []
@@ -1428,16 +1592,21 @@ def run_live_proxy_fuzz(
                     }
 
         if proxy_cmd and not active_port:
-            argv = _validate_safe_proxy_cmd(proxy_cmd)
+            argv = _validate_safe_proxy_cmd(proxy_cmd, allow_repo_exec=effective_allow_repo_exec)
             active_port = _pick_ephemeral_loopback_port()
-            env = dict(os.environ)
-            env["HOST"] = "127.0.0.1"
-            env["PORT"] = str(active_port)
-            env["PROXY_PORT"] = str(active_port)
+            env = build_scrubbed_enterprise_env(
+                {
+                    "HOST": "127.0.0.1",
+                    "PORT": str(active_port),
+                    "PROXY_PORT": str(active_port),
+                }
+            )
+            isolated_tmp_dir = tempfile.TemporaryDirectory(prefix="rfchunt_proxy_cwd_")
+            exec_cwd = str(root) if effective_allow_repo_exec else isolated_tmp_dir.name
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
             spawned_proc = subprocess.Popen(
                 argv,
-                cwd=str(root),
+                cwd=exec_cwd,
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -1466,11 +1635,15 @@ def run_live_proxy_fuzz(
                 "elapsed_sec": round(time.perf_counter() - t0, 3),
             }
 
+        _assert_not_corporate_or_system_proxy_port(active_port)
+        sink_port, _sink_sock, sink_stop_evt, sink_thread = _start_ephemeral_loopback_sink()
+        active_probes = build_live_proxy_probes(sink_port)
+
         oracle = MultiImplementationDifferentialOracle()
         probe_results: List[Dict[str, Any]] = []
         confirmed_findings: List[Dict[str, Any]] = []
 
-        for rule_id, desc, raw_probe in _LIVE_PROXY_PROBES:
+        for rule_id, desc, raw_probe in active_probes:
             trial_statuses: List[int] = []
             trial_lines: List[str] = []
             for _ in range(LIVE_PROBE_TRIALS):
@@ -1545,6 +1718,7 @@ def run_live_proxy_fuzz(
         return {
             "status": "completed",
             "target": f"{proxy_host}:{active_port}",
+            "ephemeral_sink_port": sink_port,
             "discovered_proxy_files": discovered_proxies,
             "probes_sent": len(probe_results) * LIVE_PROBE_TRIALS,
             "unique_probes": len(probe_results),
@@ -1554,6 +1728,13 @@ def run_live_proxy_fuzz(
             "elapsed_sec": round(time.perf_counter() - t0, 3),
         }
     finally:
+        if sink_stop_evt is not None:
+            sink_stop_evt.set()
+        if sink_thread is not None:
+            try:
+                sink_thread.join(timeout=1.5)
+            except Exception:
+                pass
         if spawned_proc is not None:
             try:
                 spawned_proc.terminate()
@@ -1564,6 +1745,11 @@ def run_live_proxy_fuzz(
                     spawned_proc.wait(timeout=2.0)
                 except Exception:
                     pass
+        if isolated_tmp_dir is not None:
+            try:
+                isolated_tmp_dir.cleanup()
+            except Exception:
+                pass
 
 
 def discover_nested_fuzz_crates(repo_path: Union[str, Path]) -> List[Path]:
@@ -1729,6 +1915,7 @@ def run_deep_repo_audit(
     proxy_host: str = "127.0.0.1",
     proxy_port: Optional[int] = None,
     proxy_cmd: Optional[str] = None,
+    allow_repo_exec: bool = False,
     run_docker_matrix: bool = False,
     max_trust_files: int = DEFAULT_MAX_TRUST_FILES,
     fuzz_dry_run: bool = False,
@@ -1766,6 +1953,7 @@ def run_deep_repo_audit(
             proxy_host=proxy_host,
             proxy_port=proxy_port,
             proxy_cmd=proxy_cmd,
+            allow_repo_exec=allow_repo_exec,
             run_docker_matrix=run_docker_matrix,
             approval_mode=approval_mode,
             db=db,

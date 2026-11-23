@@ -4196,6 +4196,7 @@ def cmd_deep_audit(args):
         repo_path = str(proxy_target_arg)
         proxy_target_arg = "auto"
 
+    allow_repo_exec_flag = bool(getattr(args, "allow_repo_exec", False))
     any_pillar = any(
         bool(getattr(args, flag, False))
         for flag in ("live_proxy_fuzz", "trust_boundary_review", "coverage_fuzz")
@@ -4204,7 +4205,7 @@ def cmd_deep_audit(args):
         en_live = True
         en_tb = True
         en_cov = True
-        if not proxy_target_arg and not getattr(args, "proxy_port", None) and not getattr(args, "proxy_cmd", None):
+        if allow_repo_exec_flag and not proxy_target_arg and not getattr(args, "proxy_port", None) and not getattr(args, "proxy_cmd", None):
             proxy_target_arg = "auto"
     else:
         en_live = bool(getattr(args, "live_proxy_fuzz", False)) or bool(proxy_target_arg)
@@ -4226,6 +4227,7 @@ def cmd_deep_audit(args):
             proxy_host=str(getattr(args, "proxy_host", "127.0.0.1") or "127.0.0.1"),
             proxy_port=getattr(args, "proxy_port", None),
             proxy_cmd=getattr(args, "proxy_cmd", None),
+            allow_repo_exec=allow_repo_exec_flag,
             run_docker_matrix=bool(getattr(args, "docker_parser_matrix", False)),
             max_trust_files=int(getattr(args, "trust_max_files", 80) or 80),
             fuzz_dry_run=bool(getattr(args, "fuzz_dry_run", False)),
@@ -4708,7 +4710,8 @@ def cmd_all(args):
                     en_live = True if (getattr(args, "deep_audit", False) or not any_p) else (bool(getattr(args, "live_proxy_fuzz", False)) or bool(p_target))
                     en_tb = True if (getattr(args, "deep_audit", False) or not any_p) else bool(getattr(args, "trust_boundary_review", False))
                     en_cov = True if (getattr(args, "deep_audit", False) or not any_p) else bool(getattr(args, "coverage_fuzz", False))
-                    if getattr(args, "deep_audit", False) and not p_target and not getattr(args, "proxy_port", None) and not getattr(args, "proxy_cmd", None):
+                    allow_repo_exec_flag = bool(getattr(args, "allow_repo_exec", False))
+                    if getattr(args, "deep_audit", False) and allow_repo_exec_flag and not p_target and not getattr(args, "proxy_port", None) and not getattr(args, "proxy_cmd", None):
                         p_target = "auto"
                     fl_raw = getattr(args, "fuzz_languages", None)
                     fl_list = [x.strip() for x in str(fl_raw).split(",") if x.strip()] if fl_raw else None
@@ -4722,6 +4725,7 @@ def cmd_all(args):
                         proxy_host=str(getattr(args, "proxy_host", "127.0.0.1") or "127.0.0.1"),
                         proxy_port=getattr(args, "proxy_port", None),
                         proxy_cmd=getattr(args, "proxy_cmd", None),
+                        allow_repo_exec=allow_repo_exec_flag,
                         run_docker_matrix=bool(getattr(args, "docker_parser_matrix", False)),
                         max_trust_files=int(getattr(args, "trust_max_files", 80) or 80),
                         fuzz_dry_run=bool(getattr(args, "fuzz_dry_run", False)),
@@ -6955,6 +6959,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--proxy-host", dest="proxy_host", type=str, default="127.0.0.1", help="Loopback-only proxy host for --live-proxy-fuzz (default: 127.0.0.1)")
     parser.add_argument("--proxy-port", dest="proxy_port", type=int, default=None, help="Existing loopback 127.0.0.1 proxy port to fuzz with --live-proxy-fuzz")
     parser.add_argument("--proxy-cmd", dest="proxy_cmd", type=str, default=None, help="Optional safe command to launch target repo proxy on 127.0.0.1:<PORT> during --live-proxy-fuzz (shell=False)")
+    parser.add_argument("--allow-repo-exec", dest="allow_repo_exec", action="store_true", default=False, help="Explicit opt-in required to dynamically import/execute compiled target repository proxy code (dist/*.js) or run --proxy-cmd inside target repo directory")
     parser.add_argument("--trust-max-files", dest="trust_max_files", type=int, default=80, help="Max top-ranked trust-boundary files to audit line-by-line (default: 80)")
     parser.add_argument("--enable-external-scanners", dest="enable_external_scanners", action="store_true", default=False, help="Enable external black-box scanners (httpx, katana, nuclei) — included in --all by default for live hosts; opt-in for standalone `scanner` mode")
     parser.add_argument("--no-external-scanners", dest="no_external_scanners", action="store_true", default=False, help="Disable external black-box scanners (httpx, katana, nuclei) during --all")
