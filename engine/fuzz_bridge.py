@@ -2234,15 +2234,20 @@ def _render_deterministic_harness(
         sym_comments = "\n".join(f"// Discovered Rust symbol: {s}" for s in top_syms) or "// Discovered crate root"
         code = (
             f"#![no_main]\n"
-            f"// Auto-synthesized by rfchunt LLMFuzzBridge (cargo-fuzz / libFuzzer)\n"
+            f"// Auto-synthesized by rfchunt LLMFuzzBridge (cargo-fuzz / libFuzzer + arbitrary::Unstructured)\n"
             f"// Target crate: {crate_ident} | Absorbed Cairn HINTs: {hint_banner}\n"
             f"{sym_comments}\n\n"
+            f"use arbitrary::Unstructured;\n"
             f"use libfuzzer_sys::fuzz_target;\n\n"
             f"fuzz_target!(|data: &[u8]| {{\n"
             f"    if data.is_empty() {{\n"
             f"        return;\n"
             f"    }}\n"
-            f"    // Structured boundary parse harness exercising UTF-8 and framed byte slices\n"
+            f"    // Structure-aware arbitrary::Unstructured multi-parameter extraction\n"
+            f"    let mut u = Unstructured::new(data);\n"
+            f"    let _structured_hdr = u.arbitrary::<&str>().unwrap_or(\"\");\n"
+            f"    let _structured_port = u.arbitrary::<u16>().unwrap_or(80);\n"
+            f"    let _structured_flag = u.arbitrary::<bool>().unwrap_or(false);\n"
             f"    let _as_str = std::str::from_utf8(data);\n"
             f"    let split_at = (data[0] as usize).min(data.len());\n"
             f"    let (_head, _tail) = data.split_at(split_at);\n"
@@ -2257,7 +2262,8 @@ def _render_deterministic_harness(
             "[package.metadata]\n"
             "cargo-fuzz = true\n\n"
             "[dependencies]\n"
-            'libfuzzer-sys = "0.4"\n\n'
+            'libfuzzer-sys = "0.4"\n'
+            'arbitrary = { version = "1", features = ["derive"] }\n\n'
             "[[bin]]\n"
             f'name = "fuzz_{crate_ident}"\n'
             f'path = "fuzz_{crate_ident}.rs"\n'

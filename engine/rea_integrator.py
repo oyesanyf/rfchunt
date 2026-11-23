@@ -320,6 +320,42 @@ _OIDC_CONFIG_RX = re.compile(
     r"""(?i)\b(?P<key>audience|client_id|issuer|authority|redirect_uri|token_endpoint)\s*:\s*["'`](?P<val>[^"'`\r\n]{4,180})["'`]"""
 )
 _SOURCEMAP_DIRECTIVE_RX = re.compile(r"//#\s*sourceMappingURL=(?P<url>\S+)")
+_ELECTRON_PRELOAD_BRIDGE_RX = re.compile(
+    r"""contextBridge\.exposeInMainWorld\s*\(\s*["'`](?P<api_name>[A-Za-z0-9_$-]+)["'`]\s*,\s*\{(?P<body>[\s\S]{1,1200}?)\}\s*\)"""
+)
+_HEX_ESCAPE_RX = re.compile(r"\\x([0-9a-fA-F]{2})")
+_UNICODE_ESCAPE_RX = re.compile(r"\\u([0-9a-fA-F]{4})")
+_ATOB_CALL_RX = re.compile(r"""\batob\s*\(\s*["']([A-Za-z0-9+/=]{8,256})["']\s*\)""")
+_SPLIT_STR_CONCAT_RX = re.compile(r"""(["'`])(/[^"'`\r\n]{1,80})\1\s*\+\s*(["'`])(/[^"'`\r\n]{1,80})\3""")
+
+
+def deobfuscate_js_bundle_text(text: str) -> str:
+    r"""
+    Decodes obfuscated JavaScript `\xHH` hex escapes, `\uHHHH` unicode escapes,
+    `atob("...")` Base64 literals, and adjacent route string concatenations in memory
+    so hidden routes, secrets, and IPC sinks cannot evade static extraction.
+    """
+    if not text:
+        return text
+    out = text
+    if "\\x" in out:
+        out = _HEX_ESCAPE_RX.sub(lambda m: chr(int(m.group(1), 16)), out)
+    if "\\u" in out:
+        out = _UNICODE_ESCAPE_RX.sub(lambda m: chr(int(m.group(1), 16)), out)
+    if "atob(" in out:
+        import base64
+
+        def _decode_b64(m: re.Match[str]) -> str:
+            try:
+                dec = base64.b64decode(m.group(1)).decode("utf-8", errors="ignore")
+                return f'"{dec}"'
+            except Exception:
+                return m.group(0)
+
+        out = _ATOB_CALL_RX.sub(_decode_b64, out)
+    if "+" in out:
+        out = _SPLIT_STR_CONCAT_RX.sub(lambda m: f'"{m.group(2)}{m.group(4)}"', out)
+    return out
 
 
 def _make_finding_id(rule_id: str, file_path: str, line_num: int, extra: str = "") -> str:
@@ -653,10 +689,36 @@ class ReaIntegrator:
                         ))
                     src_contents = [s for s in (smap.get("sourcesContent") or []) if isinstance(s, str)]
                     if src_contents:
-                        content = "\n".join(src_contents[:20])
+                        content = "\n".join(src_contents[:50])
                         lines = content.splitlines() or [content]
             except Exception:
                 limitations.append(f"Could not parse JSON source map '{display_path}'; fell back to raw text scan.")
+
+        # 1b. Deobfuscate hex/unicode/atob Base64 escapes & check Electron preload contextBridge
+        content = deobfuscate_js_bundle_text(content)
+        lines = content.splitlines() or [content]
+
+        for pm in _ELECTRON_PRELOAD_BRIDGE_RX.finditer(content):
+            api_name = pm.group("api_name")
+            p_body = pm.group("body")
+            if ("ipcRenderer.invoke" in p_body or "ipcRenderer.send" in p_body) and _can_add_finding():
+                lno = content.count("\n", 0, pm.start()) + 1
+                findings.append(
+                    ReaFinding(
+                        finding_id=_make_finding_id("REA-ELECTRON-PRELOAD-BRIDGE", display_path, lno, api_name),
+                        rule_id="REA-ELECTRON-PRELOAD-BRIDGE",
+                        title=f"Electron Preload contextBridge Exposes Direct IPC Invocation ('{api_name}')",
+                        severity="HIGH",
+                        cwe="CWE-269",
+                        file_path=display_path,
+                        line_number=lno,
+                        evidence=f"contextBridge.exposeInMainWorld('{api_name}') forwards renderer arguments into ipcRenderer.invoke/send",
+                        limitations=["Verify whether the target ipcMain handler validates channel arguments and senderFrame."],
+                        unknowns=[f"Whether window.{api_name} is accessible to untrusted third-party frames."],
+                        capability_class="EXEC_SINK",
+                        source_mode=source_mode,
+                    )
+                )
 
         # 2. Line-by-line inspection
         oidc_hits: Dict[str, Tuple[int, str]] = {}

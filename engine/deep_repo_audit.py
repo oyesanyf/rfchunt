@@ -905,6 +905,10 @@ def run_trust_boundary_review(
     slicer_summary: Dict[str, Any] = {}
     vi_summary: Dict[str, Any] = {"status": "disabled", "findings_count": 0}
     vi_findings: List[Dict[str, Any]] = []
+    arxiv_summary: Dict[str, Any] = {"status": "disabled", "findings_count": 0}
+    arxiv_findings: List[Dict[str, Any]] = []
+    l30d_summary: Dict[str, Any] = {"status": "disabled", "findings_count": 0}
+    l30d_findings: List[Dict[str, Any]] = []
     try:
         cg_slicer = CallGraphSlicer(max_depth=6, max_slices=20)
         cg_context = cg_slicer.build_graph_context(root)
@@ -929,20 +933,83 @@ def run_trust_boundary_review(
         slicer_summary = {"status": "error", "error": str(exc)}
         vi_summary = {"status": "error", "error": str(exc), "findings_count": 0}
 
+    try:
+        from engine.arxiv_security_bridge import ArxivSecurityBridge
+
+        ax_res = ArxivSecurityBridge().scan_repository(root)
+        for axf in ax_res.get("findings") or []:
+            arxiv_findings.append(
+                {
+                    "rule_id": axf.get("rule_id"),
+                    "severity": axf.get("severity", "HIGH"),
+                    "title": axf.get("title", ""),
+                    "file_path": axf.get("file", ""),
+                    "line_number": axf.get("line", 1),
+                    "cwe": axf.get("cwe_id", "CWE-20"),
+                    "category": axf.get("domain", "ARXIV_RESEARCH"),
+                    "description": axf.get("mathematical_invariant_violated", ""),
+                    "remediation": axf.get("remediation", ""),
+                    "evidence": axf.get("evidence_snippet", ""),
+                    "poe_level": int(axf.get("poe_level", 2) or 2),
+                    "verified": False,
+                    "scanner": "ArxivSecurityBridge",
+                }
+            )
+        arxiv_summary = {
+            "status": ax_res.get("status", "completed"),
+            "active_detectors_count": ax_res.get("active_detectors_count", 10),
+            "findings_count": len(arxiv_findings),
+            "findings_by_domain": ax_res.get("findings_by_domain", {}),
+        }
+    except Exception as exc:
+        arxiv_summary = {"status": "error", "error": str(exc), "findings_count": 0}
+
+    try:
+        from engine.last30days_security_skills import Last30DaysSecuritySkillsEngine
+
+        l30_res = Last30DaysSecuritySkillsEngine().scan_repository(root)
+        for skf in l30_res.get("findings") or []:
+            l30d_findings.append(
+                {
+                    "rule_id": skf.get("rule_id"),
+                    "severity": skf.get("severity", "HIGH"),
+                    "title": skf.get("title", ""),
+                    "file_path": skf.get("file", ""),
+                    "line_number": skf.get("line", 1),
+                    "cwe": skf.get("cwe_id", "CWE-20"),
+                    "category": skf.get("domain", "LAST30DAYS_SKILL"),
+                    "description": f"Source lane: {skf.get('source_lane', '')} ({skf.get('source_url', '')})",
+                    "remediation": skf.get("remediation", ""),
+                    "evidence": skf.get("evidence_snippet", ""),
+                    "poe_level": int(skf.get("poe_level", 2) or 2),
+                    "verified": False,
+                    "scanner": "Last30DaysSecuritySkills",
+                }
+            )
+        l30d_summary = {
+            "status": l30_res.get("status", "completed"),
+            "zero_api_key_invariant_enforced": True,
+            "active_skills_count": l30_res.get("active_skills_count", 10),
+            "findings_count": len(l30d_findings),
+            "findings_by_domain": l30_res.get("findings_by_domain", {}),
+        }
+    except Exception as exc:
+        l30d_summary = {"status": "error", "error": str(exc), "findings_count": 0}
+
     serialized_findings: List[Dict[str, Any]] = [f.to_dict() for f in all_findings]
     seen_tb_keys = {
         (str(d.get("rule_id")), str(d.get("file_path", "")).replace("\\", "/").lower(), int(d.get("line_number") or 0))
         for d in serialized_findings
     }
-    for vif in vi_findings:
+    for extra_f in [*vi_findings, *arxiv_findings, *l30d_findings]:
         v_key = (
-            str(vif.get("rule_id")),
-            str(vif.get("file_path", "")).replace("\\", "/").lower(),
-            int(vif.get("line_number") or 0),
+            str(extra_f.get("rule_id")),
+            str(extra_f.get("file_path", "")).replace("\\", "/").lower(),
+            int(extra_f.get("line_number") or 0),
         )
         if v_key not in seen_tb_keys:
             seen_tb_keys.add(v_key)
-            serialized_findings.append(vif)
+            serialized_findings.append(extra_f)
     serialized_findings.sort(
         key=lambda d: (
             sev_rank.get(str(d.get("severity", "INFO")).upper(), 9),
@@ -980,6 +1047,8 @@ def run_trust_boundary_review(
         "findings": serialized_findings,
         "call_graph_slicer": slicer_summary,
         "verification_inversion": vi_summary,
+        "arxiv_research_detectors": arxiv_summary,
+        "last30days_security_skills": l30d_summary,
         "elapsed_sec": round(time.perf_counter() - t0, 3),
     }
 
