@@ -3764,6 +3764,93 @@ def _run_all_aixcc_extensions(
     except Exception as exc:
         engines["novelty_corpus"] = {"status": "error", "error": str(exc)}
 
+    # 7. Optional HackerOne Campaign Discovery & HITL Findings Porter (--hackerone / --hackone)
+    if getattr(args, "enable_hackerone", False):
+        try:
+            h1_findings = list(res.get("verified_exploits") or []) + list(res.get("deterministic_static_findings") or [])
+            engines["hackerone_porter"] = cmd_hackerone(args, findings_override=h1_findings, return_dict_only=True)
+        except (PermissionError, ValueError):
+            raise
+        except Exception as exc:
+            engines["hackerone_porter"] = {"status": "error", "error": str(exc)}
+
+
+def cmd_hackerone(
+    args: Any,
+    *,
+    findings_override: Optional[List[Dict[str, Any]]] = None,
+    return_dict_only: bool = False,
+) -> Dict[str, Any]:
+    """
+    Executes `--hackerone` / `--hackone`: discovers/selects a HackerOne campaign, filters
+    RFCHunt findings through the strict Anti-Slop Quality Gate (Lane 1 + Lane 2 only),
+    exports redacted HackerOne Markdown drafts, and optionally launches a visible HITL
+    Playwright Computer-Use browser session (pausing for human login/2FA/CAPTCHA and
+    stopping before the final Submit button).
+    """
+    from engine.hackerone_porter import HackerOnePorter, load_findings_for_hackerone
+
+    out_root = str(Path(getattr(args, "output_dir", "reports") or "reports") / "hackerone")
+    findings = (
+        list(findings_override)
+        if findings_override is not None
+        else load_findings_for_hackerone(
+            findings_json=getattr(args, "findings_json", None),
+            reports_dir=str(getattr(args, "output_dir", "reports") or "reports"),
+        )
+    )
+    submit_api = bool(getattr(args, "hackerone_submit_api", False))
+    hitl_approved = False
+    if submit_api:
+        confirm = input(
+            "[HITL APPROVAL] You passed --hackerone-submit-api. Type YES to confirm submitting "
+            "eligible RFCHunt drafts via the official HackerOne API v1: "
+        ).strip()
+        hitl_approved = confirm == "YES"
+
+    porter = HackerOnePorter(output_dir=out_root)
+    result = porter.port_findings(
+        findings,
+        program_handle=getattr(args, "hackerone_program", None),
+        query=str(getattr(args, "hackerone_query", "") or ""),
+        min_severity=str(getattr(args, "hackerone_min_severity", "medium") or "medium"),
+        max_reports=int(getattr(args, "hackerone_max_reports", 5) or 5),
+        use_api=bool(getattr(args, "hackerone_api", False) or submit_api),
+        use_browser=bool(getattr(args, "hackerone_browser", False)),
+        submit_api=submit_api,
+        hitl_approved=hitl_approved,
+        bounties_only=bool(getattr(args, "hackerone_bounties_only", False)),
+    )
+
+    if return_dict_only:
+        return result
+
+    if getattr(args, "as_json", False):
+        from engine.cli_render import render_json
+        render_json(result)
+        return result
+
+    camp = result.get("campaign") or {}
+    print("\n" + "=" * 78)
+    print("  RFCHUNT HACKERONE CAMPAIGN FINDER & HITL REPORT PORTER (--hackerone)")
+    print("=" * 78)
+    print(f"  Campaign Handle     : {camp.get('handle')} ({camp.get('url')})")
+    print(f"  Submit Report URL   : {camp.get('submit_url')}")
+    print(f"  Anti-Slop Gate      : ENFORCED (Lane 1 + Lane 2 only; Lane 3 speculative rejected)")
+    print(f"  Eligible Drafts     : {result.get('eligible_drafts_count', 0)}")
+    print(f"  Rejected Findings   : {result.get('rejected_findings_count', 0)}")
+    print(f"  Bundle JSON         : {result.get('bundle_path')}")
+    for d in result.get("drafts") or []:
+        print(f"    -> [{d['severity_rating'].upper():<8}] {d['draft_id']} | {d['weakness_cwe']} | {d['title'][:65]}")
+        print(f"       Draft Markdown : {d['markdown_path']}")
+    if result.get("browser_session"):
+        bs = result["browser_session"]
+        print(f"  HITL Browser Status : {bs.get('status')} (Final Submit Held for Human Review)")
+        if bs.get("install_hint"):
+            print(f"  Playwright Setup    : {bs.get('install_hint')}")
+    print("=" * 78 + "\n")
+    return result
+
 
 def cmd_novelty(args):
     """Inspects offline structural novelty corpus or refreshes it from explicit local/opt-in sources (AIxCC #4)."""
@@ -7111,6 +7198,17 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--ui-allow-non-loopback", dest="ui_allow_non_loopback", action="store_true", default=False, help="Explicitly permit binding --serve-ui on a non-loopback interface")
     parser.add_argument("--network-lifecycle", dest="network_lifecycle", action="store_true", default=False, help="Run turnkey multi-target network lifecycle profile (--all + opt-in httpx/katana/nuclei discovery + Dual-Graph + retest)")
 
+    # HackerOne Campaign Finder & Human-in-the-Loop (HITL) Computer-Use Report Porter
+    parser.add_argument("--hackerone", "--hackone", dest="enable_hackerone", action="store_true", default=False, help="Discover a HackerOne campaign and port verified/deterministic RFCHunt findings into redacted HackerOne report drafts with HITL review")
+    parser.add_argument("--hackerone-program", "--hackone-program", dest="hackerone_program", type=str, default=None, help="Target HackerOne program handle (e.g. 'anthropic-vdp')")
+    parser.add_argument("--hackerone-query", "--hackone-query", dest="hackerone_query", type=str, default="", help="Search keyword for HackerOne campaign discovery")
+    parser.add_argument("--hackerone-browser", "--hackone-browser", dest="hackerone_browser", action="store_true", default=False, help="Launch visible HITL Playwright browser session for HackerOne login (human completes 2FA/CAPTCHA) and report form pre-fill (stops before final Submit)")
+    parser.add_argument("--hackerone-api", "--hackone-api", dest="hackerone_api", action="store_true", default=False, help="Query HackerOne Hacker API v1 for live campaign/scope discovery using HACKERONE_API_USERNAME and HACKERONE_API_TOKEN")
+    parser.add_argument("--hackerone-submit-api", dest="hackerone_submit_api", action="store_true", default=False, help="Explicit opt-in to submit eligible drafts via HackerOne API v1 after interactive HITL confirmation")
+    parser.add_argument("--hackerone-bounties-only", dest="hackerone_bounties_only", action="store_true", default=False, help="Filter HackerOne API campaign discovery to paid bounty programs only")
+    parser.add_argument("--hackerone-min-severity", dest="hackerone_min_severity", choices=["low", "medium", "high", "critical"], default="medium", help="Minimum severity eligible for HackerOne porting (default: medium)")
+    parser.add_argument("--hackerone-max-reports", dest="hackerone_max_reports", type=int, default=5, help="Maximum eligible drafts to generate per run (default: 5)")
+
     return parser
 
 
@@ -7564,6 +7662,11 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         if getattr(args, "authorized", False):
             args.enable_external_discovery = True
             args.enable_external_nuclei = True
+
+    # Standalone HackerOne Campaign Finder & HITL Report Porter (--hackerone / --hackone without --all)
+    if getattr(args, "enable_hackerone", False) and not getattr(args, "run_all_scans", False):
+        cmd_hackerone(args)
+        return
 
     # Standalone CLI-only blackboard hint injection (zero GUI / HTTP server calls)
     has_non_hint_action = explicit_mode_given and active_mode != "hint"

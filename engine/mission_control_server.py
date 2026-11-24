@@ -524,6 +524,25 @@ def _render_mission_control_html(session_token: str) -> str:
       <tbody id="tasks-body"></tbody>
     </table>
   </section>
+
+  <section class="panel">
+    <h2>HackerOne Campaign &amp; HITL Report Porter (--hackerone)</h2>
+    <div class="row">
+      <input id="h1-program-input" placeholder="HackerOne program handle (e.g. anthropic-vdp)" />
+      <select id="h1-sev-select">
+        <option value="medium">Min Severity: Medium</option>
+        <option value="high">Min Severity: High</option>
+        <option value="critical">Min Severity: Critical</option>
+        <option value="low">Min Severity: Low</option>
+      </select>
+      <button id="h1-port-btn">Build HITL Drafts</button>
+    </div>
+    <div class="muted" id="h1-msg" style="margin-top:8px;">Strict Anti-Slop Gate: Only Lane 1 (Verified) &amp; Lane 2 (Deterministic Static) findings are ported. Final submission always requires human review on hackerone.com.</div>
+    <table>
+      <thead><tr><th>Draft ID</th><th>Severity</th><th>Weakness</th><th>Scope</th><th>Title</th><th>Submit URL</th></tr></thead>
+      <tbody id="h1-drafts-body"></tbody>
+    </table>
+  </section>
 </main>
 <script>
 const TOKEN = {json.dumps(session_token)};
@@ -612,6 +631,43 @@ document.getElementById('launch-btn').addEventListener('click', async () => {{
   const body = await res.json();
   msg.textContent = res.ok ? ('Launched task ' + body.task.task_id) : ('Error: ' + (body.error || res.status));
   refreshAll();
+}});
+
+document.getElementById('h1-port-btn').addEventListener('click', async () => {{
+  const program = document.getElementById('h1-program-input').value.trim();
+  const min_severity = document.getElementById('h1-sev-select').value;
+  const msg = document.getElementById('h1-msg');
+  const res = await fetch('/api/hackerone/preview', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json', 'X-RFCHunt-Token': TOKEN }},
+    body: JSON.stringify({{ program_handle: program, min_severity }})
+  }});
+  const body = await res.json();
+  if (!res.ok) {{
+    msg.textContent = 'Error: ' + (body.error || res.status);
+    return;
+  }}
+  msg.textContent = 'Built ' + body.eligible_drafts_count + ' HITL draft(s) for ' + body.campaign.handle + ' (rejected ' + body.rejected_findings_count + ' speculative/low items).';
+  const hb = document.getElementById('h1-drafts-body');
+  hb.replaceChildren();
+  (body.drafts || []).forEach(d => {{
+    const tr = document.createElement('tr');
+    tdText(tr, d.draft_id);
+    tdText(tr, (d.severity_rating || '').toUpperCase());
+    tdText(tr, d.weakness_cwe);
+    tdText(tr, d.scope_match_status);
+    tdText(tr, d.title);
+    const linkTd = document.createElement('td');
+    const a = document.createElement('a');
+    a.href = d.submit_url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.style.color = '#38bdf8';
+    a.textContent = 'Open HackerOne Form';
+    linkTd.appendChild(a);
+    tr.appendChild(linkTd);
+    hb.appendChild(tr);
+  }});
 }});
 
 const es = new EventSource('/api/events');
@@ -853,6 +909,29 @@ class MissionControlServer:
                         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Task not found"})
                         return
                     self._send_json(HTTPStatus.ACCEPTED, {"task": t.to_dict()})
+                    return
+
+                if path == "/api/hackerone/preview":
+                    try:
+                        from engine.hackerone_porter import HackerOnePorter
+                        body = self._read_json_body()
+                        primary_items = server_ref.orchestrator.get_findings(lane="all").get("items") or []
+                        porter = HackerOnePorter(output_dir=str(server_ref.orchestrator.reports_root / "hackerone"))
+                        res = porter.port_findings(
+                            primary_items,
+                            program_handle=(str(body.get("program_handle") or "").strip() or None),
+                            query=str(body.get("query") or ""),
+                            min_severity=str(body.get("min_severity") or "medium"),
+                            max_reports=int(body.get("max_reports") or 5),
+                            use_api=bool(body.get("use_api", False)),
+                            use_browser=False,
+                            submit_api=False,
+                        )
+                        self._send_json(HTTPStatus.OK, res)
+                    except PermissionError as exc:
+                        self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
+                    except ValueError as exc:
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
 
                 if path.startswith("/api/approvals/"):

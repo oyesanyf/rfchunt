@@ -70,3 +70,15 @@ python rfc_hunt_swarm.py --network-lifecycle --target https://authorized.example
 python rfc_hunt_swarm.py --deep-audit /path/to/proxy-repo --allow-repo-exec
 ```
 - Executes inside an isolated empty temporary working directory with a scrubbed enterprise environment (`NO_PROXY="*"`, zero inherited credentials) and an ephemeral loopback sink telemetry listener (`127.0.0.1:<ephemeral_port>`).
+
+### HackerOne Campaign Finder & HITL Computer-Use Report Porter (`--hackerone`)
+```powershell
+# Prepare redacted HackerOne drafts (strictly Lane 1 + Lane 2; zero Lane 3 AI slop)
+python rfc_hunt_swarm.py --all /path/to/repo --hackerone --hackerone-program anthropic-vdp
+
+# Launch visible HITL Computer-Use Playwright browser session (human completes login/2FA/CAPTCHA; auto-fills report; stops before Submit)
+python rfc_hunt_swarm.py --hackerone --hackerone-program anthropic-vdp --hackerone-browser
+
+# Search live HackerOne campaigns via official API v1 (requires HACKERONE_API_USERNAME + HACKERONE_API_TOKEN in .env)
+python rfc_hunt_swarm.py --hackerone --hackerone-api --hackerone-query anthropic --hackerone-bounties-only
+```
