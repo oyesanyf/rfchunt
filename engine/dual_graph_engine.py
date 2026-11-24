@@ -6406,14 +6406,30 @@ class DualGraphAttackEngine:
                 finding_tier = "HYPOTHESIS"
                 title_out = f"HYPOTHESIS: {norm_label}"
 
+            potential_impact = (
+                "CRITICAL"
+                if (poe_level >= 3 or cand.attributes.get("has_ai_sink") or hop_count >= 3)
+                else "HIGH"
+            )
+            if poe_level >= 3:
+                effective_severity = potential_impact
+                evidence_lane = "VERIFIED_EXPLOIT"
+            elif poe_level == 2:
+                effective_severity = "MEDIUM"
+                evidence_lane = "ACTIVE_INDICATOR"
+            elif poe_level == 1:
+                effective_severity = "LOW"
+                evidence_lane = "SPECULATIVE_HYPOTHESIS"
+            else:
+                effective_severity = "INFO"
+                evidence_lane = "SPECULATIVE_HYPOTHESIS"
+
             finding = {
                 "rule_id": rule_id,
                 "title": title_out,
-                "severity": (
-                    "CRITICAL"
-                    if (poe_level >= 3 or cand.attributes.get("has_ai_sink") or hop_count >= 3)
-                    else "HIGH"
-                ),
+                "severity": effective_severity,
+                "potential_impact": potential_impact,
+                "evidence_lane": evidence_lane,
                 "cwe": cand.attributes.get("cwe", "CWE-444"),
                 "file_path": cand.attributes.get("target_path", "network-target"),
                 "line_number": 1,

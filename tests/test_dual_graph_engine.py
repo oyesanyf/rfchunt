@@ -299,7 +299,11 @@ def test_export_attack_chains_to_sarif_findings():
     first = sarif_findings[0]
     assert first["rule_id"].startswith("ARTEX-")
     assert "title" in first
-    assert first["severity"] in ("CRITICAL", "HIGH")
+    # Operational rigor: unverified poe_level <= 1 chains cap reported severity <= LOW
+    # while preserving theoretical blast radius in potential_impact
+    assert first["severity"] in ("LOW", "INFO")
+    assert first["potential_impact"] in ("CRITICAL", "HIGH")
+    assert first["evidence_lane"] == "SPECULATIVE_HYPOTHESIS"
     assert first["cwe"] == "CWE-444"
     assert "file_path" in first
     assert first["line_number"] == 1

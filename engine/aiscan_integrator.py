@@ -101,12 +101,32 @@ class PythonAIScanner:
         r'(?i)@(app|router|bp)\.(get|post|put|route)\s*\(\s*["\'](?P<route>/[^"\']+)["\']'
     )
 
+    POLYGLOT_ROUTE_PATTERNS = [
+        re.compile(
+            r'(?i)\b(?:app|router|server|fastify|hono)\.(?P<method>get|post|put|all)\s*\(\s*["\'](?P<route>/[^"\']+)["\']'
+        ),
+        re.compile(
+            r'(?i)\b(?:http|mux|r|router)\.(?:HandleFunc|Handle|Post|Get)\s*\(\s*["\'](?P<route>/[^"\']+)["\']'
+        ),
+        re.compile(
+            r'(?i)\.route\s*\(\s*["\'](?P<route>/[^"\']+)["\']\s*,\s*(?:axum::routing::|web::)?(?P<method>post|get|put)\b'
+        ),
+    ]
+
+    NEXTJS_APP_ROUTER_EXPORT = re.compile(
+        r'\bexport\s+(?:async\s+)?function\s+(?P<method>POST|GET|PUT)\s*\('
+    )
+
     AI_FRAMEWORK_IMPORTS = re.compile(
-        r'(?i)\b(?:import\s+(?:openai|anthropic|langchain|llamaindex|ollama|transformers|torch)|from\s+(?:openai|anthropic|langchain|llamaindex|ollama|transformers|torch))'
+        r'(?i)\b(?:import\s+(?:openai|anthropic|langchain|llamaindex|ollama|transformers|torch)|from\s+(?:openai|anthropic|langchain|llamaindex|ollama|transformers|torch)|require\s*\(\s*["\'](?:openai|@anthropic-ai/sdk|@langchain|ai|ollama)["\']\)|from\s+["\'](?:openai|@anthropic-ai/sdk|@langchain|ai|ollama)["\'])'
     )
 
     AI_ROUTE_KEYWORDS = re.compile(
         r'(?i)/(?:api/)?(?:v\d+/)?(?:chat|generate|prompt|llm|ai|rag|completion|predict|embeddings?|infer)'
+    )
+
+    UNICODE_SMUGGLING_PATTERN = re.compile(
+        r'[\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\U000e0000-\U000e007f]'
     )
 
     MCP_TOOL_POISONING_PATTERNS = [
@@ -117,6 +137,22 @@ class PythonAIScanner:
             "AISCAN-MCP-POISON-001",
             "CRITICAL",
             "MCP Tool-Description Prompt-Poisoning / Hidden Instruction Directive (CWE-77)",
+        ),
+        (
+            re.compile(
+                r'(?i)(?:override\s+tool|shadow\s+tool|before\s+calling\s+any\s+(?:other\s+)?tool|replace\s+the\s+output\s+of\s+tool|intercept\s+calls\s+to\s+tool)'
+            ),
+            "AISCAN-MCP-SHADOW-002",
+            "CRITICAL",
+            "MCP Cross-Server Tool Shadowing / Interception Directive (CWE-77)",
+        ),
+        (
+            re.compile(
+                r'(?i)(?:"args"\s*:\s*\[\s*"-y"\s*,\s*"(?![^"@\r\n]+@[0-9])[^"\r\n]*mcp[^"\r\n]*"|"url"\s*:\s*"http://(?!127\.0\.0\.1|localhost|\[::1\])[^"\r\n]+/(?:sse|mcp)\b)'
+            ),
+            "AISCAN-MCP-UNPINNED-EXEC-003",
+            "HIGH",
+            "MCP Server Configuration with Unpinned Remote Package Execution or Cleartext Non-Loopback Transport (CWE-829)",
         ),
     ]
 
@@ -149,12 +185,24 @@ class PythonAIScanner:
         b"@app.",
         b"@router.",
         b"@bp.",
+        b"app.post",
+        b"router.post",
+        b"handlefunc",
+        b".route(",
+        b"function post",
         b"<important>",
         b"ignore all previous",
         b"do not mention",
         b"silently read",
         b"exfiltrate",
+        b"override tool",
+        b"shadow tool",
+        b"before calling any",
         b"mcpservers",
+        b"/sse",
+        b"/mcp",
+        b"\xe2\x80",
+        b"\xf3\xa0\x80",
     )
 
     _MAX_CODE_LINE_LEN: int = 8192
@@ -187,9 +235,9 @@ class PythonAIScanner:
         lines = content.splitlines()
         is_code_file = file_path.suffix.lower() not in self._NON_CODE_EXTS
 
-        # 0. MCP Tool-Description Prompt-Poisoning (AISCAN-MCP-POISON-001)
+        # 0. MCP Tool-Description Prompt-Poisoning & Invisible Unicode Smuggling
         for line_num, line in enumerate(lines, 1):
-            if "re.compile(" in line or "AISCAN-MCP-POISON-001" in line:
+            if "re.compile(" in line or "AISCAN-MCP-" in line or "AISCAN-UNICODE-" in line:
                 continue
             for pat, rule_id, severity, desc in self.MCP_TOOL_POISONING_PATTERNS:
                 if pat.search(line):
@@ -204,6 +252,18 @@ class PythonAIScanner:
                             snippet=line.strip()[:200],
                         )
                     )
+            if self.UNICODE_SMUGGLING_PATTERN.search(line):
+                findings.append(
+                    AIFinding(
+                        finding_type="AISCAN-UNICODE-SMUGGLE-001",
+                        severity="CRITICAL",
+                        file_path=str(file_path),
+                        line_number=line_num,
+                        model_or_api="Unicode Tag / BiDi / Zero-Width Prompt Smuggling",
+                        description="Invisible Unicode Tag (U+E0000..U+E007F), BiDi override, or zero-width characters detected in prompt/skill/config (CWE-77).",
+                        snippet=repr(line.strip()[:120]),
+                    )
+                )
 
         # 1. API Keys & Credentials
         for line_num, line in enumerate(lines, 1):
@@ -252,34 +312,54 @@ class PythonAIScanner:
                         snippet=line.strip()[:200],
                     ))
 
-        # 4. Detect AI Endpoints in Web Frameworks (Flask, FastAPI, Express)
+        # 4. Detect AI Endpoints in Web Frameworks (Flask, FastAPI, Express/Fastify/Hono, Next.js, Go, Rust)
         if is_code_file:
             has_ai_import = bool(self.AI_FRAMEWORK_IMPORTS.search(content))
+            norm_path = str(file_path).replace("\\", "/")
+            is_nextjs_route = bool(re.search(r"/app/(?P<route>api/[^/]+(?:/[^/]+)*)/route\.(?:ts|js|tsx|jsx)$", norm_path))
+            nextjs_route_match = re.search(r"/app/(?P<route>api/[^/]+(?:/[^/]+)*)/route\.(?:ts|js|tsx|jsx)$", norm_path)
             for line_num, line in enumerate(lines, 1):
                 if len(line) > self._MAX_CODE_LINE_LEN:
                     continue
+                matched_route: Optional[str] = None
+                matched_method: str = "POST"
                 route_match = self.ROUTE_DECORATOR_PATTERN.search(line)
                 if route_match:
-                    route = route_match.group("route")
-                    if has_ai_import or self.AI_ROUTE_KEYWORDS.search(route):
-                        method = (route_match.group(2) or "POST").upper()
-                        endpoints.append(DiscoveredAIEndpoint(
-                            file_path=str(file_path),
-                            line_number=line_num,
-                            route_path=route,
-                            http_method=method if method != "ROUTE" else "POST",
-                            model_provider="local/llm",
-                            prompt_variable="prompt",
-                        ))
-                        findings.append(AIFinding(
-                            finding_type="unmetered_ai_endpoint",
-                            severity="MEDIUM",
-                            file_path=str(file_path),
-                            line_number=line_num,
-                            model_or_api="Web AI Endpoint",
-                            description=f"AI endpoint route '{route}' exposed without verified rate-limiting or framing isolation.",
-                            snippet=line.strip()[:200],
-                        ))
+                    matched_route = route_match.group("route")
+                    raw_m = (route_match.group(2) or "POST").upper()
+                    matched_method = raw_m if raw_m != "ROUTE" else "POST"
+                else:
+                    for poly_pat in self.POLYGLOT_ROUTE_PATTERNS:
+                        pm = poly_pat.search(line)
+                        if pm:
+                            matched_route = pm.group("route")
+                            raw_m = (pm.groupdict().get("method") or "POST").upper()
+                            matched_method = raw_m if raw_m not in ("ROUTE", "ALL") else "POST"
+                            break
+                    if matched_route is None and is_nextjs_route and nextjs_route_match:
+                        nm = self.NEXTJS_APP_ROUTER_EXPORT.search(line)
+                        if nm:
+                            matched_route = "/" + nextjs_route_match.group("route")
+                            matched_method = nm.group("method").upper()
+
+                if matched_route and (has_ai_import or self.AI_ROUTE_KEYWORDS.search(matched_route)):
+                    endpoints.append(DiscoveredAIEndpoint(
+                        file_path=str(file_path),
+                        line_number=line_num,
+                        route_path=matched_route,
+                        http_method=matched_method,
+                        model_provider="local/llm",
+                        prompt_variable="prompt",
+                    ))
+                    findings.append(AIFinding(
+                        finding_type="unmetered_ai_endpoint",
+                        severity="MEDIUM",
+                        file_path=str(file_path),
+                        line_number=line_num,
+                        model_or_api="Web AI Endpoint",
+                        description=f"AI endpoint route '{matched_route}' exposed without verified rate-limiting or framing isolation.",
+                        snippet=line.strip()[:200],
+                    ))
 
         return findings, endpoints
 
