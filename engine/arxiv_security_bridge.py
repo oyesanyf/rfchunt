@@ -390,6 +390,15 @@ _SKIP_DIRS = {
     "out",
     "artifacts",
     "work",
+    "yara",
+    "rules",
+    "reports",
+    "runs",
+    "logs",
+    "caldera_export",
+    "caldera_plugin",
+    "coverage",
+    "vendor",
 }
 
 _SOURCE_EXTENSIONS = {
@@ -1055,6 +1064,9 @@ class ArxivSecurityBridge:
         if repo_path.is_file():
             return [repo_path]
         collected: List[Path] = []
+        _data_exts = {".json", ".yaml", ".yml", ".toml"}
+        _manifest_names = {"package.json", "cargo.toml", "pyproject.toml", "tsconfig.json"}
+        data_files_added = 0
         for root, dirs, files in os.walk(repo_path):
             dirs[:] = [
                 d
@@ -1068,10 +1080,16 @@ class ArxivSecurityBridge:
                 fl = fname.lower()
                 if fl.startswith("test_") or fl.endswith("_test.py") or fl.endswith(".test.ts"):
                     continue
+                if fl.endswith((".min.js", ".min.css", ".bundle.js")):
+                    continue
                 if fl in ("arxiv_security_bridge.py", "code_verification_repair.py"):
                     continue
                 ext = Path(fname).suffix.lower()
                 if ext in _SOURCE_EXTENSIONS or fl == "dockerfile":
+                    if ext in _data_exts and fl not in _manifest_names:
+                        data_files_added += 1
+                        if data_files_added > 150:
+                            continue
                     fpath = Path(root) / fname
                     try:
                         if fpath.stat().st_size <= 1_500_000:

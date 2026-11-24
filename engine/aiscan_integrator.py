@@ -87,13 +87,13 @@ class PythonAIScanner:
     ]
 
     PROMPT_INJECTION_SINKS = [
-        (re.compile(r'(?i)f["\'].*?(?:system|prompt|instruction).*?\{(?P<var>[a-zA-Z0-9_]+)\}.*?["\']'), "Direct f-string injection into system prompt"),
-        (re.compile(r'(?i)["\'].*?(?:system|prompt|instruction).*?["\']\s*\+\s*(?P<var>[a-zA-Z0-9_]+)'), "Direct string concatenation into prompt"),
+        (re.compile(r'(?i)f["\'][^"\'\r\n]{0,200}(?:system|prompt|instruction)[^"\'\r\n]{0,200}\{(?P<var>[a-zA-Z0-9_]+)\}[^"\'\r\n]{0,200}["\']'), "Direct f-string injection into system prompt"),
+        (re.compile(r'(?i)["\'][^"\'\r\n]{0,200}(?:system|prompt|instruction)[^"\'\r\n]{0,200}["\']\s*\+\s*(?P<var>[a-zA-Z0-9_]+)'), "Direct string concatenation into prompt"),
         (re.compile(r'(?i)(?:prompt|messages|input)\s*=\s*(?:request\.(?:args|form|json|data)|req\.body)'), "Unsanitized client request body passed directly to LLM context"),
-        (re.compile(r'(?i)(?:system|prompt|instruction).*?\.format\s*\('), "Direct .format() interpolation into system prompt"),
-        (re.compile(r'(?i)(?:system|prompt|instruction).*?%\s*(?:\([^)]*\)|[a-zA-Z0-9_]+)'), "Direct % printf-style formatting into prompt"),
+        (re.compile(r'(?i)(?:system|prompt|instruction)[^\r\n]{0,160}\.format\s*\('), "Direct .format() interpolation into system prompt"),
+        (re.compile(r'(?i)(?:system|prompt|instruction)[^\r\n]{0,160}%\s*(?:\([^)]{0,120}\)|[a-zA-Z0-9_]+)'), "Direct % printf-style formatting into prompt"),
         (re.compile(r'(?i)\bPromptTemplate(?:\.from_template)?\s*\('), "LangChain PromptTemplate unescaped user parameter interpolation"),
-        (re.compile(r'(?i)["\'].*?["\']\.join\s*\([^)]*(?:prompt|system|instruction|message)[^)]*\)'), "String join concatenation into system prompt"),
+        (re.compile(r'(?i)["\'][^"\'\r\n]{0,40}["\']\.join\s*\([^)]{0,200}(?:prompt|system|instruction|message)[^)]{0,200}\)'), "String join concatenation into system prompt"),
         (re.compile(r'(?i)\$\{(?:prompt|user_input|instruction|system|query)\}'), "Template literal interpolation into prompt"),
     ]
 
@@ -157,11 +157,20 @@ class PythonAIScanner:
         b"mcpservers",
     )
 
+    _MAX_CODE_LINE_LEN: int = 8192
+    _NON_CODE_EXTS = frozenset({".json", ".yaml", ".yml", ".toml", ".md"})
+
     def scan_file(self, file_path: Path) -> Tuple[List[AIFinding], List[DiscoveredAIEndpoint]]:
         findings: List[AIFinding] = []
         endpoints: List[DiscoveredAIEndpoint] = []
 
+        fname_low = file_path.name.lower()
+        if fname_low.endswith((".min.js", ".min.css", ".bundle.js")):
+            return findings, endpoints
+
         try:
+            if file_path.stat().st_size > 2_000_000:
+                return findings, endpoints
             raw_bytes = file_path.read_bytes()
         except Exception as e:
             logger.warning("Error reading file %s: %s", file_path, e)
@@ -176,6 +185,7 @@ class PythonAIScanner:
 
         content = raw_bytes.decode("utf-8", errors="replace")
         lines = content.splitlines()
+        is_code_file = file_path.suffix.lower() not in self._NON_CODE_EXTS
 
         # 0. MCP Tool-Description Prompt-Poisoning (AISCAN-MCP-POISON-001)
         for line_num, line in enumerate(lines, 1):
@@ -212,6 +222,9 @@ class PythonAIScanner:
                         snippet=line.strip()[:200],
                     ))
 
+            if not is_code_file or len(line) > self._MAX_CODE_LINE_LEN:
+                continue
+
             # 2. Deserialization
             for pat, name, severity, desc in self.UNSAFE_DESERIALIZATION:
                 if pat.search(line):
@@ -240,30 +253,33 @@ class PythonAIScanner:
                     ))
 
         # 4. Detect AI Endpoints in Web Frameworks (Flask, FastAPI, Express)
-        has_ai_import = bool(self.AI_FRAMEWORK_IMPORTS.search(content))
-        for line_num, line in enumerate(lines, 1):
-            route_match = self.ROUTE_DECORATOR_PATTERN.search(line)
-            if route_match:
-                route = route_match.group("route")
-                if has_ai_import or self.AI_ROUTE_KEYWORDS.search(route):
-                    method = (route_match.group(2) or "POST").upper()
-                    endpoints.append(DiscoveredAIEndpoint(
-                        file_path=str(file_path),
-                        line_number=line_num,
-                        route_path=route,
-                        http_method=method if method != "ROUTE" else "POST",
-                        model_provider="local/llm",
-                        prompt_variable="prompt",
-                    ))
-                    findings.append(AIFinding(
-                        finding_type="unmetered_ai_endpoint",
-                        severity="MEDIUM",
-                        file_path=str(file_path),
-                        line_number=line_num,
-                        model_or_api="Web AI Endpoint",
-                        description=f"AI endpoint route '{route}' exposed without verified rate-limiting or framing isolation.",
-                        snippet=line.strip()[:200],
-                    ))
+        if is_code_file:
+            has_ai_import = bool(self.AI_FRAMEWORK_IMPORTS.search(content))
+            for line_num, line in enumerate(lines, 1):
+                if len(line) > self._MAX_CODE_LINE_LEN:
+                    continue
+                route_match = self.ROUTE_DECORATOR_PATTERN.search(line)
+                if route_match:
+                    route = route_match.group("route")
+                    if has_ai_import or self.AI_ROUTE_KEYWORDS.search(route):
+                        method = (route_match.group(2) or "POST").upper()
+                        endpoints.append(DiscoveredAIEndpoint(
+                            file_path=str(file_path),
+                            line_number=line_num,
+                            route_path=route,
+                            http_method=method if method != "ROUTE" else "POST",
+                            model_provider="local/llm",
+                            prompt_variable="prompt",
+                        ))
+                        findings.append(AIFinding(
+                            finding_type="unmetered_ai_endpoint",
+                            severity="MEDIUM",
+                            file_path=str(file_path),
+                            line_number=line_num,
+                            model_or_api="Web AI Endpoint",
+                            description=f"AI endpoint route '{route}' exposed without verified rate-limiting or framing isolation.",
+                            snippet=line.strip()[:200],
+                        ))
 
         return findings, endpoints
 
@@ -320,7 +336,10 @@ class PythonAIScanner:
         models = sorted({f.model_or_api for f in findings if f.model_or_api})
 
         root = target_path if target_path.is_dir() else target_path.parent
-        skip_dirs = {".git", "node_modules", "target", "venv", ".venv", "__pycache__"}
+        skip_dirs = {
+            ".git", "node_modules", "target", "venv", ".venv", "__pycache__",
+            "yara", "rules", "reports", "runs", "logs", "caldera_export", "caldera_plugin",
+        }
         try:
             for r_dir, dirs, files in os.walk(root):
                 dirs[:] = [d for d in dirs if d not in skip_dirs]

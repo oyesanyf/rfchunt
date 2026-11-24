@@ -163,3 +163,38 @@ def chat():
     assert any(ep["route_path"] == "/api/v1/chat" for ep in res["endpoints"])
     assert res["total_findings"] >= 1
 
+
+def test_python_ai_scanner_linear_time_on_large_single_line_json_and_skips_minified(tmp_path):
+    """Regression test: prevents catastrophic ReDoS on large single-line JSON/minified JS files."""
+    import time
+    from engine.call_graph_slicer import CallGraphSlicer
+
+    # Construct a ~400 KB single-line JSON blob packed with quotes and prompt/system keywords
+    single_line_json = (
+        '{"items":['
+        + ",".join(
+            f'{{"id":{i},"system":"prompt instruction check","note":"text"}}'
+            for i in range(6000)
+        )
+        + "]}"
+    )
+    json_path = tmp_path / "atlas_blob.json"
+    json_path.write_text(single_line_json, encoding="utf-8")
+
+    min_js = tmp_path / "vendor.min.js"
+    min_js.write_text("function a(){return 'system prompt';}" * 4000, encoding="utf-8")
+
+    scanner = PythonAIScanner()
+    t0 = time.perf_counter()
+    scanner.scan_file(json_path)
+    min_findings, min_eps = scanner.scan_file(min_js)
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 2.0, f"aiscan ReDoS regression: took {elapsed:.2f}s"
+    assert min_findings == [] and min_eps == []
+
+    # Verify CallGraphSlicer skips minified JS bundles
+    slicer = CallGraphSlicer()
+    discovered = slicer._discover_source_files(tmp_path)
+    assert all(not rel.endswith(".min.js") for _, rel, _ in discovered)
+
+

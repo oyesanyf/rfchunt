@@ -85,6 +85,13 @@ SKIP_DIR_NAMES: Set[str] = {
     "coverage",
     ".next",
     ".nuxt",
+    "yara",
+    "rules",
+    "reports",
+    "runs",
+    "logs",
+    "caldera_export",
+    "caldera_plugin",
 }
 
 CONTROL_KEYWORDS: Set[str] = {
@@ -2127,6 +2134,9 @@ class CallGraphSlicer:
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIR_NAMES and not d.startswith(".git"))
             for fname in sorted(filenames):
+                fl = fname.lower()
+                if fl.endswith((".min.js", ".min.mjs", ".min.cjs", ".bundle.js")):
+                    continue
                 ext = Path(fname).suffix.lower()
                 lang = LANGUAGE_BY_EXT.get(ext)
                 if not lang:
@@ -2149,6 +2159,10 @@ class CallGraphSlicer:
         try:
             source = abs_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            return None
+
+        # Skip minified single-line bundles (prevents O(N^2) brace-matching stalls)
+        if len(source) > 16_384 and source.count("\n") < max(1, len(source) // 512):
             return None
 
         if self._ts_backend.supports(lang):

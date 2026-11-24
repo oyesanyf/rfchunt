@@ -393,6 +393,15 @@ _SKIP_DIRS = {
     "out",
     "artifacts",
     "work",
+    "yara",
+    "rules",
+    "reports",
+    "runs",
+    "logs",
+    "caldera_export",
+    "caldera_plugin",
+    "coverage",
+    "vendor",
 }
 
 _SCAN_EXTENSIONS = {
@@ -431,7 +440,7 @@ _L30D_AI02_COOKIE_SIDECAR_RE = re.compile(
 
 # 3. SKILL-L30D-AI-03: Hermes SKILL.md / Plugin Manifest Supply-Chain Backdoor
 _L30D_AI03_HERMES_BACKDOOR_RE = re.compile(
-    r"""(?:curl\s+-[sSfL]+\s+https?://[^\s|]+\s*\|\s*(?:sh|bash|zsh)\b|wget\s+-qO-\s+https?://[^\s|]+\s*\|\s*(?:sh|bash)\b|Invoke-WebRequest[^|]+\|\s*(?:iex|Invoke-Expression)\b|base64\s+-d\s*\|\s*(?:sh|bash)\b)""",
+    r"""(?:curl\s+-[sSfL]+\s+https?://[^\s|]{1,300}\s*\|\s*(?:sh|bash|zsh)\b|wget\s+-qO-\s+https?://[^\s|]{1,300}\s*\|\s*(?:sh|bash)\b|Invoke-WebRequest[^|\r\n]{1,300}\|\s*(?:iex|Invoke-Expression)\b|base64\s+-d\s*\|\s*(?:sh|bash)\b)""",
     re.IGNORECASE,
 )
 
@@ -1128,6 +1137,9 @@ class Last30DaysSecuritySkillsEngine:
         if repo_path.is_file():
             return [repo_path]
         files_out: List[Path] = []
+        _data_exts = {".json", ".yaml", ".yml", ".toml"}
+        _manifest_names = {"package.json", "cargo.toml", "pyproject.toml", "tsconfig.json"}
+        data_files_added = 0
         for root, dirs, files in os.walk(repo_path):
             dirs[:] = [
                 d
@@ -1141,10 +1153,16 @@ class Last30DaysSecuritySkillsEngine:
                 fl = fname.lower()
                 if fl.startswith("test_") or fl.endswith("_test.py") or fl.endswith(".test.ts"):
                     continue
+                if fl.endswith((".min.js", ".min.css", ".bundle.js")):
+                    continue
                 if fl in ("last30days_security_skills.py", "arxiv_security_bridge.py"):
                     continue
                 ext = Path(fname).suffix.lower()
                 if ext in _SCAN_EXTENSIONS or fl == "skill.md":
+                    if ext in _data_exts and fl not in _manifest_names:
+                        data_files_added += 1
+                        if data_files_added > 150:
+                            continue
                     fpath = Path(root) / fname
                     try:
                         if fpath.stat().st_size <= 1_500_000:

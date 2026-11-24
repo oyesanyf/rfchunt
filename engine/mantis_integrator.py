@@ -637,6 +637,9 @@ def discover_candidate_files(target_path: str, max_bytes: int = 1_500_000) -> Li
             or d == ".github" or d.startswith(".github")
         )
         for fname in sorted(files):
+            fl = fname.lower()
+            if fl.endswith((".min.js", ".min.css", ".bundle.js")):
+                continue
             ext = os.path.splitext(fname)[1].lower()
             is_dockerfile = fname.lower() in ("dockerfile", "containerfile") or fname.lower().startswith(("dockerfile.", "containerfile."))
             is_env = fname.lower() == ".env" or fname.lower().startswith(".env")
