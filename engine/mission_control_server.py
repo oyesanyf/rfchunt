@@ -938,6 +938,37 @@ class MissionControlServer:
                         self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
 
+                if path == "/api/preflight/discover":
+                    try:
+                        from engine.preflight_discovery import run_preflight_discovery
+                        body = self._read_json_body()
+                        target_path = str(body.get("target_path") or "").strip() or None
+                        prompt_text = str(body.get("prompt") or "")
+                        policy_text = str(body.get("policy_text") or "")
+                        target_host = str(body.get("target_host") or "").strip() or None
+                        dry_run = bool(body.get("dry_run", False))
+                        live_req = bool(body.get("live", False)) and not dry_run
+                        enable_pqc = bool(body.get("pqc", True))
+                        include_home = bool(body.get("include_home_skills", True))
+                        raw_dirs = body.get("extra_skills_dirs")
+                        extra_dirs = [str(d) for d in raw_dirs] if isinstance(raw_dirs, list) else None
+                        res = run_preflight_discovery(
+                            target_path=target_path,
+                            prompt=prompt_text,
+                            policy_text=policy_text,
+                            target_host=target_host,
+                            live=live_req,
+                            enable_pqc=enable_pqc,
+                            include_home_skills=include_home,
+                            extra_skills_dirs=extra_dirs,
+                            output_dir=(None if dry_run else str(server_ref.orchestrator.reports_root / "preflight")),
+                            dry_run=dry_run,
+                        )
+                        self._send_json(HTTPStatus.OK, res)
+                    except ValueError as exc:
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+
                 if path == "/api/phi/scan":
                     try:
                         from engine.phi_scanner import PhiScanner
