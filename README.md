@@ -28,20 +28,49 @@
 ---
 
 ## Table of Contents
-1. [Overview & Core Architecture](#overview--core-architecture)
-2. [The Protocol Ruler Technique](#the-protocol-ruler-technique)
-3. [Interactive Mission Control Dashboard](#interactive-mission-control-dashboard)
-4. [Installation & Setup](#installation--setup)
-5. [Swarm Execution Modes & Workflows](#swarm-execution-modes--workflows)
-6. [Exhaustive CLI Flag & Parameter Reference](#exhaustive-cli-flag--parameter-reference)
+1. [Master Scorecard: Standalone Tools vs. RFCHunt (`--all`)](#master-scorecard-standalone-tools-vs-rfchunt---all)
+2. [Overview & Core Architecture](#overview--core-architecture)
+3. [The Protocol Ruler Technique](#the-protocol-ruler-technique)
+4. [Interactive Mission Control Dashboard](#interactive-mission-control-dashboard)
+5. [Installation & Setup](#installation--setup)
+6. [Swarm Execution Modes & Workflows](#swarm-execution-modes--workflows)
+7. [Exhaustive CLI Flag & Parameter Reference](#exhaustive-cli-flag--parameter-reference)
    - [rfc_hunt_swarm.py (Swarm CLI)](#1-rfc_hunt_swarmpy-swarm-orchestrator)
    - [protocol_ruler.py (Standalone Ruler)](#2-protocol_rulerpy-standalone-ruler)
    - [main.py (Modular Subcommand Toolkit)](#3-mainpy-modular-toolkit-subcommands)
-7. [The 19 Protocol Research Modules](#the-16-protocol-research-modules)
-8. [Research Attribution & Citations](#research-attribution--citations)
-9. [RAPTOR Framework Integration & Attribution](#raptor-framework-integration--attribution)
-10. [Google Research Harness² Integration & Attribution](#google-research-harness-integration--attribution)
-11. [Abliterated Models & Refusal-Free ModelFusion Guide](docs/ABLITERATED_MODELS_AND_FUSION_GUIDE.md)
+8. [The 19 Protocol Research Modules](#the-16-protocol-research-modules)
+9. [Research Attribution & Citations](#research-attribution--citations)
+10. [RAPTOR Framework Integration & Attribution](#raptor-framework-integration--attribution)
+11. [Google Research Harness² Integration & Attribution](#google-research-harness-integration--attribution)
+12. [Abliterated Models & Refusal-Free ModelFusion Guide](docs/ABLITERATED_MODELS_AND_FUSION_GUIDE.md)
+13. [Full Capability Matrix & Operational Rigor Specification](docs/MASTER_SCORECARD.md)
+
+---
+
+## Master Scorecard: Standalone Tools vs. RFCHunt (`--all`)
+
+RFCHunt unifies deep RFC protocol research, white-box AST/verification-inversion auditing, AI/MCP supply-chain defense, live differential verification, and self-hosted full-lifecycle GUI orchestration — with **default-on Strict 3-Lane Evidence Separation** so speculative passive correlations never dilute deterministic static signal or inflate severity.
+
+| Capability | `aiscan` alone | `RAPTOR` alone | `ARTEX` alone | `Mantis` alone | `Smuggler` / `Nuclei` alone | **RFCHunt (`--all` + `--serve-ui`)** |
+| :--- | :---: | :---: | :---: | :---: | :---: | :--- |
+| **AI / Prompt / MCP Poisoning & Unicode Smuggling** | Yes | Partial | No | Partial | No | **Yes (Native + Rust + Unicode BiDi/Tag + MCP Shadowing + Polyglot Routes)** |
+| **SAST + PQC Crypto Readiness + Multi-Ecosystem SCA** | No | Yes | No | Partial | No | **Yes (Native + Docker RAPTOR + NIST FIPS 203/204/205 Score + CVE Range SCA)** |
+| **6-Pass Verification Inversion Hunting** | No | No | No | No | No | **Yes (`0` FP on `sandbox-runtime`, Formal Invariants + Witness Traces)** |
+| **Live 30-Day CVE + ArXiv AST Rule Compiler** | No | No | No | No | No | **Yes (5 Structural Templates + Python AST Def-Use Taint + 3-Way Self-Test Gate)** |
+| **Enterprise-Safe Live Proxy Smuggling Fuzz** | No | No | No | No | Partial (Unsafe) | **Yes (`--allow-repo-exec` Opt-In + Env-Scrubbed + Ephemeral Sink Telemetry)** |
+| **Dual-Graph Multi-Hop Chaining + POE** | No | No | Yes | No | No | **Yes (Cross-Layer Wire + Code + AI + Default 3-Lane Isolation)** |
+| **4-Parser Differential Oracle + Merkle Proof** | No | No | No | No | No | **Yes (RFC 6962 Verified + Signed Tree Head + Consistency Proofs)** |
+| **Auto-Generated Patch + Snort 3 / Nuclei / Caldera** | No | Partial | No | Prompt only | No | **Yes (Verified-Only Gate: AST Patches + Snort 3 + Nuclei YAML + Caldera)** |
+| **Self-Hosted Full-Lifecycle GUI & Network Orchestration** | No | No | Yes | No | No | **Yes (`--serve-ui` Loopback SPA + Authenticated REST/SSE + `--network-lifecycle`)** |
+
+> [!TIP]
+> **Operational Rigor by Default (Zero Severity Inflation)**:
+> Running `python rfc_hunt_swarm.py --all <target>` strictly isolates findings into **3 orthogonal evidence lanes**:
+> 1. **Lane 1 (`VERIFIED_EXPLOIT`, `poe_level == 3`)** — Live/runtime/container-verified exploits (the only lane eligible to write RFC 6962 Merkle differential leaves and Snort 3 / Nuclei defensive rules).
+> 2. **Lane 2 (`DETERMINISTIC_STATIC`)** — Deterministic AST, Verification-Inversion, self-tested structural detectors, SAST/PQC/SCA, and AI/MCP checks (`combined_report.sarif` and headline `severity_counts` contain strictly **Lane 1 + Lane 2**).
+> 3. **Lane 3 (`SPECULATIVE_HYPOTHESIS`, `poe_level <= 1`)** — Unverified multi-hop Dual-Graph chains and synthesized probe templates are isolated into `speculative_hypotheses.sarif` (`level: "note"`, severity capped at `LOW`/`INFO` with theoretical blast radius preserved under `potential_impact`).
+>
+> See [docs/MASTER_SCORECARD.md](docs/MASTER_SCORECARD.md) for the complete architecture, verification metrics, and `--serve-ui` Mission Control guide.
 
 ---
 

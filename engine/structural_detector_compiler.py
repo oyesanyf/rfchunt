@@ -74,6 +74,8 @@ class StructuralTemplateSpec:
     self_test_passed: bool = True
     positive_test_hits: int = 1
     negative_test_hits: int = 0
+    adversarial_comment_test_hits: int = 0
+    self_test_precision: float = 1.0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -170,6 +172,64 @@ def execute_structural_template(
     raw_lines = content.splitlines()
     matches: List[StructuralMatch] = []
     tid = spec.template_id
+
+    # Python AST path for SOURCE_TO_SINK_TAINT (intraprocedural def-use taint tracking)
+    if tid == "SOURCE_TO_SINK_TAINT" and ext == ".py" and hasattr(ast, "unparse"):
+        try:
+            tree = ast.parse(clean)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    fn_src = ast.unparse(node)
+                    if any(re.search(gpat, fn_src, re.IGNORECASE) for gpat in spec.guard_patterns):
+                        continue
+                    tainted_vars = {
+                        arg.arg
+                        for arg in node.args.args
+                        if any(re.search(spat, arg.arg, re.IGNORECASE) for spat in spec.source_patterns)
+                    }
+                    for stmt in ast.walk(node):
+                        if isinstance(stmt, ast.Assign) and stmt.value is not None:
+                            rhs_s = ast.unparse(stmt.value)
+                            is_rhs_tainted = any(
+                                re.search(spat, rhs_s, re.IGNORECASE) for spat in spec.source_patterns
+                            ) or any(
+                                isinstance(sub_n, ast.Name) and sub_n.id in tainted_vars
+                                for sub_n in ast.walk(stmt.value)
+                            )
+                            is_rhs_guarded = any(
+                                re.search(gpat, rhs_s, re.IGNORECASE) for gpat in spec.guard_patterns
+                            )
+                            for tgt in stmt.targets:
+                                if isinstance(tgt, ast.Name):
+                                    if is_rhs_tainted and not is_rhs_guarded:
+                                        tainted_vars.add(tgt.id)
+                                    elif is_rhs_guarded and tgt.id in tainted_vars:
+                                        tainted_vars.discard(tgt.id)
+                    if tainted_vars:
+                        for sub in ast.walk(node):
+                            if isinstance(sub, ast.Call):
+                                call_s = ast.unparse(sub)
+                                if any(re.search(kpat, call_s, re.IGNORECASE) for kpat in spec.sink_patterns):
+                                    uses_tainted = any(
+                                        isinstance(arg_n, ast.Name) and arg_n.id in tainted_vars
+                                        for arg_n in ast.walk(sub)
+                                    )
+                                    if uses_tainted:
+                                        lno = int(getattr(sub, "lineno", node.lineno))
+                                        matches.append(
+                                            StructuralMatch(
+                                                template_id=tid,
+                                                line=lno,
+                                                function_name=node.name,
+                                                evidence_snippet=(raw_lines[lno - 1] if 1 <= lno <= len(raw_lines) else call_s).strip(),
+                                                description=f"Python AST def-use taint flow from {sorted(tainted_vars)} into sink `{call_s[:80]}` in `{node.name}`.",
+                                            )
+                                        )
+                                        break
+            if matches:
+                return matches
+        except SyntaxError:
+            pass
 
     # Python AST path for FAIL_OPEN_EXCEPTION when parsing valid Python
     if tid == "FAIL_OPEN_EXCEPTION" and ext == ".py":
@@ -455,9 +515,16 @@ def build_structural_template_spec(
         sink_patterns=sinks,
         guard_patterns=guards,
     )
+    adv_comment_fixture = "\n".join(
+        f"# {ln}\n// {ln}\n/* {ln} */" for ln in pos_fixture.splitlines() if ln.strip()
+    )
     pos_matches = execute_structural_template(pos_fixture, ".py", provisional)
     neg_matches = execute_structural_template(neg_fixture, ".py", provisional)
-    passed = len(pos_matches) >= 1 and len(neg_matches) == 0
+    adv_matches = execute_structural_template(adv_comment_fixture, ".py", provisional)
+    passed = len(pos_matches) >= 1 and len(neg_matches) == 0 and len(adv_matches) == 0
+    total_pos = len(pos_matches)
+    total_fp = len(neg_matches) + len(adv_matches)
+    precision = round(total_pos / float(total_pos + total_fp), 4) if (total_pos + total_fp) > 0 else 0.0
     return StructuralTemplateSpec(
         template_id=tid,
         cwe_id=cwe_id or "CWE-20",
@@ -467,4 +534,6 @@ def build_structural_template_spec(
         self_test_passed=passed,
         positive_test_hits=len(pos_matches),
         negative_test_hits=len(neg_matches),
+        adversarial_comment_test_hits=len(adv_matches),
+        self_test_precision=precision,
     )

@@ -222,6 +222,8 @@ class VerificationInversionFinding:
     call_chain: List[str] = field(default_factory=list)
     missing_predicates: List[str] = field(default_factory=list)
     counterexample_witness: str = ""
+    counterexample_trace: List[str] = field(default_factory=list)
+    violated_invariant_formula: str = ""
     poe_level: int = 1
     verification_status: str = "LEAD_PASSIVE_CORRELATION"
     finding_tier: str = "MANUAL_REVIEW_LEAD"
@@ -230,6 +232,69 @@ class VerificationInversionFinding:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def _synthesize_counterexample_trace_and_formula(f: VerificationInversionFinding) -> Tuple[List[str], str]:
+    """
+    Synthesizes a 3-step counterexample execution trace and formal invariant formula
+    for `VerificationInversionFinding`.
+    """
+    rid = f.rule_id
+    loc = f"{Path(f.file_path).name}:{f.line_number}"
+    chain_str = " -> ".join(f.call_chain) if f.call_chain else loc
+    if rid == "INV-COMP-ECHO-METHOD-CRED-LEAK":
+        return (
+            [
+                f"1. [Entry] Untrusted request `TRACE / HTTP/1.1` enters `{chain_str}` with `filterRequest == undefined`.",
+                f"2. [Inverted Guard @ {loc}] Method check is skipped when `filterRequest` is unset; proxy injects outbound `Authorization`/`Cookie` headers.",
+                "3. [Sink] Upstream `message/http` response echoes injected secret headers back to sandboxed caller.",
+            ],
+            "forall req: method(req) in {TRACE, TRACK} => Denied(req) || Stripped(AuthHeaders(req))",
+        )
+    if rid == "INV-REFINE-TLS-SNIFF-OPAQUE-BYPASS":
+        return (
+            [
+                f"1. [Entry] Client sends TLS ClientHello with outer record header `16 03 04 ...` (`buf[2] = 0x04`).",
+                f"2. [Inverted Guard @ {loc}] `{chain_str}` requires `buf[2] <= 0x03` and returns `false` (not a ClientHello).",
+                "3. [Sink] Proxy falls back to an uninspected opaque TCP tunnel, bypassing TLS MITM and `filterRequest`.",
+            ],
+            "forall buf: (buf[0] == 0x16 && buf[1] == 0x03) => ClassifiedAsTLSClientHello(buf)",
+        )
+    if rid == "INV-REFINE-TLS-FRAGMENT-SNI-BYPASS":
+        return (
+            [
+                f"1. [Entry] Client fragments TLS ClientHello across two TLS records split before `extensions_length`.",
+                f"2. [Inverted Guard @ {loc}] `{chain_str}` checks 16-bit record length `5 + readUInt16BE(3)` instead of 24-bit Handshake length `9 + readUIntBE(6, 3)`.",
+                "3. [Sink] Parser returns `{ kind: 'absent' }` instead of `{ kind: 'unreadable' }`.",
+            ],
+            "forall rec: HandshakeEnd(9 + uint24(rec[6..9])) > RecordEnd(5 + uint16(rec[3..5])) => Status == UNREADABLE",
+        )
+    if rid == "INV-REFINE-CASE-INSENSITIVE-FS-POLICY":
+        return (
+            [
+                f"1. [Entry] Sandbox opens `/workspace/.Git/hooks/pre-commit` on default case-insensitive macOS APFS.",
+                f"2. [Inverted Guard @ {loc}] Seatbelt profile in `{chain_str}` matches case-sensitive `(literal \".../.git/hooks\")` without `(?i)`.",
+                "3. [Sink] macOS kernel evaluates Seatbelt rule case-sensitively (no match), while APFS resolves `.Git` to `.git`.",
+            ],
+            "forall p1, p2: APFS_ResolvesSameNode(p1, p2) => (SeatbeltDeny(p1) <=> SeatbeltDeny(p2))",
+        )
+    if rid == "INV-ALG-MISSING-SHELL-STARTUP-DENY":
+        return (
+            [
+                f"1. [Entry] Sandboxed process writes payload to `~/.zshenv`.",
+                f"2. [Inverted Guard @ {loc}] Mandatory startup deny list blocks `.zshrc` and `.bashrc` but omits `.zshenv`.",
+                "3. [Sink] Next non-interactive `zsh -c` invocation sources `~/.zshenv` automatically outside the sandbox.",
+            ],
+            "forall f in ShellAutoSourcedFiles(zsh, bash): f in MandatoryWriteDenySet",
+        )
+    return (
+        [
+            f"1. [Entry] Input reaches `{chain_str}`.",
+            f"2. [Inversion @ {loc}] {f.title} ({f.evidence[:100]}).",
+            f"3. [Violation] Security contract `{f.primitive}` ({f.cwe}) fails closed invariant.",
+        ],
+        f"forall x in Domain({chain_str}): Challenge_{f.primitive}(x) => Solution_{f.rule_id}(x)",
+    )
 
 
 def _synthesize_counterexample_witness(f: VerificationInversionFinding) -> str:
@@ -356,6 +421,12 @@ class VerificationInversionHunter:
         for f in findings:
             if not f.counterexample_witness:
                 f.counterexample_witness = _synthesize_counterexample_witness(f)
+            if not f.counterexample_trace or not f.violated_invariant_formula:
+                trace_steps, inv_formula = _synthesize_counterexample_trace_and_formula(f)
+                if not f.counterexample_trace:
+                    f.counterexample_trace = trace_steps
+                if not f.violated_invariant_formula:
+                    f.violated_invariant_formula = inv_formula
             key = (f.rule_id, f.file_path.replace("\\", "/").lower(), int(f.line_number))
             if key not in seen:
                 seen.add(key)
@@ -1043,6 +1114,65 @@ class VerificationInversionHunter:
                                 call_chain=[sym.name],
                             )
                         )
+
+            # 4E. File-level sandbox policy refinement checks (macOS Seatbelt case sensitivity & shell startup deny completeness)
+            file_text = "\n".join(pf.lines)
+            if (
+                ("'.zshrc'" in file_text or '".zshrc"' in file_text)
+                and ("'.bashrc'" in file_text or '".bashrc"' in file_text)
+                and ("'.zshenv'" not in file_text and '".zshenv"' not in file_text)
+                and "DANGEROUS_FILES" in file_text
+            ):
+                for idx_ln, raw_ln in enumerate(pf.lines, start=1):
+                    if "'.zshrc'" in raw_ln or '".zshrc"' in raw_ln:
+                        out.append(
+                            VerificationInversionFinding(
+                                rule_id="INV-ALG-MISSING-SHELL-STARTUP-DENY",
+                                primitive="COMPARATOR_CONTRACT",
+                                severity="MEDIUM",
+                                cwe="CWE-732",
+                                file_path=abs_fp,
+                                line_number=idx_ln,
+                                title=f"Mandatory shell-startup deny list blocks `.zshrc`/`.bashrc` but omits `.zshenv` in {rel_path}:{idx_ln}",
+                                description=(
+                                    "Inverts `comparator` set-completeness contract: `DANGEROUS_FILES` protects `.zshrc` "
+                                    "and `.bashrc` from sandboxed writes, but omits `.zshenv`, which `zsh` sources "
+                                    "unconditionally on every interactive and non-interactive (`zsh -c`) invocation."
+                                ),
+                                evidence=raw_ln.strip()[:200],
+                                remediation="Add `'.zshenv'` and `'.zlogin'` to `DANGEROUS_FILES` mandatory write-deny list.",
+                                missing_predicates=[".zshenv"],
+                            )
+                        )
+                        break
+
+            if (
+                "(deny file-write*" in file_text
+                and "(literal " in file_text
+                and "(?i)" not in file_text
+                and ("macos" in rel_path.lower() or "seatbelt" in file_text.lower())
+            ):
+                for idx_ln, raw_ln in enumerate(pf.lines, start=1):
+                    if "(deny file-write*" in raw_ln:
+                        out.append(
+                            VerificationInversionFinding(
+                                rule_id="INV-REFINE-CASE-INSENSITIVE-FS-POLICY",
+                                primitive="REFINEMENT_GAP",
+                                severity="MEDIUM",
+                                cwe="CWE-178",
+                                file_path=abs_fp,
+                                line_number=idx_ln,
+                                title=f"macOS Seatbelt profile emits case-sensitive `(literal ...)` deny rules on case-insensitive APFS in {rel_path}:{idx_ln}",
+                                description=(
+                                    "Inverts `comp_refines_cli` (policy-vs-filesystem refinement): macOS Seatbelt `(literal ...)` "
+                                    "and `(regex ...)` path rules are evaluated case-sensitively by the kernel filter, while "
+                                    "default macOS APFS resolves paths case-insensitively (e.g. `.Git/hooks` resolves to `.git/hooks`)."
+                                ),
+                                evidence=raw_ln.strip()[:200],
+                                remediation="Emit case-insensitive Seatbelt regex rules (`(?i)`) or normalize case-variant deny patterns on macOS.",
+                            )
+                        )
+                        break
         return out
 
     # =========================================================================

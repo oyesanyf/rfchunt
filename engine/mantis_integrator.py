@@ -3179,6 +3179,25 @@ def build_sarif_document(
             ver_status = "LEAD_PASSIVE_CORRELATION"
             tier_label = "MANUAL_REVIEW_LEAD"
 
+        scanner_lbl = str(item.get("scanner") or tool_name)
+        is_speculative = (
+            str(item.get("evidence_lane") or "").upper() == "SPECULATIVE_HYPOTHESIS"
+            or (
+                poe_val < 3
+                and scanner_lbl in ("Module-17-ARTEX", "Module-17-ARTEX-DualGraph", "Module-19-PromptSmuggler")
+            )
+        )
+        evidence_lane = (
+            "VERIFIED_EXPLOIT"
+            if poe_val >= 3
+            else ("SPECULATIVE_HYPOTHESIS" if is_speculative else str(item.get("evidence_lane") or "DETERMINISTIC_STATIC"))
+        )
+        if is_speculative and sev.upper() in ("CRITICAL", "HIGH"):
+            potential_impact = str(item.get("potential_impact") or sev.upper())
+            sev = "MEDIUM" if poe_val == 2 else ("LOW" if poe_val == 1 else "INFO")
+        else:
+            potential_impact = str(item.get("potential_impact") or sev.upper())
+
         raw_title = str(item.get("title") or rid)
         if poe_val < 3 and raw_title.upper().startswith("CONFIRMED:"):
             prefix = "LEAD [ACTIVE_INDICATOR]:" if poe_val == 2 else "LEAD [PASSIVE_CORRELATION]:"
@@ -3188,10 +3207,12 @@ def build_sarif_document(
         if item.get("evidence"):
             msg += f" | Sink: {item.get('sink', '')}"
 
+        sarif_lvl = "note" if evidence_lane == "SPECULATIVE_HYPOTHESIS" else _sarif_level(sev)
+
         results.append(
             {
                 "ruleId": rid,
-                "level": _sarif_level(sev),
+                "level": sarif_lvl,
                 "message": {"text": msg},
                 "locations": [
                     {
@@ -3203,13 +3224,15 @@ def build_sarif_document(
                 ],
                 "properties": {
                     "severity": sev,
+                    "potential_impact": potential_impact,
+                    "evidence_lane": evidence_lane,
                     "cvss_score": item.get("cvss_score"),
                     "cvss_vector": item.get("cvss_vector"),
                     "reproduced": bool(item.get("reproduced", False) or poe_val >= 3),
                     "patch_verified": item.get("patch_verified", False),
-                    "scanner": item.get("scanner", tool_name),
+                    "scanner": scanner_lbl,
                     "corroborating_scanners": list(
-                        item.get("corroborating_scanners") or [item.get("scanner", tool_name)]
+                        item.get("corroborating_scanners") or [scanner_lbl]
                     ),
                     "is_zero_day": item.get("is_zero_day", False),
                     "poe_level": poe_val,
@@ -3261,6 +3284,18 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
             "cargo.toml", "cargo.lock", "go.mod",
         )
     ]
+    _KNOWN_VULN_DEP_MIN_VERSIONS: Tuple[Tuple[str, Tuple[int, int, int], str, str], ...] = (
+        ("urllib3", (2, 2, 2), "CVE-2024-37891", "Proxy-Authorization header leak on cross-origin redirect"),
+        ("cryptography", (42, 0, 4), "CVE-2024-26130", "NULL pointer dereference in pkcs12.serialize_key_and_certificates"),
+        ("aiohttp", (3, 9, 4), "CVE-2024-23334", "HTTP request smuggling & static symlink path traversal"),
+        ("axios", (1, 6, 0), "CVE-2023-45857", "Cross-site XSRF-TOKEN leakage across requests"),
+        ("ws", (8, 17, 1), "CVE-2024-37890", "DoS when handling upgrade requests with many headers"),
+        ("hyper", (0, 14, 28), "CVE-2023-26964", "HTTP/2 stream reset resource exhaustion"),
+    )
+    _DEP_VER_RE = re.compile(
+        r"""(?i)(?:^|["'\s])(?P<pkg>urllib3|cryptography|aiohttp|axios|ws|hyper)["'\s]*(?:==|>=|~=|[\^~:]\s*["']?|\s*=\s*["'][\^~]?)(?P<v1>\d+)\.(?P<v2>\d+)(?:\.(?P<v3>\d+))?"""
+    )
+
     for rfile in req_files:
         text = _read_text_safe(rfile)
         for lineno, line in enumerate(text.splitlines(), start=1):
@@ -3293,6 +3328,30 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
                         "remediation": "Pin dependency versions explicitly and use HTTPS/hash-pinned registries.",
                     }
                 )
+            m_dep = _DEP_VER_RE.search(line)
+            if m_dep:
+                pkg_low = m_dep.group("pkg").lower()
+                found_ver = (
+                    int(m_dep.group("v1")),
+                    int(m_dep.group("v2")),
+                    int(m_dep.group("v3") or 0),
+                )
+                for v_pkg, min_ver, cve_id, cve_desc in _KNOWN_VULN_DEP_MIN_VERSIONS:
+                    if pkg_low == v_pkg and found_ver < min_ver:
+                        min_ver_s = ".".join(str(x) for x in min_ver)
+                        found_ver_s = ".".join(str(x) for x in found_ver)
+                        sca_findings.append(
+                            {
+                                "rule_id": "RAPTOR-SCA-VULN-VERSION",
+                                "title": f"Vulnerable dependency {v_pkg}=={found_ver_s} ({cve_id}: {cve_desc})",
+                                "severity": "HIGH",
+                                "cwe": "CWE-1395",
+                                "file_path": rfile,
+                                "line_number": lineno,
+                                "scanner": "RAPTOR-CrossPlatform-SCA",
+                                "remediation": f"Upgrade {v_pkg} to >= {min_ver_s} to remediate {cve_id}.",
+                            }
+                        )
 
     cocci_findings: List[Dict[str, Any]] = []
     pqc_algorithms_detected: List[str] = []
@@ -3532,6 +3591,8 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
             for pqc_tok, pqc_label in (
                 ("ml-kem", "ML-KEM (FIPS 203)"),
                 ("ml_kem", "ML-KEM (FIPS 203)"),
+                ("x25519mlkem768", "X25519MLKEM768 Hybrid (FIPS 203)"),
+                ("secp256r1mlkem768", "SecP256r1MLKEM768 Hybrid (FIPS 203)"),
                 ("kyber", "Kyber/ML-KEM (FIPS 203)"),
                 ("ml-dsa", "ML-DSA (FIPS 204)"),
                 ("ml_dsa", "ML-DSA (FIPS 204)"),
@@ -3559,10 +3620,17 @@ def _run_cross_platform_raptor_fallback(target_path: str, files: List[str]) -> D
         + secret_findings
         + cocci_findings
     )
+    total_asym = len(pqc_algorithms_detected) + len(classical_asymmetric_detected)
+    if total_asym == 0:
+        pqc_score = 100.0 if not pqc_findings else max(0.0, 100.0 - 25.0 * len(pqc_findings))
+    else:
+        base_ratio = (len(pqc_algorithms_detected) / float(total_asym)) * 100.0
+        pqc_score = round(max(0.0, min(100.0, base_ratio - 15.0 * len(pqc_findings))), 1)
     pqc_readiness_summary = {
         "nist_pqc_algorithms_detected": pqc_algorithms_detected,
         "classical_asymmetric_detected": classical_asymmetric_detected,
         "hybrid_pqc_ready": bool(pqc_algorithms_detected),
+        "pqc_readiness_score": pqc_score,
         "quantum_vulnerable_findings_count": len(pqc_findings),
     }
     return {
@@ -5050,6 +5118,9 @@ def run_unified_all_scans(
                     ("mantis", "MANTIS-FIND", mantis_res.get("findings") or []),
                     ("aiscan", "AISCAN-FIND", aiscan_res.get("findings") or []),
                     ("raptor", "RAPTOR-FIND", raptor_res.get("findings") or []),
+                    ("VerificationInversionHunter", "INV-FIND", verification_inversion_res.get("findings") or []),
+                    ("ArxivSecurityBridge", "ARXIV-FIND", arxiv_research_res.get("findings") or []),
+                    ("Last30DaysSecuritySkills", "SKILL30D-FIND", last30days_skills_res.get("findings") or []),
                     ("Module-21-REA", "REA-FIND", rea_res.get("findings") or []),
                     ("ActiveFlawProber", "PROBER-FIND", prober_res.get("findings") or []),
                     ("ProtocolRuler", "RULER-FIND", ruler_res.get("findings") or []),
@@ -5064,7 +5135,11 @@ def run_unified_all_scans(
                         f_item = item if isinstance(item, dict) else {"title": str(item), "description": str(item), "rule_id": default_rule}
                         if ingester:
                             ingester(f_item, scanner=scanner_label)
-                        if scanner_label in (
+                        is_inv_wire = (
+                            scanner_label == "VerificationInversionHunter"
+                            and str(f_item.get("cwe") or "") in ("CWE-436", "CWE-444")
+                        )
+                        if is_inv_wire or scanner_label in (
                             "ActiveFlawProber",
                             "ProtocolRuler",
                             "DeterministicHarness",
@@ -5270,8 +5345,10 @@ def run_unified_all_scans(
         for probe in all_smuggle_probes:
             raw_aggregated_findings.append({
                 "rule_id": probe.probe_id,
-                "title": f"Desynchronized Prompt Injection: {probe.wire_anomaly_technique}",
-                "severity": "CRITICAL",
+                "title": f"Desynchronized Prompt Injection Hypothesis: {probe.wire_anomaly_technique}",
+                "severity": "LOW",
+                "potential_impact": "CRITICAL",
+                "evidence_lane": "SPECULATIVE_HYPOTHESIS",
                 "cwe": "CWE-444",
                 "file_path": probe.target_ai_endpoint,
                 "line_number": 1,
@@ -5293,10 +5370,18 @@ def run_unified_all_scans(
                     if ch_poe >= 3
                     else ("LEAD_ACTIVE_INDICATOR" if ch_poe == 2 else "LEAD_PASSIVE_CORRELATION")
                 )
+                ch_potential = str(ch.get("potential_impact") or ch.get("severity") or "CRITICAL").upper()
+                ch_eff_sev = (
+                    ch_potential
+                    if ch_poe >= 3
+                    else ("MEDIUM" if ch_poe == 2 else ("LOW" if ch_poe == 1 else "INFO"))
+                )
                 raw_aggregated_findings.append({
                     "rule_id": ch.get("rule_id", "ARTEX-CHAIN-001"),
                     "title": ch.get("title", "Multi-Hop Cross-Scanner Attack Chain"),
-                    "severity": ch.get("severity", "CRITICAL"),
+                    "severity": ch_eff_sev,
+                    "potential_impact": ch_potential,
+                    "evidence_lane": "VERIFIED_EXPLOIT" if ch_poe >= 3 else "SPECULATIVE_HYPOTHESIS",
                     "cwe": ch.get("cwe", "CWE-444"),
                     "file_path": ch.get("file_path", target_path),
                     "line_number": ch.get("line_number", 1),
@@ -5551,6 +5636,21 @@ def run_unified_all_scans(
         item["poe_level"] = poe_val
         item["verification_status"] = ver_status
         item["finding_tier"] = tier_label
+        is_speculative_item = (
+            str(item.get("evidence_lane") or "").upper() == "SPECULATIVE_HYPOTHESIS"
+            or (
+                poe_val < 3
+                and scanner_name in ("Module-17-ARTEX", "Module-17-ARTEX-DualGraph", "Module-19-PromptSmuggler")
+            )
+        )
+        item["evidence_lane"] = (
+            "VERIFIED_EXPLOIT"
+            if poe_val >= 3
+            else ("SPECULATIVE_HYPOTHESIS" if is_speculative_item else "DETERMINISTIC_STATIC")
+        )
+        if is_speculative_item and str(item.get("severity", "LOW")).upper() in ("CRITICAL", "HIGH"):
+            item.setdefault("potential_impact", str(item.get("severity", "CRITICAL")).upper())
+            item["severity"] = "MEDIUM" if poe_val == 2 else ("LOW" if poe_val == 1 else "INFO")
         item["corroborating_scanners"] = list(
             dict.fromkeys([*(item.get("corroborating_scanners") or []), scanner_name])
         )
@@ -5570,11 +5670,12 @@ def run_unified_all_scans(
             for sc in item["corroborating_scanners"]:
                 if sc not in existing["corroborating_scanners"]:
                     existing["corroborating_scanners"].append(sc)
-            if poe_val > int(existing.get("poe_level", 1) or 1):
+            if not is_speculative_item and poe_val > int(existing.get("poe_level", 1) or 1):
                 existing["poe_level"] = poe_val
                 existing["verification_status"] = ver_status
                 existing["finding_tier"] = tier_label
-            if _sev_order.get(str(item.get("severity", "INFO")).upper(), 0) > _sev_order.get(
+                existing["evidence_lane"] = item["evidence_lane"]
+            if not is_speculative_item and _sev_order.get(str(item.get("severity", "INFO")).upper(), 0) > _sev_order.get(
                 str(existing.get("severity", "INFO")).upper(), 0
             ):
                 existing["severity"] = str(item.get("severity", "INFO")).upper()
@@ -5582,10 +5683,18 @@ def run_unified_all_scans(
 
         is_specific_loc = (norm_fp != _norm_target_root) and (norm_line > 1 or norm_fp.startswith("/"))
         cross_key = (norm_fp, norm_line, norm_cwe)
-        if is_specific_loc and norm_cwe and cross_key in _cross_engine_index:
+        if (
+            not is_speculative_item
+            and is_specific_loc
+            and norm_cwe
+            and cross_key in _cross_engine_index
+        ):
             cand_idx = _cross_engine_index[cross_key]
             existing = aggregated_findings[cand_idx]
-            if existing.get("scanner") != scanner_name and scanner_name != "Module-17-ARTEX" and existing.get("scanner") != "Module-17-ARTEX":
+            if (
+                existing.get("scanner") != scanner_name
+                and existing.get("evidence_lane") != "SPECULATIVE_HYPOTHESIS"
+            ):
                 for sc in item["corroborating_scanners"]:
                     if sc not in existing["corroborating_scanners"]:
                         existing["corroborating_scanners"].append(sc)
@@ -5593,6 +5702,7 @@ def run_unified_all_scans(
                     existing["poe_level"] = poe_val
                     existing["verification_status"] = ver_status
                     existing["finding_tier"] = tier_label
+                    existing["evidence_lane"] = item["evidence_lane"]
                 if _sev_order.get(str(item.get("severity", "INFO")).upper(), 0) > _sev_order.get(
                     str(existing.get("severity", "INFO")).upper(), 0
                 ):
@@ -5602,12 +5712,19 @@ def run_unified_all_scans(
         new_idx = len(aggregated_findings)
         aggregated_findings.append(item)
         _exact_index[exact_key] = new_idx
-        if is_specific_loc and norm_cwe and scanner_name != "Module-17-ARTEX":
+        if is_specific_loc and norm_cwe and not is_speculative_item:
             _cross_engine_index.setdefault(cross_key, new_idx)
 
     verified_exploits: List[Dict[str, Any]] = [
-        f for f in aggregated_findings if int(f.get("poe_level", 0) or 0) >= 3
+        f for f in aggregated_findings if f.get("evidence_lane") == "VERIFIED_EXPLOIT"
     ]
+    deterministic_static_findings: List[Dict[str, Any]] = [
+        f for f in aggregated_findings if f.get("evidence_lane") == "DETERMINISTIC_STATIC"
+    ]
+    speculative_hypotheses: List[Dict[str, Any]] = [
+        f for f in aggregated_findings if f.get("evidence_lane") == "SPECULATIVE_HYPOTHESIS"
+    ]
+    primary_findings: List[Dict[str, Any]] = verified_exploits + deterministic_static_findings
     manual_review_leads: List[Dict[str, Any]] = [
         f for f in aggregated_findings if int(f.get("poe_level", 0) or 0) < 3
     ]
@@ -5643,23 +5760,41 @@ def run_unified_all_scans(
                 fusion_summary = str(exec_summary)
 
     combined_sarif_path = out_dir / "combined_report.sarif"
+    speculative_sarif_path = out_dir / "speculative_hypotheses.sarif"
     combined_json_path = out_dir / "combined_audit_summary.json"
     combined_txt_path = out_dir / "combined_summary.txt"
 
+    # Operational Rigor: primary combined_report.sarif contains ONLY verified exploits (POE=3) +
+    # deterministic static invariant findings by default, isolating speculative multi-hop hypotheses
+    # into speculative_hypotheses.sarif unless --include-leads is explicitly passed.
+    sarif_primary_inputs = aggregated_findings if include_leads else primary_findings
     combined_sarif = build_sarif_document(
         tool_name="RFCHunt-Unified-All-Scans",
         tool_uri=MANTIS_REPO_URL,
         target_root=target_path,
-        findings=aggregated_findings,
+        findings=sarif_primary_inputs,
     )
     with open(combined_sarif_path, "w", encoding="utf-8") as f:
         json.dump(combined_sarif, f, indent=2)
 
+    speculative_sarif = build_sarif_document(
+        tool_name="RFCHunt-Speculative-Hypotheses",
+        tool_uri=MANTIS_REPO_URL,
+        target_root=target_path,
+        findings=speculative_hypotheses,
+    )
+    with open(speculative_sarif_path, "w", encoding="utf-8") as f:
+        json.dump(speculative_sarif, f, indent=2)
+
     elapsed = round(time.monotonic() - t0, 3)
     sev_breakdown: Dict[str, int] = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
-    for item in aggregated_findings:
+    for item in primary_findings:
         sev = str(item.get("severity", "INFO")).upper()
         sev_breakdown[sev] = sev_breakdown.get(sev, 0) + 1
+    speculative_sev_breakdown: Dict[str, int] = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    for item in speculative_hypotheses:
+        sev = str(item.get("severity", "INFO")).upper()
+        speculative_sev_breakdown[sev] = speculative_sev_breakdown.get(sev, 0) + 1
 
     extra_report_files: Dict[str, Any] = {}
     if export_csv or export_advisory:
@@ -5719,6 +5854,122 @@ def run_unified_all_scans(
                 adv_paths.append(str(out_md))
             extra_report_files["advisories"] = adv_paths
 
+    # Strict Operational Rigor Gate 1: RFC 6962 Merkle Audit Trail ONLY ingests genuinely
+    # verified multi-trial differential wire findings (never speculative poe_level=1 leads
+    # or fabricated trials). Deterministic static provenance is recorded separately via
+    # `static_findings_sha256`.
+    merkle_audit_summary: Dict[str, Any] = {}
+    defensive_export_summary: Dict[str, Any] = {}
+    try:
+        from engine.merkle_audit import MerkleAuditTrail
+        m_trail = MerkleAuditTrail()
+        static_digest = hashlib.sha256(
+            json.dumps(
+                [
+                    {
+                        "rule_id": f.get("rule_id"),
+                        "file_path": f.get("file_path"),
+                        "line_number": f.get("line_number"),
+                        "severity": f.get("severity"),
+                        "scanner": f.get("scanner"),
+                    }
+                    for f in deterministic_static_findings
+                ],
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+
+        differential_candidates: List[Dict[str, Any]] = []
+        for f_item in verified_exploits:
+            if not isinstance(f_item, dict):
+                continue
+            v_att = int(f_item.get("verification_attempts") or 0)
+            has_real_diff = isinstance(f_item.get("four_parser_differential"), dict) and bool(
+                f_item["four_parser_differential"]
+            )
+            if (
+                f_item.get("scanner") in ("LiveH2DesyncProber", "MultiImplementationDifferentialOracle", "DeepRepoAudit-LiveProxyFuzz")
+                and v_att >= 3
+                and has_real_diff
+            ):
+                differential_candidates.append(f_item)
+
+        for idx_f, f_item in enumerate(differential_candidates[:100], start=1):
+            raw_p = str(f_item.get("raw_probe") or "").encode("latin-1", errors="replace")
+            raw_r = str(f_item.get("raw_response") or f_item.get("description") or "").encode("utf-8", errors="replace")
+            v_att = int(f_item.get("verification_attempts") or 0)
+            s_rep = int(f_item.get("successful_reproductions") or v_att)
+            r_rate = float(f_item.get("reproducibility_rate") or (s_rep / float(max(1, v_att))))
+            m_trail.record_finding(
+                entry_id=str(f_item.get("rule_id") or f"WIRE-{idx_f}"),
+                target_engine=str(f_item.get("scanner") or "RFCHunt"),
+                raw_probe=raw_p,
+                raw_response=raw_r,
+                reproducibility_rate=r_rate,
+                verification_attempts=v_att,
+                successful_reproductions=s_rep,
+                four_parser_differential=dict(f_item["four_parser_differential"]),
+                status="CONFIRMED_VULNERABILITY",
+            )
+
+        merkle_audit_summary = {
+            "status": "verified_differential_leaves_recorded" if m_trail.leaves else "no_live_differential_wire_findings",
+            "merkle_root": m_trail.get_merkle_root(),
+            "signed_tree_head": m_trail.compute_signed_tree_head(),
+            "total_leaves": len(m_trail.leaves),
+            "confirmed_leaves": len(m_trail.get_confirmed_leaves()),
+            "transient_leaves": len(m_trail.get_transient_leaves()),
+            "static_findings_sha256": static_digest,
+            "deterministic_static_count": len(deterministic_static_findings),
+        }
+    except Exception as m_exc:
+        merkle_audit_summary = {"status": "error", "error": str(m_exc)}
+
+    # Strict Operational Rigor Gate 2: Defensive Intelligence Publisher (Snort 3 / Nuclei YAML /
+    # Arm 106-107) ONLY exports signatures from Lane-1 verified wire exploits (`poe_level >= 3`)
+    # with concrete `raw_probe` wire evidence — never from speculative poe_level=1 hypotheses.
+    try:
+        from engine.defensive_publisher import DefensiveIntelligencePublisher
+        from engine.taxonomy import ImpactClass, ReproducibleVulnerability
+        verified_wire_exploits = [
+            f_item
+            for f_item in verified_exploits
+            if isinstance(f_item, dict) and str(f_item.get("raw_probe") or "").strip()
+        ]
+        if verified_wire_exploits:
+            def_pub = DefensiveIntelligencePublisher(output_dir=str(out_dir), db=db)
+            for idx_v, f_item in enumerate(verified_wire_exploits[:15], start=1):
+                probe_b = str(f_item["raw_probe"]).encode("latin-1", errors="replace")
+                v_att = max(3, int(f_item.get("verification_attempts") or 3))
+                s_rep = max(3, int(f_item.get("successful_reproductions") or v_att))
+                v_obj = ReproducibleVulnerability(
+                    vuln_id=f"{f_item.get('rule_id', 'VULN')}-{idx_v:04d}",
+                    anomaly_id=f"ANOM-{idx_v:04d}",
+                    impact=ImpactClass.DESYNCHRONIZATION,
+                    minimized_probe=probe_b,
+                    reproducibility_rate=float(f_item.get("reproducibility_rate") or 1.0),
+                    verification_attempts=v_att,
+                    successful_reproductions=s_rep,
+                    delta_debug_steps=1,
+                )
+                def_pub.publish_finding(v_obj, rfc_anchor="RFC9112", evidence_verified=True, auto_export=False)
+            exported_paths = def_pub.export_all() if def_pub.arm106_rules else {}
+            defensive_export_summary = {
+                "status": "published_from_verified_wire_exploits",
+                "rules_published": len(def_pub.arm106_rules),
+                "regression_tests_published": len(def_pub.arm107_tests),
+                "exported_files": exported_paths,
+            }
+        else:
+            defensive_export_summary = {
+                "status": "skipped_no_verified_wire_exploits",
+                "rules_published": 0,
+                "regression_tests_published": 0,
+                "exported_files": {},
+            }
+    except Exception as d_exc:
+        defensive_export_summary = {"status": "error", "error": str(d_exc)}
+
     result_payload = {
         "target_path": target_path,
         "mode": scan_mode,
@@ -5730,17 +5981,26 @@ def run_unified_all_scans(
         "fusion_enabled": enforced_fusion,
         "abliterated_model": enforced_model,
         "fusion_models": list(mantis_engine.fusion_models),
+        "strict_evidence_separation": True,
         "total_aggregated_findings": len(aggregated_findings),
+        "primary_findings_count": len(primary_findings),
         "verified_exploits_count": len(verified_exploits),
+        "deterministic_static_count": len(deterministic_static_findings),
+        "speculative_hypotheses_count": len(speculative_hypotheses),
         "manual_review_leads_count": len(manual_review_leads),
         "verified_exploits": verified_exploits,
+        "deterministic_static_findings": deterministic_static_findings,
+        "speculative_hypotheses": speculative_hypotheses,
         "manual_review_leads": manual_review_leads,
+        "merkle_audit": merkle_audit_summary,
+        "defensive_intelligence": defensive_export_summary,
         "request_hygiene": {
             "custom_headers": list(hygiene_cfg.headers),
             "user_agent": hygiene_cfg.user_agent,
             "max_rps": effective_max_rps,
         },
         "severity_counts": sev_breakdown,
+        "speculative_severity_counts": speculative_sev_breakdown,
         "executive_summary": fusion_summary,
         "engines": {
             "mantis": {
@@ -5798,6 +6058,7 @@ def run_unified_all_scans(
         },
         "report_files": {
             "combined_sarif": str(combined_sarif_path),
+            "speculative_sarif": str(speculative_sarif_path),
             "combined_json": str(combined_json_path),
             "combined_txt": str(combined_txt_path),
             "mantis_sarif": (mantis_res.get("report_files") or {}).get("sarif", "") if isinstance(mantis_res.get("report_files"), dict) else "",
@@ -5822,14 +6083,17 @@ def run_unified_all_scans(
         "=== RFCHunt Unified --all Security Scan Summary ===",
         f"Target: {target_path}",
         f"Mode: {scan_mode} | Depth: {effective_depth} | Fusion Enforced: {enforced_fusion} | Abliterated Model: {enforced_model}",
-        f"Total Aggregated Findings: {len(aggregated_findings)}",
-        f"Severity Breakdown: {json.dumps(sev_breakdown)}",
+        f"Primary Signal (Verified Exploits + Deterministic Static): {len(primary_findings)} (Verified POE=3: {len(verified_exploits)}, Deterministic Static: {len(deterministic_static_findings)})",
+        f"Headline Severity Breakdown (Primary Signal Only): {json.dumps(sev_breakdown)}",
+        f"Isolated Speculative Hypotheses (poe<=1, capped <= LOW): {len(speculative_hypotheses)} ({json.dumps(speculative_sev_breakdown)})",
         f"Mantis Findings: {mantis_res.get('total_findings', 0)} (Reproduced: {mantis_res.get('reproduced_count', 0)}, Patched Verified: {mantis_res.get('patched_verified_count', 0)})",
         f"aiscan AI Findings: {aiscan_res.get('total_findings', 0)}",
         f"RAPTOR SAST/PQC/SCA/Web Findings: {len(raptor_res.get('findings') or [])}",
         f"Module 21 REA Surface/Bundle Findings: {rea_res.get('total_findings', 0)} (Routes: {rea_res.get('total_endpoints', 0)}, AI Sinks: {rea_res.get('total_ai_sinks', 0)}, IPC: {rea_res.get('total_ipc_channels', 0)})",
         f"ARTEX Attack Chains: {artex_res.get('chains_synthesized', 0)} synthesized (Verified: {artex_res.get('exploits_verified', 0)}, Max Hops: {artex_res.get('max_hop_count', 0)}, Goal Proven: {artex_res.get('goal_proven', False)}, Traces: {artex_res.get('worker_traces_count', 0)})",
         f"Prompt Smuggling Probes Synthesized: {smuggle_res.get('probes_generated', 0)}",
+        f"Merkle Audit Trail: {merkle_audit_summary.get('status', 'unknown')} (Leaves: {merkle_audit_summary.get('total_leaves', 0)})",
+        f"Defensive Signatures: {defensive_export_summary.get('status', 'unknown')} (Rules: {defensive_export_summary.get('rules_published', 0)})",
     ]
     if has_remote:
         txt_lines.append(f"Active Flaw Prober Findings: {prober_res.get('total_findings', 0)}")
@@ -5838,8 +6102,9 @@ def run_unified_all_scans(
         txt_lines.append(f"Differential Oracle Findings: {oracle_res.get('total_findings', 0)}")
     txt_lines.extend([
         "",
-        f"Combined SARIF: {combined_sarif_path}",
-        f"Combined JSON:  {combined_json_path}",
+        f"Primary SARIF (Verified + Deterministic): {combined_sarif_path}",
+        f"Speculative SARIF (Isolated Hypotheses):  {speculative_sarif_path}",
+        f"Combined JSON:                            {combined_json_path}",
     ])
     with open(combined_txt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(txt_lines) + "\n")

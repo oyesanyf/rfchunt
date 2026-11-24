@@ -1266,11 +1266,15 @@ def _find_node_proxy_entrypoint(root: Path) -> Optional[Path]:
     return None
 
 
-def _start_ephemeral_loopback_sink() -> Tuple[int, socket.socket, threading.Event, threading.Thread]:
+def _start_ephemeral_loopback_sink(
+    telemetry_log: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[int, socket.socket, threading.Event, threading.Thread]:
     """
     Binds an ephemeral loopback sink server on `127.0.0.1:0` so any request forwarded
     by a permissive proxy lands strictly on RFCHunt's own ephemeral sink listener
     instead of hitting local enterprise services on ports 80/443.
+    When `telemetry_log` is provided, records every forwarded upstream HTTP request
+    to deterministically confirm request smuggling or authority-confusion forwarding.
     """
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1279,6 +1283,7 @@ def _start_ephemeral_loopback_sink() -> Tuple[int, socket.socket, threading.Even
     srv.listen(32)
     srv.settimeout(0.2)
     stop_evt = threading.Event()
+    log_lock = threading.Lock()
 
     def _serve() -> None:
         try:
@@ -1292,7 +1297,28 @@ def _start_ephemeral_loopback_sink() -> Tuple[int, socket.socket, threading.Even
                 with conn:
                     conn.settimeout(0.4)
                     try:
-                        conn.recv(2048)
+                        raw_req = conn.recv(4096)
+                        if telemetry_log is not None and raw_req:
+                            text_req = raw_req.decode("latin-1", errors="replace")
+                            lines = text_req.splitlines()
+                            first_line = lines[0].strip() if lines else ""
+                            host_hdr = ""
+                            for hline in lines[1:]:
+                                if hline.lower().startswith("host:"):
+                                    host_hdr = hline.split(":", 1)[1].strip()
+                                    break
+                            req_line_hits = len(
+                                re.findall(r"(?:^|\r?\n)(?:GET|POST|PUT|DELETE|CONNECT|HEAD|OPTIONS|TRACE)\s+\S+\s+HTTP/1\.", text_req)
+                            )
+                            with log_lock:
+                                telemetry_log.append(
+                                    {
+                                        "first_line": first_line[:160],
+                                        "host": host_hdr[:120],
+                                        "bytes_received": len(raw_req),
+                                        "http_requests_in_frame": max(1, req_line_hits),
+                                    }
+                                )
                         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
                     except OSError:
                         pass
@@ -1636,7 +1662,8 @@ def run_live_proxy_fuzz(
             }
 
         _assert_not_corporate_or_system_proxy_port(active_port)
-        sink_port, _sink_sock, sink_stop_evt, sink_thread = _start_ephemeral_loopback_sink()
+        sink_telemetry: List[Dict[str, Any]] = []
+        sink_port, _sink_sock, sink_stop_evt, sink_thread = _start_ephemeral_loopback_sink(sink_telemetry)
         active_probes = build_live_proxy_probes(sink_port)
 
         oracle = MultiImplementationDifferentialOracle()
@@ -1719,6 +1746,9 @@ def run_live_proxy_fuzz(
             "status": "completed",
             "target": f"{proxy_host}:{active_port}",
             "ephemeral_sink_port": sink_port,
+            "sink_requests_observed": len(sink_telemetry),
+            "sink_confirmed_smuggling": any(int(item.get("http_requests_in_frame", 1)) > 1 for item in sink_telemetry),
+            "sink_telemetry": sink_telemetry[:50],
             "discovered_proxy_files": discovered_proxies,
             "probes_sent": len(probe_results) * LIVE_PROBE_TRIALS,
             "unique_probes": len(probe_results),

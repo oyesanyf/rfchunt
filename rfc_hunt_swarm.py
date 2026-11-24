@@ -7105,6 +7105,12 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--board-width", dest="board_width", type=int, default=100, help="Column width for pure-CLI Swarm Overview board (default: 100)")
     parser.add_argument("--board-events", dest="board_events", type=int, default=15, help="Max recent blackboard events shown in `swarm-board` (default: 15)")
 
+    # Self-Hosted Mission Control Full-Lifecycle GUI Server & Turnkey Network Orchestration
+    parser.add_argument("--serve-ui", dest="serve_ui", action="store_true", default=False, help="Launch self-hosted Mission Control Web GUI & full-lifecycle REST/SSE orchestration server (loopback 127.0.0.1:8789 by default)")
+    parser.add_argument("--ui-host", dest="ui_host", type=str, default="127.0.0.1", help="Bind host for --serve-ui Mission Control server (default: 127.0.0.1)")
+    parser.add_argument("--ui-allow-non-loopback", dest="ui_allow_non_loopback", action="store_true", default=False, help="Explicitly permit binding --serve-ui on a non-loopback interface")
+    parser.add_argument("--network-lifecycle", dest="network_lifecycle", action="store_true", default=False, help="Run turnkey multi-target network lifecycle profile (--all + opt-in httpx/katana/nuclei discovery + Dual-Graph + retest)")
+
     return parser
 
 
@@ -7533,6 +7539,31 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
     # Configure ExecutionPolicy singleton with CLI flags and env opt-in
     from engine.execution_policy import ExecutionPolicy
     ExecutionPolicy.get_instance().allow_destructive = ExecutionPolicy.get_instance().allow_destructive or bool(getattr(args, "allow_destructive", False))
+
+    # Self-Hosted Mission Control Full-Lifecycle Web GUI & REST/SSE Server (--serve-ui)
+    if getattr(args, "serve_ui", False):
+        from engine.mission_control_server import MissionControlOrchestrator, MissionControlServer
+        orch = MissionControlOrchestrator(
+            reports_root=str(Path(getattr(args, "output_dir", "reports") or "reports") / "mission_control"),
+            db_path=getattr(args, "db", "terminator.db"),
+        )
+        srv = MissionControlServer(
+            host=str(getattr(args, "ui_host", "127.0.0.1") or "127.0.0.1"),
+            port=int(getattr(args, "ui_port", 8789) or 8789),
+            allow_non_loopback=bool(getattr(args, "ui_allow_non_loopback", False)),
+            orchestrator=orch,
+        )
+        srv.serve_forever()
+        return
+
+    # Turnkey Network Lifecycle Profile (--network-lifecycle) promotes --all with external discovery & retest
+    if getattr(args, "network_lifecycle", False):
+        args.run_all_scans = True
+        args.strict_poe = True
+        args.artex_retest = True
+        if getattr(args, "authorized", False):
+            args.enable_external_discovery = True
+            args.enable_external_nuclei = True
 
     # Standalone CLI-only blackboard hint injection (zero GUI / HTTP server calls)
     has_non_hint_action = explicit_mode_given and active_mode != "hint"

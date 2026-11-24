@@ -172,10 +172,63 @@ class DefensiveIntelligencePublisher:
             validation_logic=validation_code,
         )
 
+    @staticmethod
+    def synthesize_snort3_rule(rule: Arm106DefensiveRule, test: Optional[Arm107RegressionTest] = None, sid_offset: int = 1) -> str:
+        """Synthesizes a Snort 3 IDS signature from an Arm 106 rule and minimized wire probe."""
+        sid = 9100000 + int(sid_offset)
+        msg = f"RFCHunt {rule.rule_id} - {rule.name} ({rule.specification_anchor})".replace('"', "'")
+        probe_bytes = test.probe_bytes if (test and isinstance(test.probe_bytes, bytes)) else b""
+        if b"transfer-encoding" in probe_bytes.lower() and b"content-length" in probe_bytes.lower():
+            content_clause = 'content:"Transfer-Encoding",nocase; content:"Content-Length",nocase;'
+        elif b"\x00" in probe_bytes:
+            content_clause = 'content:"|00|";'
+        elif probe_bytes:
+            sample_hex = probe_bytes[:16].hex()
+            content_clause = f'content:"|{sample_hex}|";'
+        else:
+            content_clause = 'content:"HTTP/1.1";'
+        return (
+            f'alert http any any -> any any (msg:"{msg}"; '
+            f'flow:to_server,established; {content_clause} '
+            f'classtype:protocol-command-decode; sid:{sid}; rev:1;)'
+        )
+
+    @staticmethod
+    def synthesize_nuclei_template(rule: Arm106DefensiveRule, test: Optional[Arm107RegressionTest] = None) -> str:
+        """Synthesizes a ProjectDiscovery Nuclei YAML template from an Arm 106/107 finding."""
+        tid = rule.rule_id.lower()
+        sev = (rule.severity or "high").lower()
+        raw_req = (
+            test.probe_bytes.decode("latin-1", errors="replace")
+            if (test and isinstance(test.probe_bytes, bytes) and test.probe_bytes)
+            else "GET / HTTP/1.1\r\nHost: {{Hostname}}\r\n\r\n"
+        )
+        indented_req = "\n".join("        " + ln for ln in raw_req.splitlines() if ln.strip())
+        return (
+            f"id: {tid}\n"
+            f"info:\n"
+            f"  name: \"{rule.name} ({rule.specification_anchor})\"\n"
+            f"  author: rfchunt-autonomous-publisher\n"
+            f"  severity: {sev}\n"
+            f"  tags: rfc,{rule.specification_anchor.lower()},desync,arm106\n"
+            f"http:\n"
+            f"  - raw:\n"
+            f"      - |\n"
+            f"{indented_req}\n"
+            f"    unsafe: true\n"
+            f"    matchers:\n"
+            f"      - type: status\n"
+            f"        status:\n"
+            f"          - 200\n"
+            f"          - 500\n"
+        )
+
     def export_all(self) -> Dict[str, str]:
-        """Writes data files for Arms 106 and 107."""
+        """Writes data files for Arms 106 and 107, plus Snort 3 IDS rules and Nuclei YAML templates."""
         arm106_file = self.output_dir / "defensive_rules_arm106.json"
         arm107_file = self.output_dir / "regression_suite_arm107.json"
+        snort3_file = self.output_dir / "snort3_rules_arm106.rules"
+        nuclei_file = self.output_dir / "nuclei_templates_arm106.yaml"
 
         # Serialize Arm 106
         arm106_data = [
@@ -207,9 +260,23 @@ class DefensiveIntelligencePublisher:
         with open(arm107_file, "w", encoding="utf-8") as f:
             json.dump(arm107_data, f, indent=2)
 
+        snort_lines: List[str] = []
+        nuclei_docs: List[str] = []
+        for idx, r in enumerate(self.arm106_rules, start=1):
+            paired_test = self.arm107_tests[idx - 1] if idx - 1 < len(self.arm107_tests) else None
+            snort_lines.append(self.synthesize_snort3_rule(r, paired_test, sid_offset=idx))
+            nuclei_docs.append(self.synthesize_nuclei_template(r, paired_test))
+
+        with open(snort3_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(snort_lines) + ("\n" if snort_lines else ""))
+        with open(nuclei_file, "w", encoding="utf-8") as f:
+            f.write("\n---\n".join(nuclei_docs) + ("\n" if nuclei_docs else ""))
+
         return {
             "arm106_path": str(arm106_file),
             "arm107_path": str(arm107_file),
+            "snort3_path": str(snort3_file),
+            "nuclei_path": str(nuclei_file),
         }
 
     def sync_db_findings(self) -> int:
