@@ -813,6 +813,23 @@ class ToolProvisioner:
             )
 
         if tool_id == "ollama":
+            try:
+                from engine.paid_model_provider import load_paid_model_config
+
+                paid_cfg = load_paid_model_config()
+                if paid_cfg.enabled:
+                    return ToolStatus(
+                        tool_id="ollama",
+                        display_name=spec.display_name,
+                        category=spec.category,
+                        installed=True,
+                        path_or_source=paid_cfg.source_file or paid_cfg.provider,
+                        method="bypassed_paid_env_local",
+                        detail=f"Bypassed Ollama; using paid provider '{paid_cfg.provider}' from .env.local",
+                    )
+            except Exception:
+                pass
+
             from ollama_manager import HEALTH_PROBE_MAX_TIMEOUT_SEC, OllamaLifecycleManager
 
             bin_path = OllamaLifecycleManager.find_ollama_binary()
@@ -835,6 +852,23 @@ class ToolProvisioner:
             )
 
         if tool_id == "ollama_models":
+            try:
+                from engine.paid_model_provider import load_paid_model_config
+
+                paid_cfg = load_paid_model_config()
+                if paid_cfg.enabled:
+                    return ToolStatus(
+                        tool_id="ollama_models",
+                        display_name=spec.display_name,
+                        category=spec.category,
+                        installed=True,
+                        path_or_source=", ".join(paid_cfg.panel_models[:4]) or paid_cfg.primary_model,
+                        method="bypassed_paid_env_local",
+                        detail=f"Bypassed Ollama pulls; paid models active ({', '.join(paid_cfg.panel_models[:3])})",
+                    )
+            except Exception:
+                pass
+
             if not allow_probes:
                 return ToolStatus(
                     tool_id="ollama_models",
@@ -1416,6 +1450,24 @@ class ToolProvisioner:
         )
 
     def _install_ollama_and_models(self, *, pull_models: bool = True) -> ToolStatus:
+        try:
+            from engine.paid_model_provider import load_paid_model_config
+
+            paid_cfg = load_paid_model_config()
+            if paid_cfg.enabled:
+                return ToolStatus(
+                    tool_id="ollama_models" if pull_models else "ollama",
+                    display_name="Abliterated ModelFusion Trio" if pull_models else "Ollama Local AI Runtime",
+                    category="ai",
+                    installed=True,
+                    path_or_source=", ".join(paid_cfg.panel_models[:4]) or paid_cfg.provider,
+                    method="bypassed_paid_env_local",
+                    detail=f"Bypassed Ollama setup/pull; using paid provider '{paid_cfg.provider}' from .env.local",
+                    installed_now=False,
+                )
+        except Exception:
+            pass
+
         from ollama_manager import (
             HEALTH_PROBE_MAX_TIMEOUT_SEC,
             OllamaLifecycleManager,

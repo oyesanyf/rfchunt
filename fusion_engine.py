@@ -20,6 +20,13 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from database import Database
+from engine.paid_model_provider import (
+    PaidModelClient,
+    PaidModelConfig,
+    is_loopback_url,
+    is_ollama_model_tag,
+    load_paid_model_config,
+)
 from ollama_manager import (
     HEALTH_PROBE_MAX_TIMEOUT_SEC,
     OllamaLifecycleManager,
@@ -98,14 +105,67 @@ class FusionArbiter:
         preferred_model: Optional[str] = None,
         arbiter_model: Optional[str] = None,
         quiet: bool = False,
+        env_local_path: Optional[str] = None,
+        force_ollama: bool = False,
     ):
         self.endpoint = endpoint or os.environ.get("OLLAMA_ENDPOINT", self.DEFAULT_OLLAMA_ENDPOINT)
         self.db = db
         timeout_env = os.environ.get("OLLAMA_TIMEOUT", "120.0")
         self.timeout = float(timeout_env) if float(timeout_env) > 0 else None
-        self.client = httpx.Client(timeout=httpx.Timeout(self.timeout, connect=10.0))
         self.free_ram_gb = self._get_free_memory_gb()
         self.free_vram_mb = self._get_free_vram_mb()
+
+        self.paid_config: PaidModelConfig = load_paid_model_config(
+            env_local_path=env_local_path,
+            force_ollama=force_ollama,
+        )
+        self.paid_client: Optional[PaidModelClient] = None
+
+        if self.paid_config.enabled:
+            self.backend_mode = "paid_api"
+            self.using_ollama = False
+            self.paid_client = PaidModelClient(self.paid_config, timeout=self.timeout)
+            self.client = self.paid_client.client
+
+            exp_pref = (
+                preferred_model
+                if (preferred_model and not is_ollama_model_tag(preferred_model))
+                else None
+            )
+            exp_sec = (
+                sec_model
+                if (sec_model and not is_ollama_model_tag(sec_model))
+                else None
+            )
+            exp_arb = (
+                arbiter_model
+                if (arbiter_model and not is_ollama_model_tag(arbiter_model))
+                else None
+            )
+
+            self.gemma_model = exp_pref or self.paid_config.primary_model
+            self.sec_model = exp_sec or self.paid_config.sec_model
+            self.arbiter_model = exp_arb or self.paid_config.arbiter_model
+
+            panel_tags: List[str] = []
+            for m in (self.gemma_model, self.sec_model, self.arbiter_model, *self.paid_config.panel_models):
+                if m and m not in panel_tags:
+                    panel_tags.append(m)
+            self.available_tags = panel_tags
+
+            if not quiet:
+                print(
+                    f"[ModelFusion] Paid API Panel Initialized "
+                    f"(provider={self.paid_config.provider}, Ollama bypassed, source={self.paid_config.source_file}):"
+                )
+                print(f"  - Protocol Specialist : {self.gemma_model}")
+                print(f"  - Boundary Specialist : {self.sec_model}")
+                print(f"  - Reasoning Arbiter   : {self.arbiter_model}")
+            return
+
+        self.backend_mode = "ollama"
+        self.using_ollama = True
+        self.client = httpx.Client(timeout=httpx.Timeout(self.timeout, connect=10.0))
         self.available_tags = self._fetch_available_tags()
 
         # Dynamically pull missing preferred abliterated models at runtime when online
@@ -211,6 +271,13 @@ class FusionArbiter:
             print(f"  - Reasoning Arbiter   : {self.arbiter_model}")
 
     def close(self) -> None:
+        paid_client = getattr(self, "paid_client", None)
+        if paid_client is not None:
+            try:
+                paid_client.close()
+            except Exception:
+                pass
+            return
         client = getattr(self, "client", None)
         if client is not None:
             try:
@@ -250,7 +317,10 @@ class FusionArbiter:
         return size_qwen_for_free_memory(free_ram_gb, free_vram_mb)
 
     def _fetch_available_tags(self) -> List[str]:
-        """Probes Ollama (<=400ms) and auto-readies the daemon when online and auto-install enabled."""
+        """Probes Ollama (<=400ms) and auto-readies the daemon when online (skipped in paid API mode)."""
+        if not getattr(self, "using_ollama", True):
+            cfg = getattr(self, "paid_config", None)
+            return list(cfg.panel_models) if cfg and cfg.enabled else list(getattr(self, "available_tags", []) or [])
         if os.environ.get("RFCHUNT_OFFLINE") == "1":
             return []
         auto_install = os.environ.get("RFCHUNT_AUTO_INSTALL_TOOLS", "1") != "0"
@@ -392,6 +462,32 @@ class FusionArbiter:
         system_prompt: str,
         num_predict: int = 160,
     ) -> str:
+        if not getattr(self, "using_ollama", True) and getattr(self, "paid_client", None) is not None:
+            paid_client = self.paid_client
+            resp_txt = paid_client.generate(
+                system_prompt=system_prompt,
+                user_prompt=prompt,
+                model=model,
+                max_tokens=max(int(num_predict), 256),
+                temperature=0.3,
+                expect_json=True,
+            )
+            if resp_txt:
+                return resp_txt
+            for fb_model in getattr(self, "available_tags", []) or []:
+                if fb_model and fb_model != model:
+                    fb_txt = paid_client.generate(
+                        system_prompt=system_prompt,
+                        user_prompt=prompt,
+                        model=fb_model,
+                        max_tokens=max(int(num_predict), 256),
+                        temperature=0.3,
+                        expect_json=True,
+                    )
+                    if fb_txt:
+                        return fb_txt
+            return ""
+
         if not self.available_tags:
             self.available_tags = self._fetch_available_tags()
 
@@ -969,13 +1065,22 @@ Output strict JSON matching:
         ]
         participating_models = [self.gemma_model, self.sec_model, self.arbiter_model]
 
-        if not generative_tags or os.environ.get("RFCHUNT_OFFLINE") == "1":
+        paid_active = (not getattr(self, "using_ollama", True)) and getattr(self, "paid_client", None) is not None
+        paid_offline_blocked = False
+        if paid_active and os.environ.get("RFCHUNT_OFFLINE") == "1":
+            cfg = getattr(self, "paid_config", None)
+            eps = list((cfg.providers or {}).values()) if cfg else []
+            if not eps or not any(is_loopback_url(ep.base_url) for ep in eps):
+                paid_offline_blocked = True
+
+        if (not paid_active and (not generative_tags or os.environ.get("RFCHUNT_OFFLINE") == "1")) or paid_offline_blocked:
             return {
                 "task": task_name,
                 "status": "offline_fallback",
                 "consensus_type": "DeterministicFallback",
                 "participating_models": participating_models,
                 "abliterated_active": any("obliterat" in m.lower() or "abliterat" in m.lower() for m in participating_models),
+                "backend_mode": "paid_api" if paid_active else "ollama",
                 "data": default_payload if default_payload is not None else {},
             }
 

@@ -4013,6 +4013,24 @@ def run_unified_all_scans(
     scan_mode = "unified_all_scans_remote" if (has_remote and not has_local) else "unified_all_scans"
     _log(f"[*] --all Unified Scan initiated on {target_path} | mode={scan_mode} | depth={effective_depth} | local={has_local} | remote={has_remote} | targets={len(resolved_targets)} | fusion={enforced_fusion} | model={enforced_model}")
 
+    # 0. Detect `.env.local` paid models BEFORE provisioning so Ollama is completely bypassed when active
+    paid_cfg_summary: Dict[str, Any] = {
+        "mode": "ollama",
+        "enabled": False,
+        "using_ollama": True,
+        "ollama_bypassed": False,
+        "provider": "ollama",
+    }
+    paid_models_active = False
+    try:
+        from engine.paid_model_provider import load_paid_model_config
+
+        _paid_cfg = load_paid_model_config()
+        paid_cfg_summary = _paid_cfg.to_safe_dict()
+        paid_models_active = bool(_paid_cfg.enabled)
+    except Exception:
+        paid_models_active = False
+
     # 0. Dynamic AI Model & Tool Provisioning BEFORE instantiating FusionArbiter / MantisIntegrator
     auto_install_enabled = (
         bool(auto_install_tools)
@@ -4025,9 +4043,13 @@ def run_unified_all_scans(
         and not _approval_deny
     )
     resolved_include_models = (
-        bool(include_models)
-        if include_models is not None
-        else bool(should_provision)
+        False
+        if paid_models_active
+        else (
+            bool(include_models)
+            if include_models is not None
+            else bool(should_provision)
+        )
     )
     tools_provisioned: Dict[str, Any] = {}
     if should_provision:
@@ -4035,7 +4057,7 @@ def run_unified_all_scans(
             from engine.tool_provisioner import ToolProvisioner
 
             requested_tools: List[str] = ["python_deps", "semgrep", "aiscan", "raptor"]
-            if resolved_include_models:
+            if resolved_include_models and not paid_models_active:
                 requested_tools.extend(["ollama", "ollama_models"])
             if os.name == "nt" or ext_scanners_active:
                 requested_tools.append("raptor_docker")
@@ -6136,6 +6158,7 @@ def run_unified_all_scans(
         "fusion_enabled": enforced_fusion,
         "abliterated_model": enforced_model,
         "fusion_models": list(mantis_engine.fusion_models),
+        "llm_backend": paid_cfg_summary,
         "strict_evidence_separation": True,
         "total_aggregated_findings": len(aggregated_findings),
         "primary_findings_count": len(primary_findings),

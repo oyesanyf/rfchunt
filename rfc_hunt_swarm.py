@@ -3992,6 +3992,24 @@ def cmd_dry_run_plan(
     if getattr(args, "enable_hackerone", False):
         sub_plans["hackerone"] = cmd_hackerone(args, findings_override=[], return_dict_only=True)
 
+    llm_backend_plan: Dict[str, Any] = {
+        "mode": "ollama",
+        "enabled": False,
+        "using_ollama": True,
+        "ollama_bypassed": False,
+        "provider": "ollama",
+    }
+    try:
+        from engine.paid_model_provider import load_paid_model_config
+
+        _pcfg = load_paid_model_config(
+            env_local_path=getattr(args, "env_local", None),
+            force_ollama=bool(getattr(args, "force_ollama", False)),
+        )
+        llm_backend_plan = _pcfg.to_safe_dict()
+    except Exception:
+        pass
+
     plan: Dict[str, Any] = {
         "status": "dry_run_plan_ready",
         "dry_run": True,
@@ -4002,6 +4020,7 @@ def cmd_dry_run_plan(
         "target_port": getattr(args, "port", None),
         "target_tls": bool(getattr(args, "tls", False)),
         "targets": list(targets),
+        "llm_backend": llm_backend_plan,
         "authorization_checks": auth_checks,
         "request_hygiene": {
             "custom_headers": list(getattr(args, "headers", None) or []),
@@ -4030,6 +4049,14 @@ def cmd_dry_run_plan(
     print(f"  Active Mode         : {plan['active_mode']}")
     print(f"  Target Repo/Path    : {plan['target_repo_or_path'] or '-'}")
     print(f"  Target Host/Port    : {plan['target_host'] or '-'}:{plan['target_port'] or '-'} (TLS={plan['target_tls']})")
+    _lb = plan.get("llm_backend") or {}
+    if _lb.get("enabled"):
+        print(
+            f"  LLM Backend         : PAID API ({_lb.get('provider')}) | models={_lb.get('panel_models')} "
+            f"| Ollama BYPASSED (source={_lb.get('source_file')})"
+        )
+    else:
+        print("  LLM Backend         : Local Ollama (zero-cost local inference)")
     print(f"  Planned Modules     : {', '.join(planned_modules)}")
     print(f"  Request Hygiene     : headers={plan['request_hygiene']['custom_headers']} | max_rps={plan['request_hygiene']['max_rps']}")
     if auth_checks:
@@ -7261,6 +7288,8 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--cycles", type=int, default=3, help="Max mutation cycles to run per RFC")
     parser.add_argument("--timeout", type=float, default=900.0, help="Ollama LLM inference timeout in seconds (default: 900.0 = 15m; 0 for unlimited)")
     parser.add_argument("--model", type=str, default="hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M", help="Preferred primary base model (default: refusal-free hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M)")
+    parser.add_argument("--env-local", dest="env_local", type=str, default=None, help="Path to `.env.local` containing paid/enterprise LLM model credentials (when paid models are present in `.env.local`, RFCHunt uses them directly and bypasses Ollama)")
+    parser.add_argument("--force-ollama", dest="force_ollama", action="store_true", default=False, help="Force local Ollama backend even if `.env.local` defines paid model credentials")
     parser.add_argument("--abliteration", "--obliterated", dest="abliteration", action="store_true", default=True, help="Default ON: Use refusal-free abliterated models (no safety filtering) across ModelFusion panel (Gemma + Cisco Foundation-Sec + GLM)")
     parser.add_argument("--sec-model", type=str, default=None, help="Secondary security specialist model (default: Cisco fenkohq/foundation-sec-8b:latest / abliterated)")
     parser.add_argument("--no-fusion", dest="fusion", action="store_false", default=True, help="Disable multi-model panel fusion")
@@ -7862,6 +7891,10 @@ def parse_swarm_arguments(argv=None):
 def main_swarm(argv=None, caller_profile: str = "swarm"):
     """Primary unified CLI execution entrypoint for rfc_hunt_swarm (and thin compatibility callers)."""
     args = parse_swarm_arguments(argv)
+    if getattr(args, "env_local", None):
+        os.environ["RFCHUNT_ENV_LOCAL"] = str(args.env_local)
+    if getattr(args, "force_ollama", False):
+        os.environ["RFCHUNT_FORCE_OLLAMA"] = "1"
     try:
         _configure_cli_hygiene(args)
     except ValueError as exc:

@@ -14,6 +14,12 @@ import sys
 from typing import Any, Dict, List, Optional
 import httpx
 
+from engine.paid_model_provider import (
+    PaidModelClient,
+    PaidModelConfig,
+    is_ollama_model_tag,
+    load_paid_model_config,
+)
 from ollama_manager import OllamaLifecycleManager, is_embedding_model
 
 logger = logging.getLogger("terminator.models")
@@ -21,8 +27,11 @@ logger = logging.getLogger("terminator.models")
 
 class ModelFusionAdapter:
     """
-    Manages 100% local model inference via Ollama and panel fusion across models.
-    Supports Google Gemma, Qwen, Foundation-Sec, GLM, and DeepSeek-R1 locally.
+    Manages LLM inference and panel fusion across models.
+    - When `.env.local` configures paid/enterprise models (Anthropic, OpenAI,
+      Azure OpenAI, Gemini, OpenRouter, or OpenAI-compatible gateways), routes
+      all inference directly to those paid models and bypasses Ollama completely.
+    - Otherwise runs 100% locally via Ollama (Gemma, Qwen, Foundation-Sec, GLM, DeepSeek-R1).
     """
 
     DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434"
@@ -33,11 +42,56 @@ class ModelFusionAdapter:
         ollama_endpoint: Optional[str] = None,
         use_fusion: bool = True,
         sec_model: Optional[str] = None,
+        env_local_path: Optional[str] = None,
+        force_ollama: bool = False,
     ):
         self.endpoint = ollama_endpoint or os.environ.get("OLLAMA_ENDPOINT", self.DEFAULT_OLLAMA_ENDPOINT)
         self.use_fusion = use_fusion if os.environ.get("USE_MODEL_FUSION") is None else (os.environ.get("USE_MODEL_FUSION") == "1")
         self.free_ram_gb = self._get_free_memory_gb()
         self.sized_qwen = self._size_qwen_for_free_memory(self.free_ram_gb)
+
+        timeout_env = os.environ.get("OLLAMA_TIMEOUT", "120.0")
+        self.timeout = float(timeout_env) if float(timeout_env) > 0 else None
+
+        self.paid_config: PaidModelConfig = load_paid_model_config(
+            env_local_path=env_local_path,
+            force_ollama=force_ollama,
+        )
+        self.paid_client: Optional[PaidModelClient] = None
+
+        if self.paid_config.enabled:
+            self.backend_mode = "paid_api"
+            self.using_ollama = False
+            self.paid_client = PaidModelClient(self.paid_config, timeout=self.timeout)
+            self.client = self.paid_client.client
+            explicit_paid_pref = (
+                preferred_model
+                if (preferred_model and not is_ollama_model_tag(preferred_model))
+                else None
+            )
+            explicit_paid_sec = (
+                sec_model
+                if (sec_model and not is_ollama_model_tag(sec_model))
+                else None
+            )
+            self.preferred_model = explicit_paid_pref or self.paid_config.primary_model
+            self.sec_model = explicit_paid_sec or self.paid_config.sec_model
+            panel: List[str] = []
+            for m in (self.preferred_model, self.sec_model, *self.paid_config.panel_models):
+                if m and m not in panel:
+                    panel.append(m)
+            self.available_tags = panel
+            self.active_model = self.preferred_model
+            logger.info(
+                "[ModelFusion] Paid API backend active via %s (provider=%s, models=%s; Ollama bypassed)",
+                self.paid_config.source_file,
+                self.paid_config.provider,
+                ", ".join(self.available_tags),
+            )
+            return
+
+        self.backend_mode = "ollama"
+        self.using_ollama = True
         self.preferred_model = preferred_model or os.environ.get(
             "LOCAL_MODEL", "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"
         )
@@ -55,11 +109,16 @@ class ModelFusionAdapter:
             )
 
         self.active_model = self._resolve_model(self.preferred_model)
-        timeout_env = os.environ.get("OLLAMA_TIMEOUT", "120.0")
-        self.timeout = float(timeout_env) if float(timeout_env) > 0 else None
         self.client = httpx.Client(timeout=httpx.Timeout(self.timeout, connect=10.0))
 
     def close(self) -> None:
+        paid_client = getattr(self, "paid_client", None)
+        if paid_client is not None:
+            try:
+                paid_client.close()
+            except Exception:
+                pass
+            return
         client = getattr(self, "client", None)
         if client is not None:
             try:
@@ -144,7 +203,10 @@ class ModelFusionAdapter:
         return "qwen2.5:1.5b"
 
     def _fetch_available_tags(self) -> List[str]:
-        """Probes Ollama and auto-installs/auto-starts the daemon if missing."""
+        """Probes Ollama and auto-installs/auto-starts the daemon if missing (skipped in paid API mode)."""
+        if not getattr(self, "using_ollama", True):
+            cfg = getattr(self, "paid_config", None)
+            return list(cfg.panel_models) if cfg and cfg.enabled else list(getattr(self, "available_tags", []) or [])
         try:
             return OllamaLifecycleManager.ensure_ollama_ready(endpoint=self.endpoint)
         except Exception:
@@ -276,10 +338,27 @@ class ModelFusionAdapter:
         num_predict: int = 160,
     ) -> List[Dict[str, Any]]:
         """
-        Executes structured JSON generation using local Ollama model(s).
-        If use_fusion is enabled, runs panel fusion across Gemma (prioritizing abliterated Gemma-4-12B)
-        and secondary security models.
+        Executes structured JSON generation using configured paid models (when `.env.local`
+        defines paid providers) or local Ollama model(s) otherwise.
         """
+        if not getattr(self, "using_ollama", True) and getattr(self, "paid_client", None) is not None:
+            if self.use_fusion and len(self.available_tags) > 1:
+                res = self._run_paid_panel_fusion(
+                    system_instruction,
+                    user_prompt,
+                    schema_hint=schema_hint,
+                    num_predict=num_predict,
+                )
+                if res:
+                    return res
+            return self._query_paid_model(
+                self.active_model,
+                system_instruction,
+                user_prompt,
+                schema_hint=schema_hint,
+                num_predict=num_predict,
+            )
+
         if not self.available_tags:
             self.available_tags = self._fetch_available_tags()
 
@@ -305,6 +384,81 @@ class ModelFusionAdapter:
 
         return []
 
+    def _query_paid_model(
+        self,
+        model: str,
+        system_instruction: str,
+        user_prompt: str,
+        schema_hint: Optional[str] = None,
+        num_predict: int = 160,
+    ) -> List[Dict[str, Any]]:
+        paid_client = getattr(self, "paid_client", None)
+        if paid_client is None:
+            return []
+        expected_schema = schema_hint or '{"probes": [{"rationale": "...", "raw_request": "...", "is_clean": false}]}'
+        full_user = (
+            f"{user_prompt}\n\n"
+            f"CRITICAL: Output ONLY valid JSON matching schema: {expected_schema}."
+        )
+        raw_text = paid_client.generate(
+            system_prompt=system_instruction,
+            user_prompt=full_user,
+            model=model,
+            max_tokens=max(int(num_predict), 256),
+            temperature=0.3,
+            expect_json=True,
+        )
+        if not raw_text or self._is_refusal(raw_text):
+            return []
+        items = self._parse_json_array(raw_text, unwrap_lists=(schema_hint is None))
+        return [
+            it for it in items
+            if isinstance(it, dict) and not self._is_refusal(json.dumps(it, sort_keys=True))
+        ]
+
+    def _run_paid_panel_fusion(
+        self,
+        system_instruction: str,
+        user_prompt: str,
+        schema_hint: Optional[str] = None,
+        num_predict: int = 160,
+    ) -> List[Dict[str, Any]]:
+        panel = list(getattr(self, "available_tags", None) or [self.active_model])
+        logger.info("[ModelFusion] Executing Paid API panel fusion across: %s", " + ".join(panel))
+        all_probes: List[Dict[str, Any]] = []
+        seen_requests = set()
+        for model in panel:
+            probes = self._query_paid_model(
+                model,
+                system_instruction,
+                user_prompt,
+                schema_hint=schema_hint,
+                num_predict=num_predict,
+            )
+            for p in probes:
+                if not isinstance(p, dict):
+                    continue
+                if schema_hint is not None:
+                    serialized = json.dumps(p, sort_keys=True)
+                    if self._is_refusal(serialized):
+                        continue
+                    p["fused_model"] = model
+                    all_probes.append(p)
+                    continue
+                raw_val = p.get("raw_request", "")
+                if isinstance(raw_val, dict):
+                    raw_val = raw_val.get("raw_request", raw_val.get("request", ""))
+                raw_req = str(raw_val).strip()
+                rat = str(p.get("rationale", "")).strip()
+                if self._is_refusal(raw_req) or self._is_refusal(rat):
+                    continue
+                if raw_req and raw_req not in seen_requests:
+                    seen_requests.add(raw_req)
+                    p["raw_request"] = raw_req
+                    p["fused_model"] = model
+                    all_probes.append(p)
+        return all_probes
+
     def _query_ollama(
         self,
         model: str,
@@ -313,6 +467,14 @@ class ModelFusionAdapter:
         schema_hint: Optional[str] = None,
         num_predict: int = 160,
     ) -> List[Dict[str, Any]]:
+        if not getattr(self, "using_ollama", True) and getattr(self, "paid_client", None) is not None:
+            return self._query_paid_model(
+                model,
+                system_instruction,
+                user_prompt,
+                schema_hint=schema_hint,
+                num_predict=num_predict,
+            )
         if not self.available_tags:
             self.available_tags = self._fetch_available_tags()
         client_is_mocked = (

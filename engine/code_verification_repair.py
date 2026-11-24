@@ -1321,21 +1321,49 @@ def verify_python_code_native(
     }
 
     if enable_llm:
-        online, installed = probe_ollama_models_fast(endpoint=endpoint, timeout_sec=0.4)
-        ranked = rank_repair_and_verifier_models(installed, requested_model=model_id) if online else []
-        if not online:
-            llm_audit["status"] = "ollama_offline_fallback"
-        elif not ranked:
-            llm_audit["status"] = "no_eligible_chat_model_fallback"
-        else:
-            verifier_model = ranked[0]
-            prompt = _build_native_verify_prompt(arxiv_id, title, source_code, det)
-            parsed, status = _invoke_ollama_json_judge(endpoint, verifier_model, prompt, timeout_sec)
-            llm_audit["status"] = status
-            if parsed is not None:
-                llm_verified = True
-                verifier_provider = "ollama"
-                llm_audit.update(parsed)
+        paid_handled = False
+        try:
+            from engine.paid_model_provider import PaidModelClient, load_paid_model_config
+
+            paid_cfg = load_paid_model_config()
+            if paid_cfg.enabled:
+                paid_handled = True
+                verifier_model = paid_cfg.arbiter_model or paid_cfg.primary_model
+                prompt = _build_native_verify_prompt(arxiv_id, title, source_code, det)
+                with PaidModelClient(paid_cfg, timeout=timeout_sec) as p_client:
+                    raw_paid = p_client.generate(
+                        system_prompt="You are a strict formal-methods and Python security code auditor. Output strict JSON.",
+                        user_prompt=prompt,
+                        model=verifier_model,
+                        max_tokens=900,
+                        temperature=0.1,
+                        expect_json=True,
+                    )
+                parsed, status = _parse_json_judge_response(raw_paid)
+                llm_audit["status"] = status if raw_paid else "paid_api_fallback"
+                if parsed is not None:
+                    llm_verified = True
+                    verifier_provider = paid_cfg.provider
+                    llm_audit.update(parsed)
+        except Exception:
+            paid_handled = False
+
+        if not paid_handled:
+            online, installed = probe_ollama_models_fast(endpoint=endpoint, timeout_sec=0.4)
+            ranked = rank_repair_and_verifier_models(installed, requested_model=model_id) if online else []
+            if not online:
+                llm_audit["status"] = "ollama_offline_fallback"
+            elif not ranked:
+                llm_audit["status"] = "no_eligible_chat_model_fallback"
+            else:
+                verifier_model = ranked[0]
+                prompt = _build_native_verify_prompt(arxiv_id, title, source_code, det)
+                parsed, status = _invoke_ollama_json_judge(endpoint, verifier_model, prompt, timeout_sec)
+                llm_audit["status"] = status
+                if parsed is not None:
+                    llm_verified = True
+                    verifier_provider = "ollama"
+                    llm_audit.update(parsed)
 
     det_score = float(det["deterministic_score"])
     combined_findings = list(det["static_findings"])
@@ -1405,6 +1433,36 @@ def _build_native_verify_prompt(arxiv_id: str, title: str, source_code: str, det
     )
 
 
+def _parse_json_judge_response(raw_text: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    cleaned = strip_think_tags(raw_text)
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE | re.MULTILINE)
+    cleaned = re.sub(r"\s*```\s*$", "", cleaned, flags=re.MULTILINE).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end <= start:
+        return None, "llm_parse_fallback"
+    try:
+        obj = json.loads(cleaned[start : end + 1])
+    except Exception:
+        return None, "llm_parse_fallback"
+    if not isinstance(obj, dict) or not any(k in obj for k in ("verdict", "paper_fidelity_score", "correctness_score", "security_score")):
+        return None, "llm_parse_fallback"
+    v = str(obj.get("verdict", "WARN")).upper()
+    if v not in ("PASS", "WARN", "FAIL"):
+        v = "WARN"
+    return (
+        {
+            "verdict": v,
+            "paper_fidelity_score": round(max(0.0, min(100.0, float(obj.get("paper_fidelity_score", 80.0)))), 2),
+            "correctness_score": round(max(0.0, min(100.0, float(obj.get("correctness_score", 80.0)))), 2),
+            "security_score": round(max(0.0, min(100.0, float(obj.get("security_score", 80.0)))), 2),
+            "summary": str(obj.get("summary", ""))[:400],
+            "findings": list(obj.get("findings") or [])[:8],
+        },
+        "llm_verified",
+    )
+
+
 def _invoke_ollama_json_judge(
     endpoint: str,
     model_tag: str,
@@ -1434,30 +1492,7 @@ def _invoke_ollama_json_judge(
             if resp.status != 200:
                 return None, f"ollama_http_{resp.status}"
             raw_text = str(json.loads(resp.read().decode("utf-8", errors="replace")).get("response", "")).strip()
-            cleaned = strip_think_tags(raw_text)
-            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE | re.MULTILINE)
-            cleaned = re.sub(r"\s*```\s*$", "", cleaned, flags=re.MULTILINE).strip()
-            start = cleaned.find("{")
-            end = cleaned.rfind("}")
-            if start == -1 or end <= start:
-                return None, "llm_parse_fallback"
-            obj = json.loads(cleaned[start : end + 1])
-            if not isinstance(obj, dict) or not any(k in obj for k in ("verdict", "paper_fidelity_score", "correctness_score", "security_score")):
-                return None, "llm_parse_fallback"
-            v = str(obj.get("verdict", "WARN")).upper()
-            if v not in ("PASS", "WARN", "FAIL"):
-                v = "WARN"
-            return (
-                {
-                    "verdict": v,
-                    "paper_fidelity_score": round(max(0.0, min(100.0, float(obj.get("paper_fidelity_score", 80.0)))), 2),
-                    "correctness_score": round(max(0.0, min(100.0, float(obj.get("correctness_score", 80.0)))), 2),
-                    "security_score": round(max(0.0, min(100.0, float(obj.get("security_score", 80.0)))), 2),
-                    "summary": str(obj.get("summary", ""))[:400],
-                    "findings": list(obj.get("findings") or [])[:8],
-                },
-                "llm_verified",
-            )
+            return _parse_json_judge_response(raw_text)
     except TimeoutError:
         return None, "ollama_timeout"
     except Exception as exc:
@@ -1823,8 +1858,23 @@ def auto_repair_generated_code(
             duration_ms=round((time.perf_counter() - t0) * 1000.0, 2),
         )
 
-    online, installed = probe_ollama_models_fast(endpoint=endpoint, timeout_sec=0.4) if enable_llm else (False, [])
-    repair_models = rank_repair_and_verifier_models(installed, requested_model=model_id) if online else []
+    paid_cfg = None
+    if enable_llm:
+        try:
+            from engine.paid_model_provider import load_paid_model_config
+
+            _pcfg = load_paid_model_config()
+            if _pcfg.enabled:
+                paid_cfg = _pcfg
+        except Exception:
+            paid_cfg = None
+
+    if paid_cfg is not None:
+        online = True
+        repair_models = list(paid_cfg.panel_models) or [paid_cfg.primary_model]
+    else:
+        online, installed = probe_ollama_models_fast(endpoint=endpoint, timeout_sec=0.4) if enable_llm else (False, [])
+        repair_models = rank_repair_and_verifier_models(installed, requested_model=model_id) if online else []
 
     init_passed, init_total = count_layer1_gates_passed(current_report.deterministic_checks)
     effective_max = (
@@ -1854,26 +1904,52 @@ def auto_repair_generated_code(
 
         candidates: List[Tuple[str, str, List[str], str, str]] = []
 
-        # Tier A: Local Ollama LLM Repair (rotates across ranked VRAM-resident models)
+        # Tier A: Paid API (when `.env.local` configured) or Local Ollama LLM Repair
         llm_note = "llm_disabled" if not enable_llm else ("ollama_offline" if not online else "no_eligible_model")
         if enable_llm and online and repair_model is not None:
-            llm_code, llm_status = request_ollama_code_patch(
-                source_code=current_code,
-                defect_block=defect_block,
-                arxiv_id=arxiv_id,
-                title=title,
-                endpoint=endpoint,
-                model_tag=repair_model,
-                timeout_sec=timeout_sec,
-            )
-            llm_note = f"ollama({repair_model})={llm_status}"
+            if paid_cfg is not None:
+                from engine.paid_model_provider import PaidModelClient
+
+                patch_prompt = (
+                    f"Fix ALL defects in this Python module for arXiv:{arxiv_id} ({title}).\n\n"
+                    f"=== DEFECTS ===\n{defect_block}\n\n"
+                    f"Return ONLY the complete repaired Python module inside a single ```python ... ``` block.\n\n"
+                    f"```python\n{current_code}\n```\n"
+                )
+                with PaidModelClient(paid_cfg, timeout=timeout_sec) as p_client:
+                    raw_paid_patch = p_client.generate(
+                        system_prompt="You are a senior Python systems, formal verification, and security engineer.",
+                        user_prompt=patch_prompt,
+                        model=repair_model,
+                        max_tokens=4096,
+                        temperature=0.15,
+                        expect_json=False,
+                    )
+                llm_code = extract_python_code_from_response(raw_paid_patch) if raw_paid_patch else None
+                llm_status = "paid_patch_synthesized" if llm_code else "paid_patch_invalid_python"
+                llm_note = f"{paid_cfg.provider}({repair_model})={llm_status}"
+                patch_tag = "paid_llm_patch"
+                polish_tag = "paid_plus_deterministic_patch"
+            else:
+                llm_code, llm_status = request_ollama_code_patch(
+                    source_code=current_code,
+                    defect_block=defect_block,
+                    arxiv_id=arxiv_id,
+                    title=title,
+                    endpoint=endpoint,
+                    model_tag=repair_model,
+                    timeout_sec=timeout_sec,
+                )
+                llm_note = f"ollama({repair_model})={llm_status}"
+                patch_tag = "ollama_llm_patch"
+                polish_tag = "ollama_plus_deterministic_patch"
             if llm_code is not None and llm_code.strip() != current_code.strip():
-                candidates.append(("ollama_llm_patch", repair_model, [], llm_code, llm_note))
+                candidates.append((patch_tag, repair_model, [], llm_code, llm_note))
                 llm_det = run_deterministic_code_verification(llm_code, arxiv_id=arxiv_id)
                 polished, p_fixes = apply_deterministic_code_repairs(llm_code, llm_det)
                 if p_fixes and polished.strip() != llm_code.strip():
                     candidates.append(
-                        ("ollama_plus_deterministic_patch", repair_model, p_fixes, polished, f"{llm_note}; polish={','.join(p_fixes)}")
+                        (polish_tag, repair_model, p_fixes, polished, f"{llm_note}; polish={','.join(p_fixes)}")
                     )
 
         # Tier B: Deterministic Structural Auto-Patcher
