@@ -798,14 +798,22 @@ def test_unified_all_scans_full_artex_attack_chaining_integration(tmp_path, monk
         assert len(remote_artex["sse_events"]) == 3
         assert remote_artex["remote_findings_ingested"] == 1
 
-        # Verify SARIF contains ARTEX chain properties
-        sarif = json.loads(Path(res["report_files"]["combined_sarif"]).read_text(encoding="utf-8"))
+        # Operational Rigor: unverified poe_level==1 ARTEX chains are isolated into
+        # speculative_hypotheses.sarif (level='note'), keeping combined_report.sarif
+        # strictly free of speculative passive-correlation noise.
+        primary_sarif = json.loads(Path(res["report_files"]["combined_sarif"]).read_text(encoding="utf-8"))
+        assert all(
+            r["properties"].get("evidence_lane") != "SPECULATIVE_HYPOTHESIS"
+            for r in primary_sarif["runs"][0]["results"]
+        )
+        spec_sarif = json.loads(Path(res["report_files"]["speculative_sarif"]).read_text(encoding="utf-8"))
         artex_sarif_results = [
-            r for r in sarif["runs"][0]["results"]
+            r for r in spec_sarif["runs"][0]["results"]
             if str(r.get("ruleId", "")).startswith("ARTEX-")
         ]
         assert len(artex_sarif_results) >= 1
         assert any(r["properties"].get("hop_count", 0) >= 2 for r in artex_sarif_results)
+        assert all(r["level"] == "note" for r in artex_sarif_results)
 
         # Verify Caldera attack chain export and Dashboard rendering
         bridge = CalderaBridge(db_path=str(db_file))
