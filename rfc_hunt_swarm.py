@@ -40,7 +40,7 @@ import operator
 import re
 import threading
 import time
-from typing import Annotated, Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Annotated, Any, Dict, List, Optional, Sequence, Tuple, TypedDict
 
 END = "__end__"
 StateGraph = None  # Resolved lazily by _resolve_langgraph() to keep CLI startup fast
