@@ -926,10 +926,52 @@ class MissionControlServer:
                             use_api=bool(body.get("use_api", False)),
                             use_browser=False,
                             submit_api=False,
+                            researcher_username=str(body.get("researcher_username") or ""),
+                            policy_text_override=str(body.get("policy_text") or ""),
+                            include_ai_disclosure=bool(body.get("include_ai_disclosure", False)),
+                            dry_run=bool(body.get("dry_run", False)),
                         )
                         self._send_json(HTTPStatus.OK, res)
                     except PermissionError as exc:
                         self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
+                    except ValueError as exc:
+                        self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+
+                if path == "/api/phi/scan":
+                    try:
+                        from engine.phi_scanner import PhiScanner
+                        body = self._read_json_body()
+                        raw_text = body.get("text")
+                        target_path = str(body.get("target_path") or "").strip()
+                        dry_run = bool(body.get("dry_run", False))
+                        scanner = PhiScanner(enable_ml=False, enable_presidio=False)
+                        if isinstance(raw_text, str) and raw_text:
+                            res = scanner.scan_http_response(
+                                raw_text,
+                                source_url=str(body.get("source_url") or "mission-control-input"),
+                            )
+                        elif target_path:
+                            if dry_run:
+                                root_p = Path(target_path).resolve(strict=False)
+                                files = scanner._collect_files(root_p) if root_p.exists() else []
+                                res = {
+                                    "status": "dry_run_phi_plan_ready",
+                                    "dry_run": True,
+                                    "target_path": str(root_p),
+                                    "candidate_files_count": len(files),
+                                    "backends": scanner.guard.active_backends,
+                                }
+                            else:
+                                res = scanner.scan_repository(
+                                    target_path,
+                                    output_dir=str(server_ref.orchestrator.reports_root / "phi"),
+                                    write_redacted_copies=bool(body.get("redact", False)),
+                                )
+                        else:
+                            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Provide 'text' or 'target_path'"})
+                            return
+                        self._send_json(HTTPStatus.OK, res)
                     except ValueError as exc:
                         self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
