@@ -38,7 +38,7 @@ import sys
 import tempfile
 import time
 import tokenize
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 import uuid
 
 try:
@@ -3787,6 +3787,13 @@ def run_unified_all_scans(
     phi_redact: bool = False,
     phi_model: str = "urchade/gliner_multi_pii-v1",
     phi_enable_ml: bool = True,
+    enable_preflight: bool = True,
+    preflight_live: bool = True,
+    preflight_pqc: bool = True,
+    preflight_prompt: str = "",
+    preflight_skills_dirs: Optional[Sequence[str]] = None,
+    preflight_include_home_skills: bool = True,
+    preflight_timeout: float = 15.0,
 ) -> Dict[str, Any]:
     """
     Execute ALL integrated RFCHunt security scanners against `--repo`, `--path`, or remote `--host` in one pass,
@@ -4057,6 +4064,63 @@ def run_unified_all_scans(
             if FusionArbiter is not None
             else None
         )
+
+    # 0. Stage 0: Fresh Pre-Flight Stack, Post-Quantum (PQC), HackerOne-Category, Research & Safe Skill Discovery
+    #    Always runs fresh with zero cross-session cache reuse before any scanner launches.
+    preflight_res: Dict[str, Any] = {
+        "status": "disabled",
+        "cache_reused": False,
+        "detected_languages": [],
+        "detected_domains": [],
+        "active_category_ids": [],
+        "hackerone_categories": {"asset_types": [], "prioritized_cwes": [], "categories": []},
+        "post_quantum_readiness": {"status": "disabled", "total_findings": 0, "findings": []},
+        "live_research": {"status": "disabled", "cache_reused": False},
+        "skills": {"active_safe_skills_count": 0, "blocked_unsafe_skills_count": 0, "active_safe_skills": [], "blocked_unsafe_skills": []},
+        "recommended_scanner_plan": {},
+        "total_findings": 0,
+        "findings": [],
+    }
+    if enable_preflight:
+        try:
+            from engine.preflight_discovery import PreflightDiscoveryEngine
+
+            pf_engine = PreflightDiscoveryEngine()
+            preflight_res = pf_engine.run(
+                target_path=local_target_path if has_local else None,
+                prompt=str(preflight_prompt or ""),
+                target_host=clean_host if has_remote else None,
+                live=bool(preflight_live) and (not offline_or_ci) and (not _approval_deny),
+                enable_pqc=bool(preflight_pqc),
+                include_home_skills=bool(preflight_include_home_skills),
+                extra_skills_dirs=preflight_skills_dirs,
+                output_dir=str(out_dir),
+                timeout_sec=float(preflight_timeout or 15.0),
+                dry_run=False,
+            )
+            pf_plan = preflight_res.get("recommended_scanner_plan") or {}
+            if not arxiv_query and pf_plan.get("tailored_arxiv_query"):
+                arxiv_query = str(pf_plan["tailored_arxiv_query"])
+            if not last30days_topic and pf_plan.get("tailored_last30days_topic"):
+                last30days_topic = str(pf_plan["tailored_last30days_topic"])
+            if nuclei_tags is None and pf_plan.get("recommended_nuclei_tags"):
+                nuclei_tags = list(pf_plan["recommended_nuclei_tags"])
+            effective_trace(
+                f"[preflight] Fresh pass run_id={preflight_res.get('run_id', '')[:8]} "
+                f"domains={len(preflight_res.get('active_category_ids') or [])} "
+                f"langs={len(preflight_res.get('detected_languages') or [])} "
+                f"pqc={((preflight_res.get('post_quantum_readiness') or {}).get('status', 'unknown'))} "
+                f"safe_skills={((preflight_res.get('skills') or {}).get('active_safe_skills_count', 0))} "
+                f"blocked_skills={((preflight_res.get('skills') or {}).get('blocked_unsafe_skills_count', 0))}"
+            )
+        except Exception as pf_exc:
+            preflight_res = {
+                "status": "error",
+                "cache_reused": False,
+                "error": str(pf_exc),
+                "total_findings": 0,
+                "findings": [],
+            }
 
     # 1. Run Local Suite (Mantis, aiscan, RAPTOR static) and Remote Suite (RAPTOR Web, ActiveFlawProber, ProtocolRuler, Harness, DifferentialOracle) in parallel
     mantis_engine = MantisIntegrator(
@@ -5154,6 +5218,7 @@ def run_unified_all_scans(
                     ("VerificationInversionHunter", "INV-FIND", verification_inversion_res.get("findings") or []),
                     ("ArxivSecurityBridge", "ARXIV-FIND", arxiv_research_res.get("findings") or []),
                     ("Last30DaysSecuritySkills", "SKILL30D-FIND", last30days_skills_res.get("findings") or []),
+                    ("PreflightDiscovery", "PREFLIGHT-FIND", preflight_res.get("findings") or []),
                     ("Module-21-REA", "REA-FIND", rea_res.get("findings") or []),
                     ("ActiveFlawProber", "PROBER-FIND", prober_res.get("findings") or []),
                     ("ProtocolRuler", "RULER-FIND", ruler_res.get("findings") or []),
@@ -5583,6 +5648,26 @@ def run_unified_all_scans(
                 "poe_level": int(skf.get("poe_level", 2) or 2),
                 "verification_status": "LEAD_ACTIVE_INDICATOR",
                 "finding_tier": "MANUAL_REVIEW_LEAD",
+            })
+
+    for pff in (preflight_res.get("findings") if isinstance(preflight_res, dict) else []) or []:
+        if isinstance(pff, dict):
+            pff_sev = str(pff.get("severity", "MEDIUM")).upper()
+            pff_poe = int(pff.get("poe_level", 2) or 2)
+            raw_aggregated_findings.append({
+                "rule_id": pff.get("rule_id", "PREFLIGHT-001"),
+                "title": pff.get("title", "Pre-Flight Discovery Security Finding"),
+                "severity": pff_sev,
+                "cwe": pff.get("cwe_id") or pff.get("cwe", "CWE-327"),
+                "file_path": pff.get("file") or pff.get("file_path") or target_path,
+                "line_number": int(pff.get("line") or pff.get("line_number") or 1),
+                "description": pff.get("evidence") or pff.get("title", ""),
+                "remediation": pff.get("remediation", ""),
+                "scanner": pff.get("scanner", "PreflightDiscovery"),
+                "category": pff.get("category", ""),
+                "poe_level": pff_poe,
+                "verification_status": "DETERMINISTIC_STATIC" if pff_poe >= 2 else "LEAD_ACTIVE_INDICATOR",
+                "finding_tier": "PRIMARY" if pff_poe >= 2 else "MANUAL_REVIEW_LEAD",
             })
 
     for nf in (ext_nuclei_res.get("findings") or []):
@@ -6109,6 +6194,25 @@ def run_unified_all_scans(
             "arxiv_research_detectors": arxiv_research_res,
             "last30days_security_skills": last30days_skills_res,
             "phi_scanner": phi_res,
+            "preflight_discovery": {
+                k: v for k, v in preflight_res.items() if k != "checklist_markdown"
+            },
+        },
+        "preflight": {
+            "status": preflight_res.get("status", "disabled"),
+            "run_id": preflight_res.get("run_id", ""),
+            "started_at_utc": preflight_res.get("started_at_utc", ""),
+            "current_year": preflight_res.get("current_year", datetime.now(timezone.utc).year),
+            "cache_reused": False,
+            "active_category_ids": preflight_res.get("active_category_ids") or [],
+            "detected_languages": preflight_res.get("detected_languages") or [],
+            "hackerone_categories": preflight_res.get("hackerone_categories") or {},
+            "post_quantum_readiness": preflight_res.get("post_quantum_readiness") or {},
+            "live_research": preflight_res.get("live_research") or {},
+            "skills": preflight_res.get("skills") or {},
+            "recommended_scanner_plan": preflight_res.get("recommended_scanner_plan") or {},
+            "artifacts": preflight_res.get("artifacts") or {},
+            "total_findings": int(preflight_res.get("total_findings", 0) or 0),
         },
         "findings": aggregated_findings,
         "chains": artex_res.get("chains") or [],
@@ -6134,6 +6238,8 @@ def run_unified_all_scans(
             "combined_txt": str(combined_txt_path),
             "mantis_sarif": (mantis_res.get("report_files") or {}).get("sarif", "") if isinstance(mantis_res.get("report_files"), dict) else "",
             "rea_sarif": (rea_res.get("report_files") or {}).get("sarif", "") if isinstance(rea_res.get("report_files"), dict) else "",
+            "preflight_checklist_json": (preflight_res.get("artifacts") or {}).get("json", "") if isinstance(preflight_res.get("artifacts"), dict) else "",
+            "preflight_checklist_md": (preflight_res.get("artifacts") or {}).get("markdown", "") if isinstance(preflight_res.get("artifacts"), dict) else "",
             **extra_report_files,
         },
         "tools_provisioned": tools_provisioned,

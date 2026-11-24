@@ -1243,6 +1243,30 @@ class TerminatorMCPServer:
                     },
                 },
             },
+            {
+                "name": "run_preflight_discovery",
+                "description": (
+                    "[Module 23 Fresh Pre-Flight Discovery + Post-Quantum + Safe Skills] Executes a fresh, "
+                    "zero-cache pre-flight pass inspecting manifests, schemas, file extensions, and prompts "
+                    "across all 14 domains/protocols/HackerOne categories including Post-Quantum Cryptography "
+                    "(FIPS 203 ML-KEM, FIPS 204 ML-DSA, FIPS 205 SLH-DSA, XMSS/LMS, Hybrid TLS, HNDL), "
+                    "conditional keyless live research (OSV.dev exact-version CVEs, IETF RFCs, arXiv, HN), "
+                    "and fail-closed local skill safety auditing."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "target_path": {"type": "string", "default": "."},
+                        "prompt": {"type": "string", "default": ""},
+                        "policy_text": {"type": "string", "default": ""},
+                        "target_host": {"type": "string", "default": ""},
+                        "live": {"type": "boolean", "default": False},
+                        "enable_pqc": {"type": "boolean", "default": True},
+                        "include_home_skills": {"type": "boolean", "default": True},
+                        "dry_run": {"type": "boolean", "default": False},
+                    },
+                },
+            },
         ]
 
     @staticmethod
@@ -2790,6 +2814,30 @@ class TerminatorMCPServer:
                 "total_skills": len(skills),
                 "skills": skills,
             }
+
+        elif name == "run_preflight_discovery":
+            self._reject_shell_execution(args)
+            from engine.preflight_discovery import run_preflight_discovery
+
+            target_path = self._parse_strict_str(args, "target_path", ".", allow_empty=True) or None
+            prompt = self._parse_strict_str(args, "prompt", "", allow_empty=True) or ""
+            policy_text = self._parse_strict_str(args, "policy_text", "", allow_empty=True) or ""
+            target_host = self._parse_strict_str(args, "target_host", "", allow_empty=True) or None
+            live = bool(self._parse_strict_bool(args, "live", False))
+            enable_pqc = bool(self._parse_strict_bool(args, "enable_pqc", True))
+            include_home_skills = bool(self._parse_strict_bool(args, "include_home_skills", True))
+            dry_run = bool(self._parse_strict_bool(args, "dry_run", False))
+            res = run_preflight_discovery(
+                target_path=target_path,
+                prompt=prompt,
+                policy_text=policy_text,
+                target_host=target_host,
+                live=live,
+                enable_pqc=enable_pqc,
+                include_home_skills=include_home_skills,
+                dry_run=dry_run,
+            )
+            return {k: v for k, v in res.items() if k != "checklist_markdown"}
 
         raise ValueError(f"Unknown tool: {name}")
 

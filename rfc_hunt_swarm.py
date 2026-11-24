@@ -3866,6 +3866,56 @@ def cmd_phi(
     return result
 
 
+def cmd_preflight(args: Any, *, return_dict_only: bool = False) -> Dict[str, Any]:
+    """
+    Module 23: Fresh Pre-Flight Stack, Post-Quantum (PQC), HackerOne-Category,
+    Keyless Live Research & Safe Local Skill Discovery (`--preflight-only`).
+    Never reuses prior-session caches (`cache_reused: False`).
+    """
+    from engine.preflight_discovery import run_preflight_discovery
+
+    target_path = (
+        getattr(args, "repo", None)
+        or getattr(args, "path", None)
+        or getattr(args, "raptor_target", None)
+        or "."
+    )
+    host = getattr(args, "host", None) or getattr(args, "target", None)
+    raw_dirs = getattr(args, "preflight_skills_dirs", None)
+    extra_dirs = (
+        [d.strip() for d in str(raw_dirs).split(",") if d.strip()]
+        if raw_dirs
+        else None
+    )
+    dry_run = bool(getattr(args, "dry_run", False))
+    out_dir = None if dry_run else str(getattr(args, "output_dir", "reports") or "reports")
+
+    result = run_preflight_discovery(
+        target_path=str(target_path) if target_path else None,
+        prompt=str(getattr(args, "preflight_prompt", None) or ""),
+        target_host=str(host) if host else None,
+        live=bool(getattr(args, "preflight_live", True)) and not dry_run,
+        enable_pqc=bool(getattr(args, "preflight_pqc", True)),
+        include_home_skills=not bool(getattr(args, "no_home_skills", False)),
+        extra_skills_dirs=extra_dirs,
+        output_dir=out_dir,
+        timeout_sec=float(getattr(args, "preflight_timeout", 15.0) or 15.0),
+        dry_run=dry_run,
+    )
+
+    if return_dict_only:
+        return {k: v for k, v in result.items() if k != "checklist_markdown"}
+
+    if getattr(args, "as_json", False):
+        from engine.cli_render import render_json
+
+        render_json({k: v for k, v in result.items() if k != "checklist_markdown"})
+        return result
+
+    print(result.get("checklist_markdown", ""))
+    return result
+
+
 def cmd_dry_run_plan(
     args: Any,
     *,
@@ -3896,6 +3946,7 @@ def cmd_dry_run_plan(
     if getattr(args, "run_all_scans", False) or active_mode in ("all", "all_scans"):
         planned_modules.extend(
             [
+                "Module-23-PreflightDiscovery(14-Categories+PQC+HackerOne+SafeSkills)",
                 "Module-20-Mantis",
                 "Module-18-aiscan",
                 "Module-15-RAPTOR",
@@ -3907,6 +3958,8 @@ def cmd_dry_run_plan(
                 "Module-19-PromptSmuggling",
             ]
         )
+    elif getattr(args, "preflight_only", False) or active_mode == "preflight":
+        planned_modules.append("Module-23-PreflightDiscovery(14-Categories+PQC+HackerOne+SafeSkills)")
     if getattr(args, "enable_phi", False) or active_mode == "phi":
         planned_modules.append("Module-22-PhiScanner(Presidio+GLiNER+RedactX-v3)")
     if getattr(args, "deep_audit", False) or active_mode in ("deep-audit", "deep_audit") or getattr(args, "proxy_target", None):
@@ -3925,6 +3978,15 @@ def cmd_dry_run_plan(
         planned_modules.append(f"mode:{active_mode}")
 
     sub_plans: Dict[str, Any] = {}
+    if (
+        getattr(args, "preflight_only", False)
+        or active_mode == "preflight"
+        or (
+            bool(getattr(args, "enable_preflight", True))
+            and (getattr(args, "run_all_scans", False) or active_mode in ("all", "all_scans", "deep-audit", "deep_audit"))
+        )
+    ):
+        sub_plans["preflight"] = cmd_preflight(args, return_dict_only=True)
     if getattr(args, "enable_phi", False):
         sub_plans["phi"] = cmd_phi(args, return_dict_only=True)
     if getattr(args, "enable_hackerone", False):
@@ -5001,6 +5063,17 @@ def cmd_all(args):
             "phi_redact": bool(getattr(args, "phi_redact", False)),
             "phi_model": str(getattr(args, "phi_model", "urchade/gliner_multi_pii-v1") or "urchade/gliner_multi_pii-v1"),
             "phi_enable_ml": not bool(getattr(args, "no_phi_ml", False)),
+            "enable_preflight": bool(getattr(args, "enable_preflight", True)),
+            "preflight_live": bool(getattr(args, "preflight_live", True)),
+            "preflight_pqc": bool(getattr(args, "preflight_pqc", True)),
+            "preflight_prompt": str(getattr(args, "preflight_prompt", None) or ""),
+            "preflight_skills_dirs": (
+                [d.strip() for d in str(getattr(args, "preflight_skills_dirs", "")).split(",") if d.strip()]
+                if getattr(args, "preflight_skills_dirs", None)
+                else None
+            ),
+            "preflight_include_home_skills": not bool(getattr(args, "no_home_skills", False)),
+            "preflight_timeout": float(getattr(args, "preflight_timeout", 15.0) or 15.0),
         }
         try:
             _unified_sig = inspect.signature(run_unified_all_scans)
@@ -6837,7 +6910,7 @@ ALL_MODES = [
     "poc", "poc-verify", "poc_verify", "docker-doctor", "docker_doctor", "doctor-docker",
     "deep-audit", "deep_audit",
     "novelty", "novelty-refresh", "novelty_refresh", "swarm-board", "swarm_board", "board",
-    "phi", "hackerone", "hackone",
+    "phi", "preflight", "hackerone", "hackone",
 ]
 
 
@@ -7480,6 +7553,19 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     # Universal Dry-Run Safety Flag (works across ALL flags, modes, and commands)
     parser.add_argument("--dry-run", dest="dry_run", action="store_true", default=False, help="Universal zero-side-effect dry-run across ALL RFCHunt flags and modes (0 network packets, 0 disk mutations, 0 browser launches, 0 API submissions; prints complete execution & RoE compliance plan)")
 
+    # Module 23: Fresh Pre-Flight Stack, Post-Quantum (PQC), HackerOne-Category, Research & Safe Skill Discovery
+    parser.add_argument("--preflight", dest="enable_preflight", action="store_true", default=True, help="Execute fresh zero-cache pre-flight stack/PQC/HackerOne/research/safe-skill discovery at start of every --all run (default-ON)")
+    parser.add_argument("--no-preflight", dest="enable_preflight", action="store_false", help="Disable Module 23 pre-flight discovery during --all")
+    parser.add_argument("--preflight-only", dest="preflight_only", action="store_true", default=False, help="Run Module 23 fresh pre-flight discovery standalone and print the Pre-Flight Checklist (Markdown or --json)")
+    parser.add_argument("--preflight-live", dest="preflight_live", action="store_true", default=True, help="Run fresh keyless live research & OSV.dev exact-version CVE queries during online pre-flight (default-ON; auto-skipped offline/CI/--dry-run)")
+    parser.add_argument("--no-preflight-live", dest="preflight_live", action="store_false", help="Disable live network lookups during pre-flight discovery (local manifest/PQC/skill scan only)")
+    parser.add_argument("--preflight-pqc", dest="preflight_pqc", action="store_true", default=True, help="Enable Post-Quantum Cryptography (FIPS 203/204/205/XMSS/LMS/Hybrid TLS/HNDL) pre-flight auditor (default-ON)")
+    parser.add_argument("--no-preflight-pqc", dest="preflight_pqc", action="store_false", help="Disable Post-Quantum Cryptography static audit pass during pre-flight")
+    parser.add_argument("--preflight-prompt", dest="preflight_prompt", type=str, default="", help="Optional user prompt or scope notes included in pre-flight domain/protocol/PQC detection")
+    parser.add_argument("--preflight-skills-dirs", dest="preflight_skills_dirs", type=str, default=None, help="Comma-separated extra local skill directories to safety-audit and load during pre-flight")
+    parser.add_argument("--no-home-skills", dest="no_home_skills", action="store_true", default=False, help="Restrict local skill discovery to workspace directories only (skip ~/.claude/skills, ~/.gemini/...)")
+    parser.add_argument("--preflight-timeout", dest="preflight_timeout", type=float, default=15.0, help="Total live research time budget in seconds for pre-flight keyless queries (default: 15.0)")
+
     # Module 22: HIPAA Safe Harbor PHI/PII Detector & Zero-Knowledge Redaction (--phi)
     parser.add_argument("--phi", dest="enable_phi", action="store_true", default=False, help="Enable Presidio + GLiNER + RedactX-v3 18 HIPAA Safe Harbor PHI/PII detector & zero-knowledge redactor (standalone or chained into --all)")
     parser.add_argument("--phi-target", dest="phi_target", type=str, default=None, help="Explicit file or directory path for --phi scanning (defaults to --repo / --path / '.')")
@@ -7978,6 +8064,11 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         cmd_hackerone(args)
         return
 
+    # Standalone Module 23 Fresh Pre-Flight Discovery (--preflight-only without --all)
+    if (getattr(args, "preflight_only", False) or active_mode == "preflight") and not getattr(args, "run_all_scans", False):
+        cmd_preflight(args)
+        return
+
     # Standalone Module 22 HIPAA PHI/PII Detector & ZK Redaction (--phi without --all)
     if (getattr(args, "enable_phi", False) or active_mode == "phi") and not getattr(args, "run_all_scans", False):
         cmd_phi(args)
@@ -7994,6 +8085,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "enable_rea_only", "install_tools", "tool_status",
             "raptor_status", "raptor_findings", "raptor_setup",
             "harness2_report", "mantis_report", "aiscan_report",
+            "preflight_only",
         )
     )
     if active_mode == "hint" or (
