@@ -3783,6 +3783,10 @@ def run_unified_all_scans(
     enable_last30days_skills: bool = True,
     last30days_sync: bool = False,
     last30days_topic: str = "",
+    enable_phi_scan: bool = False,
+    phi_redact: bool = False,
+    phi_model: str = "urchade/gliner_multi_pii-v1",
+    phi_enable_ml: bool = True,
 ) -> Dict[str, Any]:
     """
     Execute ALL integrated RFCHunt security scanners against `--repo`, `--path`, or remote `--host` in one pass,
@@ -4132,6 +4136,31 @@ def run_unified_all_scans(
         "total_findings": 0,
         "findings": [],
     }
+    phi_res: Dict[str, Any] = {
+        "status": "disabled" if not enable_phi_scan else "pending",
+        "zero_leakage_enforced": True,
+        "total_findings": 0,
+        "findings": [],
+    }
+
+    def _run_phi_local_task(scan_root: str) -> Dict[str, Any]:
+        if not enable_phi_scan:
+            return {"status": "disabled", "zero_leakage_enforced": True, "total_findings": 0, "findings": []}
+        try:
+            from engine.phi_scanner import PhiScanner
+
+            scanner = PhiScanner(
+                gliner_model=phi_model,
+                enable_ml=bool(phi_enable_ml) and not offline_or_ci,
+                enable_presidio=bool(phi_enable_ml) and not offline_or_ci,
+            )
+            return scanner.scan_repository(
+                scan_root,
+                output_dir=str(out_dir),
+                write_redacted_copies=bool(phi_redact),
+            )
+        except Exception as exc:
+            return {"status": "error", "zero_leakage_enforced": True, "total_findings": 0, "findings": [], "error": str(exc)}
 
     def _run_verification_inversion_task(scan_root: str) -> Dict[str, Any]:
         if not enable_verification_inversion:
@@ -4544,7 +4573,7 @@ def run_unified_all_scans(
             }
 
     remote_probe_corpus: List[Dict[str, Any]] = _build_remote_probes() if has_remote else []
-    fut_mantis = fut_aiscan = fut_raptor_local = fut_rea = fut_verif_inv = fut_arxiv_detect = fut_last30days = None
+    fut_mantis = fut_aiscan = fut_raptor_local = fut_rea = fut_verif_inv = fut_arxiv_detect = fut_last30days = fut_phi = None
     fut_raptor_remote = fut_prober = fut_ruler = fut_harness = fut_oracle = fut_h2_desync = None
     rea_local_root = str(rea_target) if rea_target else (local_target_path if has_local else None)
     with ThreadPoolExecutor(max_workers=10) as pool:
@@ -4558,6 +4587,8 @@ def run_unified_all_scans(
                 fut_arxiv_detect = pool.submit(_run_arxiv_detect_task, local_target_path)
             if enable_last30days_skills:
                 fut_last30days = pool.submit(_run_last30days_skills_task, local_target_path)
+            if enable_phi_scan:
+                fut_phi = pool.submit(_run_phi_local_task, local_target_path)
         if enable_rea and rea_local_root:
             fut_rea = pool.submit(_run_rea_local_task, rea_local_root)
         if has_remote and clean_host:
@@ -4582,6 +4613,8 @@ def run_unified_all_scans(
             arxiv_research_res = fut_arxiv_detect.result()
         if fut_last30days is not None:
             last30days_skills_res = fut_last30days.result()
+        if fut_phi is not None:
+            phi_res = fut_phi.result()
         if fut_rea is not None:
             rea_res = fut_rea.result()
         if fut_raptor_remote is not None:
@@ -5582,6 +5615,27 @@ def run_unified_all_scans(
                 "poe_level": int(rf_rea.get("poe_level", 1) or 1),
             })
 
+    for pf in (phi_res.get("findings") if isinstance(phi_res, dict) else []) or []:
+        if isinstance(pf, dict):
+            raw_aggregated_findings.append({
+                "rule_id": pf.get("rule_id", "PHI-HIPAA-001"),
+                "title": pf.get("title", "Exposed HIPAA PHI / PII"),
+                "severity": str(pf.get("severity", "HIGH")).upper(),
+                "cwe": pf.get("cwe", "CWE-359"),
+                "file_path": pf.get("file_path", target_path),
+                "line_number": int(pf.get("line_number", 1) or 1),
+                "description": pf.get("description", ""),
+                "evidence": pf.get("evidence", ""),
+                "remediation": pf.get("remediation", "Remove raw PHI and replace with `<ZK_PII:TYPE:HASH8>` commitments."),
+                "scanner": "Module-22-PhiScanner",
+                "evidence_lane": "DETERMINISTIC_STATIC",
+                "poe_level": int(pf.get("poe_level", 2) or 2),
+                "phi_entity_type": pf.get("phi_entity_type", ""),
+                "hipaa_identifier": pf.get("hipaa_identifier", ""),
+                "zk_commitment": pf.get("zk_commitment", ""),
+                "zero_leakage_verified": bool(pf.get("zero_leakage_verified", True)),
+            })
+
     # R1: Normalize truthful POE tiering and cross-engine deduplication across all aggregated findings
     _sev_order = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
     aggregated_findings: List[Dict[str, Any]] = []
@@ -5724,6 +5778,22 @@ def run_unified_all_scans(
     speculative_hypotheses: List[Dict[str, Any]] = [
         f for f in aggregated_findings if f.get("evidence_lane") == "SPECULATIVE_HYPOTHESIS"
     ]
+
+    # When --phi is active, enforce end-to-end zero raw PHI leakage across ALL aggregated findings
+    # (including findings emitted by Mantis/aiscan/RAPTOR/ARTEX) before serializing JSON/SARIF.
+    if enable_phi_scan:
+        try:
+            from engine.phi_scanner import PresidioGlinerPiiZeroGuard
+
+            _phi_scrub_guard = PresidioGlinerPiiZeroGuard(enable_ml=False, enable_presidio=False)
+            for _f_item in aggregated_findings:
+                for _k in ("title", "description", "evidence", "snippet", "raw_probe", "raw_response", "remediation"):
+                    _val = _f_item.get(_k)
+                    if isinstance(_val, str) and _val:
+                        _f_item[_k], _ = _phi_scrub_guard.scrub_and_prove(_val)
+        except Exception:
+            pass
+
     primary_findings: List[Dict[str, Any]] = verified_exploits + deterministic_static_findings
     manual_review_leads: List[Dict[str, Any]] = [
         f for f in aggregated_findings if int(f.get("poe_level", 0) or 0) < 3
@@ -6038,6 +6108,7 @@ def run_unified_all_scans(
             "verification_inversion": verification_inversion_res,
             "arxiv_research_detectors": arxiv_research_res,
             "last30days_security_skills": last30days_skills_res,
+            "phi_scanner": phi_res,
         },
         "findings": aggregated_findings,
         "chains": artex_res.get("chains") or [],

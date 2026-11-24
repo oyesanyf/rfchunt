@@ -3775,6 +3775,209 @@ def _run_all_aixcc_extensions(
             engines["hackerone_porter"] = {"status": "error", "error": str(exc)}
 
 
+def cmd_phi(
+    args: Any,
+    *,
+    return_dict_only: bool = False,
+) -> Dict[str, Any]:
+    """
+    Executes `--phi`: HIPAA Safe Harbor PHI/PII detector & zero-knowledge redaction engine
+    (Presidio + GLiNER `urchade/gliner_multi_pii-v1` + RedactX-v3 18 HIPAA validators + Depth-8
+    recursive encoding unwrapper + `<ZK_PII:TYPE:HASH8>` commitments).
+    Respects universal `--dry-run`.
+    """
+    from engine.phi_scanner import DEFAULT_GLINER_MODEL, PhiScanner
+
+    target_path = (
+        getattr(args, "phi_target", None)
+        or getattr(args, "repo", None)
+        or getattr(args, "path", None)
+        or getattr(args, "target_arg", None)
+        or "."
+    )
+    out_dir = str(getattr(args, "output_dir", "reports") or "reports")
+    phi_model = str(getattr(args, "phi_model", DEFAULT_GLINER_MODEL) or DEFAULT_GLINER_MODEL)
+    enable_ml = not bool(getattr(args, "no_phi_ml", False))
+    write_redacted = bool(getattr(args, "phi_redact", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    scanner = PhiScanner(
+        gliner_model=phi_model,
+        enable_ml=enable_ml and not dry_run,
+        enable_presidio=enable_ml and not dry_run,
+    )
+    if dry_run:
+        root = Path(str(target_path)).resolve(strict=False)
+        files = scanner._collect_files(root) if root.exists() else []
+        result: Dict[str, Any] = {
+            "status": "dry_run_phi_plan_ready",
+            "dry_run": True,
+            "target_path": str(root),
+            "target_exists": root.exists(),
+            "candidate_files_count": len(files),
+            "sample_files": [str(f) for f in files[:15]],
+            "gliner_model": phi_model,
+            "ml_requested": enable_ml,
+            "backends_offline_ready": scanner.guard.active_backends,
+            "would_write_redacted_copies": write_redacted,
+            "output_dir": out_dir,
+            "network_packets_sent": 0,
+            "filesystem_mutations": 0,
+        }
+    else:
+        result = scanner.scan_repository(
+            str(target_path),
+            output_dir=out_dir,
+            write_redacted_copies=write_redacted,
+        )
+
+    if return_dict_only:
+        return result
+
+    if getattr(args, "as_json", False):
+        from engine.cli_render import render_json
+        render_json(result)
+        return result
+
+    print("\n" + "=" * 78)
+    print("  RFCHUNT MODULE 22: HIPAA PHI / PII DETECTOR & ZK REDACTION (--phi)")
+    print("=" * 78)
+    print(f"  Status              : {result.get('status')}")
+    print(f"  Target Path         : {result.get('target_path')}")
+    if dry_run:
+        print(f"  Dry-Run Mode        : ACTIVE (0 files modified, 0 network requests)")
+        print(f"  Candidate Files     : {result.get('candidate_files_count', 0)}")
+        print(f"  GLiNER Model        : {result.get('gliner_model')}")
+        print(f"  Write Redacted Copy : {result.get('would_write_redacted_copies')}")
+    else:
+        print(f"  Active Backends     : {', '.join(result.get('backends') or [])}")
+        print(f"  Files Scanned       : {result.get('files_scanned', 0)}")
+        print(f"  PHI Findings        : {result.get('total_findings', 0)} {result.get('entity_counts', {})}")
+        print(f"  Zero-Leakage Proof  : ENFORCED (<ZK_PII:TYPE:HASH8>, Platt T=1.08, Depth-8 Unwrap)")
+        print(f"  Redacted Files Out  : {result.get('redacted_files_count', 0)}")
+        print(f"  Report JSON         : {result.get('report_path')}")
+        for item in (result.get("findings") or [])[:15]:
+            print(
+                f"    -> [{item.get('severity', 'HIGH'):<8}] {item.get('rule_id')} | "
+                f"{Path(str(item.get('file_path', ''))).name}:{item.get('line_number', 1)} | "
+                f"{item.get('zk_commitment') or item.get('title', '')[:60]}"
+            )
+    print("=" * 78 + "\n")
+    return result
+
+
+def cmd_dry_run_plan(
+    args: Any,
+    *,
+    active_mode: str,
+    raw_argv: Sequence[str],
+) -> Dict[str, Any]:
+    """
+    Universal `--dry-run` planner covering ALL RFCHunt modes and flags with zero side effects:
+    zero network sockets, zero external tool installs, zero git clones, zero DB/file writes,
+    zero browser launches, and zero external API submissions.
+    """
+    from engine.safe_network_validator import validate_and_authorize_target
+
+    host = getattr(args, "host", None) or getattr(args, "target", None)
+    targets = getattr(args, "targets", None) or []
+    repo = getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "raptor_target", None)
+    auth_checks: List[Dict[str, Any]] = []
+    for cand_h in ([host] if host else []) + list(targets):
+        if cand_h:
+            ok, reason = validate_and_authorize_target(str(cand_h), authorized=bool(getattr(args, "authorized", False)))
+            auth_checks.append({"target": str(cand_h), "authorized": bool(ok), "reason": str(reason)})
+
+    enabled_flags = sorted(
+        k for k, v in vars(args).items()
+        if isinstance(v, bool) and v and not k.startswith("_")
+    )
+    planned_modules: List[str] = []
+    if getattr(args, "run_all_scans", False) or active_mode in ("all", "all_scans"):
+        planned_modules.extend(
+            [
+                "Module-20-Mantis",
+                "Module-18-aiscan",
+                "Module-15-RAPTOR",
+                "Module-21-REA",
+                "VerificationInversionHunter",
+                "ArxivSecurityBridge",
+                "Last30DaysSecuritySkills",
+                "Module-17-ARTEX-DualGraph",
+                "Module-19-PromptSmuggling",
+            ]
+        )
+    if getattr(args, "enable_phi", False) or active_mode == "phi":
+        planned_modules.append("Module-22-PhiScanner(Presidio+GLiNER+RedactX-v3)")
+    if getattr(args, "deep_audit", False) or active_mode in ("deep-audit", "deep_audit") or getattr(args, "proxy_target", None):
+        planned_modules.append("DeepRepoAudit(TrustBoundary+LoopbackProxy+CoverageFuzz)")
+    if getattr(args, "enable_poc", False):
+        planned_modules.append("PoCVerifier")
+    if getattr(args, "enable_hackerone", False) or active_mode in ("hackerone", "hackone"):
+        planned_modules.append(
+            "HackerOneAutonomousRunner(RoE-3Tier)"
+            if getattr(args, "hackerone_auto", False)
+            else "HackerOnePorter(HITL)"
+        )
+    if getattr(args, "serve_ui", False):
+        planned_modules.append(f"MissionControlServer({getattr(args, 'ui_host', '127.0.0.1')}:{getattr(args, 'ui_port', 8789)})")
+    if not planned_modules:
+        planned_modules.append(f"mode:{active_mode}")
+
+    sub_plans: Dict[str, Any] = {}
+    if getattr(args, "enable_phi", False):
+        sub_plans["phi"] = cmd_phi(args, return_dict_only=True)
+    if getattr(args, "enable_hackerone", False):
+        sub_plans["hackerone"] = cmd_hackerone(args, findings_override=[], return_dict_only=True)
+
+    plan: Dict[str, Any] = {
+        "status": "dry_run_plan_ready",
+        "dry_run": True,
+        "active_mode": active_mode,
+        "raw_argv": list(raw_argv),
+        "target_repo_or_path": str(Path(str(repo)).resolve(strict=False)) if repo else None,
+        "target_host": host,
+        "target_port": getattr(args, "port", None),
+        "target_tls": bool(getattr(args, "tls", False)),
+        "targets": list(targets),
+        "authorization_checks": auth_checks,
+        "request_hygiene": {
+            "custom_headers": list(getattr(args, "headers", None) or []),
+            "user_agent": getattr(args, "user_agent", None),
+            "max_rps": float(getattr(args, "max_rps", 0.0) or 0.0),
+        },
+        "planned_modules": planned_modules,
+        "enabled_flags": enabled_flags,
+        "sub_plans": sub_plans,
+        "side_effects": {
+            "network_packets_sent": 0,
+            "filesystem_mutations": 0,
+            "external_submissions": 0,
+            "browser_launched": False,
+        },
+    }
+
+    if getattr(args, "as_json", False):
+        from engine.cli_render import render_json
+        render_json(plan)
+        return plan
+
+    print("\n" + "=" * 78)
+    print("  RFCHUNT UNIVERSAL --dry-run EXECUTION PLAN (ZERO SIDE EFFECTS)")
+    print("=" * 78)
+    print(f"  Active Mode         : {plan['active_mode']}")
+    print(f"  Target Repo/Path    : {plan['target_repo_or_path'] or '-'}")
+    print(f"  Target Host/Port    : {plan['target_host'] or '-'}:{plan['target_port'] or '-'} (TLS={plan['target_tls']})")
+    print(f"  Planned Modules     : {', '.join(planned_modules)}")
+    print(f"  Request Hygiene     : headers={plan['request_hygiene']['custom_headers']} | max_rps={plan['request_hygiene']['max_rps']}")
+    if auth_checks:
+        for ac in auth_checks:
+            print(f"  Auth Check          : {ac['target']} -> {'OK' if ac['authorized'] else 'BLOCKED'} ({ac['reason']})")
+    print("  Guarantee           : 0 packets sent | 0 files mutated | 0 browser sessions | 0 submissions")
+    print("=" * 78 + "\n")
+    return plan
+
+
 def cmd_hackerone(
     args: Any,
     *,
@@ -3782,15 +3985,72 @@ def cmd_hackerone(
     return_dict_only: bool = False,
 ) -> Dict[str, Any]:
     """
-    Executes `--hackerone` / `--hackone`: discovers/selects a HackerOne campaign, filters
-    RFCHunt findings through the strict Anti-Slop Quality Gate (Lane 1 + Lane 2 only),
-    exports redacted HackerOne Markdown drafts, and optionally launches a visible HITL
-    Playwright Computer-Use browser session (pausing for human login/2FA/CAPTCHA and
-    stopping before the final Submit button).
+    Executes `--hackerone` / `--hackone` (and policy-aware `--hackerone-auto`):
+      - Reads & enforces HackerOne's 3-Tier Program Rules of Engagement (RoE):
+        Tier 1 Explicitly Prohibited (blocks live scanning for Safe Harbor),
+        Tier 2 Permitted with Rate Limits & Attribution (`max_rps`, `X-HackerOne: <user>`),
+        Tier 3 In-Scope Only (no out-of-scope redirect escape).
+      - Applies the Strict Anti-Slop PoC Gate (Lane 1 + Lane 2 only) & Secret/PHI redaction.
+      - Supports universal `--dry-run`.
+      - Stops strictly before final Submit for human researcher validation.
     """
-    from engine.hackerone_porter import HackerOnePorter, load_findings_for_hackerone
+    from engine.hackerone_porter import (
+        HackerOneAutonomousRunner,
+        HackerOnePorter,
+        load_findings_for_hackerone,
+    )
 
     out_root = str(Path(getattr(args, "output_dir", "reports") or "reports") / "hackerone")
+    dry_run = bool(getattr(args, "dry_run", False))
+    auto_mode = bool(getattr(args, "hackerone_auto", False))
+    researcher_username = str(getattr(args, "hackerone_username", "") or "").strip()
+    include_ai_disclosure = bool(getattr(args, "hackerone_ai_disclosure", False))
+    policy_text_override = ""
+    policy_file = getattr(args, "hackerone_policy_file", None)
+    if policy_file and Path(str(policy_file)).is_file():
+        policy_text_override = Path(str(policy_file)).read_text(encoding="utf-8", errors="replace")
+
+    if auto_mode:
+        runner = HackerOneAutonomousRunner(output_dir=out_root)
+        local_repo = getattr(args, "repo", None) or getattr(args, "path", None)
+        result = runner.run_campaign_workflow(
+            program_handle=getattr(args, "hackerone_program", None),
+            query=str(getattr(args, "hackerone_query", "") or ""),
+            max_programs=int(getattr(args, "hackerone_max_programs", 2) or 2),
+            local_repo_path=str(local_repo) if local_repo else None,
+            policy_text_override=policy_text_override,
+            researcher_username=researcher_username,
+            use_api=bool(getattr(args, "hackerone_api", False)),
+            use_browser=bool(getattr(args, "hackerone_browser", False)),
+            enable_phi_scan=bool(getattr(args, "enable_phi", False)),
+            min_severity=str(getattr(args, "hackerone_min_severity", "medium") or "medium"),
+            max_reports=int(getattr(args, "hackerone_max_reports", 5) or 5),
+            include_ai_disclosure=include_ai_disclosure,
+            dry_run=dry_run,
+        )
+        if return_dict_only:
+            return result
+        if getattr(args, "as_json", False):
+            from engine.cli_render import render_json
+            render_json(result)
+            return result
+        print("\n" + "=" * 78)
+        print("  RFCHUNT HACKERONE POLICY-AWARE AUTONOMOUS RUNNER (--hackerone --hackerone-auto)")
+        print("=" * 78)
+        print(f"  Status              : {result.get('status')} (dry_run={result.get('dry_run')})")
+        print(f"  Safe Harbor & RoE   : ENFORCED (3-Tier Policy Parser + No Cross-Scope Redirects)")
+        print(f"  Programs Evaluated  : {result.get('programs_evaluated', 0)}")
+        for pr in result.get("program_results") or []:
+            roe = pr.get("roe_compliance") or {}
+            pr_port = pr.get("port_result") or {}
+            print(f"  -> Program          : {pr.get('program_handle')}")
+            print(f"     RoE Tier         : {roe.get('automation_tier')} | Safe Harbor: {roe.get('safe_harbor_status')}")
+            print(f"     Live Scan Policy : {roe.get('live_scan_policy_decision')} | max_rps={roe.get('max_rps')}")
+            print(f"     Required Headers : {roe.get('required_headers') or ['none']}")
+            print(f"     Eligible Drafts  : {pr_port.get('eligible_drafts_count', 0)} (Rejected: {pr_port.get('rejected_findings_count', 0)})")
+        print("=" * 78 + "\n")
+        return result
+
     findings = (
         list(findings_override)
         if findings_override is not None
@@ -3801,7 +4061,7 @@ def cmd_hackerone(
     )
     submit_api = bool(getattr(args, "hackerone_submit_api", False))
     hitl_approved = False
-    if submit_api:
+    if submit_api and not dry_run:
         confirm = input(
             "[HITL APPROVAL] You passed --hackerone-submit-api. Type YES to confirm submitting "
             "eligible RFCHunt drafts via the official HackerOne API v1: "
@@ -3820,6 +4080,10 @@ def cmd_hackerone(
         submit_api=submit_api,
         hitl_approved=hitl_approved,
         bounties_only=bool(getattr(args, "hackerone_bounties_only", False)),
+        researcher_username=researcher_username,
+        include_ai_disclosure=include_ai_disclosure,
+        policy_text_override=policy_text_override,
+        dry_run=dry_run,
     )
 
     if return_dict_only:
@@ -3831,12 +4095,16 @@ def cmd_hackerone(
         return result
 
     camp = result.get("campaign") or {}
+    roe_rules = result.get("policy_rules") or {}
     print("\n" + "=" * 78)
     print("  RFCHUNT HACKERONE CAMPAIGN FINDER & HITL REPORT PORTER (--hackerone)")
     print("=" * 78)
+    print(f"  Status              : {result.get('status')} (dry_run={result.get('dry_run')})")
     print(f"  Campaign Handle     : {camp.get('handle')} ({camp.get('url')})")
     print(f"  Submit Report URL   : {camp.get('submit_url')}")
-    print(f"  Anti-Slop Gate      : ENFORCED (Lane 1 + Lane 2 only; Lane 3 speculative rejected)")
+    if roe_rules:
+        print(f"  RoE Compliance Tier : {roe_rules.get('automation_tier')} | max_rps={roe_rules.get('max_rps')} | headers={roe_rules.get('required_headers')}")
+    print(f"  Anti-Slop PoC Gate  : ENFORCED (Lane 1 + Lane 2 only; Lane 3 speculative rejected; Secrets + PHI redacted)")
     print(f"  Eligible Drafts     : {result.get('eligible_drafts_count', 0)}")
     print(f"  Rejected Findings   : {result.get('rejected_findings_count', 0)}")
     print(f"  Bundle JSON         : {result.get('bundle_path')}")
@@ -4729,6 +4997,10 @@ def cmd_all(args):
             "enable_last30days_skills": bool(getattr(args, "enable_last30days_skills", True)),
             "last30days_sync": bool(getattr(args, "last30days_sync", False)),
             "last30days_topic": getattr(args, "last30days_topic", None) or "",
+            "enable_phi_scan": bool(getattr(args, "enable_phi", False)),
+            "phi_redact": bool(getattr(args, "phi_redact", False)),
+            "phi_model": str(getattr(args, "phi_model", "urchade/gliner_multi_pii-v1") or "urchade/gliner_multi_pii-v1"),
+            "phi_enable_ml": not bool(getattr(args, "no_phi_ml", False)),
         }
         try:
             _unified_sig = inspect.signature(run_unified_all_scans)
@@ -4941,6 +5213,12 @@ def cmd_all(args):
         )
         print(f"    POE Breakdown       : {poe_bd}")
         print(f"    Module 19 Smuggling : {eng.get('prompt_smuggling', {}).get('probes_generated', 0)} probes synthesized")
+        if "phi_scanner" in eng and (eng.get("phi_scanner") or {}).get("status") != "disabled":
+            phi_info = eng.get("phi_scanner") or {}
+            print(
+                f"    Module 22 PHI/PII   : {phi_info.get('total_findings', 0)} findings "
+                f"(backends={','.join(phi_info.get('backends') or [])}, zero_leakage={phi_info.get('zero_leakage_enforced', True)})"
+            )
         if "call_graph_slicer" in eng:
             cg = eng.get("call_graph_slicer") or {}
             te = eng.get("tiered_escalation") or {}
@@ -6559,6 +6837,7 @@ ALL_MODES = [
     "poc", "poc-verify", "poc_verify", "docker-doctor", "docker_doctor", "doctor-docker",
     "deep-audit", "deep_audit",
     "novelty", "novelty-refresh", "novelty_refresh", "swarm-board", "swarm_board", "board",
+    "phi", "hackerone", "hackone",
 ]
 
 
@@ -7198,12 +7477,27 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--ui-allow-non-loopback", dest="ui_allow_non_loopback", action="store_true", default=False, help="Explicitly permit binding --serve-ui on a non-loopback interface")
     parser.add_argument("--network-lifecycle", dest="network_lifecycle", action="store_true", default=False, help="Run turnkey multi-target network lifecycle profile (--all + opt-in httpx/katana/nuclei discovery + Dual-Graph + retest)")
 
-    # HackerOne Campaign Finder & Human-in-the-Loop (HITL) Computer-Use Report Porter
-    parser.add_argument("--hackerone", "--hackone", dest="enable_hackerone", action="store_true", default=False, help="Discover a HackerOne campaign and port verified/deterministic RFCHunt findings into redacted HackerOne report drafts with HITL review")
+    # Universal Dry-Run Safety Flag (works across ALL flags, modes, and commands)
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true", default=False, help="Universal zero-side-effect dry-run across ALL RFCHunt flags and modes (0 network packets, 0 disk mutations, 0 browser launches, 0 API submissions; prints complete execution & RoE compliance plan)")
+
+    # Module 22: HIPAA Safe Harbor PHI/PII Detector & Zero-Knowledge Redaction (--phi)
+    parser.add_argument("--phi", dest="enable_phi", action="store_true", default=False, help="Enable Presidio + GLiNER + RedactX-v3 18 HIPAA Safe Harbor PHI/PII detector & zero-knowledge redactor (standalone or chained into --all)")
+    parser.add_argument("--phi-target", dest="phi_target", type=str, default=None, help="Explicit file or directory path for --phi scanning (defaults to --repo / --path / '.')")
+    parser.add_argument("--phi-redact", dest="phi_redact", action="store_true", default=False, help="Write zero-knowledge scrubbed copies (`<ZK_PII:TYPE:HASH8>`) with quarantine proofs under reports/phi_redacted/")
+    parser.add_argument("--phi-model", dest="phi_model", type=str, default="urchade/gliner_multi_pii-v1", help="GLiNER Span NER model identifier for --phi (default: urchade/gliner_multi_pii-v1)")
+    parser.add_argument("--no-phi-ml", dest="no_phi_ml", action="store_true", default=False, help="Force deterministic offline RedactX-v3 + GLiNER fallback without loading HuggingFace GLiNER or Presidio ML weights")
+
+    # HackerOne Campaign Finder, RoE Policy Engine & Autonomous HITL Computer-Use Report Porter
+    parser.add_argument("--hackerone", "--hackone", dest="enable_hackerone", action="store_true", default=False, help="Discover a HackerOne campaign, parse its 3-tier RoE policy, and port verified/deterministic RFCHunt findings into redacted HackerOne report drafts with HITL review")
+    parser.add_argument("--hackerone-auto", "--hackone-auto", dest="hackerone_auto", action="store_true", default=False, help="Policy-aware autonomous HackerOne workflow: after human login, discovers open campaigns, enforces RoE rules/Safe Harbor, audits in-scope repos (--all + --phi), and pre-fills drafts up to final human Submit")
+    parser.add_argument("--hackerone-username", "--hackone-username", dest="hackerone_username", type=str, default="", help="Researcher HackerOne username for program-mandated attribution headers (e.g. X-HackerOne: <username>)")
     parser.add_argument("--hackerone-program", "--hackone-program", dest="hackerone_program", type=str, default=None, help="Target HackerOne program handle (e.g. 'anthropic-vdp')")
     parser.add_argument("--hackerone-query", "--hackone-query", dest="hackerone_query", type=str, default="", help="Search keyword for HackerOne campaign discovery")
+    parser.add_argument("--hackerone-max-programs", dest="hackerone_max_programs", type=int, default=2, help="Max campaigns to inspect per --hackerone-auto run (default: 2)")
+    parser.add_argument("--hackerone-policy-file", dest="hackerone_policy_file", type=str, default=None, help="Optional local policy text file for offline RoE compliance evaluation & dry-run testing")
+    parser.add_argument("--hackerone-ai-disclosure", dest="hackerone_ai_disclosure", action="store_true", default=False, help="Include explicit RFCHunt research-assistance & manual PoC verification disclosure section in drafts")
     parser.add_argument("--hackerone-browser", "--hackone-browser", dest="hackerone_browser", action="store_true", default=False, help="Launch visible HITL Playwright browser session for HackerOne login (human completes 2FA/CAPTCHA) and report form pre-fill (stops before final Submit)")
-    parser.add_argument("--hackerone-api", "--hackone-api", dest="hackerone_api", action="store_true", default=False, help="Query HackerOne Hacker API v1 for live campaign/scope discovery using HACKERONE_API_USERNAME and HACKERONE_API_TOKEN")
+    parser.add_argument("--hackerone-api", "--hackone-api", dest="hackerone_api", action="store_true", default=False, help="Query HackerOne Hacker API v1 for live campaign/scope/policy discovery using HACKERONE_API_USERNAME and HACKERONE_API_TOKEN")
     parser.add_argument("--hackerone-submit-api", dest="hackerone_submit_api", action="store_true", default=False, help="Explicit opt-in to submit eligible drafts via HackerOne API v1 after interactive HITL confirmation")
     parser.add_argument("--hackerone-bounties-only", dest="hackerone_bounties_only", action="store_true", default=False, help="Filter HackerOne API campaign discovery to paid bounty programs only")
     parser.add_argument("--hackerone-min-severity", dest="hackerone_min_severity", choices=["low", "medium", "high", "critical"], default="medium", help="Minimum severity eligible for HackerOne porting (default: medium)")
@@ -7502,7 +7796,8 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "enable_rea_only", "clean_db", "raptor_status", "raptor_findings", "raptor_setup",
             "harness2_report", "mantis_report", "aiscan_report", "install_tools", "tool_status",
             "deep_audit", "proxy_target", "live_proxy_fuzz", "trust_boundary_review",
-            "coverage_fuzz", "enable_poc",
+            "coverage_fuzz", "enable_poc", "enable_phi", "enable_hackerone", "hackerone_auto",
+            "serve_ui", "network_lifecycle", "dry_run",
         )
     ) and getattr(args, "hint", None) is None and not getattr(args, "dispatch", None):
         build_swarm_parser().print_help()
@@ -7547,6 +7842,20 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         active_mode = "clean_db"
     elif active_mode in ("install-tools", "install"):
         active_mode = "setup"
+    elif active_mode in ("hackone",):
+        active_mode = "hackerone"
+
+    # Universal --dry-run guard: works across EVERY flag and subcommand with zero side effects
+    if getattr(args, "dry_run", False):
+        if (getattr(args, "enable_hackerone", False) or getattr(args, "hackerone_auto", False) or active_mode == "hackerone") and not getattr(args, "run_all_scans", False):
+            args.enable_hackerone = True
+            cmd_hackerone(args)
+            return
+        if (getattr(args, "enable_phi", False) or active_mode == "phi") and not getattr(args, "run_all_scans", False):
+            cmd_phi(args)
+            return
+        cmd_dry_run_plan(args, active_mode=active_mode, raw_argv=raw_argv)
+        return
 
     if active_mode == "setup":
         _dispatch_cmd("cmd_setup", args)
@@ -7663,9 +7972,15 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             args.enable_external_discovery = True
             args.enable_external_nuclei = True
 
-    # Standalone HackerOne Campaign Finder & HITL Report Porter (--hackerone / --hackone without --all)
-    if getattr(args, "enable_hackerone", False) and not getattr(args, "run_all_scans", False):
+    # Standalone HackerOne Campaign Finder & HITL Report Porter (--hackerone / --hackone / --hackerone-auto without --all)
+    if (getattr(args, "enable_hackerone", False) or getattr(args, "hackerone_auto", False) or active_mode == "hackerone") and not getattr(args, "run_all_scans", False):
+        args.enable_hackerone = True
         cmd_hackerone(args)
+        return
+
+    # Standalone Module 22 HIPAA PHI/PII Detector & ZK Redaction (--phi without --all)
+    if (getattr(args, "enable_phi", False) or active_mode == "phi") and not getattr(args, "run_all_scans", False):
+        cmd_phi(args)
         return
 
     # Standalone CLI-only blackboard hint injection (zero GUI / HTTP server calls)

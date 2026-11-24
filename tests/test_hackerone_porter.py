@@ -13,13 +13,16 @@ import pytest
 
 from engine.hackerone_porter import (
     HackerOneApiClient,
+    HackerOneAutonomousRunner,
     HackerOneCampaign,
     HackerOneComputerUsePorter,
     HackerOnePorter,
     build_hackerone_report_draft,
     filter_eligible_findings,
+    parse_hackerone_program_policy,
     validate_hackerone_handle,
     validate_hackerone_url,
+    validate_source_repo_url,
 )
 from engine.mission_control_server import MissionControlOrchestrator, MissionControlServer
 from rfc_hunt_swarm import parse_swarm_arguments
@@ -276,5 +279,117 @@ def test_mission_control_hackerone_preview_endpoint(tmp_path: Path) -> None:
             assert body["eligible_drafts_count"] == 1
             assert body["rejected_findings_count"] == 1
             assert body["drafts"][0]["source_rule_id"] == "INV-ALG-MISSING-SHELL-STARTUP-DENY"
+
+        # Verify Mission Control /api/phi/scan zero-leakage endpoint
+        phi_req = urllib.request.Request(
+            f"{base}/api/phi/scan",
+            data=json.dumps({"text": "Patient John Doe SSN 123-45-6789 NPI 1234567893"}).encode("utf-8"),
+            headers=tok_hdr,
+            method="POST",
+        )
+        with urllib.request.urlopen(phi_req, timeout=5.0) as phi_resp:
+            assert phi_resp.status == 200
+            phi_body = json.loads(phi_resp.read().decode("utf-8"))
+            assert phi_body["total_findings"] >= 2
+            assert "123-45-6789" not in phi_body["scrubbed_preview"]
+            assert phi_body["quarantine_proof"]["zero_leakage_verified"] is True
     finally:
         srv.stop()
+
+
+def test_hackerone_roe_three_tier_policy_parser_and_safe_harbor() -> None:
+    # Tier 1: Explicitly Prohibited (e.g. Agoda) -> blocks live scanning to preserve Safe Harbor
+    agoda_rules = parse_hackerone_program_policy(
+        "agoda",
+        "Agoda explicitly prohibits performing automated security testing or scanning against production.",
+        structured_scopes=[
+            {"attributes": {"asset_identifier": "www.agoda.com", "asset_type": "URL", "eligible_for_submission": True}},
+            {"attributes": {"asset_identifier": "oauth.thirdparty.com", "asset_type": "URL", "eligible_for_submission": False}},
+        ],
+        researcher_username="alice_h1",
+    )
+    assert agoda_rules.automation_tier == "explicitly_prohibited"
+    assert agoda_rules.automated_scanning_prohibited is True
+    assert agoda_rules.max_rps == 0.0
+    assert agoda_rules.safe_harbor_status == "blocked_to_preserve_safe_harbor"
+    assert agoda_rules.no_out_of_scope_redirects is True
+    assert "oauth.thirdparty.com" in agoda_rules.out_of_scope_assets
+
+    # Tier 2: Permitted with Rate Limits & Attribution Header + AI Disclosure
+    policy_tier2 = (
+        "Automated testing is allowed up to 5 requests per second. "
+        "You must include header X-HackerOne: <username> on all traffic. "
+        "Please disclose any use of AI or automated tools in your report. "
+        "Open-source repo: https://github.com/example-org/example-proxy"
+    )
+    tier2_ok = parse_hackerone_program_policy(
+        "example-bounty",
+        policy_tier2,
+        researcher_username="alice_h1",
+    )
+    assert tier2_ok.automation_tier == "permitted_with_limits_and_attribution"
+    assert tier2_ok.automated_scanning_prohibited is False
+    assert tier2_ok.max_rps == 5.0
+    assert "X-HackerOne: alice_h1" in tier2_ok.required_headers
+    assert tier2_ok.missing_attribution_username is False
+    assert tier2_ok.ai_disclosure_required is True
+    assert "https://github.com/example-org/example-proxy" in tier2_ok.in_scope_repos
+
+    # Tier 2 fail-closed when required attribution username is missing
+    tier2_missing = parse_hackerone_program_policy("example-bounty", policy_tier2, researcher_username="")
+    assert tier2_missing.missing_attribution_username is True
+    assert tier2_missing.safe_harbor_status == "missing_researcher_attribution_username"
+
+    # Untrusted source repo host must fail closed
+    with pytest.raises(PermissionError):
+        validate_source_repo_url("http://evil.local/org/repo")
+
+
+def test_hackerone_autonomous_runner_enforces_roe_redacts_phi_and_supports_dry_run(tmp_path: Path) -> None:
+    repo = tmp_path / "in_scope_repo"
+    repo.mkdir()
+    (repo / "billing.py").write_text(
+        'PATIENT_DATA = {"patient": "Eva Lin", "ssn": "623-45-6789", "npi": "1234567893"}\n',
+        encoding="utf-8",
+    )
+
+    runner = HackerOneAutonomousRunner(output_dir=str(tmp_path / "h1_auto"))
+
+    # 1. Dry-run verifies RoE parsing & Safe Harbor block with zero filesystem writes
+    dry_res = runner.run_campaign_workflow(
+        program_handle="agoda",
+        local_repo_path=str(repo),
+        policy_text_override="Do not use automated scanners. Disclose any use of AI tools.",
+        researcher_username="alice_h1",
+        enable_phi_scan=True,
+        dry_run=True,
+    )
+    assert dry_res["dry_run"] is True
+    assert dry_res["safe_harbor_roe_enforced"] is True
+    roe_dry = dry_res["program_results"][0]["roe_compliance"]
+    assert roe_dry["automated_scanning_prohibited"] is True
+    assert roe_dry["live_scan_policy_decision"] == "BLOCKED_BY_ROE_EXPLICITLY_PROHIBITED_SAFE_HARBOR"
+    assert not (tmp_path / "h1_auto" / "hackerone_autonomous_summary.json").exists()
+
+    # 2. Live read-only local audit + --phi + draft export with zero PHI leakage + AI disclosure
+    live_res = runner.run_campaign_workflow(
+        program_handle="clinic-vdp",
+        local_repo_path=str(repo),
+        policy_text_override="Cap automated traffic at 2 requests per second with X-HackerOne: <username>. Disclose use of AI tools.",
+        researcher_username="alice_h1",
+        enable_phi_scan=True,
+        min_severity="medium",
+        dry_run=False,
+    )
+    assert live_res["status"] == "autonomous_workflow_completed"
+    pr = live_res["program_results"][0]
+    assert pr["roe_compliance"]["max_rps"] == 2.0
+    assert "X-HackerOne: alice_h1" in pr["roe_compliance"]["required_headers"]
+    port_r = pr["port_result"]
+    assert port_r["eligible_drafts_count"] >= 1
+    first_draft = port_r["drafts"][0]
+    assert first_draft["ai_disclosure_included"] is True
+    # Zero raw SSN/NPI leakage in HackerOne draft!
+    assert "623-45-6789" not in first_draft["vulnerability_information"]
+    assert "1234567893" not in first_draft["vulnerability_information"]
+    assert Path(live_res["summary_path"]).is_file()
