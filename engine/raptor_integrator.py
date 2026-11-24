@@ -217,9 +217,26 @@ class RaptorIntegrator:
         available_tags: Optional[List[str]] = None,
     ) -> str:
         """
-        Resolves the RAPTOR Ollama model strictly from runtime free/available RAM & VRAM
-        (NEVER total physical RAM, NEVER appends `-coder` suffixes).
+        Resolves the RAPTOR LLM model:
+        - When `.env.local` configures paid models, selects the configured paid provider/model
+          (bypassing Ollama completely).
+        - Otherwise resolves the local Ollama model strictly from runtime free/available RAM & VRAM.
         """
+        try:
+            from engine.paid_model_provider import is_ollama_model_tag, load_paid_model_config
+
+            paid_cfg = load_paid_model_config()
+            if paid_cfg.enabled:
+                req = (requested_model or "").strip()
+                if req and not is_ollama_model_tag(req) and req.lower() != RAPTOR_DEFAULT_MODEL.lower():
+                    return req
+                prov_prefix = "openai" if paid_cfg.provider == "openai_compatible" else paid_cfg.provider
+                if "/" in paid_cfg.primary_model:
+                    return paid_cfg.primary_model
+                return f"{prov_prefix}/{paid_cfg.primary_model}"
+        except Exception:
+            pass
+
         from ollama_manager import get_runtime_free_memory, select_raptor_model_for_free_memory
 
         free_ram_gb, free_vram_mb = get_runtime_free_memory()
@@ -288,26 +305,43 @@ class RaptorIntegrator:
         except Exception as e:
             status["docker_error"] = str(e)
 
-        # 2. Check Ollama models with strict <=400ms health probe timeout
-        probe_timeout = min(max(float(self.OLLAMA_PROBE_TIMEOUT_SEC), 0.05), HEALTH_PROBE_MAX_TIMEOUT_SEC)
+        # 2. Check Paid API `.env.local` override first (bypasses Ollama probe when active)
+        paid_active = False
         try:
-            req = urllib.request.Request(self.OLLAMA_TAGS_URL, method="GET")
-            with urllib.request.urlopen(req, timeout=probe_timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                models = [m.get("name", "") for m in data.get("models", []) if m.get("name")]
-                status["ollama_ready"] = True
-                status["ollama_models"] = models
-                rec_model = select_raptor_model_for_free_memory(
-                    free_ram_gb,
-                    free_vram_mb,
-                    available_tags=models,
-                )
-                status["recommended_model"] = rec_model
-                status["preferred_model_installed"] = any(
-                    RAPTOR_DEFAULT_MODEL in m or rec_model in m for m in models
-                )
-        except Exception as e:
-            status["ollama_error"] = str(e)
+            from engine.paid_model_provider import load_paid_model_config
+
+            paid_cfg = load_paid_model_config()
+            if paid_cfg.enabled:
+                paid_active = True
+                status["llm_backend"] = paid_cfg.to_safe_dict()
+                status["ollama_ready"] = False
+                status["ollama_bypassed"] = True
+                status["recommended_model"] = self.resolve_runtime_model()
+                status["preferred_model_installed"] = True
+        except Exception:
+            paid_active = False
+
+        # 2b. Check Ollama models with strict <=400ms health probe timeout (only when paid models inactive)
+        if not paid_active:
+            probe_timeout = min(max(float(self.OLLAMA_PROBE_TIMEOUT_SEC), 0.05), HEALTH_PROBE_MAX_TIMEOUT_SEC)
+            try:
+                req = urllib.request.Request(self.OLLAMA_TAGS_URL, method="GET")
+                with urllib.request.urlopen(req, timeout=probe_timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    models = [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+                    status["ollama_ready"] = True
+                    status["ollama_models"] = models
+                    rec_model = select_raptor_model_for_free_memory(
+                        free_ram_gb,
+                        free_vram_mb,
+                        available_tags=models,
+                    )
+                    status["recommended_model"] = rec_model
+                    status["preferred_model_installed"] = any(
+                        RAPTOR_DEFAULT_MODEL in m or rec_model in m for m in models
+                    )
+            except Exception as e:
+                status["ollama_error"] = str(e)
 
         status["raptor_available"] = (status["docker_ready"] and self.raptor_root.exists()) or repo_present
         return status
@@ -397,13 +431,22 @@ class RaptorIntegrator:
 
         is_mocked = getattr(subprocess.run, "__module__", None) != "subprocess"
         available_tags: List[str] = []
-        if mode in ("agentic", "all"):
-            from engine.tool_provisioner import is_automated_or_offline_env
-            from ollama_manager import OllamaLifecycleManager
+        paid_active = False
+        try:
+            from engine.paid_model_provider import is_paid_model_active
 
-            if not is_mocked and not is_automated_or_offline_env():
-                auto_install = os.environ.get("RFCHUNT_AUTO_INSTALL_TOOLS", "1") != "0"
-                available_tags = OllamaLifecycleManager.ensure_ollama_ready(auto_install=auto_install)
+            paid_active = is_paid_model_active()
+        except Exception:
+            paid_active = False
+
+        if mode in ("agentic", "all"):
+            if not paid_active:
+                from engine.tool_provisioner import is_automated_or_offline_env
+                from ollama_manager import OllamaLifecycleManager
+
+                if not is_mocked and not is_automated_or_offline_env():
+                    auto_install = os.environ.get("RFCHUNT_AUTO_INSTALL_TOOLS", "1") != "0"
+                    available_tags = OllamaLifecycleManager.ensure_ollama_ready(auto_install=auto_install)
             effective_model = self.resolve_runtime_model(model, available_tags=available_tags)
         else:
             effective_model = model

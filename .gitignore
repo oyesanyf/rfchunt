@@ -35,6 +35,10 @@ engine/security_skills_catalog/
 
 # Environment & Virtual Environments
 .env
+.env.local
+.env.*.local
+.env.local.*
+!.env.local.example
 .venv/
 env/
 venv/

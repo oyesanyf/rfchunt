@@ -1132,12 +1132,38 @@ class TieredModelRouter:
         escalated_ids = {c["candidate_id"] for c in ranked_eligible[:budget]}
 
         frontier_ok, frontier_status = self._frontier_ready()
+        paid_cfg = None
+        try:
+            from engine.paid_model_provider import load_paid_model_config
+
+            _pcfg = load_paid_model_config()
+            if _pcfg.enabled:
+                paid_cfg = _pcfg
+        except Exception:
+            paid_cfg = None
+
         decisions: List[ModelRoutingDecision] = []
 
         for c in normalized:
             cid = c["candidate_id"]
             if cid in escalated_ids:
-                if frontier_ok:
+                if paid_cfg is not None:
+                    decisions.append(
+                        ModelRoutingDecision(
+                            candidate_id=cid,
+                            tier="frontier_api",
+                            model=paid_cfg.arbiter_model or paid_cfg.primary_model,
+                            provider=paid_cfg.provider,
+                            escalated=True,
+                            rank_score=c["rank_score"],
+                            poe_level=c["poe_level"],
+                            reason="top_signal_poe_gate_passed:env_local_paid_models_active",
+                            free_ram_gb=snap.free_ram_gb,
+                            free_vram_mb=snap.free_vram_mb,
+                            downgraded_for_memory=False,
+                        )
+                    )
+                elif frontier_ok:
                     decisions.append(
                         ModelRoutingDecision(
                             candidate_id=cid,
@@ -1181,21 +1207,38 @@ class TieredModelRouter:
                     reason = f"below_min_poe_gate(poe={c['poe_level']}<{self.config.min_poe_for_escalation})"
                 else:
                     reason = "outside_escalation_budget"
-                decisions.append(
-                    ModelRoutingDecision(
-                        candidate_id=cid,
-                        tier="fast_local",
-                        model=fast_model,
-                        provider="ollama",
-                        escalated=False,
-                        rank_score=c["rank_score"],
-                        poe_level=c["poe_level"],
-                        reason=reason,
-                        free_ram_gb=snap.free_ram_gb,
-                        free_vram_mb=snap.free_vram_mb,
-                        downgraded_for_memory=fast_downgraded,
+                if paid_cfg is not None:
+                    decisions.append(
+                        ModelRoutingDecision(
+                            candidate_id=cid,
+                            tier="frontier_api",
+                            model=paid_cfg.primary_model,
+                            provider=paid_cfg.provider,
+                            escalated=False,
+                            rank_score=c["rank_score"],
+                            poe_level=c["poe_level"],
+                            reason=f"{reason}:env_local_paid_models_active",
+                            free_ram_gb=snap.free_ram_gb,
+                            free_vram_mb=snap.free_vram_mb,
+                            downgraded_for_memory=False,
+                        )
                     )
-                )
+                else:
+                    decisions.append(
+                        ModelRoutingDecision(
+                            candidate_id=cid,
+                            tier="fast_local",
+                            model=fast_model,
+                            provider="ollama",
+                            escalated=False,
+                            rank_score=c["rank_score"],
+                            poe_level=c["poe_level"],
+                            reason=reason,
+                            free_ram_gb=snap.free_ram_gb,
+                            free_vram_mb=snap.free_vram_mb,
+                            downgraded_for_memory=fast_downgraded,
+                        )
+                    )
 
         return RoutingPlan(
             decisions=decisions,
