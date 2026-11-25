@@ -402,3 +402,52 @@ def audit_web_llm_repository(target_dir: str | Path, max_workers: Optional[int] 
         "untrusted_context_fenced": not fence_flagged,
     }
     return report
+
+
+_WEBLLM_RULE_TO_ATLAS: Dict[str, str] = {
+    "WEBLLM-AGENCY-001": "AML.T0040",
+    "WEBLLM-TAINT-002": "AML.T0051",
+    "WEBLLM-OUTPUT-003": "AML.T0051",
+    "WEBLLM-FENCE-004": "AML.T0051",
+    "WEBLLM-PROMPT-AUTHZ-005": "AML.T0054",
+    "WEBLLM-RAG-SCRUB-006": "AML.T0024",
+    "WEBLLM-INGEST-007": "AML.T0020",
+}
+
+
+def enrich_web_llm_report_with_atlas(
+    report: WebLLMAuditReport,
+    *,
+    refresh_stix: bool = False,
+) -> Dict[str, Any]:
+    """
+    Enriches a `WebLLMAuditReport` with live MITRE ATLAS STIX 2.1 technique metadata
+    and stack-adaptive research skills for the audited repository.
+    """
+    from engine.mitre_atlas_stix import (
+        AtlasDynamicTestGenerator,
+        AtlasStixSyncManager,
+        detect_repo_stack,
+    )
+
+    meta, kb = AtlasStixSyncManager().sync_or_load(refresh=refresh_stix)
+    stacks = detect_repo_stack(report.target)
+    skills = AtlasDynamicTestGenerator.synthesize_stack_adaptive_skills(
+        kb, stacks, new_technique_ids=meta.new_techniques_vs_golden, max_skills=12
+    )
+    enriched_findings = []
+    for f in report.findings:
+        d = f.to_dict()
+        aid = _WEBLLM_RULE_TO_ATLAS.get(f.rule_id, "AML.T0051")
+        tech = kb.techniques.get(aid)
+        d["atlas_technique_id"] = aid
+        d["atlas_technique_name"] = tech.name if tech else ""
+        d["atlas_mitigations"] = list(tech.relevant_mitigations[:3]) if tech else []
+        enriched_findings.append(d)
+    return {
+        "report": report.to_dict(),
+        "stix_metadata": meta.to_dict(),
+        "detected_stacks": stacks,
+        "adaptive_skills": [s.to_dict() for s in skills],
+        "enriched_findings": enriched_findings,
+    }

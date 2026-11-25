@@ -26,7 +26,15 @@ from engine.freshness_watcher import (
 from engine.linux_poc_runner import LinuxPocRunner, save_transcript_bundle
 
 
-REVENUE_SUBCOMMANDS = {"freshness-watch", "linux-poc", "package-audit", "bugbounty-mcp", "lean-verify"}
+REVENUE_SUBCOMMANDS = {
+    "freshness-watch",
+    "linux-poc",
+    "package-audit",
+    "bugbounty-mcp",
+    "lean-verify",
+    "ensemble-audit",
+    "atlas-llm-eval",
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -67,6 +75,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_lean = sub.add_parser("lean-verify", help="Audit and kernel-check RFCHunt's Lean 4 formal proofs.")
     p_lean.add_argument("--lean-dir", default="formal/lean4", help="Path to Lean 4 project directory.")
+
+    p_ens = sub.add_parser("ensemble-audit", help="Run Stage 0-5 --all --ensemble fusion with freshness, threat-model, and live PoC gates.")
+    p_ens.add_argument("--target", required=True, help="Target repository directory.")
+    p_ens.add_argument("--findings-json", required=True, help="JSON file of normalized engine findings.")
+    p_ens.add_argument("--program", default="generic", help="Vendor threat-model profile (shopify, anthropic, arc-bbp, cloudflare, coinbase, generic).")
+    p_ens.add_argument("--freshness-hours", type=int, default=72, help="Freshness lookback window in hours (default: 72).")
+    p_ens.add_argument("--quorum", type=int, default=2, help="Minimum independent engines for static corroboration.")
+    p_ens.add_argument("--out", default="out/ensemble_audit", help="Output directory for JSON/MD/SARIF.")
+    p_ens.add_argument("--package-client", default=None, help="Optional client name to also emit 5-file ClientAuditPackager bundle.")
+
+    p_atlas = sub.add_parser("atlas-llm-eval", help="Sync live MITRE ATLAS STIX 2.1 and evaluate LLM guardrails + 74-language/low-resource parity.")
+    p_atlas.add_argument("--llm-target", default="ollama", help="Target LLM: 'ollama', 'paid' (.env.local), or OpenAI-compatible HTTP(S) URL.")
+    p_atlas.add_argument("--model", default=None, help="Optional model name override.")
+    p_atlas.add_argument("--repo", default=None, help="Optional repository path for stack-adaptive ATLAS skill synthesis.")
+    p_atlas.add_argument("--suites", default="low_resource,canary,ssrf_tool,atlas_dynamic", help="Comma-separated suites (all, multilingual, low_resource, canary, ssrf_tool, atlas_dynamic).")
+    p_atlas.add_argument("--offline-stix", action="store_true", help="Skip live STIX download and use bundled golden snapshot.")
+    p_atlas.add_argument("--concurrency", type=int, default=8, help="Max concurrent LLM requests.")
+    p_atlas.add_argument("--out", default="out/atlas_llm_eval", help="Output directory for JSON + SARIF 2.1.0 report.")
     return parser
 
 
@@ -141,6 +167,47 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
         rep = verify_lean_workspace(args.lean_dir)
         print(json.dumps(rep.to_dict(), indent=2))
         return 0 if rep.status in ("machine_checked", "static_audited_lean_not_installed") else 1
+
+    if args.command == "ensemble-audit":
+        from engine.ensemble_orchestrator import EngineFinding, EnsembleOrchestrator
+
+        raw = json.loads(Path(args.findings_json).read_text(encoding="utf-8"))
+        items = raw.get("findings", raw) if isinstance(raw, dict) else raw
+        findings = [EngineFinding(**item) for item in items if isinstance(item, dict)]
+        orch = EnsembleOrchestrator(
+            program=args.program,
+            freshness_hours=args.freshness_hours,
+            quorum=args.quorum,
+        )
+        rep = orch.run(
+            args.target,
+            findings,
+            out_dir=args.out,
+            package_client_name=args.package_client,
+        )
+        print(f"[+] Ensemble Audit complete: {len(rep.clusters)} clusters ({rep.counts_by_disposition}) -> {args.out}")
+        return 0
+
+    if args.command == "atlas-llm-eval":
+        from engine.atlas_llm_evaluator import AtlasLLMEvaluator, LLMTargetAdapter
+
+        adapter = LLMTargetAdapter(target=args.llm_target, model=args.model)
+        evaluator = AtlasLLMEvaluator(adapter=adapter, concurrency=args.concurrency)
+        suites = [s.strip() for s in str(args.suites).split(",") if s.strip()]
+        rep = evaluator.evaluate(
+            suites=suites,
+            repo_path=args.repo,
+            refresh_stix=not args.offline_stix,
+        )
+        out_dir = Path(args.out)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "atlas_llm_report.json").write_text(json.dumps(rep.to_dict(), indent=2), encoding="utf-8")
+        (out_dir / "atlas_llm_findings.sarif").write_text(json.dumps(rep.to_sarif(), indent=2), encoding="utf-8")
+        print(
+            f"[+] ATLAS LLM Eval complete: {rep.passed_tests}/{rep.total_tests} passed "
+            f"(parity={rep.cross_lingual_parity:.2f}, canary_leaks={rep.canary_leaks}) -> {out_dir}"
+        )
+        return 0 if rep.failed_tests == 0 else 1
 
     return 2
 

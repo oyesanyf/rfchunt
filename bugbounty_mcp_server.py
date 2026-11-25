@@ -34,15 +34,31 @@ def build_rfchunt_all_argv(
     target: str,
     output_dir: str = "reports",
     dry_run: bool = False,
+    ensemble: bool = False,
+    program: str = "generic",
+    freshness_hours: int = 72,
+    ensemble_quorum: int = 2,
     extra_flags: Optional[List[str]] = None,
     swarm_script: Optional[Path] = None,
 ) -> List[str]:
-    """Builds a fail-closed argv invoking `rfc_hunt_swarm.py --all <target>` (`shell=False`)."""
+    """Builds a fail-closed argv invoking `rfc_hunt_swarm.py --all [--ensemble] <target>` (`shell=False`)."""
     t = str(target).strip()
     if not t:
         raise ValueError("target is required for bb_run_all_scan.")
     script = swarm_script or (Path(__file__).resolve().parent / "rfc_hunt_swarm.py")
     argv = [sys.executable, str(script), "--all", t, "--output-dir", str(output_dir)]
+    if ensemble:
+        argv.extend(
+            [
+                "--ensemble",
+                "--program",
+                str(program).strip() or "generic",
+                "--freshness-hours",
+                str(int(freshness_hours)),
+                "--quorum",
+                str(max(1, int(ensemble_quorum))),
+            ]
+        )
     if dry_run:
         argv.append("--dry-run")
     for flag in (extra_flags or []):
@@ -60,15 +76,23 @@ def run_rfchunt_all_scan(
     target: str,
     output_dir: str = "reports",
     dry_run: bool = False,
+    ensemble: bool = False,
+    program: str = "generic",
+    freshness_hours: int = 72,
+    ensemble_quorum: int = 2,
     include_lean_verify: bool = True,
     timeout_sec: float = 300.0,
     extra_flags: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Executes RFCHunt `--all` safely (`shell=False`) plus optional Lean 4 formal proof check."""
+    """Executes RFCHunt `--all` (optionally with `--ensemble`) safely (`shell=False`) plus Lean 4 check."""
     argv = build_rfchunt_all_argv(
         target=target,
         output_dir=output_dir,
         dry_run=dry_run,
+        ensemble=ensemble,
+        program=program,
+        freshness_hours=freshness_hours,
+        ensemble_quorum=ensemble_quorum,
         extra_flags=extra_flags,
     )
     lean_summary: Optional[Dict[str, Any]] = None
@@ -78,13 +102,16 @@ def run_rfchunt_all_scan(
         if lean_dir.is_dir():
             lean_summary = verify_lean_workspace(lean_dir).to_dict()
 
+    mode = "--all --ensemble" if ensemble else "--all"
     if dry_run:
         return {
             "status": "dry_run_ready",
-            "mode": "--all",
+            "mode": mode,
             "argv": argv,
             "target": target,
             "output_dir": output_dir,
+            "program": program,
+            "freshness_hours": freshness_hours,
             "lean_verification": lean_summary,
         }
 
@@ -98,7 +125,7 @@ def run_rfchunt_all_scan(
     )
     return {
         "status": "completed" if proc.returncode == 0 else "failed",
-        "mode": "--all",
+        "mode": mode,
         "exit_code": proc.returncode,
         "argv": argv,
         "target": target,
@@ -162,6 +189,18 @@ def validate_and_stage_hackerone_draft(
         issues.append(
             "poc_verified is False — run `bb_run_linux_poc` first to attach verbatim Linux runtime output before submission."
         )
+
+    from engine.ensemble_orchestrator import evaluate_vendor_threat_model
+
+    tm = evaluate_vendor_threat_model(
+        title=title,
+        summary=f"{vulnerability_information}\n{impact}",
+        file_path=asset,
+        program=program_handle,
+        poc_verified=bool(poc_verified),
+    )
+    if not tm.passed:
+        issues.extend(tm.reasons)
 
     status = "staged_ready" if not issues else "blocked_quality_gate"
     payload = {
@@ -349,7 +388,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
     },
     {
         "name": "bb_run_all_scan",
-        "description": "Invoke RFCHunt's full `--all` unified security audit pipeline on an authorized local repository or target (shell=False, optional dry-run and Lean 4 formal verification).",
+        "description": "Invoke RFCHunt's full `--all` (optionally `--all --ensemble`) unified security audit pipeline on an authorized local repository or target (shell=False, optional dry-run and Lean 4 formal verification).",
         "inputSchema": {
             "type": "object",
             "required": ["target"],
@@ -357,9 +396,29 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 "target": {"type": "string", "description": "Local repository path or authorized target URL"},
                 "output_dir": {"type": "string", "default": "reports"},
                 "dry_run": {"type": "boolean", "default": False},
+                "ensemble": {"type": "boolean", "default": False},
+                "program": {"type": "string", "default": "generic"},
+                "freshness_hours": {"type": "integer", "default": 72},
+                "ensemble_quorum": {"type": "integer", "default": 2},
                 "include_lean_verify": {"type": "boolean", "default": True},
                 "timeout_sec": {"type": "number", "default": 300},
                 "extra_flags": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "name": "bb_atlas_llm_eval",
+        "description": "Sync live MITRE ATLAS STIX 2.1 (with ETag cache & golden fallback), synthesize stack-adaptive skills, and evaluate an LLM target across 74-language / low-resource, canary, SSRF/tool, and dynamic ATLAS probes.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["llm_target"],
+            "properties": {
+                "llm_target": {"type": "string", "description": "'ollama', 'paid', or OpenAI-compatible HTTP(S) URL"},
+                "model": {"type": "string"},
+                "repo_path": {"type": "string", "description": "Optional repo path for stack-adaptive ATLAS skills"},
+                "suites": {"type": "array", "items": {"type": "string"}},
+                "refresh_stix": {"type": "boolean", "default": True},
+                "concurrency": {"type": "integer", "default": 8},
             },
         },
     },
@@ -504,10 +563,32 @@ class BugBountyMCPServer:
                 target=str(args["target"]),
                 output_dir=str(args.get("output_dir", "reports")),
                 dry_run=bool(args.get("dry_run", False)),
+                ensemble=bool(args.get("ensemble", False)),
+                program=str(args.get("program", "generic")),
+                freshness_hours=int(args.get("freshness_hours", 72)),
+                ensemble_quorum=int(args.get("ensemble_quorum", 2)),
                 include_lean_verify=bool(args.get("include_lean_verify", True)),
                 timeout_sec=float(args.get("timeout_sec", 300.0)),
                 extra_flags=list(args.get("extra_flags") or []),
             )
+
+        if name == "bb_atlas_llm_eval":
+            from engine.atlas_llm_evaluator import AtlasLLMEvaluator, LLMTargetAdapter
+
+            adapter = LLMTargetAdapter(
+                target=str(args["llm_target"]),
+                model=args.get("model"),
+            )
+            evaluator = AtlasLLMEvaluator(
+                adapter=adapter,
+                concurrency=int(args.get("concurrency", 8)),
+            )
+            suites = list(args.get("suites") or ["low_resource", "canary", "ssrf_tool", "atlas_dynamic"])
+            return evaluator.evaluate(
+                suites=suites,
+                repo_path=args.get("repo_path"),
+                refresh_stix=bool(args.get("refresh_stix", True)),
+            ).to_dict()
 
         raise ValueError(f"Unknown tool: {name}")
 
