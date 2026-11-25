@@ -1,0 +1,57 @@
+name: "RFCHunt Defensive PR & Code Integrity Audit"
+description: "Runs RFCHunt defensive static security checks (AI-agent hardening, Wasm/sandbox invariants, Magika PE/.NET integrity) and emits SARIF 2.1.0 for GitHub Code Scanning."
+branding:
+  icon: "shield"
+  color: "blue"
+
+inputs:
+  target-path:
+    description: "Repository directory to audit"
+    required: false
+    default: "."
+  sarif-output:
+    description: "Output path for SARIF 2.1.0 report"
+    required: false
+    default: "rfchunt-results.sarif"
+  python-version:
+    description: "Python version to use"
+    required: false
+    default: "3.12"
+  upload-sarif:
+    description: "Upload SARIF report to GitHub Code Scanning"
+    required: false
+    default: "true"
+
+outputs:
+  sarif-file:
+    description: "Path to the generated SARIF 2.1.0 report"
+    value: ${{ inputs.sarif-output }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install RFCHunt dependencies
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f "${{ github.action_path }}/requirements.txt" ]; then
+          pip install -r "${{ github.action_path }}/requirements.txt"
+        fi
+
+    - name: Run RFCHunt Defensive Static & PE Integrity Audit
+      shell: bash
+      run: |
+        python "${{ github.action_path }}/rfc_hunt_swarm.py" \
+          --repo-audit "${{ inputs.target-path }}" \
+          --sarif-out "${{ inputs.sarif-output }}"
+
+    - name: Upload SARIF to GitHub Code Scanning
+      if: inputs.upload-sarif == 'true' && hashFiles(inputs.sarif-output) != ''
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ inputs.sarif-output }}

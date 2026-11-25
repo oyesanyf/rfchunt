@@ -1,0 +1,47 @@
+name: Lean 4 Formal Security Proofs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "formal/lean4/**"
+      - "engine/lean_formal_verifier.py"
+      - "tests/test_lean_formal_verifier.py"
+      - ".github/workflows/lean4-formal-verify.yml"
+  pull_request:
+    paths:
+      - "formal/lean4/**"
+      - "engine/lean_formal_verifier.py"
+      - "tests/test_lean_formal_verifier.py"
+      - ".github/workflows/lean4-formal-verify.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  lean4-kernel-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lean 4 via elan
+        shell: bash
+        run: |
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Kernel-Check All RFCHunt Lean 4 Theorems
+        working-directory: formal/lean4
+        shell: bash
+        run: lake build
+
+      - name: Set up Python and Verify Hybrid Bridge
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Lean 4 Hybrid Bridge Unit Tests
+        shell: bash
+        run: |
+          pip install pytest
+          pytest tests/test_lean_formal_verifier.py -v
