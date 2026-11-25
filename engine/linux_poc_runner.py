@@ -227,10 +227,14 @@ def build_hardened_docker_argv(
 
 def windows_to_wsl_path(path: Union[str, Path]) -> str:
     """Converts `D:\\harfile\\rfchunt` -> `/mnt/d/harfile/rfchunt` for WSL2 execution."""
-    s = str(Path(path).resolve()).replace("\\", "/")
-    m = re.match(r"^([A-Za-z]):/(.*)$", s)
+    raw = str(path).replace("\\", "/")
+    m = re.match(r"^([A-Za-z]):/(.*)$", raw)
     if m:
         return f"/mnt/{m.group(1).lower()}/{m.group(2)}"
+    s = str(Path(path).resolve()).replace("\\", "/")
+    m2 = re.match(r"^([A-Za-z]):/(.*)$", s)
+    if m2:
+        return f"/mnt/{m2.group(1).lower()}/{m2.group(2)}"
     return s
 
 
