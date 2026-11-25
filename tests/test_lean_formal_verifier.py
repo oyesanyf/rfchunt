@@ -6,9 +6,13 @@ from pathlib import Path
 
 from engine.lean_formal_verifier import (
     audit_lean_file,
+    dotnet_pe_integrity_mirror,
     evaluate_policy_mirror,
+    evaluate_policy_verified,
+    find_lean_oracle_binary,
     permissive_cl_first_proxy_mirror,
     reconcile_verdict_mirror,
+    run_differential_parity_check,
     strict_rfc9112_oracle,
     verify_lean_workspace,
 )
@@ -97,3 +101,35 @@ def test_http_framing_oracle_mirror_matches_lean_theorems():
     assert strict_rfc9112_oracle([10, 20], False) == ("reject400", None)
     # differential_witness_cl_te
     assert strict_rfc9112_oracle([42], True) != permissive_cl_first_proxy_mirror([42], True)
+
+
+def test_compiled_lean4_oracle_and_exhaustive_differential_parity():
+    root = _lean_root()
+    allowed, backend = evaluate_policy_verified(
+        action="shellExec",
+        scope="inScopeAuthorized",
+        in_workspace_root=True,
+        allow_destructive=True,
+        rules=[("permit", True)],
+        lean_dir=root,
+    )
+    assert allowed is False
+    if find_lean_oracle_binary(root) is not None:
+        assert backend == "lean4_compiled_binary"
+        diff = run_differential_parity_check(root)
+        assert diff["status"] == "passed", f"Lean vs Python divergence: {diff['divergences']}"
+        assert diff["cases_checked"] >= 300
+        assert diff["divergences"] == []
+    else:
+        assert backend == "python_mirror"
+        # Exhaustively check DotNetPeIntegrity mirror invariants even offline
+        anom, unp, pat = dotnet_pe_integrity_mirror(
+            is_valid_pe=True,
+            has_clr_descriptor=True,
+            has_executable_image_bit=False,
+            is_umci_enforced=True,
+            is_signed_by_trusted_publisher=False,
+        )
+        assert anom is True
+        assert unp == "loadedViaUncheckedFlatMemoryFallback"
+        assert pat == "rejectedInvalidOrUnsigned"

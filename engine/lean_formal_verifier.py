@@ -253,3 +253,273 @@ def permissive_cl_first_proxy_mirror(
     if has_transfer_encoding_chunked:
         return ("acceptChunked", None)
     return ("acceptContentLength", 0)
+
+
+def dotnet_pe_integrity_mirror(
+    *,
+    is_valid_pe: bool,
+    has_clr_descriptor: bool,
+    has_executable_image_bit: bool,
+    is_umci_enforced: bool,
+    is_signed_by_trusted_publisher: bool,
+) -> Tuple[bool, str, str]:
+    """Exact mirror of `RFCHunt.DotNetPeIntegrity` (`isCve2026108398Anomaly`, unpatched, patched)."""
+    anomaly = bool(is_valid_pe and has_clr_descriptor and (not has_executable_image_bit))
+
+    if (not is_valid_pe) or (not has_clr_descriptor):
+        unpatched = "rejectedInvalidOrUnsigned"
+    elif has_executable_image_bit:
+        if is_umci_enforced and (not is_signed_by_trusted_publisher):
+            unpatched = "rejectedInvalidOrUnsigned"
+        else:
+            unpatched = "loadedViaSecImageVerified"
+    else:
+        unpatched = "loadedViaUncheckedFlatMemoryFallback"
+
+    if (not is_valid_pe) or (not has_clr_descriptor) or (not has_executable_image_bit):
+        patched = "rejectedInvalidOrUnsigned"
+    elif is_umci_enforced and (not is_signed_by_trusted_publisher):
+        patched = "rejectedInvalidOrUnsigned"
+    else:
+        patched = "loadedViaSecImageVerified"
+
+    return (anomaly, unpatched, patched)
+
+
+# ---------------------------------------------------------------------------
+# Direct Execution of Compiled Lean 4 Binary (`rfchunt-lean-oracle`)
+# ---------------------------------------------------------------------------
+
+
+def find_lean_oracle_binary(lean_dir: Union[str, Path] = "formal/lean4") -> Optional[Path]:
+    """Locates the compiled `rfchunt-lean-oracle` native Lean 4 executable if built."""
+    root = Path(lean_dir).resolve()
+    bin_dir = root / ".lake" / "build" / "bin"
+    for name in ("rfchunt-lean-oracle", "rfchunt-lean-oracle.exe"):
+        cand = bin_dir / name
+        if cand.is_file():
+            return cand
+    return None
+
+
+class LeanCompiledOracle:
+    """
+    Invokes the compiled native Lean 4 executable (`rfchunt-lean-oracle`) directly
+    so Python executes the exact kernel-proven Lean 4 code with zero mirror drift.
+    """
+
+    def __init__(self, binary_path: Union[str, Path], timeout_sec: float = 10.0):
+        self.binary_path = Path(binary_path).resolve()
+        self.timeout_sec = timeout_sec
+
+    def _run(self, *args: str) -> str:
+        proc = silent_subprocess_run(
+            [str(self.binary_path), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=self.timeout_sec,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"rfchunt-lean-oracle failed (rc={proc.returncode}): {proc.stderr.strip()}")
+        return (proc.stdout or "").strip()
+
+    @staticmethod
+    def _b(v: bool) -> str:
+        return "true" if v else "false"
+
+    def evaluate_policy(
+        self,
+        *,
+        action: str,
+        scope: str,
+        in_workspace_root: bool,
+        allow_destructive: bool,
+        rules: Sequence[Tuple[str, bool]],
+    ) -> bool:
+        rules_csv = ",".join(f"{eff}:{self._b(m)}" for eff, m in rules) if rules else "none"
+        out = self._run(
+            "policy",
+            action,
+            scope,
+            self._b(in_workspace_root),
+            self._b(allow_destructive),
+            rules_csv,
+        )
+        return out == "true"
+
+    def reconcile_verdict(self, confirmed_by_tool: bool, llm_confirmed: bool) -> bool:
+        return self._run("reconcile", self._b(confirmed_by_tool), self._b(llm_confirmed)) == "true"
+
+    def strict_rfc9112(
+        self,
+        content_lengths: Sequence[int],
+        has_transfer_encoding_chunked: bool,
+        has_bare_lf: bool = False,
+    ) -> Tuple[str, Optional[int]]:
+        cls_csv = ",".join(str(int(n)) for n in content_lengths) if content_lengths else "none"
+        out = self._run("framing", cls_csv, self._b(has_transfer_encoding_chunked), self._b(has_bare_lf))
+        if out.startswith("acceptContentLength:"):
+            return ("acceptContentLength", int(out.split(":", 1)[1]))
+        return (out, None)
+
+    def evaluate_dotnet_pe(
+        self,
+        *,
+        is_valid_pe: bool,
+        has_clr_descriptor: bool,
+        has_executable_image_bit: bool,
+        is_umci_enforced: bool,
+        is_signed_by_trusted_publisher: bool,
+    ) -> Tuple[bool, str, str]:
+        out = self._run(
+            "pe",
+            self._b(is_valid_pe),
+            self._b(has_clr_descriptor),
+            self._b(has_executable_image_bit),
+            self._b(is_umci_enforced),
+            self._b(is_signed_by_trusted_publisher),
+        )
+        anom_s, unpatched, patched = out.split("|", 2)
+        return (anom_s == "true", unpatched, patched)
+
+
+def evaluate_policy_verified(
+    *,
+    action: str,
+    scope: str,
+    in_workspace_root: bool,
+    allow_destructive: bool,
+    rules: Sequence[Tuple[str, bool]],
+    lean_dir: Union[str, Path] = "formal/lean4",
+) -> Tuple[bool, str]:
+    """
+    Executes the compiled Lean 4 binary directly when built (`backend='lean4_compiled_binary'`),
+    falling back to the isomorphic Python mirror only if the binary is absent (`backend='python_mirror'`).
+    """
+    binary = find_lean_oracle_binary(lean_dir)
+    if binary is not None:
+        oracle = LeanCompiledOracle(binary)
+        return (
+            oracle.evaluate_policy(
+                action=action,
+                scope=scope,
+                in_workspace_root=in_workspace_root,
+                allow_destructive=allow_destructive,
+                rules=rules,
+            ),
+            "lean4_compiled_binary",
+        )
+    return (
+        evaluate_policy_mirror(
+            action=action,
+            scope=scope,
+            in_workspace_root=in_workspace_root,
+            allow_destructive=allow_destructive,
+            rules=rules,
+        ),
+        "python_mirror",
+    )
+
+
+def run_differential_parity_check(
+    lean_dir: Union[str, Path] = "formal/lean4",
+) -> Dict[str, Any]:
+    """
+    AWS Cedar-style differential verification: feeds exhaustive inputs across PolicyGuard,
+    HttpFramingOracle, and DotNetPeIntegrity into BOTH the compiled Lean 4 binary and the
+    Python runtime mirrors, asserting zero divergences.
+    """
+    binary = find_lean_oracle_binary(lean_dir)
+    if binary is None:
+        return {
+            "status": "skipped_binary_not_built",
+            "cases_checked": 0,
+            "divergences": [],
+        }
+
+    oracle = LeanCompiledOracle(binary)
+    divergences: List[str] = []
+    cases = 0
+
+    # 1. PolicyGuard exhaustive matrix
+    rule_sets = [
+        [],
+        [("permit", True)],
+        [("permit", False)],
+        [("permit", True), ("forbid", True)],
+        [("permit", True), ("forbid", False)],
+    ]
+    for action in ("readWorkspaceFile", "networkProbe", "shellExec", "destructiveHttp"):
+        for scope in ("inScopeAuthorized", "outOfScope", "privateOrLoopbackBlocked"):
+            for in_root in (False, True):
+                for allow_d in (False, True):
+                    for rules in rule_sets:
+                        cases += 1
+                        lean_res = oracle.evaluate_policy(
+                            action=action,
+                            scope=scope,
+                            in_workspace_root=in_root,
+                            allow_destructive=allow_d,
+                            rules=rules,
+                        )
+                        py_res = evaluate_policy_mirror(
+                            action=action,
+                            scope=scope,
+                            in_workspace_root=in_root,
+                            allow_destructive=allow_d,
+                            rules=rules,
+                        )
+                        if lean_res != py_res:
+                            divergences.append(
+                                f"policy({action},{scope},{in_root},{allow_d},{rules}): lean={lean_res} != py={py_res}"
+                            )
+
+    # 2. Reconcile verdict exhaustive (2^2 = 4)
+    for t_conf in (False, True):
+        for l_conf in (False, True):
+            cases += 1
+            if oracle.reconcile_verdict(t_conf, l_conf) != reconcile_verdict_mirror(t_conf, l_conf):
+                divergences.append(f"reconcile({t_conf},{l_conf}) diverged")
+
+    # 3. HttpFramingOracle matrix
+    for cls in ([], [0], [42], [10, 10], [10, 20], [5, 5, 6]):
+        for has_te in (False, True):
+            for bare_lf in (False, True):
+                cases += 1
+                lean_v = oracle.strict_rfc9112(cls, has_te, bare_lf)
+                py_v = strict_rfc9112_oracle(cls, has_te, bare_lf)
+                if lean_v != py_v:
+                    divergences.append(f"framing({cls},{has_te},{bare_lf}): lean={lean_v} != py={py_v}")
+
+    # 4. DotNetPeIntegrity exhaustive (all 2^5 = 32 states)
+    for vp in (False, True):
+        for clr in (False, True):
+            for eb in (False, True):
+                for umci in (False, True):
+                    for sig in (False, True):
+                        cases += 1
+                        lean_pe = oracle.evaluate_dotnet_pe(
+                            is_valid_pe=vp,
+                            has_clr_descriptor=clr,
+                            has_executable_image_bit=eb,
+                            is_umci_enforced=umci,
+                            is_signed_by_trusted_publisher=sig,
+                        )
+                        py_pe = dotnet_pe_integrity_mirror(
+                            is_valid_pe=vp,
+                            has_clr_descriptor=clr,
+                            has_executable_image_bit=eb,
+                            is_umci_enforced=umci,
+                            is_signed_by_trusted_publisher=sig,
+                        )
+                        if lean_pe != py_pe:
+                            divergences.append(f"pe({vp},{clr},{eb},{umci},{sig}): lean={lean_pe} != py={py_pe}")
+
+    return {
+        "status": "passed" if not divergences else "diverged",
+        "binary": str(binary),
+        "cases_checked": cases,
+        "divergences": divergences,
+    }
