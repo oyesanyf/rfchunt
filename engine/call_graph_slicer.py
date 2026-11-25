@@ -153,6 +153,8 @@ _SOURCE_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
     ("rust_http_extractor", re.compile(r"\b(?:web::Query|web::Json|web::Path|web::Form|extract::Query|extract::Json|extract::Path|HttpRequest|Request<|Query<|Json<|Path<)")),
     ("cli_or_env_input", re.compile(r"\b(?:sys\.argv|std::env::args|os\.Args|process\.argv|os\.environ|getenv|input\s*\(|fgets\s*\(|recv\s*\(|scanf\s*\()")),
     ("framework_param", re.compile(r"@(?:RequestParam|RequestBody|PathVariable|QueryParam|HeaderParam)\b")),
+    ("llm_tool_arg", re.compile(r"\b(?:tool_call\.function\.arguments|tool_use\.input|function_call\.arguments|tool_args|agent_action\.tool_input)\b")),
+    ("llm_response_output", re.compile(r"\b(?:choices\[0\]\.message\.content|completion\.content|generate_content\([^)]*\)\.text|llm\.invoke\(|model_response|llm_output)\b")),
 )
 
 # Strong vs weak sanitizer patterns
@@ -356,7 +358,9 @@ class TaintSlice:
     prompt_context: str = ""
 
     def to_prompt_block(self, max_chars: int = 4000) -> str:
-        """Formats a concise, token-budgeted multi-file prompt block for 8B-14B models."""
+        """Formats a concise, token-budgeted, XML-nonce-fenced multi-file prompt block for 8B-14B models."""
+        from engine.execution_policy import sanitize_for_llm_prompt
+
         chain_arrow = " -> ".join(
             f"{s.role}:{s.symbol_name} ({s.file_path}:L{s.start_line}-L{s.end_line})"
             for s in self.steps
@@ -377,8 +381,10 @@ class TaintSlice:
             f"Sink: {self.sink_call} at {self.sink_file}:L{self.sink_line}",
             f"Files ({len(self.files_involved)}): {', '.join(self.files_involved)}",
         ]
-        budget = max(600, int(max_chars))
-        per_step_budget = max(220, (budget - sum(len(x) + 1 for x in lines)) // max(1, len(self.steps)))
+        total_budget = max(600, int(max_chars))
+        wrapper_overhead = 96
+        inner_budget = max(200, total_budget - wrapper_overhead)
+        per_step_budget = max(160, (inner_budget - sum(len(x) + 1 for x in lines)) // max(1, len(self.steps)))
 
         for step in self.steps:
             header = (
@@ -397,9 +403,24 @@ class TaintSlice:
             lines.append(snippet)
 
         rendered = "\n".join(lines)
-        if len(rendered) > budget:
-            rendered = rendered[: max(200, budget - 16)].rstrip() + "\n... [truncated]"
-        return rendered
+        if len(rendered) > inner_budget:
+            rendered = rendered[: max(120, inner_budget - 16)].rstrip() + "\n... [truncated]"
+        fenced = sanitize_for_llm_prompt(rendered, max_chars=inner_budget, source="taint_slice")
+        if len(fenced) > total_budget:
+            # Guard against expansion from neutralized injection tokens exceeding total_budget
+            m_open = re.match(r'^(<untrusted_data nonce="[^"]+">\n)', fenced)
+            closing = "\n</untrusted_data>"
+            if m_open and fenced.endswith(closing):
+                open_tag = m_open.group(1)
+                body = fenced[len(open_tag) : -len(closing)]
+                max_body = max(100, total_budget - len(open_tag) - len(closing))
+                if len(body) > max_body:
+                    trunc_marker = "\n... [truncated]"
+                    body = body[: max(40, max_body - len(trunc_marker))].rstrip()
+                    body = re.sub(r"(?i)<\s*/?\s*untrusted_data(?:\b[^>]*)?>?$", "", body).rstrip()
+                    body = f"{body}{trunc_marker}"
+                fenced = f"{open_tag}{body}{closing}"
+        return fenced
 
     def to_escalation_candidate(self) -> Dict[str, Any]:
         """Exports this slice into the normalized schema consumed by `TieredModelRouter`."""

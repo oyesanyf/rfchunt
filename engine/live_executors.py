@@ -2541,11 +2541,26 @@ class LiveWorkerExecutorRegistry:
 
             tp_norm = raw_tp.strip()
             has_ctrl = any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_tp)
+            _ws_root = getattr(self, "workspace_root", None)
+            _outside_ws = False
+            if _ws_root:
+                try:
+                    _resolved_tp = Path(tp_norm).resolve()
+                    _resolved_ws = Path(_ws_root).resolve()
+                    if _resolved_tp != _resolved_ws and not _resolved_tp.is_relative_to(_resolved_ws):
+                        _outside_ws = True
+                except Exception:
+                    _outside_ws = True
+            _sensitive_segments = (".ssh", ".aws", ".gnupg", ".kube", "etc/passwd", "etc/shadow", "system32")
+            _tp_low = tp_norm.replace("\\", "/").lower()
+            _hits_sensitive = any(seg in _tp_low for seg in _sensitive_segments) or ".." in Path(tp_norm).parts
             if (
                 has_ctrl
                 or _is_unc_path(tp_norm)
                 or _is_drive_relative_or_colon_unsafe(tp_norm)
                 or tp_norm.startswith(("/\\", "\\/", "\\\\"))
+                or _outside_ws
+                or _hits_sensitive
             ):
                 return {
                     "ok": False,
@@ -2558,7 +2573,7 @@ class LiveWorkerExecutorRegistry:
                     "ai_sinks": [],
                     "assets": [],
                     "count": 0,
-                    "error": "Unsafe target_path rejected (UNC, NT-device, drive-relative, or control-character path is forbidden).",
+                    "error": "Unsafe target_path rejected (UNC, NT-device, drive-relative, traversal, sensitive host path, or out-of-workspace path is forbidden).",
                 }
         tp_str = raw_tp
         fallback_reason = "module21_absent"
@@ -3616,10 +3631,14 @@ class LiveWorkerExecutorRegistry:
                         total_turns=turns_executed,
                     )
 
-        if explicit_finish_denied:
+        # Deterministic tool confirmation is authoritative and cannot be suppressed
+        # by an indirect-prompt-injected LLM emitting finish(confirmed=false).
+        if confirmed_by_tool:
+            final_ok = True
+        elif explicit_finish_denied:
             final_ok = False
         else:
-            final_ok = bool(confirmed_by_tool)
+            final_ok = False
 
         final_evidence = (
             finish_evidence

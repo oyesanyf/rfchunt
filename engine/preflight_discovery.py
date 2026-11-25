@@ -1440,7 +1440,7 @@ _UNSAFE_PIPED_EXEC_RE = re.compile(
     re.IGNORECASE,
 )
 _UNSAFE_PROMPT_OVERRIDE_RE = re.compile(
-    r"(?:(?:ignore|disregard|override)\s+(?:(?:all|any|the|previous|prior|above|system|developer)\s+){1,4}(?:instructions?|prompts?|rules?|safety\s+policies?)[^\n]{0,160}\b(?:exfiltrate|send|upload|execute|disable|bypass|reveal|dump)\b|silently\s+(?:send|post|exfiltrate|upload)\s+[^\n]{0,100}\b(?:env|secret|token|api[_-]?key|cookie|credential))",
+    r"(?:(?:ignore|disregard|override)\s+(?:(?:all|any|the|previous|prior|above|system|developer)\s+){1,4}(?:instructions?|prompts?|rules?|safety\s+policies?)[\s\S]{0,200}\b(?:exfiltrate|send|upload|execute|disable|bypass|reveal|dump)\b|silently\s+(?:send|post|exfiltrate|upload)\s+[\s\S]{0,120}\b(?:env|secret|token|api[_-]?key|cookie|credential)|\*{2,3}\s*important\s+system\s+message|-{2,3}\s*(?:user|assistant|system)\s+response\s*-{2,3})",
     re.IGNORECASE,
 )
 _UNSAFE_PATH_MUTATION_RE = re.compile(

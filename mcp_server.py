@@ -1267,6 +1267,38 @@ class TerminatorMCPServer:
                     },
                 },
             },
+            {
+                "name": "run_crlf_conformance_audit",
+                "description": (
+                    "[Module 24 Reverse-Proxy Config & RFC 9112 Header Conformance Auditor] Audits Nginx/OpenResty/Tengine "
+                    "configs for unsafe normalized $uri/$document_uri interpolation and optionally runs safe, read-only "
+                    "3-trial RFC 9112 header-rejection conformance diagnostics against an authorized host."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "target_path": {"type": "string", "default": "."},
+                        "host": {"type": "string", "default": ""},
+                        "port": {"type": "integer", "default": 80},
+                        "use_tls": {"type": "boolean", "default": False},
+                        "trials": {"type": "integer", "default": 3},
+                    },
+                },
+            },
+            {
+                "name": "run_web_llm_security_audit",
+                "description": (
+                    "[Module 25 Web LLM Defensive Security Auditor] Scans a repository for OWASP LLM & PortSwigger "
+                    "Web LLM flaws: excessive agency, unvalidated tool-argument sinks, insecure output handling, "
+                    "unfenced untrusted prompt data, prompt-only access control, and missing RAG tenant/PII scrubbing."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "target_path": {"type": "string", "default": "."},
+                    },
+                },
+            },
         ]
 
     @staticmethod
@@ -2838,6 +2870,33 @@ class TerminatorMCPServer:
                 dry_run=dry_run,
             )
             return {k: v for k, v in res.items() if k != "checklist_markdown"}
+
+        elif name == "run_crlf_conformance_audit":
+            self._reject_shell_execution(args)
+            from engine.crlf_desync_engine import audit_nginx_configs, run_conformance_diagnostics
+
+            target_path = self._parse_strict_str(args, "target_path", ".", allow_empty=True) or "."
+            host = self._parse_strict_str(args, "host", "", allow_empty=True) or ""
+            port = int(self._parse_strict_int(args, "port", 80, min_val=1, max_val=65535) or 80)
+            use_tls = bool(self._parse_strict_bool(args, "use_tls", False))
+            trials = int(self._parse_strict_int(args, "trials", 3, min_val=3, max_val=10) or 3)
+            rep = audit_nginx_configs(target_path)
+            if host.strip():
+                live_rep = run_conformance_diagnostics(
+                    host=host.strip(),
+                    port=port,
+                    use_tls=use_tls,
+                    trials=trials,
+                )
+                rep.findings.extend(live_rep.findings)
+            return rep.to_dict()
+
+        elif name == "run_web_llm_security_audit":
+            self._reject_shell_execution(args)
+            from engine.web_llm_auditor import audit_web_llm_repository
+
+            target_path = self._parse_strict_str(args, "target_path", ".", allow_empty=False) or "."
+            return audit_web_llm_repository(target_path).to_dict()
 
         raise ValueError(f"Unknown tool: {name}")
 

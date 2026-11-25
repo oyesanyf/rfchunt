@@ -900,13 +900,20 @@ class Last30DaysSecuritySkillsEngine:
         """
         indicators_repr = repr(tuple(spec.custom_indicators or [spec.skill_slug]))
         slug_ident = re.sub(r"[^a-zA-Z0-9_]", "_", spec.skill_slug)
+        safe_title = str(spec.title or "").replace('"""', r'\"\"\"').replace("\r", " ").replace("\n", " ")[:240]
+        safe_url = str(spec.source_url or "").replace('"""', r'\"\"\"').replace("\r", "").replace("\n", "")[:300]
+        safe_lane = str(spec.source_lane or "").replace('"""', r'\"\"\"').replace("\r", "").replace("\n", "")[:80]
+        safe_lanes = ", ".join(
+            str(l).replace('"""', r'\"\"\"').replace("\r", "").replace("\n", "")
+            for l in (spec.corroborating_lanes or [spec.source_lane])
+        )[:240]
         return (
             f'#!/usr/bin/env python3\n'
             f'"""\n'
             f'Auto-Harvested Zero-API Last30Days Security Skill Detector: {spec.skill_id}\n'
-            f'Title: {spec.title}\n'
-            f'Keyless Source Lane: {spec.source_lane} ({spec.source_url})\n'
-            f'Corroborating Lanes: {", ".join(spec.corroborating_lanes or [spec.source_lane])}\n'
+            f'Title: {safe_title}\n'
+            f'Keyless Source Lane: {safe_lane} ({safe_url})\n'
+            f'Corroborating Lanes: {safe_lanes}\n'
             f'"""\n'
             f"from __future__ import annotations\n"
             f"from typing import Dict, List, Sequence, Tuple\n\n"

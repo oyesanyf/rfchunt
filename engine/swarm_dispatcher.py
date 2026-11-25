@@ -1381,23 +1381,31 @@ class TieredModelRouter:
         import httpx
 
         norm_ep = (ollama_endpoint or "http://127.0.0.1:11434").rstrip("/")
+        messages: List[Dict[str, str]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
         with httpx.Client(timeout=httpx.Timeout(float(timeout), connect=5.0)) as client:
             resp = client.post(
-                f"{norm_ep}/api/generate",
+                f"{norm_ep}/api/chat",
                 json={
                     "model": decision.model,
-                    "system": system_prompt,
-                    "prompt": user_prompt,
+                    "messages": messages,
                     "stream": False,
                 },
             )
             resp.raise_for_status()
             data = resp.json()
+        msg = data.get("message") if isinstance(data, dict) else None
+        if isinstance(msg, dict) and msg.get("content") is not None:
+            content = str(msg.get("content") or "")
+        else:
+            content = str((data.get("response") if isinstance(data, dict) else "") or "")
         return {
             "tier": decision.tier,
             "provider": "ollama",
             "model": decision.model,
-            "response": str(data.get("response") or ""),
+            "response": content,
         }
 
 
