@@ -25,7 +25,88 @@ from engine.freshness_watcher import (
     load_watchlist,
     render_fresh_hunt_queue_markdown,
 )
-from engine.linux_poc_runner import LinuxPocRunner, save_transcript_bundle
+from engine.host_containment import silent_subprocess_run
+from engine.linux_poc_runner import LinuxPocRunner, save_transcript_bundle, validate_command_tokens
+
+
+def build_rfchunt_all_argv(
+    *,
+    target: str,
+    output_dir: str = "reports",
+    dry_run: bool = False,
+    extra_flags: Optional[List[str]] = None,
+    swarm_script: Optional[Path] = None,
+) -> List[str]:
+    """Builds a fail-closed argv invoking `rfc_hunt_swarm.py --all <target>` (`shell=False`)."""
+    t = str(target).strip()
+    if not t:
+        raise ValueError("target is required for bb_run_all_scan.")
+    script = swarm_script or (Path(__file__).resolve().parent / "rfc_hunt_swarm.py")
+    argv = [sys.executable, str(script), "--all", t, "--output-dir", str(output_dir)]
+    if dry_run:
+        argv.append("--dry-run")
+    for flag in (extra_flags or []):
+        f_s = str(flag).strip()
+        if f_s:
+            argv.append(f_s)
+    ok, err = validate_command_tokens(argv)
+    if not ok:
+        raise ValueError(err)
+    return argv
+
+
+def run_rfchunt_all_scan(
+    *,
+    target: str,
+    output_dir: str = "reports",
+    dry_run: bool = False,
+    include_lean_verify: bool = True,
+    timeout_sec: float = 300.0,
+    extra_flags: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Executes RFCHunt `--all` safely (`shell=False`) plus optional Lean 4 formal proof check."""
+    argv = build_rfchunt_all_argv(
+        target=target,
+        output_dir=output_dir,
+        dry_run=dry_run,
+        extra_flags=extra_flags,
+    )
+    lean_summary: Optional[Dict[str, Any]] = None
+    if include_lean_verify:
+        from engine.lean_formal_verifier import verify_lean_workspace
+        lean_dir = Path(__file__).resolve().parent / "formal" / "lean4"
+        if lean_dir.is_dir():
+            lean_summary = verify_lean_workspace(lean_dir).to_dict()
+
+    if dry_run:
+        return {
+            "status": "dry_run_ready",
+            "mode": "--all",
+            "argv": argv,
+            "target": target,
+            "output_dir": output_dir,
+            "lean_verification": lean_summary,
+        }
+
+    proc = silent_subprocess_run(
+        argv,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout_sec,
+    )
+    return {
+        "status": "completed" if proc.returncode == 0 else "failed",
+        "mode": "--all",
+        "exit_code": proc.returncode,
+        "argv": argv,
+        "target": target,
+        "output_dir": output_dir,
+        "stdout_tail": (proc.stdout or "")[-4000:],
+        "stderr_tail": (proc.stderr or "")[-2000:],
+        "lean_verification": lean_summary,
+    }
 
 
 SERVER_INFO = {
@@ -266,6 +347,22 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "bb_run_all_scan",
+        "description": "Invoke RFCHunt's full `--all` unified security audit pipeline on an authorized local repository or target (shell=False, optional dry-run and Lean 4 formal verification).",
+        "inputSchema": {
+            "type": "object",
+            "required": ["target"],
+            "properties": {
+                "target": {"type": "string", "description": "Local repository path or authorized target URL"},
+                "output_dir": {"type": "string", "default": "reports"},
+                "dry_run": {"type": "boolean", "default": False},
+                "include_lean_verify": {"type": "boolean", "default": True},
+                "timeout_sec": {"type": "number", "default": 300},
+                "extra_flags": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
 ]
 
 
@@ -401,6 +498,16 @@ class BugBountyMCPServer:
         if name == "bb_lean_formal_verify":
             from engine.lean_formal_verifier import verify_lean_workspace
             return verify_lean_workspace(str(args.get("lean_dir", "formal/lean4"))).to_dict()
+
+        if name == "bb_run_all_scan":
+            return run_rfchunt_all_scan(
+                target=str(args["target"]),
+                output_dir=str(args.get("output_dir", "reports")),
+                dry_run=bool(args.get("dry_run", False)),
+                include_lean_verify=bool(args.get("include_lean_verify", True)),
+                timeout_sec=float(args.get("timeout_sec", 300.0)),
+                extra_flags=list(args.get("extra_flags") or []),
+            )
 
         raise ValueError(f"Unknown tool: {name}")
 

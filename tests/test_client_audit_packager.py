@@ -70,7 +70,31 @@ def test_bugbounty_mcp_server_initialize_list_and_tools(tmp_path: Path):
         "bb_package_client_audit",
         "bb_stage_hackerone_draft",
         "bb_browser_handoff_spec",
+        "bb_lean_formal_verify",
+        "bb_run_all_scan",
     }.issubset(tool_names)
+
+    # Verify bb_run_all_scan builds --all argv and integrates Lean 4 verification in dry_run mode
+    all_resp = srv.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "bb_run_all_scan",
+                "arguments": {
+                    "target": str(tmp_path),
+                    "output_dir": str(tmp_path / "reports"),
+                    "dry_run": True,
+                    "include_lean_verify": True,
+                },
+            },
+        }
+    )
+    all_data = json.loads(all_resp["result"]["content"][0]["text"])
+    assert all_data["status"] == "dry_run_ready"
+    assert "--all" in all_data["argv"]
+    assert all_data["lean_verification"]["total_theorems"] == 11
 
     # Quality gate blocks unverified PoC by default
     blocked_resp = srv.handle_request(
