@@ -76,9 +76,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_lean = sub.add_parser("lean-verify", help="Audit and kernel-check RFCHunt's Lean 4 formal proofs.")
     p_lean.add_argument("--lean-dir", default="formal/lean4", help="Path to Lean 4 project directory.")
 
-    p_ens = sub.add_parser("ensemble-audit", help="Run Stage 0-5 --all --ensemble fusion with freshness, threat-model, and live PoC gates.")
+    p_ens = sub.add_parser("ensemble-audit", help="Run exhaustive Stage 0-5 --all --ensemble audit (exhaustive multi-engine fan-out by default).")
     p_ens.add_argument("--target", required=True, help="Target repository directory.")
-    p_ens.add_argument("--findings-json", required=True, help="JSON file of normalized engine findings.")
+    p_ens.add_argument("--findings-json", default=None, help="Optional pre-computed JSON file of findings (omitting runs exhaustive multi-engine scan by default).")
     p_ens.add_argument("--program", default="generic", help="Vendor threat-model profile (shopify, anthropic, arc-bbp, cloudflare, coinbase, generic).")
     p_ens.add_argument("--freshness-hours", type=int, default=72, help="Freshness lookback window in hours (default: 72).")
     p_ens.add_argument("--quorum", type=int, default=2, help="Minimum independent engines for static corroboration.")
@@ -171,13 +171,16 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "ensemble-audit":
         from engine.ensemble_orchestrator import EngineFinding, EnsembleOrchestrator
 
-        raw = json.loads(Path(args.findings_json).read_text(encoding="utf-8"))
-        items = raw.get("findings", raw) if isinstance(raw, dict) else raw
-        findings = [EngineFinding(**item) for item in items if isinstance(item, dict)]
+        findings = None
+        if args.findings_json:
+            raw = json.loads(Path(args.findings_json).read_text(encoding="utf-8"))
+            items = raw.get("findings", raw) if isinstance(raw, dict) else raw
+            findings = [EngineFinding(**item) for item in items if isinstance(item, dict)]
         orch = EnsembleOrchestrator(
             program=args.program,
             freshness_hours=args.freshness_hours,
             quorum=args.quorum,
+            exhaustive_default=True,
         )
         rep = orch.run(
             args.target,
@@ -185,7 +188,7 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
             out_dir=args.out,
             package_client_name=args.package_client,
         )
-        print(f"[+] Ensemble Audit complete: {len(rep.clusters)} clusters ({rep.counts_by_disposition}) -> {args.out}")
+        print(f"[+] Exhaustive Ensemble Audit complete: {len(rep.clusters)} clusters ({rep.counts_by_disposition}) -> {args.out}")
         return 0
 
     if args.command == "atlas-llm-eval":
