@@ -40,7 +40,7 @@ structure AgentRequest where
 
 structure PolicyRule where
   effect : Effect
-  matches : AgentRequest → Bool
+  applies : AgentRequest → Bool
 
 /-- Hardcoded fail-closed baseline guard matching `engine/execution_policy.py`. -/
 def baselineAllows (req : AgentRequest) : Bool :=
@@ -53,17 +53,17 @@ def baselineAllows (req : AgentRequest) : Bool :=
 /-- Evaluates a Cedar-style policy set: deny unless baseline allows AND at least one permit
     matches AND zero forbid rules match. -/
 def evaluatePolicies (rules : List PolicyRule) (req : AgentRequest) : Bool :=
-  let hasForbid := rules.any (fun r => r.effect == .forbid && r.matches req)
-  let hasPermit := rules.any (fun r => r.effect == .permit && r.matches req)
+  let hasForbid := rules.any (fun r => r.effect == .forbid && r.applies req)
+  let hasPermit := rules.any (fun r => r.effect == .permit && r.applies req)
   baselineAllows req && hasPermit && (!hasForbid)
 
 /-- Theorem 1: Any matching `forbid` rule unconditionally overrides all `permit` rules. -/
 theorem forbid_overrides_permit
     (rules : List PolicyRule) (req : AgentRequest) (r : PolicyRule)
-    (hr_mem : r ∈ rules) (hr_forbid : r.effect = .forbid) (hr_match : r.matches req = true) :
+    (hr_mem : r ∈ rules) (hr_forbid : r.effect = .forbid) (hr_match : r.applies req = true) :
     evaluatePolicies rules req = false := by
   unfold evaluatePolicies
-  have hAny : rules.any (fun x => x.effect == .forbid && x.matches req) = true := by
+  have hAny : rules.any (fun x => x.effect == .forbid && x.applies req) = true := by
     rw [List.any_eq_true]
     exact ⟨r, hr_mem, by simp [hr_forbid, hr_match]⟩
   simp [hAny]
