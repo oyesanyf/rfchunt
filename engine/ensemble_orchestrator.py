@@ -792,9 +792,31 @@ class EnsembleOrchestrator:
                 return ("raptor_semgrep", [], {"status": f"parse_error:{exc}"})
             return ("raptor_semgrep", out, {"status": "completed", "findings": len(out)})
 
+        def _run_gha_agent_auditor() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+            from engine.gha_agent_auditor import audit_gha_agent_repository
+
+            gfindings = audit_gha_agent_repository(root)
+            out = [
+                EngineFinding(
+                    engine="gha_agent",
+                    title=f.title,
+                    file_path=f.file_path,
+                    line=f.line,
+                    cwe=f.cwe,
+                    severity=f.severity,
+                    confidence=0.82,
+                    summary=f"{f.snippet} | {f.remediation}",
+                    rule_id=f.rule_id,
+                    atlas_technique=f.atlas_technique,
+                )
+                for f in gfindings
+            ]
+            return ("gha_agent", out, {"findings": len(out)})
+
         with ThreadPoolExecutor(max_workers=4) as pool:
             futs = [
                 pool.submit(_run_web_llm_atlas),
+                pool.submit(_run_gha_agent_auditor),
                 pool.submit(_run_lean4),
                 pool.submit(_run_semgrep_raptor),
             ]

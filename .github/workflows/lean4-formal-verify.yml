@@ -56,4 +56,4 @@ jobs:
         shell: bash
         run: |
           pip install -r requirements.txt pytest
-          pytest -o addopts="" --basetemp=/tmp/pytest_rfchunt tests/test_lean_formal_verifier.py tests/test_freshness_watcher.py tests/test_linux_poc_runner.py tests/test_client_audit_packager.py tests/test_ensemble_orchestrator.py tests/test_mitre_atlas_stix.py tests/test_atlas_llm_evaluator.py -v
+          pytest -o addopts="" --basetemp=/tmp/pytest_rfchunt tests/test_lean_formal_verifier.py tests/test_freshness_watcher.py tests/test_linux_poc_runner.py tests/test_client_audit_packager.py tests/test_ensemble_orchestrator.py tests/test_mitre_atlas_stix.py tests/test_atlas_llm_evaluator.py tests/test_gha_agent_auditor.py -v
