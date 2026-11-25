@@ -43,5 +43,5 @@ jobs:
       - name: Run Lean 4 Hybrid Bridge Unit Tests
         shell: bash
         run: |
-          pip install pytest
-          pytest tests/test_lean_formal_verifier.py -v
+          pip install -r requirements.txt pytest
+          pytest tests/test_lean_formal_verifier.py tests/test_freshness_watcher.py tests/test_linux_poc_runner.py tests/test_client_audit_packager.py -v
