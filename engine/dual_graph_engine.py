@@ -144,21 +144,29 @@ class UntrustedOutputBoundary:
             self.enabled = bool(enabled)
         self.nonce = secrets.token_hex(12)
 
-    def frame(self, content: str, source_label: str = "tool_output") -> str:
-        text = str(content or "")
+    def frame(self, content: Union[str, bytes], source_label: str = "tool_output") -> str:
+        if isinstance(content, (bytes, bytearray)):
+            text = bytes(content).decode("utf-8", errors="replace")
+        else:
+            text = str(content or "")
         if not self.enabled:
             return text
         import unicodedata
 
-        # Strip invisible Unicode Tags, BiDi overrides, and zero-width characters
+        # Strip invisible Unicode Tags, BiDi overrides, zero-width, and Cf format characters
         _forbidden = {
+            0x00AD, 0x034F, 0x061C, 0x2060,
             0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0xFEFF,
             0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
             0x2066, 0x2067, 0x2068, 0x2069,
         }
         text = "".join(
             ch for ch in text
-            if not (0xE0000 <= ord(ch) <= 0xE007F or ord(ch) in _forbidden)
+            if not (
+                0xE0000 <= ord(ch) <= 0xE007F
+                or ord(ch) in _forbidden
+                or unicodedata.category(ch) == "Cf"
+            )
         )
         text = unicodedata.normalize("NFKC", text)
         text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
@@ -167,6 +175,21 @@ class UntrustedOutputBoundary:
         text = re.sub(r"(?i)<\s*/?\s*untrusted_remote_response_data(?:\b[^>]*)?>?", "[FENCE_ESCAPED]", text)
         text = re.sub(r"(?i)<<<\s*(?:END_)?ARTEX_UNTRUSTED_DATA[^>]*>>>?", "[FENCE_ESCAPED]", text)
         text = re.sub(r"(?i)<<<\s*(?:END_)?RFCHUNT_FUZZ_CONTEXT[^>]*>>>?", "[FENCE_ESCAPED]", text)
+        # Neutralize LLM prompt injection tokens, chat-template markers & fake turn delimiters
+        text = re.sub(r"(?i)###\s*(system|instruction|task|human|assistant|prompt)", "[REDACTED_MARKER]", text)
+        text = re.sub(
+            r"(?i)<\|(im_start|im_end|endoftext|eot_id|start_header_id|end_header_id|system|user|assistant)\|>",
+            "[TOKEN_NEUTRALIZED]",
+            text,
+        )
+        text = re.sub(r"(?i)</?(?:system|instructions|developer|start_of_turn|end_of_turn)>", "[TAG_NEUTRALIZED]", text)
+        text = re.sub(r"(?i)\[/?INST\]", "[TOKEN_NEUTRALIZED]", text)
+        text = re.sub(r"(?i)\*{2,3}\s*important\s+system\s+message[^*\n]*\*{0,3}", "[DIRECTIVE_NEUTRALIZED]", text)
+        text = re.sub(r"(?i)-{2,3}\s*(?:user|assistant|system)\s+response\s*-{0,3}", "[TURN_DELIMITER_NEUTRALIZED]", text)
+        text = re.sub(r"(?i)(ignore\s+(all\s+)?previous\s+instructions|system\s+prompt\s*:)", "[PROMPT_OVERRIDE_DEFUSED]", text)
+        text = re.sub(r"(?i)(admin_override|jailbreak|disregard\s+prior)", "[DIRECTIVE_NEUTRALIZED]", text)
+        # Defuse markdown code fence injection
+        text = text.replace("```", "` ` `")
         safe_label = "".join(c for c in str(source_label) if c.isalnum() or c in ("_", "-", "."))[:48] or "tool_output"
         call_nonce = secrets.token_hex(12)
         self.nonce = call_nonce
@@ -4677,7 +4700,23 @@ class DualGraphAttackEngine:
         title = str(f_dict.get("title") or f_dict.get("name") or f_dict.get("description") or f_dict.get("label") or rule_id)
         cwe = str(f_dict.get("cwe") or f_dict.get("cwe_id") or "")
         severity = str(f_dict.get("severity") or "HIGH").upper()
-        file_path = str(f_dict.get("file_path") or f_dict.get("path") or f_dict.get("file") or f_dict.get("target_path") or "")
+        from engine.execution_policy import _is_drive_relative_or_colon_unsafe, _is_unc_path
+
+        raw_fp = str(f_dict.get("file_path") or f_dict.get("path") or f_dict.get("file") or f_dict.get("target_path") or "")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_fp):
+            file_path = ""
+        else:
+            file_path = raw_fp.strip()
+        if (
+            ".." in file_path.replace("\\", "/").split("/")
+            or _is_unc_path(file_path)
+            or (
+                file_path
+                and not file_path.lower().startswith(("http://", "https://"))
+                and _is_drive_relative_or_colon_unsafe(file_path)
+            )
+        ):
+            file_path = ""
         try:
             line_number = int(f_dict.get("line_number") or f_dict.get("line") or 1)
         except (ValueError, TypeError):

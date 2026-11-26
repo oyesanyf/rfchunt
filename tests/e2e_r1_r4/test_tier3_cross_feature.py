@@ -368,16 +368,16 @@ def test_t3_02_budget_ledger_untrusted_boundary_and_trace_persistence_in_db(
     assert ledger.used_turns >= 2
     assert ledger.used_tokens > 0
 
-    # Prompt 2 must frame the spoofed breakout reply with the real nonce
+    # Prompt 2 must frame the spoofed breakout reply with randomized XML nonce boundary
     assert len(arbiter.prompts) == 2
     p2 = arbiter.prompts[1]["user_prompt"]
-    assert f"nonce={boundary.nonce}" in p2
-    assert "<<<ARTEX_UNTRUSTED_DATA" in p2
+    assert re.search(r'<untrusted_data nonce="[0-9a-f]{24}">', p2)
+    assert "</untrusted_data>" in p2
 
     # SQLite trace persistence via WorkerTraceStore
     db_traces = isolated_db.list_worker_traces(task_id="TASK-T3-02")
     assert len(db_traces) >= 1
-    assert any(f"nonce={boundary.nonce}" in (t.get("raw_observation") or "") for t in db_traces)
+    assert any(re.search(r'<untrusted_data nonce="[0-9a-f]{24}">', (t.get("raw_observation") or "")) for t in db_traces)
 
     # Per-intent budget now exhausted for INTENT-T3-02, while a fresh intent still checks cleanly
     intent_usage = ledger.get_intent_usage("INTENT-T3-02")
@@ -1392,8 +1392,8 @@ def test_t3_11_protocol_ruler_deterministic_harness_approval_and_untrusted_bound
     assert len(arbiter.prompts) >= 2
     for idx in range(1, len(arbiter.prompts)):
         p_txt = arbiter.prompts[idx]["user_prompt"]
-        assert f"nonce={boundary.nonce}" in p_txt
-        assert "<<<ARTEX_UNTRUSTED_DATA" in p_txt
+        assert re.search(r'<untrusted_data nonce="[0-9a-f]{24}">', p_txt)
+        assert "</untrusted_data>" in p_txt
 
     # Verify ApprovalGate(mode="deny") blocks protocol_ruler / deterministic_harness cleanly
     deny_reg = _build_registry(
@@ -1802,7 +1802,7 @@ def test_t3_16_hybrid_all_with_repo_module21_and_advisory_csv_export(
         "    return {'admin': True, 'role': user_role}\n",
         encoding="utf-8",
     )
-    auth_file = _write_auth_profile_file(tmp_path / "auth.json")
+    auth_file = _write_auth_profile_file(repo_dir / "auth.json")
 
     subprocess_recorder.set_response(
         "httpx",

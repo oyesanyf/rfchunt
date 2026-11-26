@@ -34,15 +34,37 @@ def build_rfchunt_all_argv(
     target: str,
     output_dir: str = "reports",
     dry_run: bool = False,
+    ensemble: bool = False,
+    program: str = "generic",
+    freshness_hours: int = 72,
+    ensemble_quorum: int = 2,
+    embedded: bool = False,
+    model: Optional[str] = None,
     extra_flags: Optional[List[str]] = None,
     swarm_script: Optional[Path] = None,
 ) -> List[str]:
-    """Builds a fail-closed argv invoking `rfc_hunt_swarm.py --all <target>` (`shell=False`)."""
+    """Builds a fail-closed argv invoking `rfc_hunt_swarm.py --all [--ensemble] [--embedded] <target>` (`shell=False`)."""
     t = str(target).strip()
     if not t:
         raise ValueError("target is required for bb_run_all_scan.")
     script = swarm_script or (Path(__file__).resolve().parent / "rfc_hunt_swarm.py")
     argv = [sys.executable, str(script), "--all", t, "--output-dir", str(output_dir)]
+    if ensemble:
+        argv.extend(
+            [
+                "--ensemble",
+                "--program",
+                str(program).strip() or "generic",
+                "--freshness-hours",
+                str(int(freshness_hours)),
+                "--quorum",
+                str(max(1, int(ensemble_quorum))),
+            ]
+        )
+    if embedded:
+        argv.append("--embedded")
+    if model and str(model).strip():
+        argv.extend(["--model", str(model).strip()])
     if dry_run:
         argv.append("--dry-run")
     for flag in (extra_flags or []):
@@ -55,37 +77,149 @@ def build_rfchunt_all_argv(
     return argv
 
 
+def _probe_toolchain_status_safe(lean_dir: Optional[Path], embedded: bool) -> Dict[str, Any]:
+    """Return non-destructive backend availability status, degrading gracefully on probe errors."""
+    if embedded:
+        try:
+            from engine.ensemble_orchestrator import _embedded_toolchain_status
+
+            return _embedded_toolchain_status()
+        except Exception:
+            return {}
+    try:
+        from engine.linux_poc_runner import probe_optional_backends
+
+        eff_lean = lean_dir if (lean_dir is not None and lean_dir.is_dir()) else None
+        return probe_optional_backends(lean_dir=eff_lean, timeout_sec=2.5)
+    except Exception as exc:
+        return {
+            "docker": {"available": False, "status": "unavailable", "reason": str(exc), "path_or_module": None},
+            "wsl2": {"available": False, "status": "unavailable", "reason": str(exc), "path_or_module": None},
+            "lean4": {"available": False, "status": "unavailable", "reason": str(exc), "path_or_module": None},
+            "rfchunt_lean_oracle": {"available": False, "status": "unavailable", "reason": str(exc), "path_or_module": None},
+            "angr": {"available": False, "status": "unavailable", "reason": str(exc), "path_or_module": None},
+            "klee": {"available": False, "status": "unavailable", "reason": str(exc), "path_or_module": None},
+            "semgrep": {"available": False, "status": "unavailable", "reason": str(exc), "path_or_module": None},
+        }
+
+
+def _merge_lean_domain_enrichment(
+    base_lean: Optional[Dict[str, Any]],
+    ens_lean: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Merge counterexamples/domain_checks into base Lean workspace report without overwriting base fields."""
+    if not isinstance(ens_lean, dict):
+        return base_lean
+    if base_lean is None:
+        return dict(ens_lean)
+    enriched = dict(base_lean)
+    for key in ("counterexamples", "domain_checks", "oracle_backend", "degradation_reason"):
+        if key in ens_lean:
+            enriched[key] = ens_lean[key]
+    return enriched
+
+
 def run_rfchunt_all_scan(
     *,
     target: str,
     output_dir: str = "reports",
     dry_run: bool = False,
+    ensemble: bool = False,
+    program: str = "generic",
+    freshness_hours: int = 72,
+    ensemble_quorum: int = 2,
+    embedded: bool = False,
+    model: Optional[str] = None,
     include_lean_verify: bool = True,
     timeout_sec: float = 300.0,
     extra_flags: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Executes RFCHunt `--all` safely (`shell=False`) plus optional Lean 4 formal proof check."""
+    """Executes RFCHunt `--all` (optionally `--ensemble` / `--embedded`) safely (`shell=False`) plus Lean 4 check."""
     argv = build_rfchunt_all_argv(
         target=target,
         output_dir=output_dir,
         dry_run=dry_run,
+        ensemble=ensemble,
+        program=program,
+        freshness_hours=freshness_hours,
+        ensemble_quorum=ensemble_quorum,
+        embedded=embedded,
+        model=model,
         extra_flags=extra_flags,
     )
+    lean_dir = Path(__file__).resolve().parent / "formal" / "lean4"
     lean_summary: Optional[Dict[str, Any]] = None
     if include_lean_verify:
         from engine.lean_formal_verifier import verify_lean_workspace
-        lean_dir = Path(__file__).resolve().parent / "formal" / "lean4"
         if lean_dir.is_dir():
             lean_summary = verify_lean_workspace(lean_dir).to_dict()
 
+    mode = "--all --ensemble" if ensemble else "--all"
+    if embedded:
+        mode = f"{mode} --embedded"
     if dry_run:
-        return {
+        tc_status = _probe_toolchain_status_safe(lean_dir, bool(embedded))
+        dry_payload: Dict[str, Any] = {
             "status": "dry_run_ready",
-            "mode": "--all",
+            "mode": mode,
             "argv": argv,
             "target": target,
             "output_dir": output_dir,
+            "program": program,
+            "freshness_hours": freshness_hours,
+            "embedded": bool(embedded),
+            "model": model,
             "lean_verification": lean_summary,
+            "toolchain_status": tc_status,
+        }
+        if ensemble:
+            dry_payload["ensemble"] = {
+                "target": target,
+                "program": str(program).strip() or "generic",
+                "freshness_hours": int(freshness_hours),
+                "quorum": max(1, int(ensemble_quorum)),
+                "whiteboard": {
+                    "enabled": True,
+                    "dry_run": True,
+                    "hypotheses": [],
+                    "facts": [],
+                    "backend_status": tc_status,
+                },
+                "clusters": [],
+                "counts_by_disposition": {},
+                "toolchain_status": tc_status,
+            }
+        return dry_payload
+
+    if embedded:
+        from engine.ensemble_orchestrator import EnsembleOrchestrator
+
+        orch = EnsembleOrchestrator(
+            program=program,
+            freshness_hours=freshness_hours,
+            quorum=ensemble_quorum,
+            exhaustive_default=True,
+            embedded=True,
+            model=model,
+            enable_llm_verify=False,
+        )
+        rep = orch.run(target, out_dir=output_dir)
+        rep_dict = rep.to_dict()
+        merged_lean = _merge_lean_domain_enrichment(lean_summary, rep_dict.get("lean_verification"))
+        return {
+            "status": "completed",
+            "mode": mode,
+            "exit_code": 0,
+            "embedded": True,
+            "target": target,
+            "output_dir": output_dir,
+            "total_clusters": len(rep.clusters),
+            "counts_by_disposition": rep.counts_by_disposition,
+            "sarif_path": str(Path(output_dir) / "ensemble_findings.sarif"),
+            "telemetry": orch.last_telemetry,
+            "lean_verification": merged_lean,
+            "toolchain_status": rep.toolchain_status,
+            "ensemble": rep_dict,
         }
 
     proc = silent_subprocess_run(
@@ -96,9 +230,9 @@ def run_rfchunt_all_scan(
         errors="replace",
         timeout=timeout_sec,
     )
-    return {
+    payload: Dict[str, Any] = {
         "status": "completed" if proc.returncode == 0 else "failed",
-        "mode": "--all",
+        "mode": mode,
         "exit_code": proc.returncode,
         "argv": argv,
         "target": target,
@@ -107,6 +241,63 @@ def run_rfchunt_all_scan(
         "stderr_tail": (proc.stderr or "")[-2000:],
         "lean_verification": lean_summary,
     }
+    ens_data: Optional[Dict[str, Any]] = None
+    if ensemble and proc.returncode == 0:
+        out_path = Path(output_dir)
+        ens_report_path = out_path / "ensemble_report.json"
+        combined_json_path = out_path / "combined_audit_summary.json"
+        if ens_report_path.is_file():
+            try:
+                loaded = json.loads(ens_report_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    ens_data = loaded
+            except Exception:
+                ens_data = None
+        if ens_data is None and combined_json_path.is_file():
+            try:
+                comb = json.loads(combined_json_path.read_text(encoding="utf-8"))
+                if isinstance(comb, dict) and isinstance(comb.get("ensemble"), dict):
+                    ens_data = comb["ensemble"]
+            except Exception:
+                ens_data = None
+        if ens_data is None and (proc.stdout or "").strip():
+            try:
+                parsed_stdout = json.loads((proc.stdout or "").strip())
+                if isinstance(parsed_stdout, dict) and isinstance(parsed_stdout.get("ensemble"), dict):
+                    ens_data = parsed_stdout["ensemble"]
+            except Exception:
+                ens_data = None
+
+    if isinstance(ens_data, dict):
+        payload["ensemble"] = ens_data
+        tc_from_ens = ens_data.get("toolchain_status")
+        payload["toolchain_status"] = (
+            tc_from_ens if isinstance(tc_from_ens, dict) else _probe_toolchain_status_safe(lean_dir, False)
+        )
+        payload["lean_verification"] = _merge_lean_domain_enrichment(
+            lean_summary, ens_data.get("lean_verification")
+        )
+    else:
+        tc_fallback = _probe_toolchain_status_safe(lean_dir, False)
+        payload["toolchain_status"] = tc_fallback
+        if ensemble:
+            payload["ensemble"] = {
+                "target": target,
+                "program": str(program).strip() or "generic",
+                "freshness_hours": int(freshness_hours),
+                "quorum": max(1, int(ensemble_quorum)),
+                "whiteboard": {
+                    "enabled": True,
+                    "status": "completed" if proc.returncode == 0 else "failed",
+                    "hypotheses": [],
+                    "facts": [],
+                    "backend_status": tc_fallback,
+                },
+                "clusters": [],
+                "counts_by_disposition": {},
+                "toolchain_status": tc_fallback,
+            }
+    return payload
 
 
 SERVER_INFO = {
@@ -162,6 +353,18 @@ def validate_and_stage_hackerone_draft(
         issues.append(
             "poc_verified is False — run `bb_run_linux_poc` first to attach verbatim Linux runtime output before submission."
         )
+
+    from engine.ensemble_orchestrator import evaluate_vendor_threat_model
+
+    tm = evaluate_vendor_threat_model(
+        title=title,
+        summary=f"{vulnerability_information}\n{impact}",
+        file_path=asset,
+        program=program_handle,
+        poc_verified=bool(poc_verified),
+    )
+    if not tm.passed:
+        issues.extend(tm.reasons)
 
     status = "staged_ready" if not issues else "blocked_quality_gate"
     payload = {
@@ -349,7 +552,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
     },
     {
         "name": "bb_run_all_scan",
-        "description": "Invoke RFCHunt's full `--all` unified security audit pipeline on an authorized local repository or target (shell=False, optional dry-run and Lean 4 formal verification).",
+        "description": "Invoke RFCHunt's full `--all` (optionally `--all --ensemble --embedded`) unified security audit pipeline on an authorized local repository or target (shell=False, optional in-process embedded mode, dry-run, and Lean 4 formal verification).",
         "inputSchema": {
             "type": "object",
             "required": ["target"],
@@ -357,9 +560,48 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 "target": {"type": "string", "description": "Local repository path or authorized target URL"},
                 "output_dir": {"type": "string", "default": "reports"},
                 "dry_run": {"type": "boolean", "default": False},
+                "ensemble": {"type": "boolean", "default": False},
+                "embedded": {"type": "boolean", "default": False},
+                "model": {"type": "string", "description": "Optional LLM model override"},
+                "program": {"type": "string", "default": "generic"},
+                "freshness_hours": {"type": "integer", "default": 72},
+                "ensemble_quorum": {"type": "integer", "default": 2},
                 "include_lean_verify": {"type": "boolean", "default": True},
                 "timeout_sec": {"type": "number", "default": 300},
                 "extra_flags": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "name": "bb_gha_workflow_audit",
+        "description": "Audit GitHub Actions workflows via Zizmor, Actionlint, gha_agent_auditor, and optional LLM semantic verification inside EnsembleConsensusVoter with SARIF 2.1.0 output.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["target"],
+            "properties": {
+                "target": {"type": "string", "description": "Repository root, .github/workflows dir, or workflow YAML path"},
+                "embedded": {"type": "boolean", "default": False},
+                "model": {"type": "string"},
+                "enable_llm_verify": {"type": "boolean", "default": True},
+                "program": {"type": "string", "default": "generic"},
+                "quorum": {"type": "integer", "default": 2},
+                "out_dir": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "bb_atlas_llm_eval",
+        "description": "Sync live MITRE ATLAS STIX 2.1 (with ETag cache & golden fallback), synthesize stack-adaptive skills, and evaluate an LLM target across 74-language / low-resource, canary, SSRF/tool, and dynamic ATLAS probes.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["llm_target"],
+            "properties": {
+                "llm_target": {"type": "string", "description": "'ollama', 'paid', or OpenAI-compatible HTTP(S) URL"},
+                "model": {"type": "string"},
+                "repo_path": {"type": "string", "description": "Optional repo path for stack-adaptive ATLAS skills"},
+                "suites": {"type": "array", "items": {"type": "string"}},
+                "refresh_stix": {"type": "boolean", "default": True},
+                "concurrency": {"type": "integer", "default": 8},
             },
         },
     },
@@ -504,10 +746,56 @@ class BugBountyMCPServer:
                 target=str(args["target"]),
                 output_dir=str(args.get("output_dir", "reports")),
                 dry_run=bool(args.get("dry_run", False)),
+                ensemble=bool(args.get("ensemble", False)),
+                program=str(args.get("program", "generic")),
+                freshness_hours=int(args.get("freshness_hours", 72)),
+                ensemble_quorum=int(args.get("ensemble_quorum", 2)),
+                embedded=bool(args.get("embedded", False)),
+                model=args.get("model"),
                 include_lean_verify=bool(args.get("include_lean_verify", True)),
                 timeout_sec=float(args.get("timeout_sec", 300.0)),
                 extra_flags=list(args.get("extra_flags") or []),
             )
+
+        if name == "bb_gha_workflow_audit":
+            from engine.ensemble_orchestrator import EnsembleOrchestrator
+
+            embedded_flag = bool(args.get("embedded", False))
+            orch = EnsembleOrchestrator(
+                program=str(args.get("program", "generic")),
+                quorum=int(args.get("quorum", 2)),
+                exhaustive_default=True,
+                embedded=embedded_flag,
+                model=args.get("model"),
+                enable_llm_verify=(not embedded_flag and bool(args.get("enable_llm_verify", True))),
+                gha_only=True,
+            )
+            rep = orch.run(
+                str(args["target"]),
+                out_dir=args.get("out_dir"),
+            )
+            payload = rep.to_dict()
+            payload["sarif"] = rep.to_sarif()
+            payload["telemetry"] = orch.last_telemetry
+            return payload
+
+        if name == "bb_atlas_llm_eval":
+            from engine.atlas_llm_evaluator import AtlasLLMEvaluator, LLMTargetAdapter
+
+            adapter = LLMTargetAdapter(
+                target=str(args["llm_target"]),
+                model=args.get("model"),
+            )
+            evaluator = AtlasLLMEvaluator(
+                adapter=adapter,
+                concurrency=int(args.get("concurrency", 8)),
+            )
+            suites = list(args.get("suites") or ["low_resource", "canary", "ssrf_tool", "atlas_dynamic"])
+            return evaluator.evaluate(
+                suites=suites,
+                repo_path=args.get("repo_path"),
+                refresh_stix=bool(args.get("refresh_stix", True)),
+            ).to_dict()
 
         raise ValueError(f"Unknown tool: {name}")
 

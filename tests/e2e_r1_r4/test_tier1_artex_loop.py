@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 import types
 from pathlib import Path
 from typing import Any, Dict, List
@@ -648,13 +649,13 @@ def test_f05_every_tool_output_framed_with_untrusted_output_boundary(
 
     assert len(arbiter.prompts) >= 2
     second_prompt = arbiter.prompts[1]["user_prompt"]
-    assert f"nonce={boundary.nonce}" in second_prompt
-    assert "<<<ARTEX_UNTRUSTED_DATA" in second_prompt
-    assert "<<<END_ARTEX_UNTRUSTED_DATA" in second_prompt
+    assert re.search(r'<untrusted_data nonce="[0-9a-f]{24}">', second_prompt)
+    assert "[source: " in second_prompt
+    assert "</untrusted_data>" in second_prompt
 
     traces = list(trace_store.traces.values())
     assert len(traces) >= 1
-    assert any(f"nonce={boundary.nonce}" in t.raw_observation for t in traces)
+    assert any(re.search(r'<untrusted_data nonce="[0-9a-f]{24}">', t.raw_observation) for t in traces)
 
 
 def test_f05_multiturn_loop_stops_on_max_turns_and_budget_exhaustion(
@@ -703,11 +704,11 @@ def test_f05_artex_worker_execute_candidate_preserves_custom_executor_fn_compat(
     )
 
     def _custom_3tuple(attrs: Dict[str, Any]) -> Any:
-        return True, "Custom 3-tuple verified", "GET /api/v1"
+        return True, "Custom 3-tuple active indicator", "GET /api/v1"
 
-    assert eng.worker.execute_candidate(cand, executor_fn=_custom_3tuple) is True
-    assert "EXPLOIT-CAND-COMPAT-1" in eng.exploration_graph.nodes
-    assert eng.exploration_graph.nodes["EXPLOIT-CAND-COMPAT-1"].node_type == "CONFIRMED_EXPLOIT"
+    assert eng.worker.execute_candidate(cand, executor_fn=_custom_3tuple) is False
+    assert "LEAD-CAND-COMPAT-1" in eng.exploration_graph.nodes
+    assert eng.exploration_graph.nodes["LEAD-CAND-COMPAT-1"].node_type == "MANUAL_REVIEW_LEAD"
 
     cand4 = eng.exploration_graph.add_intent(
         node_id="CAND-COMPAT-2",
@@ -716,9 +717,20 @@ def test_f05_artex_worker_execute_candidate_preserves_custom_executor_fn_compat(
         attributes={"target_host": "127.0.0.1", "target_route": "/api/v1", "attack_type": "COMPAT_CHECK"},
         status="PENDING",
     )
+    ex4 = eng.traffic_session.record_exchange(
+        method="GET",
+        url="http://127.0.0.1:8080/api/v1",
+        host="127.0.0.1",
+        port=8080,
+        status_code=200,
+        response_body=b"HTTP/1.1 200 OK\nCustom 4-tuple verified",
+    )
 
     def _custom_4tuple(attrs: Dict[str, Any]) -> Any:
-        return True, "Custom 4-tuple verified", "GET /api/v1", {"evidence_quote": "HTTP/1.1 200 OK"}
+        return True, "Custom 4-tuple verified", "GET /api/v1", {
+            "traffic_id": ex4.traffic_id,
+            "evidence_quote": "HTTP/1.1 200 OK",
+        }
 
     assert eng.worker.execute_candidate(cand4, executor_fn=_custom_4tuple) is True
     assert "EXPLOIT-CAND-COMPAT-2" in eng.exploration_graph.nodes
@@ -806,6 +818,7 @@ def test_f06_surface_mining_uses_module21_when_present(
         host=loopback_server.host,
         port=loopback_server.port,
         authorized=True,
+        workspace_root=tmp_path,
     )
     assert hasattr(registry, "surface_mining"), "M2 contract missing: LiveWorkerExecutorRegistry.surface_mining"
     res = registry.surface_mining(target_path=str(tmp_path), query="secret")
@@ -860,6 +873,7 @@ def test_f06_surface_mining_fallback_mines_local_repo_via_mantis_and_aiscan(
         host=loopback_server.host,
         port=loopback_server.port,
         authorized=True,
+        workspace_root=tmp_path,
     )
     assert hasattr(registry, "surface_mining"), "M2 contract missing: LiveWorkerExecutorRegistry.surface_mining"
     res = registry.surface_mining(target_path=str(tmp_path), query="")

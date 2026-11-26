@@ -1397,10 +1397,8 @@ class TieredModelRouter:
             resp.raise_for_status()
             data = resp.json()
         msg = data.get("message") if isinstance(data, dict) else None
-        if isinstance(msg, dict) and msg.get("content") is not None:
-            content = str(msg.get("content") or "")
-        else:
-            content = str((data.get("response") if isinstance(data, dict) else "") or "")
+        msg_content = str(msg.get("content") or "").strip() if isinstance(msg, dict) else ""
+        content = msg_content or str((data.get("response") if isinstance(data, dict) else "") or "").strip()
         return {
             "tier": decision.tier,
             "provider": "ollama",

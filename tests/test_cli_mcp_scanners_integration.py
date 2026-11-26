@@ -1354,7 +1354,7 @@ def test_run_unified_all_scans_deduplicates_overlapping_repo_openapi_and_httpx_e
         '@app.route("/internal/admin")\ndef a(): return "admin"\n',
         encoding="utf-8",
     )
-    oa = tmp_path / "openapi.json"
+    oa = repo / "openapi.json"
     oa.write_text(
         json.dumps({
             "openapi": "3.0.0",

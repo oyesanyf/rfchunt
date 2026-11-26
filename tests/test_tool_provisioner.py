@@ -21,6 +21,7 @@ Verifies:
 from __future__ import annotations
 
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 import os
@@ -28,7 +29,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-from unittest.mock import MagicMock, patch
+import threading
 import zipfile
 
 import pytest
@@ -78,8 +79,8 @@ def test_offline_guard_blocks_install_subprocesses(tmp_path: Path, monkeypatch: 
     prov = ToolProvisioner(repo_root=tmp_path, raptor_root=tmp_path / "raptor")
 
     called = []
-    with patch("subprocess.run", side_effect=lambda *a, **kw: called.append(a)):
-        summary = prov.ensure_all(include_docker=True, include_models=True)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: called.append(a))
+    summary = prov.ensure_all(include_docker=True, include_models=True)
 
     assert summary["offline_or_test_skipped"] is True
     assert len(called) == 0
@@ -199,38 +200,63 @@ def test_dynamic_installers_github_cargo_raptor_and_npm(tmp_path: Path, monkeypa
     asset_name = "katana_1.8.0_windows_amd64.zip" if os.name == "nt" else (
         "katana_1.8.0_macOS_arm64.zip" if sys.platform == "darwin" else "katana_1.8.0_linux_amd64.zip"
     )
-    release_meta = {
-        "tag_name": "v1.8.0",
-        "assets": [
-            {"name": asset_name, "browser_download_url": "https://downloads.example/katana.zip"},
-            {
-                "name": "katana_1.8.0_linux_amd64.zip",
-                "browser_download_url": "https://downloads.example/katana_linux_amd64.zip",
-            },
-            {
-                "name": "katana_1.8.0_linux_arm64.zip",
-                "browser_download_url": "https://downloads.example/katana_linux_arm64.zip",
-            },
-            {
-                "name": "katana_1.8.0_macOS_amd64.zip",
-                "browser_download_url": "https://downloads.example/katana_mac.zip",
-            },
-            {
-                "name": "katana-1.8.0-checksums.txt",
-                "browser_download_url": "https://downloads.example/checksums.txt",
-            },
-        ],
-    }
+    checksum_txt = f"{sha}  {asset_name}\n".encode("utf-8")
 
-    with patch.object(ToolProvisioner, "_http_get_json", return_value=release_meta), patch.object(
-        ToolProvisioner,
-        "_http_download_bytes",
-        side_effect=[zbytes, f"{sha}  {asset_name}\n".encode("utf-8")],
-    ):
-        st_katana = prov.ensure_tool("katana", force=True)
-    assert st_katana.installed is True
-    assert st_katana.installed_now is True
-    assert Path(st_katana.path_or_source).read_bytes() == fake_bin
+    # Serve release assets from a real loopback HTTP server so _http_download_bytes exercises real urllib HTTP
+    class _AssetHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def do_GET(self) -> None:
+            if self.path == "/katana.zip":
+                data = zbytes
+            elif self.path == "/checksums.txt":
+                data = checksum_txt
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _AssetHandler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        release_meta = {
+            "tag_name": "v1.8.0",
+            "assets": [
+                {"name": asset_name, "browser_download_url": f"http://127.0.0.1:{port}/katana.zip"},
+                {
+                    "name": "katana_1.8.0_linux_amd64.zip",
+                    "browser_download_url": f"http://127.0.0.1:{port}/katana.zip",
+                },
+                {
+                    "name": "katana_1.8.0_linux_arm64.zip",
+                    "browser_download_url": f"http://127.0.0.1:{port}/katana.zip",
+                },
+                {
+                    "name": "katana_1.8.0_macOS_amd64.zip",
+                    "browser_download_url": f"http://127.0.0.1:{port}/katana.zip",
+                },
+                {
+                    "name": "katana-1.8.0-checksums.txt",
+                    "browser_download_url": f"http://127.0.0.1:{port}/checksums.txt",
+                },
+            ],
+        }
+        with monkeypatch.context() as mp:
+            mp.setattr(ToolProvisioner, "_http_get_json", staticmethod(lambda *a, **kw: release_meta))
+            st_katana = prov.ensure_tool("katana", force=True)
+        assert st_katana.installed is True
+        assert st_katana.installed_now is True
+        assert Path(st_katana.path_or_source).read_bytes() == fake_bin
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
     # 2. Test RAPTOR provisioning + models.json + Invoke-RaptorScan.ps1 + host.docker.internal patch
     raptor_zip = io.BytesIO()
@@ -244,9 +270,9 @@ def test_dynamic_installers_github_cargo_raptor_and_npm(tmp_path: Path, monkeypa
             "raptor-main/core/llm/detection.py",
             'if host in ("localhost", "0.0.0.0"):\n    pass\n',
         )
-    with patch("shutil.which", return_value=None), patch.object(
-        ToolProvisioner, "_http_download_bytes", return_value=raptor_zip.getvalue()
-    ):
+    with monkeypatch.context() as mp:
+        mp.setattr(shutil, "which", lambda *a, **kw: None)
+        mp.setattr(ToolProvisioner, "_http_download_bytes", staticmethod(lambda *a, **kw: raptor_zip.getvalue()))
         st_raptor = prov.ensure_tool("raptor", force=True)
     assert st_raptor.installed is True
     assert (raptor_root / "raptor.py").is_file()
@@ -276,23 +302,24 @@ def test_dynamic_installers_github_cargo_raptor_and_npm(tmp_path: Path, monkeypa
             pbin.write_text("#!/usr/bin/env node\n", encoding="utf-8")
             if os.name != "nt":
                 pbin.chmod(0o755)
-        m = MagicMock()
-        m.returncode = 0
-        m.stdout = ""
-        m.stderr = ""
-        return m
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    with patch("engine.tool_provisioner._run_quiet_subprocess", side_effect=_fake_subproc), patch.object(
-        ToolProvisioner, "find_binary", side_effect=[None, prov.cargo_root / "bin" / ("aiscan.exe" if os.name == "nt" else "aiscan")]
-    ), patch("shutil.which", return_value="/usr/bin/cargo"):
+    expected_aiscan = prov.cargo_root / "bin" / ("aiscan.exe" if os.name == "nt" else "aiscan")
+    find_seq = iter([None, expected_aiscan])
+    import engine.tool_provisioner as tp_mod
+
+    with monkeypatch.context() as mp:
+        mp.setattr(tp_mod, "_run_quiet_subprocess", _fake_subproc)
+        mp.setattr(ToolProvisioner, "find_binary", lambda self, stem: next(find_seq))
+        mp.setattr(shutil, "which", lambda *a, **kw: "/usr/bin/cargo")
         st_ai = prov.ensure_tool("aiscan", force=True)
     assert st_ai.installed is True
     assert any("cargo" in " ".join(c).lower() and "install" in c for c in recorded_cmds)
 
     # 4. Test rea-agents npm local installation
-    with patch("engine.tool_provisioner._run_quiet_subprocess", side_effect=_fake_subproc), patch(
-        "shutil.which", return_value="/usr/bin/npm"
-    ):
+    with monkeypatch.context() as mp:
+        mp.setattr(tp_mod, "_run_quiet_subprocess", _fake_subproc)
+        mp.setattr(shutil, "which", lambda *a, **kw: "/usr/bin/npm")
         st_rea = prov.ensure_tool("rea_agents", force=True)
     assert (prov.npm_prefix / "node_modules" / "rea-agents" / "scripts" / "rea.mjs").is_file()
     if os.name != "nt":
@@ -404,9 +431,9 @@ def test_dynamic_free_ram_and_vram_ollama_sizing_never_appends_coder(
     with zipfile.ZipFile(raptor_zip, "w") as zf:
         zf.writestr("raptor-main/raptor.py", "print('ok')\n")
     prov = ToolProvisioner(repo_root=tmp_path / "repo_low", raptor_root=tmp_path / "raptor_low_dst", allow_in_tests=True)
-    with patch("shutil.which", return_value=None), patch.object(
-        ToolProvisioner, "_http_download_bytes", return_value=raptor_zip.getvalue()
-    ):
+    with monkeypatch.context() as mp:
+        mp.setattr(shutil, "which", lambda *a, **kw: None)
+        mp.setattr(ToolProvisioner, "_http_download_bytes", staticmethod(lambda *a, **kw: raptor_zip.getvalue()))
         prov.ensure_tool("raptor", force=True)
     models_cfg = json.loads((tmp_path / "raptor_low_dst" / "models.json").read_text(encoding="utf-8"))
     model_names = [entry["model"] for entry in models_cfg["models"]]
@@ -415,11 +442,13 @@ def test_dynamic_free_ram_and_vram_ollama_sizing_never_appends_coder(
 
     # 4. Verify ensure_panel_models_installed respects runtime free RAM/VRAM (low RAM -> 1.5b only; high VRAM -> full trio)
     pulled_low: list[str] = []
-    with patch.object(ollama_manager.OllamaLifecycleManager, "probe_ollama", return_value=[]), patch.object(
-        ollama_manager.OllamaLifecycleManager,
-        "ensure_model_installed",
-        side_effect=lambda name, **kw: pulled_low.append(name) or True,
-    ):
+    with monkeypatch.context() as mp:
+        mp.setattr(ollama_manager.OllamaLifecycleManager, "probe_ollama", staticmethod(lambda *a, **kw: []))
+        mp.setattr(
+            ollama_manager.OllamaLifecycleManager,
+            "ensure_model_installed",
+            staticmethod(lambda name, **kw: pulled_low.append(name) or True),
+        )
         ollama_manager.OllamaLifecycleManager.ensure_panel_models_installed(
             available_tags=[],
             free_ram_gb=4.0,
@@ -430,11 +459,13 @@ def test_dynamic_free_ram_and_vram_ollama_sizing_never_appends_coder(
     assert all("-coder" not in m for m in pulled_low)
 
     pulled_vram: list[str] = []
-    with patch.object(ollama_manager.OllamaLifecycleManager, "probe_ollama", return_value=[]), patch.object(
-        ollama_manager.OllamaLifecycleManager,
-        "ensure_model_installed",
-        side_effect=lambda name, **kw: pulled_vram.append(name) or True,
-    ):
+    with monkeypatch.context() as mp:
+        mp.setattr(ollama_manager.OllamaLifecycleManager, "probe_ollama", staticmethod(lambda *a, **kw: []))
+        mp.setattr(
+            ollama_manager.OllamaLifecycleManager,
+            "ensure_model_installed",
+            staticmethod(lambda name, **kw: pulled_vram.append(name) or True),
+        )
         ollama_manager.OllamaLifecycleManager.ensure_panel_models_installed(
             available_tags=[],
             free_ram_gb=4.0,
@@ -453,6 +484,7 @@ def test_ollama_health_probe_timeouts_clamped_to_400ms(
 ) -> None:
     import httpx as _httpx
     import ollama_manager
+    import engine.raptor_integrator as ri_mod
     from engine.raptor_integrator import RaptorIntegrator
 
     seen_timeouts: list[float] = []
@@ -465,7 +497,8 @@ def test_ollama_health_probe_timeouts_clamped_to_400ms(
         ollama_manager.OllamaLifecycleManager._cached_by_endpoint.clear()
         ollama_manager.OllamaLifecycleManager._cached_tags = ["qwen2.5:3b"]
 
-    with patch.object(_httpx, "get", side_effect=_fake_httpx_get):
+    with monkeypatch.context() as mp:
+        mp.setattr(_httpx, "get", _fake_httpx_get)
         res = ollama_manager.OllamaLifecycleManager.probe_ollama(
             endpoint="http://127.0.0.1:11434",
             fast_timeout=5.0,
@@ -494,9 +527,9 @@ def test_ollama_health_probe_timeouts_clamped_to_400ms(
 
     monkeypatch.setattr(ollama_manager, "get_runtime_free_memory", lambda allow_in_tests=False: (12.0, 0.0))
     raptor = RaptorIntegrator(raptor_root=tmp_path / "raptor_probe")
-    with patch("engine.raptor_integrator.subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="")), patch(
-        "engine.raptor_integrator.urllib.request.urlopen", side_effect=_fake_urlopen
-    ):
+    with monkeypatch.context() as mp:
+        mp.setattr(ri_mod.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout="", stderr=""))
+        mp.setattr(ri_mod.urllib.request, "urlopen", _fake_urlopen)
         st = raptor.check_status()
     assert len(raptor_timeouts) == 1
     assert raptor_timeouts[0] <= 0.4
@@ -506,7 +539,11 @@ def test_ollama_health_probe_timeouts_clamped_to_400ms(
 
     # Verify get_free_vram_mb enforces <=400ms timeout and zero subprocesses under offline guard
     monkeypatch.setenv("RFCHUNT_OFFLINE", "1")
-    with patch("ollama_manager.subprocess.run", side_effect=AssertionError("must not run nvidia-smi offline")):
+    with monkeypatch.context() as mp:
+        def _forbid_subproc(*a, **kw):
+            raise AssertionError("must not run nvidia-smi offline")
+
+        mp.setattr(ollama_manager.subprocess, "run", _forbid_subproc)
         assert ollama_manager.get_free_vram_mb(allow_in_tests=True) == 0.0
 
     monkeypatch.setenv("RFCHUNT_OFFLINE", "0")
@@ -517,11 +554,11 @@ def test_ollama_health_probe_timeouts_clamped_to_400ms(
 
     def _fake_nvidia(argv, **kw):
         vram_calls.append({"argv": list(argv), "timeout": kw.get("timeout"), "shell": kw.get("shell")})
-        return MagicMock(returncode=0, stdout="8192\n16384\n", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="8192\n16384\n", stderr="")
 
-    with patch("ollama_manager.shutil.which", return_value="/usr/bin/nvidia-smi"), patch(
-        "ollama_manager.subprocess.run", side_effect=_fake_nvidia
-    ):
+    with monkeypatch.context() as mp:
+        mp.setattr(ollama_manager.shutil, "which", lambda *a, **kw: "/usr/bin/nvidia-smi")
+        mp.setattr(ollama_manager.subprocess, "run", _fake_nvidia)
         vram_mb = ollama_manager.get_free_vram_mb(allow_in_tests=True)
     assert vram_mb == 16384.0
     assert len(vram_calls) == 1
@@ -555,25 +592,29 @@ def test_tool_provisioner_ollama_auto_ready_and_include_models(
         ]
         return list(pulled_tags)
 
-    with patch.object(ollama_manager, "get_runtime_free_memory", return_value=(16.0, 8192.0)), patch.object(
-        ollama_manager.OllamaLifecycleManager, "find_ollama_binary", return_value="/usr/bin/ollama"
-    ), patch.object(
-        ollama_manager.OllamaLifecycleManager,
-        "ensure_ollama_ready",
-        side_effect=lambda **kw: events.append(("ensure_ollama_ready", kw)) or ["qwen2.5:7b"],
-    ), patch.object(
-        ollama_manager.OllamaLifecycleManager,
-        "ensure_panel_models_installed",
-        side_effect=_fake_panel_install,
-    ), patch.object(
-        ollama_manager.OllamaLifecycleManager,
-        "ensure_model_installed",
-        side_effect=lambda name, **kw: events.append(("ensure_model_installed", {"name": name, **kw})) or True,
-    ), patch.object(
-        ollama_manager.OllamaLifecycleManager,
-        "probe_ollama",
-        side_effect=lambda **kw: list(pulled_tags),
-    ):
+    with monkeypatch.context() as mp:
+        mp.setattr(ollama_manager, "get_runtime_free_memory", lambda *a, **kw: (16.0, 8192.0))
+        mp.setattr(ollama_manager.OllamaLifecycleManager, "find_ollama_binary", staticmethod(lambda: "/usr/bin/ollama"))
+        mp.setattr(
+            ollama_manager.OllamaLifecycleManager,
+            "ensure_ollama_ready",
+            staticmethod(lambda **kw: events.append(("ensure_ollama_ready", kw)) or ["qwen2.5:7b"]),
+        )
+        mp.setattr(
+            ollama_manager.OllamaLifecycleManager,
+            "ensure_panel_models_installed",
+            staticmethod(_fake_panel_install),
+        )
+        mp.setattr(
+            ollama_manager.OllamaLifecycleManager,
+            "ensure_model_installed",
+            staticmethod(lambda name, **kw: events.append(("ensure_model_installed", {"name": name, **kw})) or True),
+        )
+        mp.setattr(
+            ollama_manager.OllamaLifecycleManager,
+            "probe_ollama",
+            staticmethod(lambda **kw: list(pulled_tags)),
+        )
         res = prov.ensure_all(tool_ids=["ollama_models"], include_docker=False, include_models=True, force=True)
 
     assert res["offline_or_test_skipped"] is False
@@ -593,7 +634,9 @@ def test_run_unified_all_scans_provisioning_order_include_models_and_guards(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import engine.aiscan_integrator as ai_mod
     import engine.mantis_integrator as mi
+    import engine.raptor_integrator as ri_mod
     from database import Database
 
     repo_dir = tmp_path / "mini_repo"
@@ -634,15 +677,21 @@ def test_run_unified_all_scans_provisioning_order_include_models_and_guards(
 
     db = Database(str(tmp_path / "prov_order.db"), secret_key_path=str(tmp_path / "k" / "s.key"))
     try:
-        with patch.object(ToolProvisioner, "ensure_all", _fake_ensure_all), patch.object(
-            mi, "FusionArbiter", _SpyArbiter
-        ), patch.object(mi.MantisIntegrator, "__init__", _spy_mantis_init), patch(
-            "engine.aiscan_integrator.AiscanIntegrator._find_aiscan_binary", return_value=None
-        ), patch("engine.raptor_integrator.RaptorIntegrator.check_status", return_value={}):
+        with monkeypatch.context() as mp:
+            mp.setattr(ToolProvisioner, "ensure_all", _fake_ensure_all)
+            mp.setattr(mi, "FusionArbiter", _SpyArbiter)
+            mp.setattr(mi.MantisIntegrator, "__init__", _spy_mantis_init)
+            mp.setattr(ai_mod.AiscanIntegrator, "_find_aiscan_binary", lambda self: None)
+            mp.setattr(ri_mod.RaptorIntegrator, "check_status", lambda self: {})
             mi.run_unified_all_scans(
                 repo=str(repo_dir),
                 db=db,
                 reports_dir=str(tmp_path / "rep_online"),
+                enable_preflight=False,
+                enable_arxiv_detect=False,
+                enable_last30days_skills=False,
+                enable_pe_audit=False,
+                enable_verification_inversion=False,
                 quiet=True,
             )
 
@@ -655,16 +704,22 @@ def test_run_unified_all_scans_provisioning_order_include_models_and_guards(
 
         # 2. include_models=False excludes ollama & ollama_models from provisioning
         prov_calls.clear()
-        with patch.object(ToolProvisioner, "ensure_all", _fake_ensure_all), patch.object(
-            mi, "FusionArbiter", _SpyArbiter
-        ), patch("engine.aiscan_integrator.AiscanIntegrator._find_aiscan_binary", return_value=None), patch(
-            "engine.raptor_integrator.RaptorIntegrator.check_status", return_value={}
-        ):
+        with monkeypatch.context() as mp:
+            mp.setattr(ToolProvisioner, "ensure_all", _fake_ensure_all)
+            mp.setattr(mi, "FusionArbiter", _SpyArbiter)
+            mp.setattr(ai_mod.AiscanIntegrator, "_find_aiscan_binary", lambda self: None)
+            mp.setattr(ri_mod.RaptorIntegrator, "check_status", lambda self: {})
             mi.run_unified_all_scans(
                 repo=str(repo_dir),
                 db=db,
                 reports_dir=str(tmp_path / "rep_nomodels"),
                 include_models=False,
+                enable_preflight=False,
+                enable_arxiv_detect=False,
+                enable_last30days_skills=False,
+                enable_pe_audit=False,
+                enable_verification_inversion=False,
+                enable_rea=False,
                 quiet=True,
             )
         assert len(prov_calls) == 1
@@ -685,18 +740,23 @@ def test_run_unified_all_scans_provisioning_order_include_models_and_guards(
             with monkeypatch.context() as mp:
                 for ek, ev in env_overrides.items():
                     mp.setenv(ek, ev)
-                with patch.object(ToolProvisioner, "ensure_all", _fake_ensure_all), patch.object(
-                    mi, "FusionArbiter", _SpyArbiter
-                ), patch("engine.aiscan_integrator.AiscanIntegrator._find_aiscan_binary", return_value=None), patch(
-                    "engine.raptor_integrator.RaptorIntegrator.check_status", return_value={}
-                ):
-                    mi.run_unified_all_scans(
-                        repo=str(repo_dir),
-                        db=db,
-                        reports_dir=str(tmp_path / "rep_guard"),
-                        quiet=True,
-                        **extra_kw,
-                    )
+                mp.setattr(ToolProvisioner, "ensure_all", _fake_ensure_all)
+                mp.setattr(mi, "FusionArbiter", _SpyArbiter)
+                mp.setattr(ai_mod.AiscanIntegrator, "_find_aiscan_binary", lambda self: None)
+                mp.setattr(ri_mod.RaptorIntegrator, "check_status", lambda self: {})
+                mi.run_unified_all_scans(
+                    repo=str(repo_dir),
+                    db=db,
+                    reports_dir=str(tmp_path / "rep_guard"),
+                    enable_preflight=False,
+                    enable_arxiv_detect=False,
+                    enable_last30days_skills=False,
+                    enable_pe_audit=False,
+                    enable_verification_inversion=False,
+                    enable_rea=False,
+                    quiet=True,
+                    **extra_kw,
+                )
             assert len(prov_calls) == 0, f"Provisioner must be skipped under {env_overrides!r} / {extra_kw!r}"
     finally:
         db.close()

@@ -491,11 +491,24 @@ def test_artex_worker_charges_executor_usage_and_defers_exhausted_intent(tmp_pat
             label="Test 4-tuple spend",
             attributes={"target_host": "127.0.0.1", "target_route": "/api/test"},
         )
+        ex1 = eng.traffic_session.record_exchange(
+            method="GET",
+            url="http://127.0.0.1/api/test",
+            host="127.0.0.1",
+            port=80,
+            status_code=200,
+            response_body=b"HTTP/1.1 200 OK\nverified",
+        )
         seen_attrs = {}
 
         def _exec_4tuple(exec_attrs):
             seen_attrs.update(exec_attrs)
-            return True, "verified", "GET /api/test", {"tokens_used": 640, "turns_used": 2}
+            return True, "verified", "GET /api/test", {
+                "tokens_used": 640,
+                "turns_used": 2,
+                "traffic_id": ex1.traffic_id,
+                "evidence_quote": "verified",
+            }
 
         assert eng.worker.execute_candidate(cand1, executor_fn=_exec_4tuple) is True
         assert seen_attrs["intent_id"] == "CAND-CHARGE-1"
@@ -526,14 +539,15 @@ def test_artex_worker_charges_executor_usage_and_defers_exhausted_intent(tmp_pat
         assert cand2.attributes["intent_budget_exhausted"] is True
         assert cand2.status == "PENDING"
 
-        # Legacy 3-tuple executor charges tokens=0, turns=1
+        # Legacy 3-tuple executor without bound traffic records POE=2 lead while still charging tokens=0, turns=1
         cand3 = eng.exploration_graph.add_intent(
             node_id="CAND-LEGACY-3",
             node_type="ATTACK_CANDIDATE",
             label="Legacy 3-tuple",
             attributes={"target_host": "127.0.0.1", "target_route": "/api/legacy"},
         )
-        assert eng.worker.execute_candidate(cand3, executor_fn=lambda _a: (True, "ok", "GET /api/legacy")) is True
+        assert eng.worker.execute_candidate(cand3, executor_fn=lambda _a: (True, "ok", "GET /api/legacy")) is False
+        assert "LEAD-CAND-LEGACY-3" in eng.exploration_graph.nodes
         assert eng.budget_ledger.get_intent_usage("CAND-LEGACY-3") == {"tokens": 0, "turns": 1}
     finally:
         db.close()
@@ -605,11 +619,24 @@ def test_dual_graph_engine_run_attack_chain_cycle_defers_intent_exceeding_budget
             )
             eng.budget_ledger.record_worker_run(tokens=500, turns=1, intent_id="CAND-PRE-EXHAUSTED")
 
+            ex_allowed = eng.traffic_session.record_exchange(
+                method="GET",
+                url="http://127.0.0.1/allowed",
+                host="127.0.0.1",
+                port=80,
+                status_code=200,
+                response_body=b"allowed_ok_quote",
+            )
             dispatched_ids = []
 
             def _exec(attrs):
                 dispatched_ids.append(attrs["intent_id"])
-                return True, "ok", "GET /allowed", {"tokens_used": 100, "turns_used": 1}
+                return True, "ok", "GET /allowed", {
+                    "tokens_used": 100,
+                    "turns_used": 1,
+                    "traffic_id": ex_allowed.traffic_id,
+                    "evidence_quote": "allowed_ok_quote",
+                }
 
             res = eng.run_attack_chain_cycle(round_num=1, executor_fn=_exec)
             assert "CAND-PRE-EXHAUSTED" not in dispatched_ids
@@ -851,9 +878,27 @@ def test_budget_ledger_malformed_inputs_min_turn_and_concurrent_task_cap(tmp_pat
                 "intent_turns_used": float("inf"),
             },
         )
+        ex_bad = eng.traffic_session.record_exchange(
+            method="GET",
+            url="http://127.0.0.1/bad",
+            host="127.0.0.1",
+            port=80,
+            status_code=200,
+            response_body=b"bad_attr_ok",
+        )
         assert eng.worker.execute_candidate(
             cand_bad,
-            executor_fn=lambda _a: (True, "ok", "GET /bad", {"tokens_used": float("inf"), "turns_used": 1}),
+            executor_fn=lambda _a: (
+                True,
+                "ok",
+                "GET /bad",
+                {
+                    "tokens_used": float("inf"),
+                    "turns_used": 1,
+                    "traffic_id": ex_bad.traffic_id,
+                    "evidence_quote": "bad_attr_ok",
+                },
+            ),
         ) is True
         assert cand_bad.status == "VERIFIED"
         assert eng.budget_ledger.get_intent_usage("CAND-BAD-ATTR") == {"tokens": 0, "turns": 1}

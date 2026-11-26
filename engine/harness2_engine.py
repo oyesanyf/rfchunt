@@ -425,26 +425,38 @@ def diversity(trees: Mapping[str, Tree]) -> Dict[str, Any]:
     }
 
 
+def _win_long_path(p: Path, *, min_len: int = 240) -> Path:
+    """Apply Windows extended-length path prefix (`\\\\?\\`) for deep paths >= min_len chars."""
+    if os.name == "nt":
+        abs_s = os.path.abspath(os.fspath(p))
+        if len(abs_s) >= min_len and not abs_s.startswith("\\\\?\\"):
+            if abs_s.startswith("\\\\"):
+                return Path("\\\\?\\UNC\\" + abs_s[2:])
+            return Path("\\\\?\\" + abs_s)
+    return p
+
+
 def read_tree(
     surface: SurfaceSpec, d: Path | str, *, rejected: Optional[List[str]] = None
 ) -> Tree:
     """Read rel -> content for every file on the editable c1..c8 surface, excluding README stubs."""
-    d = Path(d)
+    d_io = _win_long_path(Path(d), min_len=120)
     out: Tree = {}
-    if not d.is_dir():
+    if not d_io.is_dir():
         return out
     stubs = frozenset(rel for rel, _ in surface.stubs)
-    for p in sorted(d.rglob("*")):
-        if not p.is_file() or "__pycache__" in p.parts:
+    for p in sorted(d_io.rglob("*")):
+        p_io = _win_long_path(p)
+        if not p_io.is_file() or "__pycache__" in p.parts:
             continue
-        rel = str(p.relative_to(d)).replace("\\", "/")
+        rel = str(p.relative_to(d_io)).replace("\\", "/")
         if rel in stubs:
             continue
         if not is_allowed(surface, rel):
             if rejected is not None:
                 rejected.append(rel)
             continue
-        out[rel] = p.read_text(encoding="utf-8", errors="replace")
+        out[rel] = p_io.read_text(encoding="utf-8", errors="replace")
     return out
 
 
@@ -452,19 +464,20 @@ def _clear_readonly_attr(
     target: Union[str, os.PathLike[str]], *, is_dir: Optional[bool] = None
 ) -> None:
     """Clear read-only permission bits on a file or directory prior to removal."""
+    t_io = os.fspath(_win_long_path(Path(target)))
     try:
-        st = os.lstat(target)
+        st = os.lstat(t_io)
         dir_flag = stat.S_ISDIR(st.st_mode) if is_dir is None else is_dir
         needed = stat.S_IRWXU if dir_flag else (stat.S_IWUSR | stat.S_IRUSR)
-        os.chmod(target, st.st_mode | needed)
+        os.chmod(t_io, st.st_mode | needed)
     except OSError:
         fallback = stat.S_IRWXU if is_dir else (stat.S_IWUSR | stat.S_IRUSR)
-        os.chmod(target, fallback)
+        os.chmod(t_io, fallback)
 
 
 def _rmtree_force(path: Union[Path, str]) -> None:
     """Recursively delete a file, symlink, or directory tree, clearing ReadOnly attributes."""
-    p = Path(path)
+    p = _win_long_path(Path(path), min_len=120)
     if not p.exists() and not p.is_symlink():
         return
     if p.is_symlink() or p.is_file():
@@ -478,14 +491,15 @@ def _rmtree_force(path: Union[Path, str]) -> None:
             return
         if not isinstance(exc, PermissionError):
             raise exc
-        _clear_readonly_attr(target, is_dir=os.path.isdir(target))
-        parent = os.path.dirname(target)
+        t_io = os.fspath(_win_long_path(Path(target)))
+        _clear_readonly_attr(t_io, is_dir=os.path.isdir(t_io))
+        parent = os.path.dirname(t_io)
         if parent:
             try:
                 _clear_readonly_attr(parent, is_dir=True)
             except OSError:
                 pass
-        func(target)
+        func(t_io)
 
     if sys.version_info >= (3, 12):
         shutil.rmtree(p, onexc=_onexc)
@@ -501,12 +515,13 @@ def write_tree(
 ) -> Path:
     """Write a validated c1..c8 tree to disk, optionally including README component stubs."""
     dest = Path(dest)
-    if dest.exists() or dest.is_symlink():
-        _rmtree_force(dest)
-    dest.mkdir(parents=True, exist_ok=True)
+    dest_io = _win_long_path(dest)
+    if dest_io.exists() or dest_io.is_symlink():
+        _rmtree_force(dest_io)
+    dest_io.mkdir(parents=True, exist_ok=True)
 
     for a in surface.always_on:
-        p = dest / normalize_rel(a)
+        p = _win_long_path(dest / normalize_rel(a))
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(tree.get(a, ""), encoding="utf-8")
 
@@ -514,13 +529,13 @@ def write_tree(
         norm = normalize_rel(rel)
         if not is_allowed(surface, norm):
             continue
-        p = dest / norm
+        p = _win_long_path(dest / norm)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
 
     if stubs:
         for stub_rel, stub_body in surface.stubs:
-            sp = dest / normalize_rel(stub_rel)
+            sp = _win_long_path(dest / normalize_rel(stub_rel))
             if not sp.exists():
                 sp.parent.mkdir(parents=True, exist_ok=True)
                 sp.write_text(stub_body, encoding="utf-8")

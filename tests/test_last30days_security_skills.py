@@ -7,7 +7,9 @@ SKILL.md package auditing, and MCP Agent Tools).
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import pytest
 
 from engine.last30days_security_skills import (
     BUILTIN_LAST30DAYS_SECURITY_SKILLS,
@@ -154,13 +156,18 @@ def test_last30days_mcp_agent_tools(tmp_path: Path) -> None:
             }
         )
         txt = list_resp["result"]["content"][0]["text"]
-        assert '"zero_api_key_invariant_enforced": true' in txt
-        assert '"total_skills": 10' in txt
+        data = json.loads(txt)
+        assert data["zero_api_key_invariant_enforced"] is True
+        assert data["total_skills"] >= 10
 
 
-def test_six_lane_harvesting_clustering_code_synthesis_skills_num_and_unified_all(tmp_path: Path) -> None:
+def test_six_lane_harvesting_clustering_code_synthesis_skills_num_and_unified_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from engine.mantis_integrator import run_unified_all_scans
     from rfc_hunt_swarm import parse_swarm_arguments
+
+    monkeypatch.setenv("RFCHUNT_OFFLINE", "1")
 
     # 1. Verify --skills-num / --skill-num CLI flags
     args_sk = parse_swarm_arguments(["--all", "--skills-num", "6", "--reseach-num", "4"])

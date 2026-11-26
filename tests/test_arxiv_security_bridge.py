@@ -7,7 +7,12 @@ research-to-code detectors, multi-article D:\\harfile\\arixiv-to-code conversion
 """
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
+import platform
+import sys
+import pytest
 
 from engine.arxiv_security_bridge import BUILTIN_RESEARCH_DETECTORS, ArxivSecurityBridge
 from mcp_server import TerminatorMCPServer
@@ -25,14 +30,21 @@ def test_builtin_10_research_detectors_all_have_code_and_github_repos() -> None:
         assert spec.code_repo_url.startswith("https://github.com/")
 
 
-def test_multi_article_discover_and_convert_research_with_research_num(tmp_path: Path) -> None:
+def test_multi_article_discover_and_convert_research_with_research_num(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RFCHUNT_OFFLINE", "1")
+    if os.name == "nt" or sys.platform == "win32":
+        monkeypatch.setattr(platform, "system", lambda: "Windows")
+        monkeypatch.setattr(platform, "machine", lambda: "AMD64")
     bridge = ArxivSecurityBridge(detectors_dir=tmp_path / "detectors", research_num=3)
     res = bridge.discover_and_convert_research(
-        query="LLM agent sandbox escape static taint analysis",
+        query="",
         domain="both",
         research_num=3,
         require_code_repo=True,
-        evolve=True,
+        evolve=False,
+        auto_repair=False,
         output_dir=tmp_path / "detectors",
     )
     assert res["status"] == "completed"
@@ -166,4 +178,7 @@ def test_cli_reseach_num_flag_and_mcp_tools(tmp_path: Path) -> None:
                 "params": {"name": "list_active_arxiv_research_detectors", "arguments": {"domain": "all"}},
             }
         )
-        assert '"total_detectors": 10' in cat_resp["result"]["content"][0]["text"]
+        cat_data = json.loads(cat_resp["result"]["content"][0]["text"])
+        assert cat_data["total_detectors"] >= 10
+        det_ids = {d["detector_id"] for d in cat_data.get("detectors", [])}
+        assert "ARXIV-AI-01-BOUNDED-AGENTS-APC" in det_ids

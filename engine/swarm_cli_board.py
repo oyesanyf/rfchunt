@@ -212,6 +212,7 @@ AGENT_ROLE_EMOJIS: Dict[str, str] = {
     "novelty-triage": "\u2728",       # ✨
     "blackboard": "\U0001f4cb",       # 📋
     "deep_repo_audit": "\U0001f50e",  # 🔎
+    "pe-auditor": "\U0001f6e1\ufe0f", # 🛡️
 }
 
 EVENT_KIND_EMOJIS: Dict[str, str] = {
@@ -1233,6 +1234,11 @@ class SwarmCLIBoard:
     def _out_stream(self) -> Any:
         return self._stream if self._stream is not None else sys.stdout
 
+    @property
+    def tasks(self) -> Dict[str, BoardTask]:
+        with self._lock:
+            return dict(self._tasks)
+
     def set_goal(self, title: Optional[str] = None, line: Optional[str] = None) -> None:
         with self._lock:
             if title is not None:
@@ -1795,6 +1801,7 @@ def create_all_scan_board(
     board.add_task("mantis", "Mantis threat model, hypotheses & patch verification", worker="mantis", thread_id="static_ai")
     board.add_task("raptor", "RAPTOR SAST, Post-Quantum Crypto & SCA scan", worker="raptor", thread_id="static_ai")
     board.add_task("aiscan", "AI/LLM security surface audit (aiscan)", worker="aiscan", thread_id="static_ai")
+    board.add_task("pe_dotnet_auditor", "PE & .NET UMCI/SEC_COMMIT, YARA & host patch audit", worker="pe-auditor", thread_id="static_ai")
     board.add_task("rea_agents", "REA capability & boundary static/CLI analysis", worker="rea-agents", thread_id="static_ai")
     board.add_task("call_graph", "Whole-repo call-graph & taint slicing", worker="slicer", thread_id="static_ai")
     board.add_task("external_scanners", "External discovery & safe Nuclei scan (httpx/katana/nuclei)", worker="scanners", thread_id="static_ai")
@@ -1901,25 +1908,39 @@ def update_all_board_from_result(board: SwarmCLIBoard, result: Dict[str, Any]) -
             return normalize_task_state(str(raw_val)), str(raw_val)
         return "Skipped", "not executed"
 
+    engines_dict = result.get("engines") if isinstance(result.get("engines"), dict) else {}
+
     mapping = (
-        ("provisioner", "provisioning"),
-        ("mantis", "mantis"),
-        ("raptor", "raptor"),
-        ("aiscan", "aiscan"),
-        ("rea_agents", "rea_agents"),
-        ("call_graph", "call_graph"),
-        ("external_scanners", "external_discovery"),
-        ("differential_matrix", "differential_matrix"),
-        ("sandbox_invariants", "sandbox_invariants"),
-        ("fuzz_bridge", "fuzz_bridge"),
-        ("artex_dual_graph", "artex"),
-        ("poe_verifier", "poe_verification"),
-        ("novelty_corpus", "novelty"),
-        ("dream_rsi", "dream_rsi"),
+        ("provisioner", ("provisioning",)),
+        ("mantis", ("mantis",)),
+        ("raptor", ("raptor",)),
+        ("aiscan", ("aiscan",)),
+        ("pe_dotnet_auditor", ("pe_dotnet_auditor",)),
+        ("rea_agents", ("rea_agents", "rea_surface")),
+        ("call_graph", ("call_graph", "call_graph_slicer")),
+        ("external_scanners", ("external_discovery",)),
+        ("differential_matrix", ("differential_matrix", "docker_parser_matrix")),
+        ("sandbox_invariants", ("sandbox_invariants",)),
+        ("fuzz_bridge", ("fuzz_bridge",)),
+        ("artex_dual_graph", ("artex", "artex_dual_graph")),
+        ("poe_verifier", ("poe_verification", "poe_verifier")),
+        ("novelty_corpus", ("novelty", "novelty_corpus")),
+        ("dream_rsi", ("dream_rsi",)),
     )
-    for task_name, key in mapping:
-        if key in result:
-            st, note = _status_to_state(result.get(key))
+    for task_name, candidate_keys in mapping:
+        matched_val = None
+        found = False
+        for key in candidate_keys:
+            if key in result:
+                matched_val = result.get(key)
+                found = True
+                break
+            if key in engines_dict:
+                matched_val = engines_dict.get(key)
+                found = True
+                break
+        if found:
+            st, note = _status_to_state(matched_val)
             board.set_task_state(task_name, st, note=note)
 
 

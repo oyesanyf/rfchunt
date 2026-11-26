@@ -15,6 +15,7 @@ Supports:
 from __future__ import annotations
 
 import ast
+import functools
 import json
 import logging
 import os
@@ -27,7 +28,61 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from engine.execution_policy import (
+    ExecutionPolicy,
+    _collect_intermediate_reparse_hops,
+    _is_symlink_or_reparse,
+    _normalize_win_readlink_target,
+    _validate_canonical_path_syntax,
+)
+
 logger = logging.getLogger("terminator.aiscan")
+
+
+def _reject_aiscan_reparse_ancestors(target_p: Union[str, Path], label: str = "path") -> None:
+    """
+    Rejects traversal (`..`), canonical syntax hazards, and direct or intermediate symlinks /
+    Windows NTFS junctions / mount-point reparse points (including broken junctions) across
+    both uncollapsed prefix segments and resolved components up to drive/filesystem anchor.
+    """
+    raw_s = os.fspath(target_p) if isinstance(target_p, os.PathLike) else str(target_p)
+    syn_err = _validate_canonical_path_syntax(raw_s, allow_trailing_slash=True)
+    if syn_err is not None and raw_s != ".":
+        raise PermissionError(f"Unsafe {label} rejected: {syn_err}")
+
+    cand_raw = Path(raw_s)
+    cur_raw: Optional[Path] = cand_raw
+    seen_raw: set = set()
+    while cur_raw is not None and str(cur_raw) not in ("", "."):
+        rk = os.path.normcase(str(cur_raw))
+        if rk in seen_raw or cur_raw.parent == cur_raw:
+            break
+        seen_raw.add(rk)
+        if _is_symlink_or_reparse(cur_raw):
+            raise PermissionError(
+                f"Unsafe symlink/junction {label} rejected: '{target_p}' traverses reparse point '{cur_raw}'."
+            )
+        cur_raw = cur_raw.parent
+
+    cand_abs = Path(os.path.abspath(raw_s))
+    cur: Optional[Path] = cand_abs
+    seen: set = set()
+    while cur is not None:
+        cur_key = os.path.normcase(str(cur))
+        if cur_key in seen or cur.parent == cur:
+            break
+        seen.add(cur_key)
+        if _is_symlink_or_reparse(cur):
+            raise PermissionError(
+                f"Unsafe symlink/junction {label} rejected: '{target_p}' traverses reparse point '{cur}'."
+            )
+        cur = cur.parent
+
+    hops = _collect_intermediate_reparse_hops(cand_abs, None)
+    if hops:
+        raise PermissionError(
+            f"Unsafe symlink/junction {label} rejected: '{target_p}' traverses reparse point '{hops[0]}'."
+        )
 
 
 @dataclass
@@ -208,7 +263,48 @@ class PythonAIScanner:
     _MAX_CODE_LINE_LEN: int = 8192
     _NON_CODE_EXTS = frozenset({".json", ".yaml", ".yml", ".toml", ".md"})
 
-    def scan_file(self, file_path: Path) -> Tuple[List[AIFinding], List[DiscoveredAIEndpoint]]:
+    @staticmethod
+    def _is_within_root(cand: Path, root_cmp: Path) -> bool:
+        try:
+            resolved = cand.resolve(strict=False)
+            cand_cmp = Path(os.path.normcase(str(resolved)))
+            if cand_cmp != root_cmp and not cand_cmp.is_relative_to(root_cmp):
+                return False
+        except OSError:
+            return False
+        if _is_symlink_or_reparse(cand):
+            try:
+                raw_link = _normalize_win_readlink_target(os.readlink(cand))
+                link_target = Path(raw_link)
+                if not link_target.is_absolute():
+                    link_target = cand.parent / link_target
+                link_cmp = Path(os.path.normcase(str(link_target.resolve(strict=False))))
+                if link_cmp != root_cmp and not link_cmp.is_relative_to(root_cmp):
+                    return False
+            except OSError:
+                return False
+        return True
+
+    def scan_file(
+        self,
+        file_path: Path,
+        *,
+        root_dir: Optional[Union[str, Path]] = None,
+    ) -> Tuple[List[AIFinding], List[DiscoveredAIEndpoint]]:
+        if root_dir is not None:
+            ok_fp, detail_fp = ExecutionPolicy.get_instance().validate_file_path(
+                file_path,
+                workspace_root=root_dir,
+                allow_directory=False,
+                allow_nonexistent=False,
+            )
+            if not ok_fp:
+                raise PermissionError(f"Unsafe file_path rejected outside root_dir: {detail_fp}")
+            file_path = Path(detail_fp)
+        else:
+            _reject_aiscan_reparse_ancestors(file_path, label="file_path")
+            file_path = Path(file_path)
+
         findings: List[AIFinding] = []
         endpoints: List[DiscoveredAIEndpoint] = []
 
@@ -382,9 +478,35 @@ class PythonAIScanner:
         data_files_scanned = 0
         candidate_files: List[Path] = []
 
-        for root, dirs, files in os.walk(root_dir):
-            dirs[:] = [d for d in dirs if d not in skip_dirs]
-            for file in files:
+        _reject_aiscan_reparse_ancestors(root_dir, label="root_dir")
+        root_resolved = Path(root_dir).resolve(strict=False)
+        root_cmp = Path(os.path.normcase(str(root_resolved)))
+
+        for root, dirs, files in os.walk(root_resolved, followlinks=False):
+            root_p = Path(root)
+            if root_p != root_resolved and (
+                _is_symlink_or_reparse(root_p) or not self._is_within_root(root_p, root_cmp)
+            ):
+                logger.warning("Skipping symlink/junction directory outside scan root: %s", root_p)
+                dirs[:] = []
+                continue
+
+            kept_dirs: List[str] = []
+            for d in sorted(dirs):
+                if d in skip_dirs:
+                    continue
+                sub_p = root_p / d
+                if _is_symlink_or_reparse(sub_p) or not self._is_within_root(sub_p, root_cmp):
+                    logger.warning("Pruned symlink/junction subdirectory outside scan root: %s", sub_p)
+                    continue
+                kept_dirs.append(d)
+            dirs[:] = kept_dirs
+
+            for file in sorted(files):
+                cand = root_p / file
+                if not self._is_within_root(cand, root_cmp):
+                    logger.warning("Skipped symlink/reparse file escaping scan root: %s", cand)
+                    continue
                 ext = Path(file).suffix.lower()
                 is_dockerfile = file.lower() in ("dockerfile", "containerfile") or file.lower().startswith("dockerfile.")
                 if ext in valid_exts or is_dockerfile:
@@ -392,12 +514,15 @@ class PythonAIScanner:
                         data_files_scanned += 1
                         if data_files_scanned > 150:
                             continue
-                    candidate_files.append(Path(root) / file)
+                    candidate_files.append(cand)
 
         if candidate_files:
             max_workers = min(16, max(4, (os.cpu_count() or 4) * 2))
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                for f_list, e_list in pool.map(self.scan_file, candidate_files):
+                for f_list, e_list in pool.map(
+                    functools.partial(self.scan_file, root_dir=root_resolved),
+                    candidate_files,
+                ):
                     all_findings.extend(f_list)
                     all_endpoints.extend(e_list)
 
@@ -415,18 +540,36 @@ class PythonAIScanner:
         mcp_servers: List[str] = []
         models = sorted({f.model_or_api for f in findings if f.model_or_api})
 
-        root = target_path if target_path.is_dir() else target_path.parent
+        _reject_aiscan_reparse_ancestors(target_path, label="target_path")
+        tp_obj = Path(target_path)
+        root = (tp_obj if tp_obj.is_dir() else tp_obj.parent).resolve(strict=False)
+        root_cmp = Path(os.path.normcase(str(root)))
         skip_dirs = {
             ".git", "node_modules", "target", "venv", ".venv", "__pycache__",
             "yara", "rules", "reports", "runs", "logs", "caldera_export", "caldera_plugin",
         }
         try:
-            for r_dir, dirs, files in os.walk(root):
-                dirs[:] = [d for d in dirs if d not in skip_dirs]
-                for fname in files:
+            for r_dir, dirs, files in os.walk(root, followlinks=False):
+                r_p = Path(r_dir)
+                if r_p != root and (_is_symlink_or_reparse(r_p) or not self._is_within_root(r_p, root_cmp)):
+                    dirs[:] = []
+                    continue
+                kept_dirs: List[str] = []
+                for d in sorted(dirs):
+                    if d in skip_dirs:
+                        continue
+                    sub_p = r_p / d
+                    if _is_symlink_or_reparse(sub_p) or not self._is_within_root(sub_p, root_cmp):
+                        continue
+                    kept_dirs.append(d)
+                dirs[:] = kept_dirs
+
+                for fname in sorted(files):
+                    fp = r_p / fname
+                    if not self._is_within_root(fp, root_cmp):
+                        continue
                     fl = fname.lower()
                     ext = Path(fname).suffix.lower()
-                    fp = Path(r_dir) / fname
                     if ext in weights_exts:
                         weights_files.append(str(fp))
                     elif fl in ("mcp.json", ".mcp.json", "claude_desktop_config.json"):
@@ -533,13 +676,31 @@ class AiscanIntegrator:
         target_path: Union[str, Path],
         *,
         auto_install: Optional[bool] = None,
+        workspace_root: Optional[Union[str, Path]] = None,
     ) -> Dict[str, Any]:
         """
         Executes AI risk audit on target directory using aiscan binary if present
         (dynamically provisioning when online and allowed), falling back to embedded
         Python AST scanner.
         """
-        tp = Path(target_path).resolve()
+        raw_tp = str(target_path)
+        if "\x00" in raw_tp:
+            raise ValueError("Invalid null byte in target_path")
+        if workspace_root is not None:
+            ok_tp, detail_tp = ExecutionPolicy.get_instance().validate_file_path(
+                raw_tp,
+                workspace_root=workspace_root,
+                allow_directory=True,
+                allow_nonexistent=True,
+            )
+            if not ok_tp:
+                raise PermissionError(f"Unsafe target_path rejected outside workspace_root: {detail_tp}")
+            tp = Path(detail_tp).resolve(strict=False)
+        else:
+            if not raw_tp.strip():
+                raise ValueError("target_path must be a non-empty path.")
+            _reject_aiscan_reparse_ancestors(raw_tp, label="target_path")
+            tp = Path(raw_tp).resolve(strict=False)
         if not tp.exists():
             return {"error": f"Target path does not exist: {tp}", "findings": [], "endpoints": []}
 
@@ -587,7 +748,10 @@ class AiscanIntegrator:
 
         # Always run embedded scanner to discover web AI endpoints and AST sinks so endpoints are never dropped
         if tp.is_file():
-            f_ast, e_ast = self.python_scanner.scan_file(tp)
+            f_ast, e_ast = self.python_scanner.scan_file(
+                tp,
+                root_dir=(workspace_root if workspace_root is not None else tp.parent),
+            )
         else:
             f_ast, e_ast = self.python_scanner.scan_directory(tp)
 

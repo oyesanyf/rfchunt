@@ -490,6 +490,7 @@ def test_hybrid_repo_and_host_runs_local_and_remote_and_feeds_artex_before_chain
     from engine.raptor_integrator import RaptorIntegrator
     from engine.taxonomy import AnomalyCategory, ImplementationAnomaly
 
+    monkeypatch.setenv("RFCHUNT_OFFLINE", "1")
     repo_dir = tmp_path / "hybrid_app"
     repo_dir.mkdir(parents=True)
     (repo_dir / "app.py").write_text(

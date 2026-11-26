@@ -12,12 +12,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
 import os
+from pathlib import Path
 import queue
+import re
 import secrets
 import sys
+import tempfile
 import threading
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import parse_qs, urlparse
 
 
@@ -268,12 +271,370 @@ from engine.raptor_integrator import (
 
 
 class TerminatorMCPServer:
-    def __init__(self, db_path: str = "terminator.db"):
+    def __init__(self, db_path: str = "terminator.db", workspace_root: Optional[Union[str, Path]] = None):
+        self._explicit_init_workspace_root: bool = workspace_root is not None
+        raw_ws = (
+            workspace_root
+            if workspace_root is not None
+            else (os.environ.get("RFCHUNT_MCP_WORKSPACE_ROOT") or os.environ.get("RFCHUNT_WORKSPACE_ROOT"))
+        )
+        self.workspace_root: Optional[Path] = self._normalize_mcp_workspace_root(raw_ws)
         self.db_path = db_path
         self.db = Database(db_path)
         self.fetcher = RFCFetcher(db=self.db)
         self.permutator = VectorPermutator(db=self.db)
         self.raptor = RaptorIntegrator(db=self.db)
+
+    @staticmethod
+    def _normalize_mcp_workspace_root(workspace_root: Optional[Union[str, Path]]) -> Optional[Path]:
+        if workspace_root is None:
+            return None
+        ws_raw = os.fspath(workspace_root) if isinstance(workspace_root, os.PathLike) else workspace_root
+        if not isinstance(ws_raw, str):
+            raise ValueError("MCP workspace_root must be a string or Path.")
+        ws_stripped = ws_raw.strip()
+        if not ws_stripped:
+            raise PermissionError("Unsafe MCP workspace_root rejected (empty or whitespace-only).")
+        from engine.execution_policy import (
+            _is_drive_relative_or_colon_unsafe,
+            _is_unc_path,
+            _validate_canonical_path_syntax,
+        )
+
+        if ws_raw != ws_stripped or any(ord(ch) < 32 or ord(ch) == 127 for ch in ws_raw):
+            raise PermissionError("Unsafe MCP workspace_root rejected (whitespace or control characters).")
+        if _is_unc_path(ws_stripped) or _is_drive_relative_or_colon_unsafe(ws_stripped):
+            raise PermissionError("Unsafe MCP workspace_root rejected (UNC, NT-device, or drive-relative/ADS path).")
+        ws_err = _validate_canonical_path_syntax(ws_stripped, allow_trailing_slash=True)
+        if ws_err is not None and ws_stripped != ".":
+            raise PermissionError(f"Unsafe MCP workspace_root rejected: {ws_err}")
+        ws_resolved = Path(ws_stripped).resolve(strict=False)
+        if _is_unc_path(str(ws_resolved)) or _is_drive_relative_or_colon_unsafe(str(ws_resolved)):
+            raise PermissionError("Unsafe resolved MCP workspace_root rejected.")
+        if ws_resolved.exists() and not ws_resolved.is_dir():
+            raise PermissionError("MCP workspace_root must be a directory.")
+        TerminatorMCPServer._check_sensitive_host_path(ws_raw, str(ws_resolved), label="MCP workspace_root")
+        return ws_resolved
+
+    def _resolve_mcp_workspace_root(self, args: Optional[Dict[str, Any]] = None) -> Optional[Path]:
+        if self.workspace_root is None:
+            if isinstance(args, dict) and args.get("workspace_root") is not None:
+                norm_ws = self._normalize_mcp_workspace_root(args.get("workspace_root"))
+                if norm_ws is not None and norm_ws.exists() and not norm_ws.is_dir():
+                    raise PermissionError("MCP workspace_root must be a directory.")
+                return norm_ws
+            return None
+        if isinstance(args, dict) and args.get("workspace_root") is not None:
+            from engine.execution_policy import ExecutionPolicy
+
+            raw_arg_ws = args.get("workspace_root")
+            if isinstance(raw_arg_ws, str) and not raw_arg_ws.strip():
+                raise PermissionError("Unsafe MCP workspace_root rejected (empty or whitespace-only).")
+            if isinstance(raw_arg_ws, (str, os.PathLike)):
+                self._check_sensitive_host_path(os.fspath(raw_arg_ws), None, label="MCP workspace_root")
+            ok, detail = ExecutionPolicy.get_instance().validate_file_path(
+                raw_arg_ws,
+                workspace_root=self.workspace_root,
+                allow_directory=True,
+            )
+            if not ok:
+                raise PermissionError(f"MCP workspace_root cannot exceed configured server root: {detail}")
+            narrowed_ws = Path(detail).resolve(strict=False)
+            if narrowed_ws.exists() and not narrowed_ws.is_dir():
+                raise PermissionError("MCP workspace_root must be a directory.")
+            self._check_sensitive_host_path(os.fspath(raw_arg_ws) if isinstance(raw_arg_ws, (str, os.PathLike)) else str(raw_arg_ws), str(narrowed_ws), label="MCP workspace_root")
+            return narrowed_ws
+        return self.workspace_root
+
+    def _has_explicit_output_confinement(self, args: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        True when workspace_root was explicitly configured on TerminatorMCPServer(...)
+        or explicitly provided in per-call tool args['workspace_root'] (as opposed to
+        ambient RFCHUNT_WORKSPACE_ROOT env fallback or repo-inferred root).
+        """
+        return bool(
+            getattr(self, "_explicit_init_workspace_root", False)
+            or (isinstance(args, dict) and args.get("workspace_root") is not None)
+        )
+
+    @staticmethod
+    def _check_sensitive_host_path(
+        raw_str: str,
+        resolved_str: Optional[str] = None,
+        *,
+        label: str = "MCP path",
+    ) -> None:
+        candidates: List[str] = []
+        if raw_str:
+            candidates.append(raw_str)
+            if raw_str.startswith("~"):
+                try:
+                    expanded = os.path.expanduser(raw_str)
+                    candidates.append(expanded)
+                    candidates.append(str(Path(expanded).resolve(strict=False)))
+                except Exception:
+                    pass
+        if resolved_str:
+            candidates.append(resolved_str)
+
+        sensitive_markers = (
+            "/.ssh",
+            "/.aws",
+            "/.gnupg",
+            "/.kube",
+            "/etc/passwd",
+            "/etc/shadow",
+            "/windows/system32",
+            "/windows/syswow64",
+            "/windows/temp",
+        )
+        win_roots: List[str] = []
+        for env_k in ("SystemRoot", "WINDIR"):
+            val = os.environ.get(env_k)
+            if val:
+                try:
+                    win_roots.append(str(Path(val).resolve(strict=False)).replace("\\", "/").lower().rstrip("/"))
+                except Exception:
+                    win_roots.append(val.replace("\\", "/").lower().rstrip("/"))
+        home_cred_dirs: List[str] = []
+        try:
+            home_base = Path.home().resolve(strict=False)
+            for cred_sub in (".ssh", ".aws", ".gnupg", ".kube"):
+                home_cred_dirs.append(str(home_base / cred_sub).replace("\\", "/").lower().rstrip("/"))
+        except Exception:
+            pass
+
+        for cand in candidates:
+            cand_low = cand.replace("\\", "/").lower()
+            cand_trimmed = cand_low.rstrip("/") or "/"
+            if any(
+                cand_trimmed == m
+                or cand_trimmed.startswith(m + "/")
+                or cand_trimmed.endswith(m)
+                or (m + "/" in cand_trimmed)
+                for m in sensitive_markers
+            ):
+                raise PermissionError(f"Unsafe {label} rejected: sensitive host path '{raw_str}' is forbidden.")
+            if re.match(r"^[a-z]:/windows(?:/|$)", cand_trimmed) or re.match(
+                r"^[a-z]:/(?:system32|syswow64)(?:/|$)", cand_trimmed
+            ):
+                raise PermissionError(f"Unsafe {label} rejected: Windows system directory '{raw_str}' is forbidden.")
+            for wr in win_roots:
+                if wr and (cand_trimmed == wr or cand_trimmed.startswith(wr + "/")):
+                    raise PermissionError(f"Unsafe {label} rejected: Windows system directory '{raw_str}' is forbidden.")
+            for hc in home_cred_dirs:
+                if hc and (cand_trimmed == hc or cand_trimmed.startswith(hc + "/")):
+                    raise PermissionError(f"Unsafe {label} rejected: user credential directory '{raw_str}' is forbidden.")
+
+    def _validate_mcp_scan_path(
+        self,
+        raw_path: Any,
+        *,
+        workspace_root: Optional[Union[str, Path]] = None,
+        allow_directory: bool = True,
+        allow_nonexistent: bool = True,
+        enforce_workspace_root: bool = True,
+    ) -> str:
+        from engine.execution_policy import (
+            ExecutionPolicy,
+            _collect_intermediate_reparse_hops,
+            _is_drive_relative_or_colon_unsafe,
+            _is_symlink_or_reparse,
+            _is_unc_path,
+            _normalize_win_readlink_target,
+            _validate_canonical_path_syntax,
+        )
+
+        eff_ws = (self.workspace_root if self.workspace_root is not None else workspace_root) if enforce_workspace_root else None
+        if isinstance(raw_path, (str, os.PathLike)):
+            self._check_sensitive_host_path(os.fspath(raw_path), None, label="MCP path")
+        if eff_ws is not None:
+            ok, detail = ExecutionPolicy.get_instance().validate_file_path(
+                raw_path,
+                workspace_root=eff_ws,
+                allow_directory=allow_directory,
+                allow_nonexistent=allow_nonexistent,
+            )
+            if not ok:
+                raise PermissionError(f"MCP path rejected outside workspace_root: {detail}")
+            self._check_sensitive_host_path(
+                os.fspath(raw_path) if isinstance(raw_path, (str, os.PathLike)) else str(raw_path),
+                detail,
+                label="MCP path",
+            )
+            return detail
+
+        if raw_path is None:
+            raise ValueError("Path parameter is required.")
+        raw_str = os.fspath(raw_path) if isinstance(raw_path, os.PathLike) else raw_path
+        if not isinstance(raw_str, str) or not raw_str.strip():
+            raise ValueError("Path parameter must be a non-empty string.")
+        if raw_str != raw_str.strip():
+            raise PermissionError("Unsafe MCP path rejected: leading/trailing whitespace obfuscation forbidden.")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_str):
+            raise PermissionError("Unsafe MCP path rejected: control/NUL character forbidden.")
+        if _is_unc_path(raw_str) or _is_drive_relative_or_colon_unsafe(raw_str):
+            raise PermissionError("Unsafe MCP path rejected: UNC, NT-device, or drive-relative/ADS path forbidden.")
+        p_err = _validate_canonical_path_syntax(raw_str, allow_trailing_slash=allow_directory)
+        if p_err is not None and not (allow_directory and raw_str == "."):
+            raise PermissionError(f"Unsafe MCP path rejected: {p_err}")
+        norm = raw_str.replace("\\", "/")
+        if os.name == "nt" and norm.startswith("/") and not (len(norm) >= 2 and norm[1] == ":"):
+            raise PermissionError(f"Unsafe MCP path rejected: single-slash POSIX path '{raw_str}' forbidden on Windows.")
+        cand_raw = Path(raw_str)
+        raw_abs = Path(os.path.abspath(raw_str))
+        cur_anc: Optional[Path] = raw_abs
+        seen_anc: set = set()
+        while cur_anc is not None:
+            cur_key = os.path.normcase(str(cur_anc))
+            if cur_key in seen_anc or cur_anc.parent == cur_anc:
+                break
+            seen_anc.add(cur_key)
+            try:
+                if cur_anc.exists():
+                    anc_real = Path(os.path.normcase(os.path.realpath(str(cur_anc))))
+                    parent_real = Path(os.path.normcase(os.path.realpath(str(cur_anc.parent))))
+                    if anc_real != parent_real and not anc_real.is_relative_to(parent_real):
+                        raise PermissionError(
+                            f"Unsafe MCP path rejected: path '{raw_str}' escapes parent directory."
+                        )
+                pending_hops: List[Path] = [cur_anc]
+                seen_hops: set = {cur_key}
+                for _ in range(16):
+                    if not pending_hops:
+                        break
+                    hop_p = pending_hops.pop(0)
+                    if not _is_symlink_or_reparse(hop_p):
+                        continue
+                    raw_parent_cmp = Path(os.path.normcase(str(hop_p.parent)))
+                    raw_parent = hop_p.parent.resolve(strict=False)
+                    parent_cmp = Path(os.path.normcase(str(raw_parent)))
+                    try:
+                        norm_link = _normalize_win_readlink_target(os.readlink(hop_p))
+                    except OSError as exc:
+                        raise PermissionError(
+                            f"Unsafe MCP path rejected: cannot inspect symlink/reparse point '{hop_p}': {exc}"
+                        ) from exc
+                    if _is_unc_path(norm_link) or _is_drive_relative_or_colon_unsafe(norm_link):
+                        raise PermissionError(f"Unsafe MCP path rejected: symlink target '{norm_link}' is unsafe.")
+                    link_t = Path(norm_link)
+                    if not link_t.is_absolute():
+                        link_t = hop_p.parent / link_t
+                    link_res = link_t.resolve(strict=False)
+                    if _is_unc_path(str(link_res)) or _is_drive_relative_or_colon_unsafe(str(link_res)):
+                        raise PermissionError(f"Unsafe MCP path rejected: symlink target '{link_res}' is unsafe.")
+                    res_cmp = Path(os.path.normcase(str(link_res)))
+                    if res_cmp != parent_cmp and not res_cmp.is_relative_to(parent_cmp):
+                        raise PermissionError(f"Unsafe MCP path rejected: symlink '{raw_str}' escapes parent directory.")
+                    cand_hops = _collect_intermediate_reparse_hops(link_t, raw_parent_cmp, seen_hops)
+                    if link_res != link_t:
+                        cand_hops.extend(_collect_intermediate_reparse_hops(link_res, parent_cmp, seen_hops))
+                    for ch_p in cand_hops:
+                        ch_key = os.path.normcase(str(ch_p))
+                        if ch_key not in seen_hops:
+                            seen_hops.add(ch_key)
+                            pending_hops.append(ch_p)
+                if pending_hops:
+                    raise PermissionError(
+                        f"Unsafe MCP path rejected: symlink chain '{raw_str}' exceeded max resolution depth."
+                    )
+            except PermissionError:
+                raise
+            except OSError as exc:
+                raise PermissionError(
+                    f"Unsafe MCP path rejected: symlink/reparse inspection failed for '{raw_str}': {exc}"
+                ) from exc
+            cur_anc = cur_anc.parent
+        resolved = cand_raw.resolve(strict=False)
+        res_str = str(resolved)
+        if _is_unc_path(res_str) or _is_drive_relative_or_colon_unsafe(res_str):
+            raise PermissionError(f"Unsafe resolved MCP path rejected: '{res_str}'.")
+        self._check_sensitive_host_path(raw_str, res_str, label="MCP path")
+        if not allow_directory and resolved.exists() and resolved.is_dir():
+            raise PermissionError(f"Directory target '{raw_str}' forbidden.")
+        if not allow_nonexistent and not resolved.exists():
+            raise ValueError(f"Target path does not exist: {resolved}")
+        return res_str
+
+    def _validate_mcp_output_dir(
+        self,
+        raw_path: Any,
+        *,
+        workspace_root: Optional[Union[str, Path]] = None,
+        enforce_explicit_ws: Optional[bool] = None,
+        allow_directory: bool = True,
+    ) -> str:
+        """
+        Validates report output_dir / archive_path:
+        - When workspace_root was explicitly supplied (`TerminatorMCPServer(..., workspace_root=...)`
+          or `args["workspace_root"]`), fails closed with `PermissionError` for any path outside it.
+        - Otherwise (when workspace_root is None, env-inherited, or repo-inferred), allows paths inside
+          `workspace_root` as well as designated report subdirectories (`reports`, `out`, `runs`, ...)
+          and strict `%TEMP%` subdirectories, while always rejecting traversal, UNC/ADS/NUL,
+          symlink/junction escapes, and sensitive host directories.
+        """
+        from engine.execution_policy import ExecutionPolicy
+
+        eff_ws = workspace_root if workspace_root is not None else self.workspace_root
+        explicit_ws = (
+            bool(enforce_explicit_ws)
+            if enforce_explicit_ws is not None
+            else bool(getattr(self, "_explicit_init_workspace_root", False))
+        )
+        if isinstance(raw_path, (str, os.PathLike)):
+            self._check_sensitive_host_path(os.fspath(raw_path), None, label="MCP output_dir")
+        if eff_ws is not None:
+            ok_ws, detail_ws = ExecutionPolicy.get_instance().validate_file_path(
+                raw_path,
+                workspace_root=eff_ws,
+                allow_directory=allow_directory,
+                allow_nonexistent=True,
+            )
+            if ok_ws:
+                self._check_sensitive_host_path(
+                    os.fspath(raw_path) if isinstance(raw_path, (str, os.PathLike)) else str(raw_path),
+                    detail_ws,
+                    label="MCP output_dir",
+                )
+                return detail_ws
+            if explicit_ws:
+                raise PermissionError(
+                    f"Unsafe MCP output path rejected outside workspace_root '{eff_ws}': {detail_ws}"
+                )
+
+        safe_res = self._validate_mcp_scan_path(
+            raw_path,
+            workspace_root=None,
+            allow_directory=allow_directory,
+            allow_nonexistent=True,
+            enforce_workspace_root=False,
+        )
+
+        resolved_out = Path(safe_res).resolve(strict=False)
+        self._check_sensitive_host_path(
+            os.fspath(raw_path) if isinstance(raw_path, (str, os.PathLike)) else str(raw_path),
+            str(resolved_out),
+            label="MCP output_dir",
+        )
+        out_cmp = Path(os.path.normcase(str(resolved_out)))
+        temp_root = Path(os.path.normcase(str(Path(tempfile.gettempdir()).resolve(strict=False))))
+        if out_cmp != temp_root and out_cmp.is_relative_to(temp_root):
+            return safe_res
+
+        rfchunt_root = Path(__file__).resolve().parent
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            pytest_temp_root = Path(os.path.normcase(str((rfchunt_root.parent / ".pytest_temp").resolve(strict=False))))
+            if out_cmp != pytest_temp_root and out_cmp.is_relative_to(pytest_temp_root):
+                return safe_res
+
+        for allowed_sub in ExecutionPolicy.ALLOWED_WRITE_SUBDIRS:
+            allowed_dir = Path(os.path.normcase(str((rfchunt_root / allowed_sub).resolve(strict=False))))
+            if out_cmp == allowed_dir or out_cmp.is_relative_to(allowed_dir):
+                return safe_res
+
+        raise PermissionError(
+            f"MCP output_dir rejected outside workspace_root and designated report/temp directories: '{raw_path}'"
+        )
 
     def close(self) -> None:
         """Closes internal HTTP client and database handle cleanly."""
@@ -607,6 +968,9 @@ class TerminatorMCPServer:
                         "artex_intent_turns": {"type": "integer", "default": 0},
                         "artex_intent_tokens": {"type": "integer", "default": 0},
                         "approval_mode": {"type": "string", "enum": ["policy", "deny"], "default": "policy"},
+                        "enable_pe_audit": {"type": "boolean", "default": True, "description": "Run PE & .NET Code Integrity Anomaly Auditor during --all"},
+                        "pe_include_host_audit": {"type": "boolean", "default": False, "description": "Include Windows KB5127694 and VirtualBox 7.2.18+ host patch audit during --all"},
+                        "pe_include_yara": {"type": "boolean", "default": True, "description": "Evaluate defensive PE/.NET YARA rules during --all"},
                     },
                 },
             },
@@ -652,6 +1016,9 @@ class TerminatorMCPServer:
                         "artex_intent_turns": {"type": "integer", "default": 0},
                         "artex_intent_tokens": {"type": "integer", "default": 0},
                         "approval_mode": {"type": "string", "enum": ["policy", "deny"], "default": "policy"},
+                        "enable_pe_audit": {"type": "boolean", "default": True},
+                        "pe_include_host_audit": {"type": "boolean", "default": False},
+                        "pe_include_yara": {"type": "boolean", "default": True},
                     },
                 },
             },
@@ -1299,6 +1666,24 @@ class TerminatorMCPServer:
                     },
                 },
             },
+            {
+                "name": "run_pe_dotnet_audit",
+                "description": (
+                    "[PE & .NET Code Integrity Anomaly Auditor] Scans PE/.NET binaries and workspaces for "
+                    "Google Magika hybrid PE classification, extension masquerading, CVE-2026-108398 "
+                    "(IMAGE_FILE_EXECUTABLE_IMAGE 0x0002 cleared), UMCI / SEC_COMMIT flat memory fallback "
+                    "anomalies, defensive YARA rules, and Windows KB5127694 / VirtualBox 7.2.18+ host patch audit."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "target_path": {"type": "string", "default": "."},
+                        "workspace_root": {"type": "string", "description": "Optional workspace root directory for strict path confinement"},
+                        "include_host_audit": {"type": "boolean", "default": False, "description": "Include Windows KB5127694 and VirtualBox 7.2.18+ host patch audit"},
+                        "include_yara": {"type": "boolean", "default": True, "description": "Evaluate defensive PE/.NET YARA rules"},
+                    },
+                },
+            },
         ]
 
     @staticmethod
@@ -1431,7 +1816,12 @@ class TerminatorMCPServer:
         TargetAuthorizationGate.check_auth(host=clean_host, payload_len=0)
         return clean_host, resolved_port, resolved_tls
 
-    def _build_mcp_approval_gate(self, args: Dict[str, Any], task_id: str):
+    def _build_mcp_approval_gate(
+        self,
+        args: Dict[str, Any],
+        task_id: str,
+        workspace_root: Optional[Union[str, Path]] = None,
+    ):
         from engine.approval_gate import ApprovalGate
 
         mode_raw = self._parse_strict_str(args, "approval_mode", "policy")
@@ -1442,6 +1832,11 @@ class TerminatorMCPServer:
             )
         rules_path = self._parse_strict_str(args, "approval_rules", None)
         if rules_path:
+            rules_path = self._validate_mcp_scan_path(
+                rules_path,
+                workspace_root=workspace_root,
+                allow_directory=False,
+            )
             return ApprovalGate.from_rules_file(
                 rules_path,
                 mode=approval_mode,
@@ -1586,11 +1981,17 @@ class TerminatorMCPServer:
             return self.raptor.check_status()
 
         elif name == "raptor_describe_target":
-            t_path = args.get("target_path", ".")
+            explicit_ws_root = self._resolve_mcp_workspace_root(args)
+            t_path = self._validate_mcp_scan_path(
+                args.get("target_path", "."),
+                workspace_root=explicit_ws_root,
+                allow_directory=True,
+            )
             return self.raptor.describe_target(t_path)
 
         elif name == "raptor_scan_project":
-            t_path = args.get("target_path", ".")
+            explicit_ws_root = self._resolve_mcp_workspace_root(args)
+            t_path = str(args.get("target_path", "."))
             mode = args.get("mode", "scan")
             model = args.get("model", "fenkohq/foundation-sec-8b:latest")
             pg = args.get("policy_groups", "")
@@ -1603,8 +2004,13 @@ class TerminatorMCPServer:
                 if not ok:
                     raise PermissionError(reason)
                 return self.raptor.run_host_scan(host=host, port=port, use_tls=tls, authorized=authorized)
+            validated_t_path = self._validate_mcp_scan_path(
+                t_path,
+                workspace_root=explicit_ws_root,
+                allow_directory=True,
+            )
             return self.raptor.run_scan(
-                target_path=t_path,
+                target_path=validated_t_path,
                 mode=mode,
                 model=model,
                 policy_groups=pg,
@@ -1694,6 +2100,9 @@ class TerminatorMCPServer:
                 self._parse_strict_bool(args, "rea_use_cli", False)
                 or self._parse_strict_bool(args, "rea_cli", False)
             )
+            enable_pe_audit = bool(self._parse_strict_bool(args, "enable_pe_audit", True))
+            pe_include_host_audit = bool(self._parse_strict_bool(args, "pe_include_host_audit", False))
+            pe_include_yara = bool(self._parse_strict_bool(args, "pe_include_yara", True))
 
             if remote_host is not None:
                 self._authorize_mcp_target(
@@ -1731,16 +2140,72 @@ class TerminatorMCPServer:
                 TargetAuthorizationGate.check_rate_limit()
 
             resolved_repo = None
-            resolved_path = path
+            resolved_path = None
+            explicit_ws_root = self._resolve_mcp_workspace_root(args)
+            primary_ws: Optional[Union[str, Path]] = explicit_ws_root
             if repo or path or (not remote_host and not targets_arg):
-                raw_target = str(repo or path or ".")
-                if "\x00" in raw_target:
-                    raise ValueError("Invalid target path containing NUL byte.")
-                resolved = os.path.abspath(raw_target)
-                if not os.path.exists(resolved):
-                    return {"error": f"Target path does not exist: {resolved}"}
-                resolved_repo = resolved if repo or not path else None
-                resolved_path = resolved if path and not repo else path
+                if repo is not None:
+                    resolved_repo = self._validate_mcp_scan_path(
+                        repo, workspace_root=explicit_ws_root, allow_directory=True
+                    )
+                    if not os.path.exists(resolved_repo):
+                        return {"error": f"Target path does not exist: {resolved_repo}"}
+                if path is not None:
+                    resolved_path = self._validate_mcp_scan_path(
+                        path, workspace_root=explicit_ws_root, allow_directory=True
+                    )
+                    if not os.path.exists(resolved_path):
+                        return {"error": f"Target path does not exist: {resolved_path}"}
+                if repo is None and path is None:
+                    resolved_repo = self._validate_mcp_scan_path(
+                        ".", workspace_root=explicit_ws_root, allow_directory=True
+                    )
+                    if not os.path.exists(resolved_repo):
+                        return {"error": f"Target path does not exist: {resolved_repo}"}
+                primary_candidate = resolved_repo or resolved_path
+                if primary_ws is None and primary_candidate:
+                    primary_ws = (
+                        primary_candidate
+                        if os.path.isdir(primary_candidate)
+                        else os.path.dirname(primary_candidate)
+                    )
+            if rea_target is not None:
+                rea_target = self._validate_mcp_scan_path(
+                    rea_target, workspace_root=primary_ws, allow_directory=True
+                )
+            if import_har is not None:
+                import_har = self._validate_mcp_scan_path(
+                    import_har, workspace_root=primary_ws, allow_directory=False
+                )
+            if import_openapi is not None:
+                import_openapi = self._validate_mcp_scan_path(
+                    import_openapi, workspace_root=primary_ws, allow_directory=False
+                )
+            if scope_file is not None:
+                scope_file = self._validate_mcp_scan_path(
+                    scope_file, workspace_root=primary_ws, allow_directory=False
+                )
+            if auth_profile is not None:
+                ap_parts = [p.strip() for p in auth_profile.split(",")]
+                if not ap_parts or any(not p for p in ap_parts):
+                    raise PermissionError("Unsafe MCP auth_profile rejected: empty profile path entry.")
+                validated_ap_parts: List[str] = [
+                    self._validate_mcp_scan_path(
+                        ap_item, workspace_root=primary_ws, allow_directory=False
+                    )
+                    for ap_item in ap_parts
+                ]
+                auth_profile = ",".join(validated_ap_parts)
+            if approval_rules is not None:
+                approval_rules = self._validate_mcp_scan_path(
+                    approval_rules, workspace_root=primary_ws, allow_directory=False
+                )
+            explicit_out_ws = self._has_explicit_output_confinement(args)
+            reports_dir = self._validate_mcp_output_dir(
+                reports_dir,
+                workspace_root=(explicit_ws_root or primary_ws),
+                enforce_explicit_ws=explicit_out_ws,
+            )
 
             with _suppress_stdout_to_stderr():
                 return run_unified_all_scans(
@@ -1794,6 +2259,11 @@ class TerminatorMCPServer:
                     enable_rea=enable_rea,
                     rea_target=rea_target,
                     rea_use_cli=rea_use_cli,
+                    enable_pe_audit=enable_pe_audit,
+                    pe_include_host_audit=pe_include_host_audit,
+                    pe_include_yara=pe_include_yara,
+                    workspace_root=explicit_ws_root,
+                    confine_reports_to_workspace_root=explicit_out_ws,
                 )
 
         elif name == "artex_run_attack_chain":
@@ -1829,7 +2299,8 @@ class TerminatorMCPServer:
                 use_tls=use_tls,
                 authorized=authorized,
             )
-            gate = self._build_mcp_approval_gate(args, "MCP-ARTEX-CHAIN")
+            resolved_ws_root = self._resolve_mcp_workspace_root(args)
+            gate = self._build_mcp_approval_gate(args, "MCP-ARTEX-CHAIN", workspace_root=resolved_ws_root)
             if multiturn and gate.mode == "deny":
                 fmt_host = f"[{clean_host}]" if ":" in clean_host and not clean_host.startswith("[") else clean_host
                 gate.require(
@@ -1837,6 +2308,14 @@ class TerminatorMCPServer:
                     target=f"{'https' if resolved_tls else 'http'}://{fmt_host}:{resolved_port}/",
                     method="GET",
                     rationale="MCP artex_run_attack_chain multi-turn execution",
+                )
+
+            raw_reports_dir = self._parse_strict_str(args, "reports_dir", None)
+            if raw_reports_dir is not None:
+                raw_reports_dir = self._validate_mcp_output_dir(
+                    raw_reports_dir,
+                    workspace_root=resolved_ws_root,
+                    enforce_explicit_ws=self._has_explicit_output_confinement(args),
                 )
 
             proxy_cfg = ArtexProxyConfig.from_env_or_args(
@@ -1853,7 +2332,7 @@ class TerminatorMCPServer:
             try:
                 engine = DualGraphAttackEngine(
                     db=self.db,
-                    reports_dir=self._parse_strict_str(args, "reports_dir", None),
+                    reports_dir=raw_reports_dir,
                     noise_profile=self._parse_strict_str(args, "noise_profile", None),
                     max_task_turns=budget_turns,
                     max_intent_turns=max_intent_turns,
@@ -1897,6 +2376,7 @@ class TerminatorMCPServer:
                         trace_store=engine.trace_store,
                         boundary=engine.boundary,
                         asset_graph=engine.asset_graph,
+                        workspace_root=self._resolve_mcp_workspace_root(args),
                     )
                     executor_fn = registry.as_multiturn_executor_fn(
                         max_turns=(max_intent_turns if max_intent_turns > 0 else None),
@@ -1975,7 +2455,12 @@ class TerminatorMCPServer:
             if noise_profile not in ("off", "quiet", "balanced", "aggressive"):
                 raise ValueError(f"Unsupported noise_profile: {noise_profile!r}")
             strict_poe = bool(self._parse_strict_bool(args, "strict_poe", False))
-            reports_dir = self._parse_strict_str(args, "reports_dir", "reports") or "reports"
+            resolved_ws_root = self._resolve_mcp_workspace_root(args)
+            reports_dir = self._validate_mcp_output_dir(
+                self._parse_strict_str(args, "reports_dir", "reports") or "reports",
+                workspace_root=resolved_ws_root,
+                enforce_explicit_ws=self._has_explicit_output_confinement(args),
+            )
             task_id = self._parse_strict_str(args, "task_id", None)
             worker_id = self._parse_strict_str(args, "worker_id", "artex-mcp-worker-1") or "artex-mcp-worker-1"
             auth_profile_path = self._parse_strict_str(args, "auth_profile", None)
@@ -1992,7 +2477,7 @@ class TerminatorMCPServer:
             fmt_host = f"[{clean_host}]" if ":" in clean_host and not clean_host.startswith("[") else clean_host
             target_url = f"{'https' if resolved_tls else 'http'}://{fmt_host}:{resolved_port}"
 
-            gate = self._build_mcp_approval_gate(args, task_id or "MCP-MULTITURN")
+            gate = self._build_mcp_approval_gate(args, task_id or "MCP-MULTITURN", workspace_root=resolved_ws_root)
             if gate.mode == "deny":
                 gate.require(
                     action_type="network_socket",
@@ -2001,7 +2486,19 @@ class TerminatorMCPServer:
                     rationale="MCP bounded multi-turn ArtexWorker execution",
                 )
 
-            loaded_profiles = load_auth_profiles(auth_profile_path) if auth_profile_path else {}
+            if auth_profile_path is not None:
+                ap_parts = [p.strip() for p in auth_profile_path.split(",")]
+                if not ap_parts or any(not p for p in ap_parts):
+                    raise PermissionError("Unsafe MCP auth_profile rejected: empty profile path entry.")
+                auth_profile_path = ",".join(
+                    self._validate_mcp_scan_path(p, workspace_root=resolved_ws_root, allow_directory=False)
+                    for p in ap_parts
+                )
+            if auth_profile_path and "," in auth_profile_path:
+                from engine.h2_live_authz import resolve_auth_profiles_from_cli
+                loaded_profiles = resolve_auth_profiles_from_cli(auth_profile_path)
+            else:
+                loaded_profiles = load_auth_profiles(auth_profile_path) if auth_profile_path else {}
             if not loaded_profiles:
                 loaded_profiles = {
                     "anonymous_probe": _MCPAuthProfile(
@@ -2064,6 +2561,7 @@ class TerminatorMCPServer:
                     trace_store=engine.trace_store,
                     boundary=engine.boundary,
                     asset_graph=engine.asset_graph,
+                    workspace_root=self._resolve_mcp_workspace_root(args),
                 )
                 mt_fn = registry.as_multiturn_executor_fn(
                     max_turns=(eff_intent_turns if eff_intent_turns > 0 else None),
@@ -2258,7 +2756,11 @@ class TerminatorMCPServer:
                 except TypeError as te:
                     raise ValueError(str(te)) from te
 
-            gate = self._build_mcp_approval_gate(args, task_id or f"MCP-{tool_key.upper()}")
+            gate = self._build_mcp_approval_gate(
+                args,
+                task_id or f"MCP-{tool_key.upper()}",
+                workspace_root=self._resolve_mcp_workspace_root(args),
+            )
             governor = NoiseGovernor(profile=noise_profile)
             eff_auth = bool(authorized or is_explicit_loopback_host(clean_host))
 
@@ -2358,9 +2860,15 @@ class TerminatorMCPServer:
                 load_scope_file,
             )
 
+            explicit_ws_root = self._resolve_mcp_workspace_root(args)
             loaded_scope = None
             if args.get("scope_path"):
-                loaded_scope = load_scope_file(str(args["scope_path"]))
+                validated_scope_path = self._validate_mcp_scan_path(
+                    args["scope_path"],
+                    workspace_root=explicit_ws_root,
+                    allow_directory=False,
+                )
+                loaded_scope = load_scope_file(validated_scope_path)
             ag = AssetGraph(
                 db=self.db,
                 scope_hosts=set(loaded_scope.get("allow_hosts") or []) or None if loaded_scope else None,
@@ -2372,14 +2880,24 @@ class TerminatorMCPServer:
             if loaded_scope is not None:
                 out["scope"] = loaded_scope
             if args.get("openapi_path"):
+                validated_openapi_path = self._validate_mcp_scan_path(
+                    args["openapi_path"],
+                    workspace_root=explicit_ws_root,
+                    allow_directory=False,
+                )
                 out["openapi"] = import_openapi_spec(
-                    str(args["openapi_path"]),
+                    validated_openapi_path,
                     asset_graph=ag,
                     default_host=str(args.get("host") or "127.0.0.1"),
                     default_port=int(args.get("port") or 443),
                 )
             if args.get("har_path"):
-                har_res = import_har_file(str(args["har_path"]), asset_graph=ag, traffic_session=ts)
+                validated_har_path = self._validate_mcp_scan_path(
+                    args["har_path"],
+                    workspace_root=explicit_ws_root,
+                    allow_directory=False,
+                )
+                har_res = import_har_file(validated_har_path, asset_graph=ag, traffic_session=ts)
                 out["har"] = {k: v for k, v in har_res.items() if k != "extracted_auth_headers"}
                 out["har"]["auth_headers_found"] = har_res.get("auth_headers_found", [])
             out["total_assets_ingested"] = len(ag.nodes)
@@ -2389,7 +2907,27 @@ class TerminatorMCPServer:
             from pathlib import Path as _Path
             from engine.advisory_exporter import AdvisoryExporter, _safe_filename
 
-            out_dir = _Path(str(args.get("output_dir") or "reports/advisories"))
+            explicit_ws_root = self._resolve_mcp_workspace_root(args)
+            explicit_out_ws = self._has_explicit_output_confinement(args)
+            raw_out_dir = self._parse_strict_str(args, "output_dir", "reports/advisories") or "reports/advisories"
+            out_dir = _Path(
+                self._validate_mcp_output_dir(
+                    raw_out_dir,
+                    workspace_root=explicit_ws_root,
+                    enforce_explicit_ws=explicit_out_ws,
+                )
+            )
+            raw_archive_path = self._parse_strict_str(args, "archive_path", None)
+            validated_archive_path = (
+                self._validate_mcp_output_dir(
+                    raw_archive_path,
+                    workspace_root=explicit_ws_root,
+                    enforce_explicit_ws=explicit_out_ws,
+                    allow_directory=False,
+                )
+                if raw_archive_path is not None
+                else None
+            )
             exporter = AdvisoryExporter(reports_dir=out_dir)
             if args.get("chain_id"):
                 ch = self.db.get_attack_chain(str(args["chain_id"]), task_id=args.get("task_id"))
@@ -2410,10 +2948,10 @@ class TerminatorMCPServer:
                 csv_path = out_dir / "findings_and_chains.csv"
                 exporter.export_findings_csv(findings, chains=chains, output_path=csv_path)
                 resp["csv_path"] = str(csv_path)
-            if args.get("archive_path"):
+            if validated_archive_path is not None:
                 resp["archive"] = exporter.export_task_archive(
                     self.db,
-                    str(args["archive_path"]),
+                    validated_archive_path,
                     task_id=args.get("task_id"),
                     secret_box=getattr(self.db, "secret_box", None),
                 )
@@ -2502,16 +3040,23 @@ class TerminatorMCPServer:
         elif name == "mantis_scan":
             from engine.mantis_integrator import DEFAULT_ABLITERATED_MODEL, MantisIntegrator
 
+            explicit_ws_root = self._resolve_mcp_workspace_root(args)
             raw_target = str(args.get("target_path") or args.get("repo") or args.get("path") or ".")
-            if "\x00" in raw_target:
-                raise ValueError("Invalid target path containing NUL byte.")
-            resolved = os.path.abspath(raw_target)
+            resolved = self._validate_mcp_scan_path(
+                raw_target, workspace_root=explicit_ws_root, allow_directory=True
+            )
             if not os.path.exists(resolved):
                 return {"error": f"Target path does not exist: {resolved}"}
+            raw_out_dir = self._parse_strict_str(args, "output_dir", "reports") or "reports"
+            validated_out_dir = self._validate_mcp_output_dir(
+                raw_out_dir,
+                workspace_root=explicit_ws_root,
+                enforce_explicit_ws=self._has_explicit_output_confinement(args),
+            )
 
             integrator = MantisIntegrator(
                 db=self.db,
-                reports_dir=args.get("output_dir") or "reports",
+                reports_dir=validated_out_dir,
                 use_fusion=True,
                 preferred_model=DEFAULT_ABLITERATED_MODEL,
             )
@@ -2538,11 +3083,22 @@ class TerminatorMCPServer:
                 self._parse_strict_bool(args, "use_rea_cli", False)
                 or self._parse_strict_bool(args, "rea_cli", False)
             )
-            reports_dir = self._parse_strict_str(args, "output_dir", "reports") or "reports"
+            explicit_ws_root = self._resolve_mcp_workspace_root(args)
+            reports_dir = self._validate_mcp_output_dir(
+                self._parse_strict_str(args, "output_dir", "reports") or "reports",
+                workspace_root=explicit_ws_root,
+                enforce_explicit_ws=self._has_explicit_output_confinement(args),
+            )
             noise_profile = self._parse_strict_str(args, "noise_profile", "off") or "off"
 
             if not target_path and not raw_host:
                 target_path = "."
+            if target_path is not None:
+                target_path = self._validate_mcp_scan_path(
+                    target_path,
+                    workspace_root=explicit_ws_root,
+                    allow_directory=True,
+                )
 
             clean_host = None
             resolved_port = None
@@ -2557,12 +3113,16 @@ class TerminatorMCPServer:
             else:
                 TargetAuthorizationGate.check_rate_limit()
 
-            gate = self._build_mcp_approval_gate(args, "MCP-REA-SURFACE")
+            eff_rea_ws = explicit_ws_root
+            if eff_rea_ws is None and target_path is not None:
+                eff_rea_ws = Path(target_path) if os.path.isdir(target_path) else Path(target_path).parent
+            gate = self._build_mcp_approval_gate(args, "MCP-REA-SURFACE", workspace_root=eff_rea_ws)
             integrator = ReaIntegrator(
                 db=self.db,
                 reports_dir=reports_dir,
                 approval_gate=gate,
                 noise_governor=NoiseGovernor(profile=noise_profile),
+                workspace_root=explicit_ws_root,
             )
             res_obj = integrator.analyze(
                 target_path=target_path,
@@ -2572,6 +3132,7 @@ class TerminatorMCPServer:
                 authorized=bool(authorized or (clean_host and is_explicit_loopback_host(clean_host))),
                 use_rea_cli=use_rea_cli,
                 write_reports=True,
+                workspace_root=explicit_ws_root,
             )
             out = res_obj.to_dict()
             out["total_findings"] = len(out.get("findings") or [])
@@ -2713,7 +3274,12 @@ class TerminatorMCPServer:
             self._reject_shell_execution(args)
             from engine.arxiv_security_bridge import ArxivSecurityBridge
 
-            repo_path = self._parse_strict_str(args, "repo_path", ".", allow_empty=False) or "."
+            explicit_ws_root = self._resolve_mcp_workspace_root(args)
+            repo_path = self._validate_mcp_scan_path(
+                self._parse_strict_str(args, "repo_path", ".", allow_empty=False) or ".",
+                workspace_root=explicit_ws_root,
+                allow_directory=True,
+            )
             research_num = int(
                 self._parse_strict_int(args, "research_num", 5, min_val=1, max_val=25) or 5
             )
@@ -2728,7 +3294,12 @@ class TerminatorMCPServer:
             self._reject_shell_execution(args)
             from engine.arxiv_security_bridge import ArxivSecurityBridge
 
-            repo_path = self._parse_strict_str(args, "repo_path", ".", allow_empty=False) or "."
+            explicit_ws_root = self._resolve_mcp_workspace_root(args)
+            repo_path = self._validate_mcp_scan_path(
+                self._parse_strict_str(args, "repo_path", ".", allow_empty=False) or ".",
+                workspace_root=explicit_ws_root,
+                allow_directory=True,
+            )
             research_num = int(
                 self._parse_strict_int(args, "research_num", 5, min_val=1, max_val=25) or 5
             )
@@ -2743,7 +3314,12 @@ class TerminatorMCPServer:
             self._reject_shell_execution(args)
             from engine.arxiv_security_bridge import ArxivSecurityBridge
 
-            repo_path = self._parse_strict_str(args, "repo_path", ".", allow_empty=False) or "."
+            explicit_ws_root = self._resolve_mcp_workspace_root(args)
+            repo_path = self._validate_mcp_scan_path(
+                self._parse_strict_str(args, "repo_path", ".", allow_empty=False) or ".",
+                workspace_root=explicit_ws_root,
+                allow_directory=True,
+            )
             sync_new_query = self._parse_strict_str(args, "sync_new_query", "", allow_empty=True) or ""
             research_num = int(
                 self._parse_strict_int(args, "research_num", 5, min_val=1, max_val=25) or 5
@@ -2803,7 +3379,12 @@ class TerminatorMCPServer:
             self._reject_shell_execution(args)
             from engine.last30days_security_skills import Last30DaysSecuritySkillsEngine
 
-            repo_path = self._parse_strict_str(args, "repo_path", ".", allow_empty=False) or "."
+            explicit_ws_root = self._resolve_mcp_workspace_root(args)
+            repo_path = self._validate_mcp_scan_path(
+                self._parse_strict_str(args, "repo_path", ".", allow_empty=False) or ".",
+                workspace_root=explicit_ws_root,
+                allow_directory=True,
+            )
             domain = self._parse_strict_str(args, "domain", "both", allow_empty=False) or "both"
             sync_online = bool(self._parse_strict_bool(args, "sync_online", False))
             topic = self._parse_strict_str(args, "topic", "", allow_empty=True) or ""
@@ -2826,9 +3407,12 @@ class TerminatorMCPServer:
             self._reject_shell_execution(args)
             from engine.last30days_security_skills import Last30DaysSecuritySkillsEngine
 
-            skill_path = self._parse_strict_str(
-                args, "skill_or_repo_path", ".", allow_empty=False
-            ) or "."
+            explicit_ws_root = self._resolve_mcp_workspace_root(args)
+            skill_path = self._validate_mcp_scan_path(
+                self._parse_strict_str(args, "skill_or_repo_path", ".", allow_empty=False) or ".",
+                workspace_root=explicit_ws_root,
+                allow_directory=True,
+            )
             engine = Last30DaysSecuritySkillsEngine()
             return engine.audit_agent_skill_package(skill_path)
 
@@ -2851,7 +3435,14 @@ class TerminatorMCPServer:
             self._reject_shell_execution(args)
             from engine.preflight_discovery import run_preflight_discovery
 
+            explicit_ws_root = self._resolve_mcp_workspace_root(args)
             target_path = self._parse_strict_str(args, "target_path", ".", allow_empty=True) or None
+            if target_path is not None:
+                target_path = self._validate_mcp_scan_path(
+                    target_path,
+                    workspace_root=explicit_ws_root,
+                    allow_directory=True,
+                )
             prompt = self._parse_strict_str(args, "prompt", "", allow_empty=True) or ""
             policy_text = self._parse_strict_str(args, "policy_text", "", allow_empty=True) or ""
             target_host = self._parse_strict_str(args, "target_host", "", allow_empty=True) or None
@@ -2875,7 +3466,12 @@ class TerminatorMCPServer:
             self._reject_shell_execution(args)
             from engine.crlf_desync_engine import audit_nginx_configs, run_conformance_diagnostics
 
-            target_path = self._parse_strict_str(args, "target_path", ".", allow_empty=True) or "."
+            explicit_ws_root = self._resolve_mcp_workspace_root(args)
+            target_path = self._validate_mcp_scan_path(
+                self._parse_strict_str(args, "target_path", ".", allow_empty=True) or ".",
+                workspace_root=explicit_ws_root,
+                allow_directory=True,
+            )
             host = self._parse_strict_str(args, "host", "", allow_empty=True) or ""
             port = int(self._parse_strict_int(args, "port", 80, min_val=1, max_val=65535) or 80)
             use_tls = bool(self._parse_strict_bool(args, "use_tls", False))
@@ -2895,8 +3491,38 @@ class TerminatorMCPServer:
             self._reject_shell_execution(args)
             from engine.web_llm_auditor import audit_web_llm_repository
 
-            target_path = self._parse_strict_str(args, "target_path", ".", allow_empty=False) or "."
+            explicit_ws_root = self._resolve_mcp_workspace_root(args)
+            target_path = self._validate_mcp_scan_path(
+                self._parse_strict_str(args, "target_path", ".", allow_empty=False) or ".",
+                workspace_root=explicit_ws_root,
+                allow_directory=True,
+            )
             return audit_web_llm_repository(target_path).to_dict()
+
+        elif name == "run_pe_dotnet_audit":
+            self._reject_shell_execution(args)
+            from engine.pe_magika_classifier import audit_pe_dotnet_target
+
+            explicit_ws_root = self._resolve_mcp_workspace_root(args)
+            raw_target = (
+                self._parse_strict_str(args, "target_path", None, allow_empty=False)
+                or self._parse_strict_str(args, "path", None, allow_empty=False)
+                or self._parse_strict_str(args, "repo", None, allow_empty=False)
+                or "."
+            )
+            target_path = self._validate_mcp_scan_path(
+                raw_target,
+                workspace_root=explicit_ws_root,
+                allow_directory=True,
+            )
+            include_host_audit = bool(self._parse_strict_bool(args, "include_host_audit", False))
+            include_yara = bool(self._parse_strict_bool(args, "include_yara", True))
+            return audit_pe_dotnet_target(
+                target_path,
+                include_host_audit=include_host_audit,
+                include_yara=include_yara,
+                workspace_root=explicit_ws_root,
+            )
 
         raise ValueError(f"Unknown tool: {name}")
 
@@ -3013,29 +3639,139 @@ class MCPHttpServer:
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(raw)))
                 self.send_header("Cache-Control", "no-store")
+                has_conn_hdr = False
                 if extra_headers:
                     for k, v in extra_headers.items():
+                        if str(k).lower() == "connection":
+                            has_conn_hdr = True
                         self.send_header(k, v)
+                if self.close_connection and not has_conn_hdr:
+                    self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(raw)
 
+            def _drain_request_body(self, max_bytes: int = 10 * 1024 * 1024) -> bool:
+                te_vals = self.headers.get_all("Transfer-Encoding", [])
+                if te_vals:
+                    return False
+                cl_vals = self.headers.get_all("Content-Length", [])
+                if not cl_vals:
+                    return True
+                if len(cl_vals) > 1:
+                    return False
+                raw_s = str(cl_vals[0]).strip()
+                if not (raw_s.isascii() and raw_s.isdigit()):
+                    return False
+                length = int(raw_s)
+                if length < 0 or length > max_bytes:
+                    return False
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                    if not chunk:
+                        return False
+                    remaining -= len(chunk)
+                return True
+
+            def _send_error_drained(self, status: int, body: Any) -> None:
+                drained = self._drain_request_body()
+                extra = None
+                if not drained:
+                    self.close_connection = True
+                    extra = {"Connection": "close"}
+                self._send_json(status, body, extra_headers=extra)
+
             def _require_auth(self) -> bool:
                 if not parent._check_origin(self.headers.get("Origin")):
-                    self._send_json(403, {"error": "Forbidden Origin header (MCP DNS-rebinding / CSRF guard)"})
+                    self._send_error_drained(403, {"error": "Forbidden Origin header (MCP DNS-rebinding / CSRF guard)"})
                     return False
                 if not parent._check_auth(self.headers.get("Authorization")):
-                    self._send_json(401, {"error": "Unauthorized: invalid or missing Bearer token"})
+                    self._send_error_drained(401, {"error": "Unauthorized: invalid or missing Bearer token"})
                     return False
                 return True
 
+            def _read_chunked_body(self, max_bytes: int = 2 * 1024 * 1024) -> Tuple[Optional[bytes], Optional[str]]:
+                buf = bytearray()
+                max_line = 4096
+                max_chunks = 4096
+                for _ in range(max_chunks):
+                    line = self.rfile.readline(max_line + 1)
+                    if not line or len(line) > max_line or not line.endswith(b"\r\n"):
+                        self.close_connection = True
+                        return None, "Malformed chunked header"
+                    size_tok = line[:-2].split(b";", 1)[0]
+                    if not re.fullmatch(rb"[0-9a-fA-F]{1,8}", size_tok):
+                        self.close_connection = True
+                        return None, "Malformed chunked size"
+                    chunk_size = int(size_tok, 16)
+                    if chunk_size == 0:
+                        for _ in range(64):
+                            tline = self.rfile.readline(max_line + 1)
+                            if not tline or len(tline) > max_line or not tline.endswith(b"\r\n"):
+                                self.close_connection = True
+                                return None, "Malformed chunked trailer"
+                            if tline == b"\r\n":
+                                return bytes(buf), None
+                        self.close_connection = True
+                        return None, "Too many chunked trailers"
+                    if len(buf) + chunk_size > max_bytes:
+                        self.close_connection = True
+                        return None, "Payload exceeds 2 MiB limit"
+                    rem = chunk_size
+                    while rem > 0:
+                        part = self.rfile.read(rem)
+                        if not part:
+                            self.close_connection = True
+                            return None, "Truncated chunked body"
+                        buf.extend(part)
+                        rem -= len(part)
+                    crlf = self.rfile.read(2)
+                    if crlf != b"\r\n":
+                        self.close_connection = True
+                        return None, "Malformed chunk terminator"
+                self.close_connection = True
+                return None, "Too many chunks"
+
             def _read_json_body(self) -> Tuple[Optional[Any], Optional[str]]:
-                try:
-                    length = int(self.headers.get("Content-Length") or "0")
-                except ValueError:
-                    return None, "Invalid Content-Length"
-                if length > 2 * 1024 * 1024:
-                    return None, "Payload exceeds 2 MiB limit"
-                raw = self.rfile.read(length) if length > 0 else b""
+                te_vals = self.headers.get_all("Transfer-Encoding", [])
+                cl_vals = self.headers.get_all("Content-Length", [])
+                if te_vals:
+                    if cl_vals:
+                        self.close_connection = True
+                        return None, "Conflicting Content-Length and Transfer-Encoding headers"
+                    te_tokens = [tok.strip().lower() for hdr in te_vals for tok in str(hdr).split(",") if tok.strip()]
+                    if te_tokens != ["chunked"]:
+                        self.close_connection = True
+                        return None, "Unsupported Transfer-Encoding"
+                    raw, c_err = self._read_chunked_body(max_bytes=2 * 1024 * 1024)
+                    if c_err is not None or raw is None:
+                        return None, c_err or "Malformed chunked body"
+                else:
+                    if len(cl_vals) > 1:
+                        self.close_connection = True
+                        return None, "Duplicate Content-Length"
+                    length = 0
+                    if cl_vals:
+                        raw_s = str(cl_vals[0]).strip()
+                        if not (raw_s.isascii() and raw_s.isdigit()):
+                            self.close_connection = True
+                            return None, "Invalid Content-Length"
+                        length = int(raw_s)
+                    if length > 2 * 1024 * 1024:
+                        self.close_connection = True
+                        return None, "Payload exceeds 2 MiB limit"
+                    raw = b""
+                    if length > 0:
+                        chunks = bytearray()
+                        rem = length
+                        while rem > 0:
+                            part = self.rfile.read(rem)
+                            if not part:
+                                self.close_connection = True
+                                return None, "Truncated JSON body"
+                            chunks.extend(part)
+                            rem -= len(part)
+                        raw = bytes(chunks)
                 if not raw:
                     return None, "Empty JSON body"
                 try:
@@ -3099,7 +3835,8 @@ class MCPHttpServer:
                 if parsed.path in ("/http", "/mcp"):
                     payload, err = self._read_json_body()
                     if err:
-                        self._send_json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": err}})
+                        extra = {"Connection": "close"} if self.close_connection else None
+                        self._send_json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": err}}, extra_headers=extra)
                         return
 
                     if isinstance(payload, list):
@@ -3127,6 +3864,8 @@ class MCPHttpServer:
                         self.send_response(200)
                         self.send_header("Content-Type", "text/event-stream")
                         self.send_header("Content-Length", str(len(frame)))
+                        if self.close_connection:
+                            self.send_header("Connection", "close")
                         self.end_headers()
                         self.wfile.write(frame)
                         return
@@ -3134,6 +3873,8 @@ class MCPHttpServer:
                     if not result_obj:
                         self.send_response(202)
                         self.send_header("Content-Length", "0")
+                        if self.close_connection:
+                            self.send_header("Connection", "close")
                         self.end_headers()
                         return
 
@@ -3145,16 +3886,17 @@ class MCPHttpServer:
                     qs = parse_qs(parsed.query)
                     sid = (qs.get("sessionId") or [""])[0].strip()
                     if not sid:
-                        self._send_json(400, {"error": "Missing sessionId query parameter"})
+                        self._send_error_drained(400, {"error": "Missing sessionId query parameter"})
                         return
                     with parent._sessions_lock:
                         has_session = sid in parent._sessions
                     if not has_session:
-                        self._send_json(404, {"error": f"Unknown or closed SSE session: {sid}"})
+                        self._send_error_drained(404, {"error": f"Unknown or closed SSE session: {sid}"})
                         return
                     payload, err = self._read_json_body()
                     if err or not isinstance(payload, dict):
-                        self._send_json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": err or "Invalid request"}})
+                        extra = {"Connection": "close"} if self.close_connection else None
+                        self._send_json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": err or "Invalid request"}}, extra_headers=extra)
                         return
                     resp = parent.mcp_server.handle_request(payload)
                     if resp:
@@ -3165,7 +3907,7 @@ class MCPHttpServer:
                     self._send_json(202, {"status": "accepted", "sessionId": sid})
                     return
 
-                self._send_json(404, {"error": f"Not found: {parsed.path}"})
+                self._send_error_drained(404, {"error": f"Not found: {parsed.path}"})
 
             def do_DELETE(self) -> None:
                 if not self._require_auth():

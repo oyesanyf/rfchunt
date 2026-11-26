@@ -17,17 +17,22 @@ Security & Integrity Invariants:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import importlib.util
 import json
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
+import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from engine.docker_wsl_doctor import diagnose_docker_wsl
+from engine.docker_wsl_doctor import diagnose_docker_wsl, find_docker_binary, probe_docker_daemon
 from engine.host_containment import silent_subprocess_run
 
 
@@ -150,10 +155,13 @@ def validate_mount_path(repo_path: Union[str, Path]) -> Tuple[bool, str]:
     raw = str(repo_path).strip()
     if not raw:
         return False, "Repository mount path is empty."
-    if "\x00" in raw or raw.startswith("\\\\"):
+    if "\x00" in raw or raw.startswith("\\\\") or raw.startswith("//"):
         return False, f"Unsafe or UNC mount path rejected: {raw!r}"
     resolved = Path(raw).resolve()
-    norm = str(resolved).replace("\\", "/").lower()
+    resolved_str = str(resolved)
+    if resolved_str.startswith("\\\\") or resolved.as_posix().startswith("//"):
+        return False, f"Unsafe or UNC mount path rejected: {resolved_str!r}"
+    norm = resolved_str.replace("\\", "/").lower()
     if _WINDOWS_CRITICAL_RE.match(norm):
         return False, f"Critical Windows host directory cannot be mounted: {resolved}"
     for prefix in _FORBIDDEN_MOUNT_PREFIXES:
@@ -161,7 +169,7 @@ def validate_mount_path(repo_path: Union[str, Path]) -> Tuple[bool, str]:
             return False, f"Critical POSIX host directory cannot be mounted: {resolved}"
     if not resolved.exists() or not resolved.is_dir():
         return False, f"Repository directory does not exist: {resolved}"
-    return True, str(resolved)
+    return True, resolved_str
 
 
 def validate_command_tokens(cmd: Sequence[str]) -> Tuple[bool, str]:
@@ -411,3 +419,746 @@ def save_transcript_bundle(
     json_path.write_text(json.dumps(transcript.to_dict(), indent=2), encoding="utf-8")
     md_path.write_text(transcript.to_markdown(), encoding="utf-8")
     return json_path, md_path
+
+
+# ---------------------------------------------------------------------------
+# Non-Destructive Toolchain Probes & Optional Symbolic Hooks (M1)
+# ---------------------------------------------------------------------------
+
+
+def _safe_find_spec(module_name: str) -> Optional[Any]:
+    try:
+        return importlib.util.find_spec(module_name)
+    except (ImportError, ValueError, AttributeError, OSError):
+        return None
+
+
+def _default_lean_dir() -> Path:
+    return Path(__file__).resolve().parent.parent / "formal" / "lean4"
+
+
+def _validate_symbolic_target_path(target_path: Union[str, Path]) -> Tuple[bool, str]:
+    """
+    Validates a file or directory target using `validate_mount_path` invariants.
+    Rejects empty, UNC (`\\\\` or `//`), NUL-byte, missing, or critical Windows/POSIX paths.
+    """
+    if target_path is None:
+        return validate_mount_path("")
+    raw = str(target_path).strip()
+    if not raw or "\x00" in raw or raw.startswith("\\\\") or raw.startswith("//"):
+        return validate_mount_path(raw)
+    try:
+        resolved = Path(raw).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False, f"Invalid target path: {raw!r}"
+
+    resolved_str = str(resolved)
+    if resolved_str.startswith("\\\\") or resolved.as_posix().startswith("//"):
+        return False, f"Unsafe or UNC mount path rejected: {resolved_str!r}"
+
+    if resolved.is_file():
+        norm = resolved_str.replace("\\", "/").lower()
+        if _WINDOWS_CRITICAL_RE.match(norm):
+            return False, f"Critical Windows host file cannot be inspected: {resolved}"
+        for prefix in _FORBIDDEN_MOUNT_PREFIXES:
+            if norm == prefix or norm.startswith(prefix + "/"):
+                return False, f"Critical POSIX host file cannot be inspected: {resolved}"
+        ok_parent, parent_msg = validate_mount_path(resolved.parent)
+        if not ok_parent:
+            return False, parent_msg
+        return True, resolved_str
+
+    return validate_mount_path(raw)
+
+
+def probe_optional_backends(
+    lean_dir: Optional[Union[str, Path]] = None,
+    *,
+    timeout_sec: float = 2.5,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Non-destructively probes optional local verification toolchains concurrently with
+    strictly bounded wall-clock timeouts (<= 3.0s). Returns availability dictionaries
+    for `docker`, `wsl2`, `lean4`, `rfchunt_lean_oracle`, `angr`, `klee`, and `semgrep`.
+    """
+    t0 = time.monotonic()
+    bounded_timeout = max(0.2, min(float(timeout_sec), 3.0))
+    deadline = t0 + bounded_timeout
+    resolved_lean_dir = (
+        Path(lean_dir).resolve() if lean_dir is not None else _default_lean_dir()
+    )
+
+    def _entry(
+        available: bool, status: str, reason: str, path_or_module: Optional[str]
+    ) -> Dict[str, Any]:
+        return {
+            "available": bool(available),
+            "status": status,
+            "reason": reason,
+            "path_or_module": path_or_module,
+        }
+
+    # Subprocess probes run in daemon threads so a hanging child/pipe teardown
+    # returns `status="timeout"` immediately at `bounded_timeout` without blocking.
+    docker_box: Dict[str, Dict[str, Any]] = {}
+    docker_bin_ref: List[Optional[str]] = [None]
+    docker_done = threading.Event()
+
+    def _probe_docker() -> None:
+        try:
+            docker_bin = find_docker_binary()
+            docker_bin_ref[0] = docker_bin
+            if not docker_bin:
+                docker_box["value"] = _entry(
+                    False,
+                    "unavailable",
+                    "Docker CLI/Desktop not found on host.",
+                    None,
+                )
+                return
+            daemon_up, server_ver = probe_docker_daemon(
+                docker_bin, timeout=bounded_timeout
+            )
+            if daemon_up:
+                ver = f" (server {server_ver})" if server_ver else ""
+                docker_box["value"] = _entry(
+                    True,
+                    "available",
+                    f"Docker daemon running{ver}.",
+                    docker_bin,
+                )
+            else:
+                docker_box["value"] = _entry(
+                    False,
+                    "unavailable",
+                    "Docker CLI found, but Docker daemon is not running.",
+                    docker_bin,
+                )
+        except subprocess.TimeoutExpired:
+            docker_box["value"] = _entry(
+                False,
+                "timeout",
+                f"Docker daemon probe timed out after {bounded_timeout:.1f}s.",
+                docker_bin_ref[0],
+            )
+        except Exception as exc:
+            docker_box["value"] = _entry(
+                False,
+                "unavailable",
+                f"Docker probe failed cleanly: {exc}",
+                docker_bin_ref[0],
+            )
+        finally:
+            docker_done.set()
+
+    wsl_box: Dict[str, Dict[str, Any]] = {}
+    wsl_bin_ref: List[Optional[str]] = [None]
+    wsl_done = threading.Event()
+
+    def _probe_wsl2() -> None:
+        try:
+            wsl_bin = shutil.which("wsl.exe") or shutil.which("wsl")
+            wsl_bin_ref[0] = wsl_bin
+            if not wsl_bin:
+                wsl_box["value"] = _entry(
+                    False,
+                    "unavailable",
+                    "wsl.exe / wsl not found on PATH.",
+                    None,
+                )
+                return
+            proc = silent_subprocess_run(
+                [wsl_bin, "--status"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=bounded_timeout,
+            )
+            if proc.returncode == 0:
+                wsl_box["value"] = _entry(
+                    True,
+                    "available",
+                    "WSL2 status probe succeeded.",
+                    wsl_bin,
+                )
+            else:
+                snippet = (
+                    (proc.stderr or "") or (proc.stdout or "")
+                ).replace("\x00", "").strip()
+                first_line = (
+                    snippet.splitlines()[0][:200]
+                    if snippet
+                    else f"exit code {proc.returncode}"
+                )
+                wsl_box["value"] = _entry(
+                    False,
+                    "unavailable",
+                    f"WSL2 probe returned non-zero ({first_line}).",
+                    wsl_bin,
+                )
+        except subprocess.TimeoutExpired:
+            wsl_box["value"] = _entry(
+                False,
+                "timeout",
+                f"WSL2 probe timed out after {bounded_timeout:.1f}s.",
+                wsl_bin_ref[0],
+            )
+        except Exception as exc:
+            wsl_box["value"] = _entry(
+                False,
+                "unavailable",
+                f"WSL2 probe failed cleanly: {exc}",
+                wsl_bin_ref[0],
+            )
+        finally:
+            wsl_done.set()
+
+    def _probe_lean4() -> Dict[str, Any]:
+        lean_bin = shutil.which("lean")
+        lake_bin = shutil.which("lake")
+        has_lakefile = (resolved_lean_dir / "lakefile.lean").is_file()
+        if lean_bin and lake_bin:
+            lake_note = "lakefile.lean present" if has_lakefile else "lakefile.lean missing"
+            return _entry(
+                True,
+                "available",
+                f"Lean 4 (`lean` and `lake`) found ({lake_note}).",
+                lake_bin,
+            )
+        missing = [name for name, path in (("lean", lean_bin), ("lake", lake_bin)) if not path]
+        return _entry(
+            False,
+            "unavailable",
+            f"Lean 4 toolchain missing ({', '.join(missing)} not on PATH).",
+            lake_bin or lean_bin,
+        )
+
+    def _probe_lean_oracle() -> Dict[str, Any]:
+        try:
+            from engine.lean_formal_verifier import find_lean_oracle_binary
+
+            oracle_bin = find_lean_oracle_binary(resolved_lean_dir)
+            if oracle_bin is not None:
+                return _entry(
+                    True,
+                    "available",
+                    "Compiled rfchunt-lean-oracle binary found.",
+                    str(oracle_bin),
+                )
+            return _entry(
+                False,
+                "unavailable",
+                f"Compiled rfchunt-lean-oracle binary not built under {resolved_lean_dir}.",
+                None,
+            )
+        except Exception as exc:
+            return _entry(
+                False,
+                "unavailable",
+                f"rfchunt-lean-oracle probe failed cleanly: {exc}",
+                None,
+            )
+
+    def _probe_angr() -> Dict[str, Any]:
+        angr_spec = _safe_find_spec("angr")
+        if angr_spec is not None:
+            return _entry(
+                True,
+                "available",
+                "Python package `angr` is importable.",
+                getattr(angr_spec, "origin", None) or "angr",
+            )
+        return _entry(
+            False,
+            "unavailable",
+            "Python package `angr` is not installed.",
+            None,
+        )
+
+    def _probe_klee() -> Dict[str, Any]:
+        klee_bin = shutil.which("klee")
+        klee_spec = _safe_find_spec("klee")
+        if klee_bin:
+            return _entry(
+                True,
+                "available",
+                "KLEE CLI binary found on PATH.",
+                klee_bin,
+            )
+        if klee_spec is not None:
+            return _entry(
+                True,
+                "available",
+                "Python package `klee` is importable.",
+                getattr(klee_spec, "origin", None) or "klee",
+            )
+        return _entry(
+            False,
+            "unavailable",
+            "Optional symbolic backend `klee` is not installed.",
+            None,
+        )
+
+    def _probe_semgrep() -> Dict[str, Any]:
+        semgrep_bin = shutil.which("semgrep")
+        semgrep_spec = _safe_find_spec("semgrep")
+        if semgrep_bin:
+            return _entry(
+                True,
+                "available",
+                "Semgrep CLI binary found on PATH.",
+                semgrep_bin,
+            )
+        if semgrep_spec is not None:
+            return _entry(
+                True,
+                "available",
+                "Python package `semgrep` is importable.",
+                getattr(semgrep_spec, "origin", None) or "semgrep",
+            )
+        return _entry(
+            False,
+            "unavailable",
+            "Semgrep CLI/package is not installed.",
+            None,
+        )
+
+    def _probe_rea() -> Dict[str, Any]:
+        rea_spec = _safe_find_spec("engine.rea_integrator")
+        rea_bin = shutil.which("rea-agents")
+        repo_rea_mjs = (
+            Path(__file__).resolve().parent.parent
+            / "tools"
+            / "npm"
+            / "node_modules"
+            / "rea-agents"
+            / "scripts"
+            / "rea.mjs"
+        )
+        cli_path = rea_bin or (str(repo_rea_mjs) if repo_rea_mjs.is_file() else None)
+        if rea_spec is not None:
+            detail = (
+                f"Module 21 REA offline analyzer loaded (CLI: {cli_path})."
+                if cli_path
+                else "Module 21 REA offline pure-Python surface analyzer loaded."
+            )
+            return _entry(
+                True,
+                "available",
+                detail,
+                getattr(rea_spec, "origin", None) or "engine.rea_integrator",
+            )
+        if cli_path:
+            return _entry(
+                True,
+                "available",
+                "REA CLI binary found on host.",
+                cli_path,
+            )
+        return _entry(
+            False,
+            "unavailable",
+            "Module 21 REA analyzer is not available.",
+            None,
+        )
+
+    docker_thread = threading.Thread(
+        target=_probe_docker, name="rfchunt-probe-docker", daemon=True
+    )
+    wsl_thread = threading.Thread(
+        target=_probe_wsl2, name="rfchunt-probe-wsl2", daemon=True
+    )
+    docker_thread.start()
+    wsl_thread.start()
+
+    results: Dict[str, Dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        f_lean = pool.submit(_probe_lean4)
+        f_oracle = pool.submit(_probe_lean_oracle)
+        f_angr = pool.submit(_probe_angr)
+        f_klee = pool.submit(_probe_klee)
+        f_semgrep = pool.submit(_probe_semgrep)
+        f_rea = pool.submit(_probe_rea)
+        results["lean4"] = f_lean.result()
+        results["rfchunt_lean_oracle"] = f_oracle.result()
+        results["angr"] = f_angr.result()
+        results["klee"] = f_klee.result()
+        results["semgrep"] = f_semgrep.result()
+        results["rea"] = f_rea.result()
+
+    if docker_done.wait(timeout=max(0.0, deadline - time.monotonic())):
+        results["docker"] = docker_box.get("value") or _entry(
+            False, "unavailable", "Docker probe produced no result.", docker_bin_ref[0]
+        )
+    else:
+        results["docker"] = _entry(
+            False,
+            "timeout",
+            f"Docker daemon probe timed out after {bounded_timeout:.1f}s.",
+            docker_bin_ref[0],
+        )
+
+    if wsl_done.wait(timeout=max(0.0, deadline - time.monotonic())):
+        results["wsl2"] = wsl_box.get("value") or _entry(
+            False, "unavailable", "WSL2 probe produced no result.", wsl_bin_ref[0]
+        )
+    else:
+        results["wsl2"] = _entry(
+            False,
+            "timeout",
+            f"WSL2 probe timed out after {bounded_timeout:.1f}s.",
+            wsl_bin_ref[0],
+        )
+
+    return {
+        "docker": results["docker"],
+        "wsl2": results["wsl2"],
+        "lean4": results["lean4"],
+        "rfchunt_lean_oracle": results["rfchunt_lean_oracle"],
+        "angr": results["angr"],
+        "klee": results["klee"],
+        "semgrep": results["semgrep"],
+        "rea": results["rea"],
+    }
+
+
+probe_toolchain_availability = probe_optional_backends
+
+
+def run_rea_hook(
+    target_path: Union[str, Path],
+    *,
+    query: str = "",
+    timeout_sec: float = 30.0,
+) -> Dict[str, Any]:
+    """
+    Auto-loaded, bounded, offline-first Module 21 (`morluto/rea`) surface & client-bundle
+    reverse-engineering hook. Enforces `_validate_symbolic_target_path` fail-closed and
+    delegates to `engine.rea_integrator.ReaIntegrator(write_reports=False)` without
+    invoking native binary decompilers or spawning shells.
+    """
+    t0 = time.monotonic()
+    raw_target_str = str(target_path) if target_path is not None else ""
+    _ = timeout_sec
+
+    ok_target, target_info = _validate_symbolic_target_path(target_path)
+    if not ok_target:
+        return {
+            "backend": "rea",
+            "target_path": raw_target_str,
+            "available": False,
+            "status": "rejected_unsafe",
+            "verified": False,
+            "findings": [],
+            "discovered_endpoints": [],
+            "ai_sinks": [],
+            "ipc_channels": [],
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "command": [],
+            "elapsed_ms": round((time.monotonic() - t0) * 1000.0, 2),
+            "remediation_hint": target_info,
+        }
+
+    try:
+        from engine.rea_integrator import ReaIntegrator
+
+        integrator = ReaIntegrator()
+        res = integrator.analyze(target_path=target_info, write_reports=False)
+        findings_dicts = [f.to_dict() for f in (res.findings or [])]
+        endpoints = list(res.discovered_endpoints or [])
+        ai_sinks = list(res.ai_sinks or [])
+        ipc_channels = list(res.ipc_channels or [])
+        if query and str(query).strip():
+            q_low = str(query).strip().lower()
+            filtered_ep = [
+                ep
+                for ep in endpoints
+                if q_low in str(ep.get("route", "")).lower()
+                or q_low in str(ep.get("node_type", "")).lower()
+            ]
+            if filtered_ep:
+                endpoints = filtered_ep
+        return {
+            "backend": "rea",
+            "target_path": target_info,
+            "available": True,
+            "status": "passed" if res.status == "completed" else str(res.status),
+            "mode": str(res.mode),
+            "verified": False,
+            "findings": findings_dicts,
+            "discovered_endpoints": endpoints,
+            "ai_sinks": ai_sinks,
+            "ipc_channels": ipc_channels,
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "command": ["engine.rea_integrator.ReaIntegrator.analyze", target_info],
+            "elapsed_ms": round((time.monotonic() - t0) * 1000.0, 2),
+            "remediation_hint": "",
+        }
+    except Exception as exc:
+        return {
+            "backend": "rea",
+            "target_path": target_info,
+            "available": False,
+            "status": "failed",
+            "verified": False,
+            "findings": [],
+            "discovered_endpoints": [],
+            "ai_sinks": [],
+            "ipc_channels": [],
+            "exit_code": None,
+            "stdout": "",
+            "stderr": str(exc),
+            "command": [],
+            "elapsed_ms": round((time.monotonic() - t0) * 1000.0, 2),
+            "remediation_hint": f"REA hook failed cleanly: {exc}",
+        }
+
+
+def run_symbolic_hook(
+    backend: str,
+    target_path: Union[str, Path],
+    *,
+    args: Optional[Sequence[str]] = None,
+    timeout_sec: float = 30.0,
+) -> Dict[str, Any]:
+    """
+    Bounded, non-destructive optional symbolic/reverse-engineering hook for `angr`, `klee`,
+    and auto-loaded `rea` (Module 21 client-bundle/Electron surface analyzer).
+    Enforces `validate_mount_path` and `validate_command_tokens` invariants, uses
+    `silent_subprocess_run(..., shell=False)`, and degrades gracefully with
+    `status="unavailable"` and `verified=False` when optional tools are absent.
+    """
+    t0 = time.monotonic()
+    norm_backend = str(backend or "").strip().lower()
+    raw_target_str = str(target_path) if target_path is not None else ""
+
+    if norm_backend == "rea":
+        if args is not None:
+            if isinstance(args, (str, bytes, bytearray, dict)) or not isinstance(args, Sequence):
+                return {
+                    "backend": "rea",
+                    "target_path": raw_target_str,
+                    "available": False,
+                    "status": "rejected_unsafe",
+                    "verified": False,
+                    "findings": [],
+                    "exit_code": None,
+                    "stdout": "",
+                    "stderr": "",
+                    "command": [],
+                    "elapsed_ms": round((time.monotonic() - t0) * 1000.0, 2),
+                    "remediation_hint": (
+                        "Symbolic hook args must be a non-string Sequence of string tokens."
+                    ),
+                }
+            args_list = list(args)
+            if args_list:
+                ok_args, args_err = validate_command_tokens(args_list)
+                if not ok_args:
+                    return {
+                        "backend": "rea",
+                        "target_path": raw_target_str,
+                        "available": False,
+                        "status": "rejected_unsafe",
+                        "verified": False,
+                        "findings": [],
+                        "exit_code": None,
+                        "stdout": "",
+                        "stderr": "",
+                        "command": [],
+                        "elapsed_ms": round((time.monotonic() - t0) * 1000.0, 2),
+                        "remediation_hint": args_err,
+                    }
+        return run_rea_hook(target_path, timeout_sec=timeout_sec)
+
+    def _result(
+        *,
+        available: bool,
+        status: str,
+        verified: bool = False,
+        findings: Optional[List[Dict[str, Any]]] = None,
+        exit_code: Optional[int] = None,
+        stdout: str = "",
+        stderr: str = "",
+        command: Optional[List[str]] = None,
+        remediation_hint: str = "",
+        resolved_target: str = raw_target_str,
+    ) -> Dict[str, Any]:
+        return {
+            "backend": norm_backend,
+            "target_path": resolved_target,
+            "available": bool(available),
+            "status": status,
+            "verified": bool(verified),
+            "findings": list(findings) if findings is not None else [],
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "command": list(command) if command is not None else [],
+            "elapsed_ms": round((time.monotonic() - t0) * 1000.0, 2),
+            "remediation_hint": remediation_hint,
+        }
+
+    if norm_backend not in ("angr", "klee", "rea"):
+        return _result(
+            available=False,
+            status="unsupported_backend",
+            remediation_hint=f"Unsupported symbolic backend {backend!r}; choose 'angr', 'klee', or 'rea'.",
+        )
+
+    ok_target, target_info = _validate_symbolic_target_path(target_path)
+    if not ok_target:
+        return _result(
+            available=False,
+            status="rejected_unsafe",
+            remediation_hint=target_info,
+        )
+
+    safe_args: List[str] = []
+    if args is not None:
+        if isinstance(args, (str, bytes, bytearray, dict)) or not isinstance(args, Sequence):
+            return _result(
+                available=False,
+                status="rejected_unsafe",
+                resolved_target=target_info,
+                remediation_hint=(
+                    "Symbolic hook args must be a non-string Sequence of string tokens "
+                    "(e.g. list or tuple), not a str, bytes, dict, or non-sequence."
+                ),
+            )
+        args_list = list(args)
+        if args_list:
+            ok_args, args_err = validate_command_tokens(args_list)
+            if not ok_args:
+                return _result(
+                    available=False,
+                    status="rejected_unsafe",
+                    resolved_target=target_info,
+                    remediation_hint=args_err,
+                )
+            safe_args = args_list
+
+    angr_spec = None
+    klee_bin = None
+    klee_spec = None
+    if norm_backend == "angr":
+        angr_spec = _safe_find_spec("angr")
+        if angr_spec is None:
+            return _result(
+                available=False,
+                status="unavailable",
+                resolved_target=target_info,
+                remediation_hint="Optional symbolic backend 'angr' is not installed. Install with `pip install angr`.",
+            )
+    else:
+        klee_bin = shutil.which("klee")
+        klee_spec = _safe_find_spec("klee")
+        if not klee_bin and klee_spec is None:
+            return _result(
+                available=False,
+                status="unavailable",
+                resolved_target=target_info,
+                remediation_hint="Optional symbolic backend 'klee' is not installed on PATH or in Python environment.",
+            )
+
+    bounded_timeout = max(0.1, min(float(timeout_sec), 300.0))
+    if norm_backend == "angr":
+        probe_script = (
+            "import angr, json, sys; "
+            "p = angr.Project(sys.argv[1], auto_load_libs=False); "
+            "print(json.dumps({"
+            "'arch': str(p.arch.name), "
+            "'entry': int(p.entry), "
+            "'mode': 'bounded_metadata_probe', "
+            "'args_received': sys.argv[2:], "
+            "'findings': [], "
+            "'verified': False"
+            "}))"
+        )
+        exec_argv = [sys.executable, "-c", probe_script, target_info, *safe_args]
+    else:
+        if klee_bin:
+            if safe_args:
+                exec_argv = [klee_bin, *safe_args, target_info]
+            elif Path(target_info).is_file():
+                exec_argv = [klee_bin, "--max-time=10", target_info]
+            else:
+                exec_argv = [klee_bin, "--version"]
+        else:
+            exec_argv = [sys.executable, "-m", "klee", *(safe_args or ["--version"])]
+
+    try:
+        proc = silent_subprocess_run(
+            exec_argv,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=bounded_timeout,
+        )
+        out_s = proc.stdout or ""
+        err_s = proc.stderr or ""
+        parsed_findings: List[Dict[str, Any]] = []
+        verified = False
+        if proc.returncode == 0 and out_s.strip():
+            try:
+                parsed = json.loads(out_s.strip())
+                if isinstance(parsed, dict):
+                    raw_findings = parsed.get("findings")
+                    if isinstance(raw_findings, list):
+                        parsed_findings = [f for f in raw_findings if isinstance(f, dict)]
+                    verified = parsed.get("verified") is True
+            except (json.JSONDecodeError, ValueError):
+                verified = False
+
+        return _result(
+            available=True,
+            status="passed" if proc.returncode == 0 else "failed",
+            verified=verified,
+            findings=parsed_findings,
+            exit_code=proc.returncode,
+            stdout=out_s,
+            stderr=err_s,
+            command=exec_argv,
+            resolved_target=target_info,
+        )
+    except subprocess.TimeoutExpired as exc:
+        out_s = (
+            exc.stdout.decode("utf-8", errors="replace")
+            if isinstance(exc.stdout, bytes)
+            else (exc.stdout or "")
+        )
+        err_s = (
+            exc.stderr.decode("utf-8", errors="replace")
+            if isinstance(exc.stderr, bytes)
+            else (exc.stderr or "")
+        )
+        return _result(
+            available=True,
+            status="timeout",
+            verified=False,
+            findings=[],
+            exit_code=None,
+            stdout=out_s,
+            stderr=err_s,
+            command=exec_argv,
+            resolved_target=target_info,
+            remediation_hint=f"Symbolic hook `{norm_backend}` exceeded {bounded_timeout}s timeout.",
+        )
+    except Exception as exc:
+        return _result(
+            available=True,
+            status="failed",
+            verified=False,
+            findings=[],
+            exit_code=None,
+            stderr=str(exc),
+            command=exec_argv,
+            resolved_target=target_info,
+            remediation_hint=f"Symbolic hook `{norm_backend}` failed cleanly: {exc}",
+        )

@@ -541,7 +541,7 @@ def test_har_session_auth_profile_visibility_in_unified_scan(tmp_path, monkeypat
         "@app.get('/internal/service')\ndef svc(authorization: str):\n    return verify_oidc_token(authorization)\n",
         encoding="utf-8",
     )
-    har_file = tmp_path / "session.har"
+    har_file = repo / "session.har"
     har_file.write_text(
         json.dumps({
             "log": {

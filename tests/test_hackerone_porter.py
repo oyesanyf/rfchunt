@@ -345,7 +345,10 @@ def test_hackerone_roe_three_tier_policy_parser_and_safe_harbor() -> None:
         validate_source_repo_url("http://evil.local/org/repo")
 
 
-def test_hackerone_autonomous_runner_enforces_roe_redacts_phi_and_supports_dry_run(tmp_path: Path) -> None:
+def test_hackerone_autonomous_runner_enforces_roe_redacts_phi_and_supports_dry_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RFCHUNT_OFFLINE", "1")
     repo = tmp_path / "in_scope_repo"
     repo.mkdir()
     (repo / "billing.py").write_text(

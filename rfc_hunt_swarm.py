@@ -40,7 +40,7 @@ import operator
 import re
 import threading
 import time
-from typing import Annotated, Any, Dict, List, Optional, Sequence, Tuple, TypedDict
+from typing import Annotated, Any, Dict, List, Optional, Sequence, Tuple, TypedDict, Union
 
 END = "__end__"
 StateGraph = None  # Resolved lazily by _resolve_langgraph() to keep CLI startup fast
@@ -2781,6 +2781,36 @@ def cmd_aiscan(args):
         db.close()
 
 
+def _resolve_cli_workspace_root(args) -> Optional[Path]:
+    ws_raw = (
+        getattr(args, "workspace_root", None)
+        or getattr(args, "repo", None)
+        or getattr(args, "path", None)
+    )
+    if ws_raw is None:
+        return None
+    ws_str = os.fspath(ws_raw) if isinstance(ws_raw, os.PathLike) else str(ws_raw)
+    if not ws_str.strip():
+        return None
+    from engine.execution_policy import (
+        _is_drive_relative_or_colon_unsafe,
+        _is_unc_path,
+        _validate_canonical_path_syntax,
+    )
+
+    if ws_str != ws_str.strip() or any(ord(ch) < 32 or ord(ch) == 127 for ch in ws_str):
+        raise PermissionError("Unsafe CLI workspace_root rejected (whitespace or control characters).")
+    if _is_unc_path(ws_str) or _is_drive_relative_or_colon_unsafe(ws_str):
+        raise PermissionError("Unsafe CLI workspace_root rejected (UNC, NT-device, or drive-relative/ADS path).")
+    err = _validate_canonical_path_syntax(ws_str, allow_trailing_slash=True)
+    if err is not None and ws_str != ".":
+        raise PermissionError(f"Unsafe CLI workspace_root rejected: {err}")
+    resolved = Path(ws_str).resolve(strict=False)
+    if resolved.exists() and resolved.is_file():
+        return resolved.parent
+    return resolved
+
+
 def cmd_artex(args):
     """Execute BaaRai/ARTEX Dual-Graph & Durable Attack Chaining Engine (Module 17)."""
     from datetime import datetime, timezone
@@ -2935,6 +2965,7 @@ def cmd_artex(args):
                 noise_governor=shared_noise,
                 auth_profiles=loaded_auth_profiles,
                 arbiter=arbiter,
+                workspace_root=_resolve_cli_workspace_root(args),
             )
             live_executor_fn = live_registry.as_executor_fn()
 
@@ -3535,6 +3566,76 @@ def _run_all_aixcc_extensions(
     )
     out_root = Path(str(reports_dir or "reports"))
 
+    explicit_fuzz = bool(getattr(args, "fuzz_bridge", False))
+    disable_fuzz = bool(getattr(args, "no_fuzz_bridge", False))
+    exec_fuzz_containers = (not bool(getattr(args, "fuzz_dry_run", False))) and (
+        str(approval_mode or "").strip().lower() != "deny"
+    )
+    eligible_fuzz = local_target_exists and not disable_fuzz and (explicit_fuzz or not in_offline_or_pytest)
+
+    explicit_dpm = bool(getattr(args, "docker_parser_matrix", False))
+    disable_dpm = bool(getattr(args, "no_docker_parser_matrix", False))
+    eligible_dpm = (not disable_dpm) and (explicit_dpm or (bool(host) and not in_offline_or_pytest))
+
+    explicit_inv = bool(getattr(args, "sandbox_invariants", False))
+    disable_inv = bool(getattr(args, "no_sandbox_invariants", False))
+    eligible_inv = local_target_exists and not disable_inv and (explicit_inv or not in_offline_or_pytest)
+
+    explicit_poe = bool(getattr(args, "poe_verify", False))
+    disable_poe = bool(getattr(args, "no_poe_verify", False))
+    eligible_poe = (not disable_poe) and (explicit_poe or not in_offline_or_pytest)
+
+    # Single shared lightweight Docker daemon probe (<=1.0s) when running online with
+    # container-capable AIxCC extensions enabled, preventing 3-4 sequential 2.5s-3.0s
+    # Docker CLI timeouts on Windows hosts where Docker Desktop is stopped/absent.
+    shared_docker_ok: Optional[bool] = None
+    shared_docker_reason = ""
+    if not in_offline_or_pytest and (
+        (eligible_fuzz and exec_fuzz_containers) or eligible_dpm or eligible_inv or eligible_poe
+    ):
+        import shutil as _shutil
+        import subprocess as _subprocess
+        from engine.host_containment import silent_subprocess_run
+
+        _docker_bin = _shutil.which("docker")
+        if not _docker_bin:
+            shared_docker_ok = False
+            shared_docker_reason = "docker binary not found on PATH"
+        else:
+            try:
+                _docker_proc = silent_subprocess_run(
+                    [_docker_bin, "info", "--format", "{{.ServerVersion}}"],
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=1.0,
+                )
+                if _docker_proc.returncode == 0:
+                    shared_docker_ok = True
+                else:
+                    shared_docker_ok = False
+                    shared_docker_reason = (
+                        (_docker_proc.stderr or _docker_proc.stdout or f"exit code {_docker_proc.returncode}").strip()[:240]
+                    )
+            except _subprocess.TimeoutExpired:
+                shared_docker_ok = False
+                shared_docker_reason = "docker daemon probe timed out after 1.0s"
+            except OSError as _docker_exc:
+                shared_docker_ok = False
+                shared_docker_reason = str(_docker_exc)[:240]
+
+    def _unavailable_docker_runner(cmd: Sequence[str], **_kwargs: Any) -> Any:
+        import subprocess as _subprocess
+
+        return _subprocess.CompletedProcess(
+            args=list(cmd),
+            returncode=1,
+            stdout="",
+            stderr=shared_docker_reason or "docker daemon unavailable",
+        )
+
     # 1. Whole-Repo Multi-Language Call-Graph & Taint Slicer + Tiered Model Escalation (AIxCC #2)
     run_slicer = not bool(getattr(args, "no_call_graph_slice", False))
     if local_target_exists and run_slicer:
@@ -3610,29 +3711,55 @@ def _run_all_aixcc_extensions(
         engines["call_graph_slicer"] = {"status": "disabled"}
 
     # 2. Multi-Language LLM-Guided Coverage Fuzzing Bridge (AIxCC #3)
-    explicit_fuzz = bool(getattr(args, "fuzz_bridge", False))
-    disable_fuzz = bool(getattr(args, "no_fuzz_bridge", False))
     if local_target_exists and not disable_fuzz:
         if explicit_fuzz or not in_offline_or_pytest:
             try:
-                from engine.fuzz_bridge import run_fuzz_bridge_scan
+                from engine.fuzz_bridge import FuzzBridgeConfig, LLMFuzzBridge, run_fuzz_bridge_scan
 
-                exec_containers = (not bool(getattr(args, "fuzz_dry_run", False))) and (
-                    str(approval_mode or "").strip().lower() != "deny"
-                )
                 fuzz_langs = _parse_csv_list(getattr(args, "fuzz_languages", None))
                 fuzz_out = out_root / "fuzz_bridge"
-                fuzz_res = run_fuzz_bridge_scan(
-                    str(local_target),
-                    output_dir=str(fuzz_out),
-                    db=db,
-                    task_id=task_id,
-                    languages=fuzz_langs,
-                    timeout_sec=float(getattr(args, "fuzz_timeout", 60.0) or 60.0),
-                    max_total_time_sec=int(getattr(args, "fuzz_max_time", 30) or 30),
-                    cpp_backend=str(getattr(args, "fuzz_cpp_backend", "afl++") or "afl++"),
-                    execute_containers=exec_containers,
-                )
+                fuzz_timeout = float(getattr(args, "fuzz_timeout", 60.0) or 60.0)
+                fuzz_max_time = int(getattr(args, "fuzz_max_time", 30) or 30)
+                fuzz_cpp_backend = str(getattr(args, "fuzz_cpp_backend", "afl++") or "afl++")
+                if (
+                    shared_docker_ok is False
+                    and exec_fuzz_containers
+                    and getattr(run_fuzz_bridge_scan, "__module__", "") == "engine.fuzz_bridge"
+                    and getattr(LLMFuzzBridge, "__module__", "") == "engine.fuzz_bridge"
+                ):
+                    fuzz_cfg = FuzzBridgeConfig(
+                        timeout_sec=fuzz_timeout,
+                        max_total_time_sec=fuzz_max_time,
+                        cpp_backend=fuzz_cpp_backend,
+                        execute_containers=exec_fuzz_containers,
+                        docker_binary="",
+                    )
+                    fuzz_bridge = LLMFuzzBridge(
+                        db=db,
+                        config=fuzz_cfg,
+                        task_id=task_id,
+                        subprocess_runner=_unavailable_docker_runner,
+                    )
+                    fuzz_res = fuzz_bridge.run(
+                        str(local_target),
+                        output_dir=str(fuzz_out),
+                        task_id=task_id,
+                        languages=fuzz_langs,
+                        execute=exec_fuzz_containers,
+                    ).to_dict()
+                else:
+                    fuzz_res = run_fuzz_bridge_scan(
+                        str(local_target),
+                        output_dir=str(fuzz_out),
+                        db=db,
+                        task_id=task_id,
+                        languages=fuzz_langs,
+                        timeout_sec=fuzz_timeout,
+                        max_total_time_sec=fuzz_max_time,
+                        cpp_backend=fuzz_cpp_backend,
+                        execute_containers=exec_fuzz_containers,
+                        **({"docker_binary": ""} if shared_docker_ok is False else {}),
+                    )
                 engines["fuzz_bridge"] = fuzz_res
             except Exception as exc:
                 engines["fuzz_bridge"] = {"status": "error", "error": str(exc)}
@@ -3648,17 +3775,29 @@ def _run_all_aixcc_extensions(
         engines["fuzz_bridge"] = {"status": "disabled"}
 
     # 3. Real Differential Docker Parser Matrix (AIxCC #1a)
-    explicit_dpm = bool(getattr(args, "docker_parser_matrix", False))
-    disable_dpm = bool(getattr(args, "no_docker_parser_matrix", False))
     if not disable_dpm and (explicit_dpm or (bool(host) and not in_offline_or_pytest)):
         try:
-            from engine.differential_oracle import MultiImplementationDifferentialOracle
+            from engine.differential_oracle import DockerParserMatrix, MultiImplementationDifferentialOracle
 
             dpm_parsers = _parse_csv_list(getattr(args, "parsers", None))
             dpm_oracle = MultiImplementationDifferentialOracle()
+            dpm_matrix = (
+                DockerParserMatrix(
+                    parsers=dpm_parsers,
+                    docker_bin="",
+                    subprocess_runner=_unavailable_docker_runner,
+                )
+                if (
+                    shared_docker_ok is False
+                    and getattr(MultiImplementationDifferentialOracle, "__module__", "") == "engine.differential_oracle"
+                    and getattr(DockerParserMatrix, "__module__", "") == "engine.differential_oracle"
+                )
+                else None
+            )
             engines["docker_parser_matrix"] = dpm_oracle.run_docker_parser_matrix(
                 parsers=dpm_parsers,
                 fallback_to_4parsers=bool(getattr(args, "fallback_4parsers", False)),
+                **({"docker_matrix": dpm_matrix} if dpm_matrix is not None else {}),
             )
         except Exception as exc:
             engines["docker_parser_matrix"] = {"status": "error", "error": str(exc)}
@@ -3666,14 +3805,19 @@ def _run_all_aixcc_extensions(
         engines["docker_parser_matrix"] = {"status": "disabled"}
 
     # 4. Sandboxed Repo Invariant Runner (AIxCC #1b)
-    explicit_inv = bool(getattr(args, "sandbox_invariants", False))
-    disable_inv = bool(getattr(args, "no_sandbox_invariants", False))
     if local_target_exists and not disable_inv:
         if explicit_inv or not in_offline_or_pytest:
             try:
                 from engine.sandbox_invariant_runner import SandboxInvariantRunner
 
-                inv_runner = SandboxInvariantRunner()
+                inv_runner = (
+                    SandboxInvariantRunner(docker_bin="", subprocess_runner=_unavailable_docker_runner)
+                    if (
+                        shared_docker_ok is False
+                        and getattr(SandboxInvariantRunner, "__module__", "") == "engine.sandbox_invariant_runner"
+                    )
+                    else SandboxInvariantRunner()
+                )
                 inv_report = inv_runner.run(
                     str(local_target),
                     db=db,
@@ -3695,15 +3839,20 @@ def _run_all_aixcc_extensions(
         engines["sandbox_invariants"] = {"status": "disabled"}
 
     # 5. Containerized Non-Destructive POE==3 Verifier (AIxCC #5a)
-    explicit_poe = bool(getattr(args, "poe_verify", False))
-    disable_poe = bool(getattr(args, "no_poe_verify", False))
     if not disable_poe:
         if explicit_poe or not in_offline_or_pytest:
             try:
                 from engine.poe_container_verifier import ContainerPOEVerifier
 
                 all_findings = res.get("findings") if isinstance(res.get("findings"), list) else []
-                poe_verifier = ContainerPOEVerifier()
+                poe_verifier = (
+                    ContainerPOEVerifier(docker_bin="", subprocess_runner=_unavailable_docker_runner)
+                    if (
+                        shared_docker_ok is False
+                        and getattr(ContainerPOEVerifier, "__module__", "") == "engine.poe_container_verifier"
+                    )
+                    else ContainerPOEVerifier()
+                )
                 poe_batch = poe_verifier.verify_findings(
                     all_findings,
                     repo_path=str(local_target) if local_target_exists else None,
@@ -3916,6 +4065,232 @@ def cmd_preflight(args: Any, *, return_dict_only: bool = False) -> Dict[str, Any
     return result
 
 
+def _validate_cli_output_dir(
+    raw_out_dir: Any,
+    *,
+    explicit_ws_root: Optional[Path] = None,
+    inferred_ws_root: Optional[Path] = None,
+    label: str = "output_dir",
+) -> Path:
+    """
+    Validates CLI `--output-dir` against canonical syntax, sensitive host directories,
+    symlinks / NTFS junctions / reparse ancestors, and `workspace_root` confinement:
+    - When `--workspace-root` is explicitly set (`explicit_ws_root`), strictly confines output
+      inside `explicit_ws_root` (no `%TEMP%` fallthrough).
+    - Otherwise allows paths inside `inferred_ws_root`, strict `%TEMP%` subdirectories,
+      `.pytest_temp` (under pytest), or `ExecutionPolicy.ALLOWED_WRITE_SUBDIRS`.
+    """
+    import tempfile as _tempfile
+    from engine.execution_policy import (
+        ExecutionPolicy,
+        _is_drive_relative_or_colon_unsafe,
+        _is_unc_path,
+        _validate_canonical_path_syntax,
+    )
+    from engine.pe_magika_classifier import _reject_reparse_ancestors
+
+    raw_s = os.fspath(raw_out_dir) if isinstance(raw_out_dir, os.PathLike) else raw_out_dir
+    if not isinstance(raw_s, str) or not raw_s.strip():
+        raise ValueError(f"Unsafe {label} rejected: empty path")
+    if raw_s != raw_s.strip() or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_s):
+        raise PermissionError(f"Unsafe {label} rejected (whitespace or control characters).")
+    if _is_unc_path(raw_s) or _is_drive_relative_or_colon_unsafe(raw_s):
+        raise PermissionError(f"Unsafe {label} rejected (UNC, NT-device, or drive-relative/ADS path).")
+    syn_err = _validate_canonical_path_syntax(raw_s, allow_trailing_slash=True)
+    if syn_err is not None and raw_s != ".":
+        raise PermissionError(f"Unsafe {label} rejected: {syn_err}")
+
+    def _reject_sensitive(cand_raw: str, cand_res: Optional[str]) -> None:
+        sensitive_markers = (
+            "/.ssh",
+            "/.aws",
+            "/.gnupg",
+            "/.kube",
+            "/etc/passwd",
+            "/etc/shadow",
+            "/windows/system32",
+            "/windows/syswow64",
+            "/windows/temp",
+        )
+        cands: List[str] = [cand_raw]
+        if cand_raw.startswith("~"):
+            try:
+                exp = os.path.expanduser(cand_raw)
+                cands.extend([exp, str(Path(exp).resolve(strict=False))])
+            except Exception:
+                pass
+        if cand_res:
+            cands.append(cand_res)
+        for c in cands:
+            c_low = c.replace("\\", "/").lower().rstrip("/") or "/"
+            if (
+                any(
+                    c_low == m or c_low.startswith(m + "/") or c_low.endswith(m) or (m + "/" in c_low)
+                    for m in sensitive_markers
+                )
+                or re.match(r"^[a-z]:/windows(?:/|$)", c_low)
+                or re.match(r"^[a-z]:/(?:system32|syswow64)(?:/|$)", c_low)
+            ):
+                raise PermissionError(f"Unsafe {label} rejected: sensitive host path '{raw_out_dir}' is forbidden.")
+
+    _reject_sensitive(raw_s, None)
+
+    pol = ExecutionPolicy.get_instance()
+    if explicit_ws_root is not None:
+        ok_ws, detail_ws = pol.validate_file_path(
+            raw_s,
+            workspace_root=explicit_ws_root,
+            allow_directory=True,
+            allow_nonexistent=True,
+        )
+        if not ok_ws:
+            raise PermissionError(
+                f"Unsafe {label} rejected outside --workspace-root '{explicit_ws_root}': {detail_ws}"
+            )
+        _reject_sensitive(raw_s, detail_ws)
+        return Path(detail_ws)
+
+    if inferred_ws_root is not None:
+        ok_inf, detail_inf = pol.validate_file_path(
+            raw_s,
+            workspace_root=inferred_ws_root,
+            allow_directory=True,
+            allow_nonexistent=True,
+        )
+        if ok_inf:
+            _reject_sensitive(raw_s, detail_inf)
+            return Path(detail_inf)
+
+    _reject_reparse_ancestors(raw_s, label=label)
+    resolved_out = Path(raw_s).resolve(strict=False)
+    _reject_sensitive(raw_s, str(resolved_out))
+
+    out_cmp = Path(os.path.normcase(str(resolved_out)))
+    temp_root = Path(os.path.normcase(str(Path(_tempfile.gettempdir()).resolve(strict=False))))
+    if out_cmp != temp_root and out_cmp.is_relative_to(temp_root):
+        return resolved_out
+
+    rfchunt_root = Path(__file__).resolve().parent
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        pt_root = Path(os.path.normcase(str((rfchunt_root.parent / ".pytest_temp").resolve(strict=False))))
+        if out_cmp != pt_root and out_cmp.is_relative_to(pt_root):
+            return resolved_out
+
+    for allowed_sub in ExecutionPolicy.ALLOWED_WRITE_SUBDIRS:
+        allowed_dir = Path(os.path.normcase(str((rfchunt_root / allowed_sub).resolve(strict=False))))
+        if out_cmp == allowed_dir or out_cmp.is_relative_to(allowed_dir):
+            return resolved_out
+
+    raise PermissionError(
+        f"Unsafe {label} rejected outside workspace_root and designated report/temp directories: '{raw_out_dir}'"
+    )
+
+
+def cmd_pe_audit(args: Any) -> Dict[str, Any]:
+    """
+    Standalone PE & .NET Code Integrity Anomaly Auditor (`pe-audit` / `--pe-audit`):
+    runs Magika hybrid PE classification, CVE-2026-108398, UMCI/SEC_COMMIT flat memory
+    fallback heuristics, defensive YARA rules, and optional KB5127694 / VirtualBox 7.2.18+
+    host patch auditing with strict workspace_root confinement.
+    """
+    from engine.execution_policy import ExecutionPolicy, _validate_canonical_path_syntax
+    from engine.pe_magika_classifier import audit_pe_dotnet_target
+
+    as_json = bool(getattr(args, "as_json", False))
+    if getattr(args, "dry_run", False):
+        return cmd_dry_run_plan(args, active_mode="pe-audit", raw_argv=[])
+
+    target_path = (
+        getattr(args, "path", None)
+        or getattr(args, "repo", None)
+        or getattr(args, "target_arg", None)
+        or "."
+    )
+    explicit_ws_arg = getattr(args, "workspace_root", None)
+    explicit_ws_root: Optional[Path] = None
+    try:
+        ws_root = _resolve_cli_workspace_root(args)
+        if explicit_ws_arg is not None and str(explicit_ws_arg).strip():
+            explicit_ws_root = ws_root
+        pol = ExecutionPolicy.get_instance()
+        if ws_root is not None:
+            ok_tp, detail_tp = pol.validate_file_path(
+                target_path,
+                workspace_root=ws_root,
+                allow_directory=True,
+                allow_nonexistent=True,
+            )
+            if not ok_tp:
+                raise PermissionError(f"Unsafe target_path rejected outside workspace_root: {detail_tp}")
+            resolved_target = detail_tp
+        else:
+            err = _validate_canonical_path_syntax(str(target_path), allow_trailing_slash=True)
+            if err is not None and str(target_path) != ".":
+                raise PermissionError(f"Unsafe target_path rejected: {err}")
+            resolved_target = str(Path(str(target_path)).resolve(strict=False))
+
+        out_dir_raw = getattr(args, "output_dir", None)
+        validated_out_dir: Optional[Path] = None
+        if out_dir_raw:
+            validated_out_dir = _validate_cli_output_dir(
+                out_dir_raw,
+                explicit_ws_root=explicit_ws_root,
+                inferred_ws_root=ws_root,
+                label="PE/.NET audit output_dir",
+            )
+    except (PermissionError, ValueError) as exc:
+        print(f"[!] PE/.NET audit path error: {exc}", file=(sys.stderr if as_json else sys.stdout))
+        sys.exit(1)
+
+    raw_host_audit = getattr(args, "pe_include_host_audit", None)
+    include_host = True if raw_host_audit is None else bool(raw_host_audit)
+    include_yara = bool(getattr(args, "pe_include_yara", True))
+
+    try:
+        result = audit_pe_dotnet_target(
+            resolved_target,
+            include_host_audit=include_host,
+            include_yara=include_yara,
+            workspace_root=ws_root,
+        )
+    except (PermissionError, ValueError) as exc:
+        print(f"[!] PE/.NET audit path error: {exc}", file=(sys.stderr if as_json else sys.stdout))
+        sys.exit(1)
+
+    if validated_out_dir is not None:
+        try:
+            validated_out_dir.mkdir(parents=True, exist_ok=True)
+            report_file = validated_out_dir / "pe_dotnet_audit.json"
+            with open(report_file, "w", encoding="utf-8") as fh:
+                import json as _json
+                _json.dump(result, fh, indent=2)
+            result["report_path"] = str(report_file)
+        except (PermissionError, ValueError, OSError) as exc:
+            print(f"[!] PE/.NET audit output_dir error: {exc}", file=(sys.stderr if as_json else sys.stdout))
+            sys.exit(1)
+
+    if as_json:
+        from engine.cli_render import render_json
+        render_json(result)
+        return result
+
+    print("\n" + "=" * 78)
+    print("  RFCHUNT PE & .NET CODE INTEGRITY ANOMALY AUDITOR (--pe-audit)")
+    print("=" * 78)
+    print(f"  Status              : {result.get('status')}")
+    print(f"  Target Path         : {result.get('target_path')}")
+    print(f"  Files Scanned       : {result.get('files_scanned', 0)} (PE={result.get('pe_files_found', 0)}, .NET={result.get('dotnet_assemblies_found', 0)})")
+    print(f"  CVE-2026-108398     : {result.get('cve_2026_108398_count', 0)}")
+    print(f"  UMCI/SEC_COMMIT     : {result.get('umci_fallback_risk_count', 0)}")
+    print(f"  Masqueraded Files   : {result.get('masqueraded_files_count', 0)}")
+    print(f"  YARA Matches        : {result.get('yara_matches_count', 0)}")
+    print(f"  Total Findings      : {result.get('total_findings', 0)} {result.get('severity_counts', {})}")
+    if result.get("report_path"):
+        print(f"  Report JSON         : {result.get('report_path')}")
+    print("=" * 78 + "\n")
+    return result
+
+
 def cmd_dry_run_plan(
     args: Any,
     *,
@@ -3932,6 +4307,10 @@ def cmd_dry_run_plan(
     host = getattr(args, "host", None) or getattr(args, "target", None)
     targets = getattr(args, "targets", None) or []
     repo = getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "raptor_target", None)
+    if not repo and getattr(args, "target_arg", None):
+        _ta = str(args.target_arg)
+        if not _ta.lower().startswith(("http://", "https://")):
+            repo = _ta
     auth_checks: List[Dict[str, Any]] = []
     for cand_h in ([host] if host else []) + list(targets):
         if cand_h:
@@ -3958,8 +4337,17 @@ def cmd_dry_run_plan(
                 "Module-19-PromptSmuggling",
             ]
         )
+        if not getattr(args, "no_pe_audit", False):
+            planned_modules.append("Module-PE-DotNet-Auditor(UMCI/SEC_COMMIT/YARA/HostPatch)")
     elif getattr(args, "preflight_only", False) or active_mode == "preflight":
         planned_modules.append("Module-23-PreflightDiscovery(14-Categories+PQC+HackerOne+SafeSkills)")
+    if getattr(args, "ensemble", False):
+        planned_modules.append("EnsembleWhiteboardOrchestrator(Planner-Worker-Verifier+Lean4)")
+    if (
+        getattr(args, "enable_pe_audit", False)
+        or active_mode in ("pe-audit", "pe_audit", "pe-dotnet", "pe_dotnet")
+    ) and "Module-PE-DotNet-Auditor(UMCI/SEC_COMMIT/YARA/HostPatch)" not in planned_modules:
+        planned_modules.append("Module-PE-DotNet-Auditor(UMCI/SEC_COMMIT/YARA/HostPatch)")
     if getattr(args, "enable_phi", False) or active_mode == "phi":
         planned_modules.append("Module-22-PhiScanner(Presidio+GLiNER+RedactX-v3)")
     if getattr(args, "deep_audit", False) or active_mode in ("deep-audit", "deep_audit") or getattr(args, "proxy_target", None):
@@ -4029,6 +4417,10 @@ def cmd_dry_run_plan(
         },
         "planned_modules": planned_modules,
         "enabled_flags": enabled_flags,
+        "ensemble": bool(getattr(args, "ensemble", False)),
+        "program": str(getattr(args, "program", "generic") or "generic"),
+        "freshness_hours": int(getattr(args, "freshness_hours", 72) or 72),
+        "quorum": int(getattr(args, "quorum", 2) or 2),
         "sub_plans": sub_plans,
         "side_effects": {
             "network_packets_sent": 0,
@@ -4058,6 +4450,11 @@ def cmd_dry_run_plan(
     else:
         print("  LLM Backend         : Local Ollama (zero-cost local inference)")
     print(f"  Planned Modules     : {', '.join(planned_modules)}")
+    if plan.get("ensemble"):
+        print(
+            f"  Ensemble Whiteboard : enabled (program={plan['program']}, "
+            f"freshness={plan['freshness_hours']}h, quorum={plan['quorum']})"
+        )
     print(f"  Request Hygiene     : headers={plan['request_hygiene']['custom_headers']} | max_rps={plan['request_hygiene']['max_rps']}")
     if auth_checks:
         for ac in auth_checks:
@@ -4888,6 +5285,99 @@ def cmd_fuzz_bridge(args):
     )
 
 
+def _validate_export_sarif_path(
+    export_sarif_arg: Any,
+    *,
+    reports_dir: Union[str, Path],
+    workspace_root: Optional[Path] = None,
+) -> Path:
+    """
+    Validates `--export-sarif` (both relative and absolute paths) against canonical path syntax,
+    reparse/junction/symlink escapes, sensitive host paths, and confinement within `reports_dir`
+    or `workspace_root`.
+    """
+    from engine.execution_policy import (
+        ExecutionPolicy,
+        _is_drive_relative_or_colon_unsafe,
+        _is_unc_path,
+        _validate_canonical_path_syntax,
+    )
+
+    raw_s = os.fspath(export_sarif_arg) if isinstance(export_sarif_arg, os.PathLike) else export_sarif_arg
+    if not isinstance(raw_s, str) or not raw_s.strip():
+        raise ValueError("--export-sarif path must be a non-empty string.")
+    if raw_s != raw_s.strip() or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_s):
+        raise PermissionError("Unsafe --export-sarif path rejected (whitespace or control characters).")
+    if _is_unc_path(raw_s) or _is_drive_relative_or_colon_unsafe(raw_s):
+        raise PermissionError("Unsafe --export-sarif path rejected (UNC, NT-device, or drive-relative/ADS path).")
+    syn_err = _validate_canonical_path_syntax(raw_s, allow_trailing_slash=False)
+    if syn_err is not None:
+        raise PermissionError(f"Unsafe --export-sarif path rejected: {syn_err}")
+
+    candidates: List[str] = [raw_s]
+    if raw_s.startswith("~"):
+        try:
+            exp = os.path.expanduser(raw_s)
+            candidates.extend([exp, str(Path(exp).resolve(strict=False))])
+        except Exception:
+            pass
+    sensitive_markers = (
+        "/.ssh",
+        "/.aws",
+        "/.gnupg",
+        "/.kube",
+        "/etc/passwd",
+        "/etc/shadow",
+        "/windows/system32",
+        "/windows/syswow64",
+        "/windows/temp",
+    )
+    for cand in candidates:
+        cand_low = cand.replace("\\", "/").lower().rstrip("/") or "/"
+        if any(
+            cand_low == m or cand_low.startswith(m + "/") or cand_low.endswith(m) or (m + "/" in cand_low)
+            for m in sensitive_markers
+        ) or re.match(r"^[a-z]:/windows(?:/|$)", cand_low) or re.match(r"^[a-z]:/(?:system32|syswow64)(?:/|$)", cand_low):
+            raise PermissionError(f"Unsafe --export-sarif path rejected: sensitive host path '{export_sarif_arg}' is forbidden.")
+
+    out_dir_resolved = Path(str(reports_dir)).resolve(strict=False)
+    pol = ExecutionPolicy.get_instance()
+    sarif_req = Path(raw_s)
+    if not sarif_req.is_absolute():
+        ok_out, detail_out = pol.validate_file_path(
+            raw_s,
+            workspace_root=out_dir_resolved,
+            allow_directory=False,
+            allow_nonexistent=True,
+        )
+        if not ok_out:
+            raise PermissionError(f"--export-sarif path escapes output directory: {export_sarif_arg} ({detail_out})")
+        return Path(detail_out)
+
+    ok_out, detail_out = pol.validate_file_path(
+        raw_s,
+        workspace_root=out_dir_resolved,
+        allow_directory=False,
+        allow_nonexistent=True,
+    )
+    if ok_out:
+        return Path(detail_out)
+
+    if workspace_root is not None:
+        ok_ws, detail_ws = pol.validate_file_path(
+            raw_s,
+            workspace_root=workspace_root,
+            allow_directory=False,
+            allow_nonexistent=True,
+        )
+        if ok_ws:
+            return Path(detail_ws)
+
+    raise PermissionError(
+        f"--export-sarif absolute path escapes --output-dir and --workspace-root: {export_sarif_arg}"
+    )
+
+
 def cmd_all(args):
     """
     Unified --all orchestrator running Google Mantis, haasonsaas/aiscan, BaaRai/ARTEX Dual-Graph,
@@ -4943,6 +5433,24 @@ def cmd_all(args):
         if not ok:
             print(f"[!] Target authorization error for {host}: {reason}", file=(sys.stderr if as_json else sys.stdout))
             sys.exit(1)
+
+    try:
+        cli_ws_root = _resolve_cli_workspace_root(args)
+        export_sarif_arg = getattr(args, "export_sarif", None)
+        if export_sarif_arg:
+            pre_out_dir = (
+                (cli_ws_root / str(reports_dir))
+                if (cli_ws_root is not None and not Path(str(reports_dir)).is_absolute())
+                else Path(str(reports_dir))
+            )
+            _validate_export_sarif_path(
+                export_sarif_arg,
+                reports_dir=pre_out_dir,
+                workspace_root=cli_ws_root,
+            )
+    except (PermissionError, ValueError) as exc:
+        print(f"[!] Invalid workspace_root/repo/path: {exc}", file=(sys.stderr if as_json else sys.stdout))
+        sys.exit(1)
 
     all_task_id = str(getattr(args, "task_id", None) or "default").strip() or "default"
     if getattr(args, "hint", None) is not None:
@@ -5101,6 +5609,13 @@ def cmd_all(args):
             ),
             "preflight_include_home_skills": not bool(getattr(args, "no_home_skills", False)),
             "preflight_timeout": float(getattr(args, "preflight_timeout", 15.0) or 15.0),
+            "enable_pe_audit": not bool(getattr(args, "no_pe_audit", False)),
+            "pe_include_host_audit": bool(getattr(args, "pe_include_host_audit", False)),
+            "pe_include_yara": bool(getattr(args, "pe_include_yara", True)),
+            "workspace_root": str(cli_ws_root) if cli_ws_root is not None else None,
+            "confine_reports_to_workspace_root": bool(
+                getattr(args, "workspace_root", None) is not None and str(getattr(args, "workspace_root", "")).strip()
+            ),
         }
         try:
             _unified_sig = inspect.signature(run_unified_all_scans)
@@ -5113,6 +5628,14 @@ def cmd_all(args):
         except (TypeError, ValueError):
             unified_kwargs.update(_extra_unified)
 
+        _prev_cmd_all_auto_pull = os.environ.get("RFCHUNT_AUTO_PULL_MODELS")
+        _cmd_all_no_pull = (
+            (not include_models_val)
+            or (not bool(getattr(args, "auto_install", True)))
+            or (os.environ.get("RFCHUNT_AUTO_INSTALL_TOOLS") == "0")
+        )
+        if _cmd_all_no_pull:
+            os.environ["RFCHUNT_AUTO_PULL_MODELS"] = "0"
         try:
             _stdout_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
             with _stdout_ctx:
@@ -5134,24 +5657,40 @@ def cmd_all(args):
         except (PermissionError, ValueError) as exc:
             print(f"[!] Target authorization or scanner configuration error for {host or targets or repo or path}: {exc}", file=(sys.stderr if as_json else sys.stdout))
             sys.exit(1)
-
-        export_sarif_arg = getattr(args, "export_sarif", None)
-        if export_sarif_arg:
-            import shutil as _shutil
-            src_sarif = (res.get("report_files") or {}).get("combined_sarif")
-            if src_sarif and os.path.isfile(str(src_sarif)):
-                sarif_req = Path(str(export_sarif_arg))
-                out_dir_resolved = Path(str(reports_dir)).resolve()
-                if sarif_req.is_absolute():
-                    dst_sarif = sarif_req
+        finally:
+            if _cmd_all_no_pull:
+                if _prev_cmd_all_auto_pull is None:
+                    os.environ.pop("RFCHUNT_AUTO_PULL_MODELS", None)
                 else:
-                    dst_sarif = (out_dir_resolved / sarif_req).resolve()
-                    if not dst_sarif.is_relative_to(out_dir_resolved):
-                        raise ValueError(f"--export-sarif path escapes output directory: {export_sarif_arg}")
-                dst_sarif.parent.mkdir(parents=True, exist_ok=True)
-                if Path(str(src_sarif)).resolve() != dst_sarif.resolve():
-                    _shutil.copyfile(str(src_sarif), str(dst_sarif))
-                res.setdefault("report_files", {})["exported_sarif"] = str(dst_sarif)
+                    os.environ["RFCHUNT_AUTO_PULL_MODELS"] = _prev_cmd_all_auto_pull
+
+        try:
+            export_sarif_arg = getattr(args, "export_sarif", None)
+            if export_sarif_arg:
+                import shutil as _shutil
+                src_sarif = (res.get("report_files") or {}).get("combined_sarif")
+                eff_out_dir = (
+                    Path(str(src_sarif)).resolve().parent
+                    if src_sarif and os.path.isfile(str(src_sarif))
+                    else (
+                        (cli_ws_root / str(reports_dir)).resolve(strict=False)
+                        if (cli_ws_root is not None and not Path(str(reports_dir)).is_absolute())
+                        else Path(str(reports_dir)).resolve(strict=False)
+                    )
+                )
+                dst_sarif = _validate_export_sarif_path(
+                    export_sarif_arg,
+                    reports_dir=eff_out_dir,
+                    workspace_root=cli_ws_root,
+                )
+                if src_sarif and os.path.isfile(str(src_sarif)):
+                    dst_sarif.parent.mkdir(parents=True, exist_ok=True)
+                    if Path(str(src_sarif)).resolve() != dst_sarif.resolve():
+                        _shutil.copyfile(str(src_sarif), str(dst_sarif))
+                    res.setdefault("report_files", {})["exported_sarif"] = str(dst_sarif)
+        except (PermissionError, ValueError) as exc:
+            print(f"[!] Target authorization or scanner configuration error for {host or targets or repo or path}: {exc}", file=(sys.stderr if as_json else sys.stdout))
+            sys.exit(1)
 
         if any(
             bool(getattr(args, flag, False))
@@ -5243,6 +5782,117 @@ def cmd_all(args):
             except Exception as poc_exc:
                 res.setdefault("engines", {})["poc_verification"] = {"status": "error", "error": str(poc_exc)}
 
+        if getattr(args, "ensemble", False):
+            from engine.ensemble_orchestrator import EnsembleOrchestrator
+            from revenue_cli import unified_findings_to_engine_findings
+
+            ensemble_target = str(repo or path or host or ".")
+            combined_json_str = str((res.get("report_files") or {}).get("combined_json") or "").strip()
+            if combined_json_str:
+                ens_out_dir = Path(combined_json_str).resolve(strict=False).parent
+            else:
+                ens_out_dir = Path(str(reports_dir)).resolve(strict=False)
+
+            ens_offline = (
+                os.environ.get("RFCHUNT_OFFLINE") == "1"
+                or bool(os.environ.get("CI"))
+                or bool(getattr(args, "embedded", False))
+                or (not bool(getattr(args, "preflight_live", True)))
+            )
+            ens_embedded = bool(getattr(args, "embedded", False))
+            no_models_offline = (not bool(getattr(args, "include_models", True))) and (
+                os.environ.get("RFCHUNT_OFFLINE") == "1" or bool(os.environ.get("CI"))
+            )
+            ens_llm_verify = (
+                (not bool(getattr(args, "no_llm", False)))
+                and (not ens_embedded)
+                and (not no_models_offline)
+            )
+            ens_model = getattr(args, "model", None)
+            if ens_model == "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M":
+                ens_model = None
+
+            orch = EnsembleOrchestrator(
+                program=str(getattr(args, "program", "generic") or "generic"),
+                freshness_hours=int(getattr(args, "freshness_hours", 72) or 72),
+                quorum=max(1, int(getattr(args, "quorum", 2) or 2)),
+                exhaustive_default=True,
+                embedded=ens_embedded,
+                model=ens_model,
+                enable_llm_verify=ens_llm_verify,
+                gha_only=bool(getattr(args, "gha_only", False)),
+                no_external_scanners=bool(getattr(args, "no_external_scanners", False)),
+                proxy=getattr(args, "proxy_target", None),
+                db=db,
+            )
+
+            converted_findings = unified_findings_to_engine_findings(
+                res.get("findings") or [],
+                target_root=ensemble_target if (repo or path) else None,
+                exclude_speculative_and_preflight=False,
+            )
+            merged_findings = list(converted_findings)
+            ens_target_p = Path(ensemble_target)
+            is_local_target = bool(repo or path) and (
+                ens_target_p.is_dir()
+                or (ens_target_p.is_file() and ens_target_p.suffix.lower() in (".yml", ".yaml"))
+            )
+            all_scan_summary = {
+                "target_path": res.get("target_path"),
+                "mode": res.get("mode"),
+                "total_aggregated_findings": res.get("total_aggregated_findings", 0),
+                "primary_findings_count": res.get("primary_findings_count", 0),
+                "verified_exploits_count": res.get("verified_exploits_count", 0),
+                "deterministic_static_count": res.get("deterministic_static_count", 0),
+                "speculative_hypotheses_count": res.get("speculative_hypotheses_count", 0),
+                "chains_synthesized": res.get("chains_synthesized", 0),
+                "severity_counts": res.get("severity_counts") or {},
+            }
+
+            _ens_stdout_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+            with _ens_stdout_ctx:
+                if is_local_target:
+                    local_findings, local_tele = EnsembleOrchestrator.run_exhaustive_local_engines(
+                        ens_target_p,
+                        refresh_stix=(not ens_offline),
+                        embedded=ens_embedded,
+                        model=ens_model,
+                        enable_llm_verify=ens_llm_verify,
+                        gha_only=bool(getattr(args, "gha_only", False)) or (ens_target_p.is_file() and ens_target_p.suffix.lower() in (".yml", ".yaml")),
+                        no_external_scanners=bool(getattr(args, "no_external_scanners", False)),
+                        lean_dir=orch.lean_dir,
+                    )
+                    orch.last_telemetry = local_tele
+                    merged_findings.extend(local_findings)
+
+                ens_rep = orch.run(
+                    ensemble_target,
+                    findings=merged_findings,
+                    all_scan_summary=all_scan_summary,
+                    out_dir=ens_out_dir,
+                    package_client_name=getattr(args, "package_client", None),
+                    refresh_stix=(not ens_offline),
+                )
+
+            ens_dict = ens_rep.to_dict()
+            res["ensemble"] = ens_dict
+            res["toolchain_status"] = ens_dict.get("toolchain_status", {})
+            res["lean_verification"] = ens_dict.get("lean_verification", {})
+            res.setdefault("engines", {})["ensemble"] = {
+                "total_clusters": len(ens_rep.clusters),
+                "counts_by_disposition": dict(ens_rep.counts_by_disposition),
+                "whiteboard": ens_dict.get("whiteboard", {}),
+                "lean_verification": res["lean_verification"],
+                "toolchain_status": res["toolchain_status"],
+                "telemetry": orch.last_telemetry,
+            }
+            rf = res.setdefault("report_files", {})
+            rf["ensemble_json"] = str(ens_out_dir / "ensemble_report.json")
+            rf["ensemble_md"] = str(ens_out_dir / "ensemble_summary.md")
+            rf["ensemble_sarif"] = str(ens_out_dir / "ensemble_findings.sarif")
+            if combined_json_str and Path(combined_json_str).parent.exists():
+                Path(combined_json_str).write_text(json.dumps(res, indent=2), encoding="utf-8")
+
         if hasattr(db, "add_fact"):
             try:
                 total_agg = int(res.get("total_aggregated_findings", 0) or 0)
@@ -5306,6 +5956,13 @@ def cmd_all(args):
         print(f"    Module 18 aiscan    : {eng.get('aiscan', {}).get('total_findings', 0)}")
         print(f"    Module 15 RAPTOR    : {eng.get('raptor', {}).get('total_findings', 0)} ({eng.get('raptor', {}).get('mode', 'static')})")
         print(f"    Module 21 REA       : {eng.get('rea_surface', {}).get('total_findings', 0)} ({eng.get('rea_surface', {}).get('status', 'disabled')}, routes={eng.get('rea_surface', {}).get('total_endpoints', 0)})")
+        if "pe_dotnet_auditor" in eng:
+            pe_eng = eng.get("pe_dotnet_auditor") or {}
+            print(
+                f"    PE/.NET Auditor     : {pe_eng.get('total_findings', 0)} findings "
+                f"(status={pe_eng.get('status', 'disabled')}, files={pe_eng.get('files_scanned', 0)}, "
+                f"CVE-2026-108398={pe_eng.get('cve_2026_108398_count', 0)}, UMCI={pe_eng.get('umci_fallback_risk_count', 0)})"
+            )
         print(
             f"    Module 17 ARTEX     : {chaining.get('chains_synthesized', 0)} chains synthesized "
             f"(Verified: {chaining.get('exploits_verified', 0)}, Max Hops: {chaining.get('max_hop_count', 0)}, "
@@ -5378,6 +6035,14 @@ def cmd_all(args):
                 f"    Deep Repo Audit     : {da_info.get('status', 'completed')} "
                 f"(trust_files={tb_i.get('files_reviewed', 0)}, tb_findings={tb_i.get('findings_count', 0)}, "
                 f"proxy={lp_i.get('status', 'disabled')}, fuzz_targets={len(cf_i.get('targets_scanned') or [])})"
+            )
+        if "ensemble" in eng:
+            ens_info = eng.get("ensemble") or {}
+            wb_info = ens_info.get("whiteboard") or {}
+            print(
+                f"    Ensemble Whiteboard : {ens_info.get('total_clusters', 0)} clusters "
+                f"(hyps={wb_info.get('total_hypotheses', len(wb_info.get('hypotheses') or []))}, "
+                f"lean={res.get('lean_verification', {}).get('status', 'unknown')})"
             )
         print(f"    Combined SARIF      : {res['report_files'].get('combined_sarif')}")
         if res["report_files"].get("exported_sarif"):
@@ -5982,6 +6647,7 @@ def cmd_retest(args):
                     use_tls=bool(use_tls),
                     authorized=authorized,
                     traffic_session=session,
+                    workspace_root=_resolve_cli_workspace_root(args),
                 )
 
                 def _live_fallback_verifier(chain_obj, _reg=reg):
@@ -6140,6 +6806,7 @@ def cmd_rea(args):
     from engine.approval_gate import ApprovalGate
     from engine.cli_render import render_json, render_kv_panel, render_table
     from engine.dual_graph_engine import NoiseGovernor
+    from engine.execution_policy import ExecutionPolicy, _validate_canonical_path_syntax
     from engine.rea_integrator import ReaIntegrator
     from engine.safe_network_validator import (
         is_explicit_loopback_host,
@@ -6150,10 +6817,33 @@ def cmd_rea(args):
     as_json = bool(getattr(args, "as_json", False))
     plain = bool(getattr(args, "plain", False))
     err_stream = sys.stderr if as_json else sys.stdout
-    target_path = getattr(args, "rea_target", None) or getattr(args, "path", None) or getattr(args, "repo", None)
+    rea_target_arg = getattr(args, "rea_target", None)
+    primary_ws = getattr(args, "workspace_root", None) or getattr(args, "repo", None) or getattr(args, "path", None)
+    rea_ws = (
+        str(Path(primary_ws).parent)
+        if (primary_ws and Path(primary_ws).exists() and Path(primary_ws).is_file())
+        else primary_ws
+    )
+    target_path = rea_target_arg or primary_ws
     raw_host = getattr(args, "host", None)
     if not target_path and not raw_host:
         target_path = "."
+    if target_path is not None:
+        raw_tp = str(target_path)
+        tp_err = _validate_canonical_path_syntax(raw_tp, allow_trailing_slash=True)
+        if tp_err is not None and raw_tp != ".":
+            print(f"[!] REA target_path rejected: {tp_err} ('{raw_tp}')", file=err_stream)
+            sys.exit(1)
+    if rea_target_arg and rea_ws:
+        ok_rea, detail_rea = ExecutionPolicy.get_instance().validate_file_path(
+            rea_target_arg,
+            workspace_root=rea_ws,
+            allow_directory=True,
+        )
+        if not ok_rea:
+            print(f"[!] REA target_path outside workspace_root: {detail_rea}", file=err_stream)
+            sys.exit(1)
+        target_path = detail_rea
 
     clean_host = None
     resolved_port = None
@@ -6202,6 +6892,7 @@ def cmd_rea(args):
             reports_dir=reports_dir,
             approval_gate=gate,
             noise_governor=noise_gov,
+            workspace_root=rea_ws,
         )
         _stdout_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
         with _stdout_ctx:
@@ -6213,6 +6904,7 @@ def cmd_rea(args):
                 authorized=bool(authorized or (clean_host and is_explicit_loopback_host(clean_host))),
                 use_rea_cli=bool(getattr(args, "rea_cli", False)),
                 write_reports=True,
+                workspace_root=rea_ws,
             )
             payload = result.to_dict()
     except (PermissionError, ValueError) as exc:
@@ -6938,6 +7630,7 @@ ALL_MODES = [
     "deep-audit", "deep_audit",
     "novelty", "novelty-refresh", "novelty_refresh", "swarm-board", "swarm_board", "board",
     "phi", "preflight", "hackerone", "hackone",
+    "pe-audit", "pe_audit", "pe-dotnet", "pe_dotnet",
 ]
 
 
@@ -7624,6 +8317,24 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     # Module 25: Web LLM Defensive Security Auditor (--web-llm)
     parser.add_argument("--web-llm", dest="enable_web_llm", action="store_true", default=False, help="Run Module 25 static Web LLM security auditor (excessive agency, tool-arg taint, insecure output handling, prompt-only authz, RAG scrubbing)")
 
+    # PE & .NET Code Integrity Anomaly Auditor (--pe-audit / --pe-dotnet)
+    parser.add_argument("--workspace-root", dest="workspace_root", type=str, default=None, help="Explicit workspace root directory for strict file_path/target_path confinement")
+    parser.add_argument("--pe-audit", "--pe-dotnet", dest="enable_pe_audit", action="store_true", default=False, help="Run PE & .NET Code Integrity Anomaly Auditor (Magika hybrid PE, CVE-2026-108398, UMCI/SEC_COMMIT fallback, YARA, KB5127694/VirtualBox host patch audit)")
+    parser.add_argument("--no-pe-audit", "--no-pe-dotnet", dest="no_pe_audit", action="store_true", default=False, help="Disable PE & .NET Code Integrity Anomaly Auditor during --all")
+    parser.add_argument("--pe-include-host-audit", dest="pe_include_host_audit", action="store_true", default=None, help="Include Windows KB5127694 & VirtualBox 7.2.18+ host patch audit during --all / --pe-audit")
+    parser.add_argument("--pe-no-host-audit", dest="pe_include_host_audit", action="store_false", help="Disable host patch-level audit during --pe-audit")
+    parser.add_argument("--pe-no-yara", dest="pe_include_yara", action="store_false", default=True, help="Disable defensive YARA rule evaluation during PE & .NET auditing")
+
+    # Planner-Worker-Verifier Whiteboard & Lean 4 Ensemble Orchestration (--ensemble / --essemble)
+    parser.add_argument("--ensemble", "--essemble", dest="ensemble", action="store_true", default=False, help="Enable Planner-Worker-Verifier shared-whiteboard + Lean 4 formal ensemble orchestration in --all")
+    parser.add_argument("--program", dest="program", type=str, default="generic", help="Vendor threat-model profile for --ensemble (generic, shopify, anthropic, arc-bbp, cloudflare, coinbase)")
+    parser.add_argument("--freshness-hours", dest="freshness_hours", type=int, default=72, help="Git commit freshness lookback window in hours for --ensemble (default: 72)")
+    parser.add_argument("--quorum", dest="quorum", type=int, default=2, help="Minimum independent engine quorum for static corroboration in --ensemble (default: 2)")
+    parser.add_argument("--embedded", "--embeded", dest="embedded", action="store_true", default=False, help="Run --ensemble strictly in-process offline without spawning external scanner subprocesses")
+    parser.add_argument("--no-llm", dest="no_llm", action="store_true", default=False, help="Disable optional LLM semantic verification layer in --ensemble")
+    parser.add_argument("--gha-only", dest="gha_only", action="store_true", default=False, help="Restrict --ensemble local engine fan-out to GitHub Actions workflow scanners")
+    parser.add_argument("--package-client", dest="package_client", type=str, default=None, help="Optional client organization name to emit 5-file ClientAuditPackager bundle in --ensemble")
+
     return parser
 
 
@@ -7855,6 +8566,98 @@ RELATED FLAGS:
     print(help_text)
 
 
+def _normalize_all_positional_target(
+    argv_list: List[str],
+    parser: argparse.ArgumentParser,
+) -> Tuple[List[str], Optional[str]]:
+    """
+    Normalizes `["--all", "<target>", ...]` (e.g. from `bugbounty_mcp_server.build_rfchunt_all_argv`)
+    using `parser._option_string_actions` so `<target>` is mapped to `--host` or `--repo`
+    instead of failing `command` (`choices=ALL_MODES`) with `SystemExit(2)`.
+    """
+    opt_actions = getattr(parser, "_option_string_actions", {})
+    has_all_flag = False
+    has_explicit_target_opt = False
+
+    def _consume_option_count(tok: str, idx: int, tokens: List[str]) -> int:
+        if "=" in tok:
+            return 0
+        act = opt_actions.get(tok)
+        if act is None:
+            return 0
+        nargs = getattr(act, "nargs", None)
+        if nargs is None:
+            return 1 if idx + 1 < len(tokens) else 0
+        if isinstance(nargs, int):
+            return min(nargs, max(0, len(tokens) - idx - 1))
+        if nargs == "?":
+            if idx + 1 < len(tokens) and not tokens[idx + 1].startswith("-"):
+                return 1
+            return 0
+        if nargs in ("*", "+"):
+            cnt = 0
+            while idx + 1 + cnt < len(tokens) and not tokens[idx + 1 + cnt].startswith("-"):
+                cnt += 1
+            return cnt
+        return 0
+
+    i = 0
+    while i < len(argv_list):
+        tok = argv_list[i]
+        if tok == "--":
+            break
+        if tok.startswith("-"):
+            opt_key = tok.split("=", 1)[0]
+            if opt_key in ("--all", "--run-all", "--all-scans"):
+                has_all_flag = True
+            elif opt_key == "--mode":
+                if "=" in tok:
+                    if tok.split("=", 1)[1] in ("all", "all_scans"):
+                        has_all_flag = True
+                elif i + 1 < len(argv_list) and argv_list[i + 1] in ("all", "all_scans"):
+                    has_all_flag = True
+            if opt_key in ("--repo", "--raptor-target", "--folder", "--dir", "--path", "--host", "--target"):
+                has_explicit_target_opt = True
+            i += 1 + _consume_option_count(tok, i, argv_list)
+        else:
+            if tok in ("all", "all_scans"):
+                has_all_flag = True
+            i += 1
+
+    if not has_all_flag:
+        return list(argv_list), None
+
+    out: List[str] = []
+    promoted_target: Optional[str] = None
+    pos_idx = 0
+    i = 0
+    while i < len(argv_list):
+        tok = argv_list[i]
+        if tok == "--":
+            out.extend(argv_list[i:])
+            break
+        if tok.startswith("-"):
+            consume = _consume_option_count(tok, i, argv_list)
+            out.extend(argv_list[i : i + 1 + consume])
+            i += 1 + consume
+            continue
+        if pos_idx == 0 and tok not in ALL_MODES:
+            promoted_target = tok
+            if not has_explicit_target_opt:
+                if tok.lower().startswith(("http://", "https://")):
+                    out.extend(["--host", tok])
+                else:
+                    out.extend(["--repo", tok])
+                has_explicit_target_opt = True
+            pos_idx += 1
+            i += 1
+            continue
+        pos_idx += 1
+        out.append(tok)
+        i += 1
+    return out, promoted_target
+
+
 def parse_swarm_arguments(argv=None):
     """Parses arguments using build_swarm_parser."""
     raw_args = sys.argv[1:] if argv is None else list(argv)
@@ -7874,9 +8677,19 @@ def parse_swarm_arguments(argv=None):
 
     parser = build_swarm_parser()
     norm_args = _normalize_harness2_argv(raw_args)
+    norm_args, promoted_target = _normalize_all_positional_target(norm_args, parser)
     args = parser.parse_args(norm_args)
     if not hasattr(args, "_explicit_cli_dests"):
         args._explicit_cli_dests = set()
+    if promoted_target is not None and not getattr(args, "target_arg", None):
+        args.target_arg = promoted_target
+    if getattr(args, "command", None) in ("all", "all_scans") and getattr(args, "target_arg", None):
+        _t_pos = str(args.target_arg)
+        if _t_pos.lower().startswith(("http://", "https://")) and "host" not in args._explicit_cli_dests:
+            args.host = _t_pos
+            args._explicit_cli_dests.add("host")
+        elif not getattr(args, "repo", None) and not getattr(args, "path", None):
+            args.repo = _t_pos
     if isinstance(args.targets, str):
         args.targets = [t.strip() for t in args.targets.split(",") if t.strip()]
     if isinstance(args.terminators, str):
@@ -7922,7 +8735,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "harness2_report", "mantis_report", "aiscan_report", "install_tools", "tool_status",
             "deep_audit", "proxy_target", "live_proxy_fuzz", "trust_boundary_review",
             "coverage_fuzz", "enable_poc", "enable_phi", "enable_hackerone", "hackerone_auto",
-            "serve_ui", "network_lifecycle", "dry_run",
+            "serve_ui", "network_lifecycle", "dry_run", "enable_pe_audit",
         )
     ) and getattr(args, "hint", None) is None and not getattr(args, "dispatch", None):
         build_swarm_parser().print_help()
@@ -7969,6 +8782,38 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         active_mode = "setup"
     elif active_mode in ("hackone",):
         active_mode = "hackerone"
+
+    # Validate numeric CLI bounds BEFORE --dry-run early return so invalid flags exit rc=1
+    _as_json_cli = bool(getattr(args, "as_json", False))
+    for _turn_attr in ("artex_intent_turns", "artex_intent_tokens", "artex_budget_turns"):
+        _tval = getattr(args, _turn_attr, 0)
+        if isinstance(_tval, bool) or (_tval is not None and int(_tval) < 0):
+            print(
+                "[!] ARTEX budget/turn parameters must be non-negative (>= 0).",
+                file=(sys.stderr if _as_json_cli else sys.stdout),
+            )
+            sys.exit(1)
+    _rounds_val = getattr(args, "artex_rounds", None)
+    if _rounds_val is not None and int(_rounds_val) < 1:
+        print(
+            "[!] --artex-rounds must be >= 1.",
+            file=(sys.stderr if _as_json_cli else sys.stdout),
+        )
+        sys.exit(1)
+    _workers_val = getattr(args, "artex_workers", None)
+    if _workers_val is not None and int(_workers_val) < 1:
+        print(
+            "[!] --artex-workers must be >= 1.",
+            file=(sys.stderr if _as_json_cli else sys.stdout),
+        )
+        sys.exit(1)
+    _max_rps_val = getattr(args, "max_rps", None)
+    if _max_rps_val is not None and float(_max_rps_val) < 0.0:
+        print(
+            "[!] --max-rps must be non-negative (>= 0).",
+            file=(sys.stderr if _as_json_cli else sys.stdout),
+        )
+        sys.exit(1)
 
     # Universal --dry-run guard: works across EVERY flag and subcommand with zero side effects
     if getattr(args, "dry_run", False):
@@ -8124,7 +8969,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "enable_rea_only", "install_tools", "tool_status",
             "raptor_status", "raptor_findings", "raptor_setup",
             "harness2_report", "mantis_report", "aiscan_report",
-            "preflight_only",
+            "preflight_only", "enable_pe_audit",
         )
     )
     if active_mode == "hint" or (
@@ -8268,6 +9113,13 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             print(f"[+] Module 25 (Web LLM Security Auditor): scanned {rep.files_scanned} file(s), found {len(rep.findings)} issue(s).")
             for f in rep.findings[:25]:
                 print(f"  [{f.severity}] {f.rule_id} ({f.owasp_llm}) {f.file_path}:{f.line} — {f.title}")
+        return
+
+    if (
+        active_mode in ("pe-audit", "pe_audit", "pe-dotnet", "pe_dotnet")
+        or (bool(getattr(args, "enable_pe_audit", False)) and not getattr(args, "run_all_scans", False))
+    ):
+        _dispatch_cmd("cmd_pe_audit", args, check_main_shim=False)
         return
 
     if active_mode in ("scanner", "artex-loop", "proxy", "retest", "chains", "traces", "coverage", "export-advisory", "archive", "rea"):
@@ -9049,5 +9901,24 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
 
 
 if __name__ == "__main__":
+    _cli_argv = sys.argv[1:]
+    _has_embedded = any(t in ("--embedded", "--embeded") for t in _cli_argv)
+    _has_all_flag = (
+        any(t in ("--all", "--run-all", "--all-scans", "all", "all_scans") for t in _cli_argv)
+        or any(t in ("--mode=all", "--mode=all_scans") for t in _cli_argv)
+        or any(
+            _cli_argv[idx] == "--mode"
+            and idx + 1 < len(_cli_argv)
+            and _cli_argv[idx + 1] in ("all", "all_scans")
+            for idx in range(len(_cli_argv))
+        )
+    )
+    from revenue_cli import REVENUE_SUBCOMMANDS, maybe_dispatch_revenue_cli
+
+    _is_rev_subcmd = bool(_cli_argv) and (_cli_argv[0] in REVENUE_SUBCOMMANDS)
+    if _is_rev_subcmd or _has_embedded or not _has_all_flag:
+        _rev_rc = maybe_dispatch_revenue_cli(_cli_argv)
+        if _rev_rc is not None:
+            raise SystemExit(_rev_rc)
     main_swarm()
 

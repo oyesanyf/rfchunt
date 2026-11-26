@@ -26,10 +26,11 @@ def test_sanitize_for_llm_prompt_symmetric_nonce_and_breakout_defense():
         "```python\nprint(1)\n```"
     )
     out = sanitize_for_llm_prompt(hostile, max_chars=2000)
-    m_open = re.search(r'<untrusted_remote_response_data nonce="([0-9a-f]{16})">', out)
-    m_close = re.search(r'</untrusted_remote_response_data nonce="([0-9a-f]{16})">', out)
+    m_open = re.search(r'<untrusted_data nonce="([0-9a-f]{24})">', out)
+    m_close = re.search(r'</untrusted_data>', out)
     assert m_open is not None and m_close is not None
-    assert m_open.group(1) == m_close.group(1)
+    assert out.startswith(f'<untrusted_data nonce="{m_open.group(1)}">')
+    assert out.rstrip().endswith("</untrusted_data>")
     assert "\u202e" not in out
     assert "\U000e0041" not in out
     assert "\u200b" not in out
@@ -48,8 +49,8 @@ def test_untrusted_output_boundary_escapes_inner_markers_and_invisible_unicode()
     assert "\u202e" not in framed
     assert "\U000e0020" not in framed
     assert "[FENCE_ESCAPED]" in framed
-    assert framed.startswith(f"<<<ARTEX_UNTRUSTED_DATA source=http_body nonce={b.nonce}>>>")
-    assert framed.endswith(f"<<<END_ARTEX_UNTRUSTED_DATA nonce={b.nonce}>>>")
+    assert framed.startswith(f'<untrusted_data nonce="{b.nonce}">\n[source: http_body]\n')
+    assert framed.rstrip().endswith("</untrusted_data>")
 
 
 def test_audit_skill_content_safety_catches_multiline_and_fake_turn():

@@ -531,10 +531,8 @@ class ModelFusionAdapter:
             if resp.status_code == 200:
                 data = resp.json()
                 msg = data.get("message") if isinstance(data, dict) else None
-                if isinstance(msg, dict) and msg.get("content") is not None:
-                    raw_text = str(msg.get("content") or "").strip()
-                else:
-                    raw_text = str((data.get("response") if isinstance(data, dict) else "") or "").strip()
+                msg_content = str(msg.get("content") or "").strip() if isinstance(msg, dict) else ""
+                raw_text = msg_content or str((data.get("response") if isinstance(data, dict) else "") or "").strip()
                 if self._is_refusal(raw_text):
                     return []
                 items = self._parse_json_array(raw_text, unwrap_lists=(schema_hint is None))

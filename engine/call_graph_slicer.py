@@ -381,10 +381,10 @@ class TaintSlice:
             f"Sink: {self.sink_call} at {self.sink_file}:L{self.sink_line}",
             f"Files ({len(self.files_involved)}): {', '.join(self.files_involved)}",
         ]
-        total_budget = max(600, int(max_chars))
+        total_budget = max(80, int(max_chars))
         wrapper_overhead = 96
-        inner_budget = max(200, total_budget - wrapper_overhead)
-        per_step_budget = max(160, (inner_budget - sum(len(x) + 1 for x in lines)) // max(1, len(self.steps)))
+        inner_budget = max(16, total_budget - wrapper_overhead)
+        per_step_budget = max(40, (inner_budget - sum(len(x) + 1 for x in lines)) // max(1, len(self.steps)))
 
         for step in self.steps:
             header = (
@@ -398,27 +398,42 @@ class TaintSlice:
             header += " ---"
             snippet = step.snippet.strip()
             if len(snippet) > per_step_budget:
-                snippet = snippet[: max(80, per_step_budget - 18)].rstrip() + "\n... [truncated]"
+                trunc_step = "\n... [truncated]"
+                if per_step_budget > len(trunc_step) + 16:
+                    snippet = snippet[: per_step_budget - len(trunc_step)].rstrip() + trunc_step
+                else:
+                    snippet = snippet[:per_step_budget].rstrip()
             lines.append(header)
             lines.append(snippet)
 
         rendered = "\n".join(lines)
         if len(rendered) > inner_budget:
-            rendered = rendered[: max(120, inner_budget - 16)].rstrip() + "\n... [truncated]"
+            trunc_rendered = "\n... [truncated]"
+            if inner_budget > len(trunc_rendered) + 16:
+                rendered = rendered[: inner_budget - len(trunc_rendered)].rstrip() + trunc_rendered
+            else:
+                rendered = rendered[:inner_budget].rstrip()
         fenced = sanitize_for_llm_prompt(rendered, max_chars=inner_budget, source="taint_slice")
         if len(fenced) > total_budget:
-            # Guard against expansion from neutralized injection tokens exceeding total_budget
-            m_open = re.match(r'^(<untrusted_data nonce="[^"]+">\n)', fenced)
+            # Guard against expansion from neutralized injection tokens or wrapper overhead exceeding total_budget
+            if total_budget >= 96:
+                m_open = re.match(r'^(<untrusted_data nonce="[^"]+">\n(?:\[source: [^\]]+\]\n)?)', fenced)
+            else:
+                m_open = re.match(r'^(<untrusted_data nonce="[^"]+">\n)', fenced)
             closing = "\n</untrusted_data>"
             if m_open and fenced.endswith(closing):
                 open_tag = m_open.group(1)
                 body = fenced[len(open_tag) : -len(closing)]
-                max_body = max(100, total_budget - len(open_tag) - len(closing))
+                max_body = max(0, total_budget - len(open_tag) - len(closing))
                 if len(body) > max_body:
                     trunc_marker = "\n... [truncated]"
-                    body = body[: max(40, max_body - len(trunc_marker))].rstrip()
-                    body = re.sub(r"(?i)<\s*/?\s*untrusted_data(?:\b[^>]*)?>?$", "", body).rstrip()
-                    body = f"{body}{trunc_marker}"
+                    if max_body > len(trunc_marker) + 8:
+                        body = body[: max_body - len(trunc_marker)].rstrip()
+                        body = re.sub(r"(?i)<\s*/?\s*untrusted_data(?:\b[^>]*)?>?$", "", body).rstrip()
+                        body = f"{body}{trunc_marker}"
+                    else:
+                        body = body[:max_body].rstrip()
+                        body = re.sub(r"(?i)<\s*/?\s*untrusted_data(?:\b[^>]*)?>?$", "", body).rstrip()
                 fenced = f"{open_tag}{body}{closing}"
         return fenced
 

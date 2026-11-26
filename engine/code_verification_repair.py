@@ -39,8 +39,8 @@ import ast
 import concurrent.futures
 import importlib.util
 import json
+import math
 import os
-import platform
 import re
 import subprocess
 import sys
@@ -51,6 +51,12 @@ import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+_WIN_CREATE_NO_WINDOW: int = (
+    getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    if (sys.platform == "win32" or os.name == "nt")
+    else 0
+)
 
 EVOLVE_START_MARKER = "# EVOLVE-BLOCK-START"
 EVOLVE_END_MARKER = "# EVOLVE-BLOCK-END"
@@ -441,7 +447,7 @@ def run_static_code_linters(source_code: str) -> Dict[str, Any]:
 
     if importlib.util.find_spec("ruff") is not None:
         engines_used.append("ruff")
-        creationflags = 0x08000000 if platform.system() == "Windows" else 0
+        creationflags = _WIN_CREATE_NO_WINDOW
         with tempfile.TemporaryDirectory(prefix="rfchunt_lint_") as tmpdir:
             tmp_py = Path(tmpdir) / "generated_module.py"
             tmp_py.write_text(source_code, encoding="utf-8")
@@ -566,7 +572,7 @@ def run_mypy_type_checker(
     if importlib.util.find_spec("mypy") is None:
         return _builtin_ast_strict_type_check(source_code)
 
-    creationflags = 0x08000000 if platform.system() == "Windows" else 0
+    creationflags = _WIN_CREATE_NO_WINDOW
     with tempfile.TemporaryDirectory(prefix="rfchunt_mypy_") as tmpdir:
         tmp_root = Path(tmpdir)
         src_file = tmp_root / "generated_module.py"
@@ -674,7 +680,7 @@ def run_generated_code_pytest(
         }
 
     slug = re.sub(r"[^A-Za-z0-9_]+", "_", arxiv_id or "custom")
-    creationflags = 0x08000000 if platform.system() == "Windows" else 0
+    creationflags = _WIN_CREATE_NO_WINDOW
     env = dict(os.environ)
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
 
@@ -918,7 +924,7 @@ def run_property_based_fuzzing_and_benchmark(
     benchmark verification inside an isolated child Python process (never using
     in-process dynamic execution).
     """
-    creationflags = 0x08000000 if platform.system() == "Windows" else 0
+    creationflags = _WIN_CREATE_NO_WINDOW
     with tempfile.TemporaryDirectory(prefix="rfchunt_fuzz_") as tmpdir:
         tmp_root = Path(tmpdir)
         cand_file = tmp_root / "candidate_module.py"
@@ -1392,38 +1398,90 @@ def verify_python_code_native(
                     llm_audit.update(parsed)
 
     det_score = float(det["deterministic_score"])
+    if det_hard_fail:
+        det_verdict = "FAIL"
+    elif det_score >= 85.0 and det["zero_mock_single_token_indicators"]:
+        det_verdict = "PASS"
+    elif det_score >= 60.0:
+        det_verdict = "WARN"
+    else:
+        det_verdict = "FAIL"
+
     combined_findings = list(det["static_findings"])
+    advisory_recommendations: List[str] = []
     if llm_verified:
-        combined_findings.extend(llm_audit.get("findings") or [])
+        raw_llm_findings = llm_audit.get("findings") or []
+        if isinstance(raw_llm_findings, list):
+            combined_findings.extend(f for f in raw_llm_findings if isinstance(f, dict))
         llm_avg = (
-            float(llm_audit["paper_fidelity_score"])
-            + float(llm_audit["correctness_score"])
-            + float(llm_audit["security_score"])
+            _safe_score(llm_audit.get("paper_fidelity_score"), 80.0)
+            + _safe_score(llm_audit.get("correctness_score"), 80.0)
+            + _safe_score(llm_audit.get("security_score"), 80.0)
         ) / 3.0
-        overall = round((0.45 * det_score) + (0.55 * llm_avg), 2)
+        blended = round((0.45 * det_score) + (0.55 * llm_avg), 2)
+        llm_verdict = str(llm_audit.get("verdict") or "").strip().upper()
         if det_hard_fail:
             verdict = "FAIL"
-            overall = min(overall, 45.0)
-        elif llm_audit["verdict"] == "FAIL" or overall < 55.0:
-            verdict = "FAIL"
-        elif llm_audit["verdict"] == "WARN" or overall < 75.0 or not det["zero_mock_single_token_indicators"]:
-            verdict = "WARN"
-        else:
+            overall = min(blended, 45.0)
+            if llm_verdict == "PASS":
+                llm_audit["override_blocked"] = True
+                advisory_recommendations.append(
+                    "Advisory LLM audit returned PASS, but Layer-1 deterministic checks hard-failed; deterministic FAIL preserved."
+                )
+        elif det_verdict == "PASS":
+            # Deterministic override immunity: passing Layer-1 checks cannot be vetoed or downgraded by LLM.
             verdict = "PASS"
+            overall = max(blended, det_score)
+            if llm_verdict != "PASS" or llm_avg < 75.0:
+                llm_audit["override_blocked"] = True
+                advisory_recommendations.append(
+                    f"Advisory LLM audit ({llm_verdict or 'UNKNOWN'}, avg={llm_avg:.1f}) dissented from passing Layer-1 deterministic checks; deterministic PASS preserved."
+                )
+        elif det_verdict == "FAIL":
+            # Deterministic FAIL cannot be upgraded to PASS/WARN by LLM.
+            verdict = "FAIL"
+            overall = min(blended, 54.0)
+            if llm_verdict != "FAIL":
+                llm_audit["override_blocked"] = True
+                advisory_recommendations.append(
+                    "Advisory LLM audit attempted to upgrade a failing Layer-1 deterministic build; deterministic FAIL preserved."
+                )
+        else:
+            # Deterministic WARN cannot be upgraded to PASS by an adversarial LLM returning 100/100/100.
+            overall = min(blended, 84.99)
+            if not det["zero_mock_single_token_indicators"]:
+                if llm_verdict == "FAIL" or overall < 55.0:
+                    verdict = "FAIL"
+                else:
+                    verdict = "WARN"
+                    if llm_verdict == "PASS" or blended >= 85.0:
+                        llm_audit["override_blocked"] = True
+                        advisory_recommendations.append(
+                            "Advisory LLM audit returned PASS, but anti-mock single-token indicator check warned; deterministic WARN preserved."
+                        )
+            elif llm_verdict == "FAIL" or overall < 55.0:
+                verdict = "FAIL"
+            else:
+                verdict = "WARN"
+                if llm_verdict == "PASS" or blended >= 85.0:
+                    llm_audit["override_blocked"] = True
+                    advisory_recommendations.append(
+                        f"Advisory LLM audit ({llm_verdict or 'UNKNOWN'}) attempted to upgrade a Layer-1 WARN build (det_score={det_score:.1f}); deterministic WARN preserved."
+                    )
         mode = "llm_and_deterministic_verified"
     else:
         overall = det_score
-        if det_hard_fail:
-            verdict = "FAIL"
-        elif overall >= 85.0 and det["zero_mock_single_token_indicators"]:
-            verdict = "PASS"
-        elif overall >= 60.0:
-            verdict = "WARN"
-        else:
-            verdict = "FAIL"
+        verdict = det_verdict
         mode = "deterministic_static_and_runtime_fallback"
 
-    recs = list(dict.fromkeys(f["recommendation"] for f in combined_findings if f.get("recommendation")))
+    recs = list(
+        dict.fromkeys(
+            [
+                *(f["recommendation"] for f in combined_findings if isinstance(f, dict) and f.get("recommendation")),
+                *advisory_recommendations,
+            ]
+        )
+    )
     return CodeVerificationResult(
         arxiv_id=arxiv_id,
         title=title,
@@ -1463,6 +1521,18 @@ def _build_native_verify_prompt(arxiv_id: str, title: str, source_code: str, det
     )
 
 
+def _safe_score(val: Any, default: float = 80.0) -> float:
+    if val is None or isinstance(val, bool):
+        return default
+    try:
+        num = float(val)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(num):
+        return default
+    return round(max(0.0, min(100.0, num)), 2)
+
+
 def _parse_json_judge_response(raw_text: str) -> Tuple[Optional[Dict[str, Any]], str]:
     cleaned = strip_think_tags(raw_text)
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE | re.MULTILINE)
@@ -1477,17 +1547,23 @@ def _parse_json_judge_response(raw_text: str) -> Tuple[Optional[Dict[str, Any]],
         return None, "llm_parse_fallback"
     if not isinstance(obj, dict) or not any(k in obj for k in ("verdict", "paper_fidelity_score", "correctness_score", "security_score")):
         return None, "llm_parse_fallback"
-    v = str(obj.get("verdict", "WARN")).upper()
+    v = str(obj.get("verdict") or "WARN").upper()
     if v not in ("PASS", "WARN", "FAIL"):
         v = "WARN"
+    raw_findings = obj.get("findings")
+    if isinstance(raw_findings, (list, tuple)):
+        clean_findings = [f for f in list(raw_findings)[:8] if isinstance(f, dict)]
+    else:
+        clean_findings = []
+    summary_raw = obj.get("summary")
     return (
         {
             "verdict": v,
-            "paper_fidelity_score": round(max(0.0, min(100.0, float(obj.get("paper_fidelity_score", 80.0)))), 2),
-            "correctness_score": round(max(0.0, min(100.0, float(obj.get("correctness_score", 80.0)))), 2),
-            "security_score": round(max(0.0, min(100.0, float(obj.get("security_score", 80.0)))), 2),
-            "summary": str(obj.get("summary", ""))[:400],
-            "findings": list(obj.get("findings") or [])[:8],
+            "paper_fidelity_score": _safe_score(obj.get("paper_fidelity_score"), 80.0),
+            "correctness_score": _safe_score(obj.get("correctness_score"), 80.0),
+            "security_score": _safe_score(obj.get("security_score"), 80.0),
+            "summary": ("" if summary_raw is None else str(summary_raw))[:400],
+            "findings": clean_findings,
         },
         "llm_verified",
     )
@@ -1533,10 +1609,8 @@ def _invoke_ollama_json_judge(
                 return None, f"ollama_http_{resp.status}"
             resp_data = json.loads(resp.read().decode("utf-8", errors="replace"))
             msg = resp_data.get("message") if isinstance(resp_data, dict) else None
-            if isinstance(msg, dict) and msg.get("content") is not None:
-                raw_text = str(msg.get("content") or "").strip()
-            else:
-                raw_text = str((resp_data.get("response") if isinstance(resp_data, dict) else "") or "").strip()
+            msg_content = str(msg.get("content") or "").strip() if isinstance(msg, dict) else ""
+            raw_text = msg_content or str((resp_data.get("response") if isinstance(resp_data, dict) else "") or "").strip()
             return _parse_json_judge_response(raw_text)
     except TimeoutError:
         return None, "ollama_timeout"
@@ -1606,10 +1680,14 @@ def build_defect_diagnostic_summary(report: CodeVerificationResult) -> Tuple[str
     if det.get("runtime_error"):
         defects.append(f"RUNTIME: {det['runtime_error']}")
     if report.llm_verified:
-        for f in (report.llm_audit.get("findings") or [])[:8]:
-            sev = str(f.get("severity", "INFO")).upper()
-            if sev in ("CRITICAL", "HIGH", "MEDIUM"):
-                defects.append(f"LLM [{sev} {f.get('category', 'general')}]: {f.get('message', '')}")
+        raw_llm_f = report.llm_audit.get("findings") or []
+        if isinstance(raw_llm_f, (list, tuple)):
+            for f in list(raw_llm_f)[:8]:
+                if not isinstance(f, dict):
+                    continue
+                sev = str(f.get("severity", "INFO")).upper()
+                if sev in ("CRITICAL", "HIGH", "MEDIUM"):
+                    defects.append(f"LLM [{sev} {f.get('category', 'general')}]: {f.get('message', '')}")
     return "\n".join(f"  {i + 1}. {d}" for i, d in enumerate(defects)), defects
 
 
@@ -1851,10 +1929,8 @@ def request_ollama_code_patch(
                 return None, f"ollama_http_{resp.status}"
             resp_data = json.loads(resp.read().decode("utf-8", errors="replace"))
             msg = resp_data.get("message") if isinstance(resp_data, dict) else None
-            if isinstance(msg, dict) and msg.get("content") is not None:
-                raw_text = str(msg.get("content") or "").strip()
-            else:
-                raw_text = str((resp_data.get("response") if isinstance(resp_data, dict) else "") or "").strip()
+            msg_content = str(msg.get("content") or "").strip() if isinstance(msg, dict) else ""
+            raw_text = msg_content or str((resp_data.get("response") if isinstance(resp_data, dict) else "") or "").strip()
             extracted = extract_python_code_from_response(raw_text)
             return (extracted, "ollama_patch_synthesized") if extracted else (None, "ollama_patch_invalid_python")
     except TimeoutError:
