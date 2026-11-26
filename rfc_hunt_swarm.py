@@ -7618,6 +7618,12 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--hackerone-min-severity", dest="hackerone_min_severity", choices=["low", "medium", "high", "critical"], default="medium", help="Minimum severity eligible for HackerOne porting (default: medium)")
     parser.add_argument("--hackerone-max-reports", dest="hackerone_max_reports", type=int, default=5, help="Maximum eligible drafts to generate per run (default: 5)")
 
+    # Module 24: Reverse-Proxy Config & HTTP Header Conformance Auditor (--crlf-desync / --crlf-conformance)
+    parser.add_argument("--crlf-desync", "--crlf-conformance", dest="enable_crlf_conformance", action="store_true", default=False, help="Run Module 24 static Nginx/OpenResty $uri config audit and safe 3-trial RFC 9112 header conformance checks")
+
+    # Module 25: Web LLM Defensive Security Auditor (--web-llm)
+    parser.add_argument("--web-llm", dest="enable_web_llm", action="store_true", default=False, help="Run Module 25 static Web LLM security auditor (excessive agency, tool-arg taint, insecure output handling, prompt-only authz, RAG scrubbing)")
+
     return parser
 
 
@@ -8229,6 +8235,39 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
 
     if active_mode in ("swarm-board", "swarm_board", "board"):
         _dispatch_cmd("cmd_swarm_board", args)
+        return
+
+    if bool(getattr(args, "enable_crlf_conformance", False)) and not getattr(args, "run_all_scans", False):
+        from engine.crlf_desync_engine import audit_nginx_configs, run_conformance_diagnostics
+        target_dir = getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "target_arg", None) or "."
+        rep = audit_nginx_configs(target_dir)
+        if has_host_flag and getattr(args, "host", None):
+            live_rep = run_conformance_diagnostics(
+                host=str(args.host),
+                port=int(getattr(args, "port", 80) or 80),
+                use_tls=bool(getattr(args, "tls", False)),
+            )
+            rep.findings.extend(live_rep.findings)
+        if bool(getattr(args, "as_json", False)):
+            from engine.cli_render import render_json
+            render_json(rep.to_dict())
+        else:
+            print(f"[+] Module 24 (CRLF/Header Conformance): scanned {rep.files_scanned} config(s), found {len(rep.findings)} issue(s).")
+            for f in rep.findings[:25]:
+                print(f"  [{f.severity}] {f.rule_id} {f.location}:{f.line} — {f.title}")
+        return
+
+    if bool(getattr(args, "enable_web_llm", False)) and not getattr(args, "run_all_scans", False):
+        from engine.web_llm_auditor import audit_web_llm_repository
+        target_dir = getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "target_arg", None) or "."
+        rep = audit_web_llm_repository(target_dir)
+        if bool(getattr(args, "as_json", False)):
+            from engine.cli_render import render_json
+            render_json(rep.to_dict())
+        else:
+            print(f"[+] Module 25 (Web LLM Security Auditor): scanned {rep.files_scanned} file(s), found {len(rep.findings)} issue(s).")
+            for f in rep.findings[:25]:
+                print(f"  [{f.severity}] {f.rule_id} ({f.owasp_llm}) {f.file_path}:{f.line} — {f.title}")
         return
 
     if active_mode in ("scanner", "artex-loop", "proxy", "retest", "chains", "traces", "coverage", "export-advisory", "archive", "rea"):

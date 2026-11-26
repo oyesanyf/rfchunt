@@ -269,9 +269,10 @@ def test_prompt_injection_sanitization():
     for raw in malicious_responses:
         sanitized = sanitize_for_llm_prompt(raw, max_chars=500)
 
-        # Must be wrapped in quarantine tags
-        assert "<untrusted_remote_response_data nonce=" in sanitized
-        assert "</untrusted_remote_response_data>" in sanitized
+        # Must be wrapped in randomized XML nonce quarantine tags
+        assert '<untrusted_data nonce="' in sanitized
+        assert "</untrusted_data>" in sanitized
+        assert "<untrusted_remote_response_data" not in sanitized
 
         # Must neutralize injection tokens
         assert "### SYSTEM" not in sanitized

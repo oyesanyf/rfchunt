@@ -62,9 +62,34 @@ def _start_loopback_ollama(
             raw = self.rfile.read(length).decode("utf-8", errors="replace")
             body = json.loads(raw) if raw else {}
             model_name = str(body.get("model", models[0] if models else "glm4:9b"))
-            prompt = str(body.get("prompt", ""))
-            reply = responder(model_name, prompt)
-            payload = json.dumps({"model": model_name, "response": reply, "done": True}).encode("utf-8")
+            if self.path == "/api/chat":
+                messages = body.get("messages")
+                if not isinstance(messages, list) or not any(
+                    isinstance(m, dict) and m.get("role") == "system" and m.get("content")
+                    for m in messages
+                ) or not any(
+                    isinstance(m, dict) and m.get("role") == "user" and m.get("content")
+                    for m in messages
+                ):
+                    err = json.dumps({"error": "missing system/user messages"}).encode("utf-8")
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(err)))
+                    self.end_headers()
+                    self.wfile.write(err)
+                    return
+                prompt = "\n".join(str(m.get("content", "")) for m in messages if isinstance(m, dict))
+                reply = responder(model_name, prompt)
+                resp_obj = {
+                    "model": model_name,
+                    "message": {"role": "assistant", "content": reply},
+                    "done": True,
+                }
+            else:
+                prompt = str(body.get("prompt", ""))
+                reply = responder(model_name, prompt)
+                resp_obj = {"model": model_name, "response": reply, "done": True}
+            payload = json.dumps(resp_obj).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))

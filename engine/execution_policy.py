@@ -1858,37 +1858,86 @@ class ExecutionPolicy:
         )
 
 
-def sanitize_for_llm_prompt(untrusted_text: Union[str, bytes], max_chars: int = 1000) -> str:
+def sanitize_for_llm_prompt(
+    untrusted_text: Union[str, bytes],
+    max_chars: int = 1000,
+    *,
+    nonce: Optional[str] = None,
+    source: Optional[str] = None,
+) -> str:
     """
-    Sanitizes untrusted remote HTTP response headers and bodies before feeding them into LLM contexts.
-    - Decodes bytes safely
-    - Strips non-printable ASCII control characters
-    - Neutralizes prompt injection directives and instruction tokens
-    - Defuses markdown code fence escapes
-    - Wraps data in strict quarantine tags with random nonce
+    Sanitizes untrusted remote HTTP response headers, bodies, and target snippets before feeding into LLM contexts.
+    - Decodes bytes safely and applies NFKC normalization
+    - Strips Unicode Tag blocks (U+E0000-U+E007F), BiDi overrides, zero-width chars, and ASCII control chars
+    - Neutralizes prompt injection directives, chat-template tokens, and PortSwigger fake turn/system delimiters
+    - Escapes any embedded quarantine fence tags (closed or unclosed) and markdown code fences
+    - Wraps data in randomized XML nonce tags (<untrusted_data nonce="...">...</untrusted_data>)
     """
+    import unicodedata
+
     if isinstance(untrusted_text, bytes):
         text = untrusted_text.decode("latin-1", errors="replace")
     else:
         text = str(untrusted_text or "")
 
-    # Truncate to maximum characters
-    text = text[:max_chars]
+    # Strip Unicode Tag smuggling (U+E0000..U+E007F), BiDi overrides, and zero-width characters
+    _FORBIDDEN_UNICODE = {
+        0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0xFEFF,
+        0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
+        0x2066, 0x2067, 0x2068, 0x2069,
+    }
+    text = "".join(
+        ch for ch in text
+        if not (0xE0000 <= ord(ch) <= 0xE007F or ord(ch) in _FORBIDDEN_UNICODE)
+    )
+
+    # NFKC normalize homoglyphs before truncation and pattern neutralization
+    text = unicodedata.normalize("NFKC", text)
+
+    # Truncate BEFORE escaping so escaping cannot be split across max_chars
+    limit = max(0, int(max_chars))
+    text = text[:limit]
 
     # Strip ASCII control characters except \r, \n, \t
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
 
-    # Neutralize LLM prompt injection tokens & role markers
+    # Escape any embedded quarantine fence breakout attempts (case-insensitive, closed or unclosed)
+    text = re.sub(r"(?i)<\s*/?\s*untrusted_data(?:\b[^>]*)?>?", "[FENCE_ESCAPED]", text)
+    text = re.sub(r"(?i)<\s*/?\s*untrusted_remote_response_data(?:\b[^>]*)?>?", "[FENCE_ESCAPED]", text)
+    text = re.sub(r"(?i)<<<\s*(?:END_)?ARTEX_UNTRUSTED_DATA[^>]*>>>?", "[FENCE_ESCAPED]", text)
+    text = re.sub(r"(?i)<<<\s*(?:END_)?RFCHUNT_FUZZ_CONTEXT[^>]*>>>?", "[FENCE_ESCAPED]", text)
+
+    # Neutralize LLM prompt injection tokens, chat-template markers & fake turn delimiters
     text = re.sub(r"(?i)###\s*(system|instruction|task|human|assistant|prompt)", "[REDACTED_MARKER]", text)
-    text = re.sub(r"(?i)<\|(im_start|im_end|endoftext|system|user|assistant)\|>", "[TOKEN_NEUTRALIZED]", text)
+    text = re.sub(
+        r"(?i)<\|(im_start|im_end|endoftext|eot_id|start_header_id|end_header_id|system|user|assistant)\|>",
+        "[TOKEN_NEUTRALIZED]",
+        text,
+    )
+    text = re.sub(r"(?i)</?(?:system|instructions|developer|start_of_turn|end_of_turn)>", "[TAG_NEUTRALIZED]", text)
+    text = re.sub(r"(?i)\[/?INST\]", "[TOKEN_NEUTRALIZED]", text)
+    text = re.sub(r"(?i)\*{2,3}\s*important\s+system\s+message[^*\n]*\*{0,3}", "[DIRECTIVE_NEUTRALIZED]", text)
+    text = re.sub(r"(?i)-{2,3}\s*(?:user|assistant|system)\s+response\s*-{0,3}", "[TURN_DELIMITER_NEUTRALIZED]", text)
     text = re.sub(r"(?i)(ignore\s+(all\s+)?previous\s+instructions|system\s+prompt\s*:)", "[PROMPT_OVERRIDE_DEFUSED]", text)
     text = re.sub(r"(?i)(admin_override|jailbreak|disregard\s+prior)", "[DIRECTIVE_NEUTRALIZED]", text)
 
     # Defuse markdown code fence injection
     text = text.replace("```", "` ` `")
 
-    nonce = secrets.token_hex(8)
-    return f'<untrusted_remote_response_data nonce="{nonce}">\n{text}\n</untrusted_remote_response_data>'
+    raw_nonce = re.sub(r"[^a-zA-Z0-9_-]", "", str(nonce)) if nonce is not None else ""
+    active_nonce = raw_nonce or secrets.token_hex(12)
+
+    if source is not None and str(source).strip():
+        safe_source = re.sub(r"[^a-zA-Z0-9_.:/-]", "_", str(source).strip())[:64].strip("_") or "untrusted"
+        body = f"[source: {safe_source}]\n{text}"
+    else:
+        body = text
+
+    return (
+        f'<untrusted_data nonce="{active_nonce}">\n'
+        f"{body}\n"
+        "</untrusted_data>"
+    )
 
 
 def validate_llm_json_response(data: Any, schema_type: str = "probe") -> Tuple[bool, Any, Optional[str]]:

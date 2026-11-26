@@ -499,16 +499,19 @@ class ModelFusionAdapter:
 
         expected_schema = schema_hint or '{"probes": [{"rationale": "...", "raw_request": "...", "is_clean": false}]}'
         full_prompt = (
-            f"### SYSTEM INSTRUCTION:\n{system_instruction}\n\n"
-            f"### TASK PROMPT:\n{user_prompt}\n\n"
+            f"{user_prompt}\n\n"
             f"CRITICAL: Output ONLY valid JSON matching schema: {expected_schema}."
         )
 
         is_r1 = "deepseek-r1" in target_model.lower()
         effective_predict = max(int(num_predict), 384) if is_r1 else int(num_predict)
+        messages: List[Dict[str, str]] = []
+        if system_instruction:
+            messages.append({"role": "system", "content": system_instruction})
+        messages.append({"role": "user", "content": full_prompt})
         payload: Dict[str, Any] = {
             "model": target_model,
-            "prompt": full_prompt,
+            "messages": messages,
             "stream": False,
             "keep_alive": "60m",
             "options": {
@@ -521,12 +524,17 @@ class ModelFusionAdapter:
 
         try:
             resp = self.client.post(
-                f"{self.endpoint}/api/generate",
+                f"{self.endpoint}/api/chat",
                 json=payload,
                 timeout=httpx.Timeout(self.timeout, connect=10.0),
             )
             if resp.status_code == 200:
-                raw_text = resp.json().get("response", "").strip()
+                data = resp.json()
+                msg = data.get("message") if isinstance(data, dict) else None
+                if isinstance(msg, dict) and msg.get("content") is not None:
+                    raw_text = str(msg.get("content") or "").strip()
+                else:
+                    raw_text = str((data.get("response") if isinstance(data, dict) else "") or "").strip()
                 if self._is_refusal(raw_text):
                     return []
                 items = self._parse_json_array(raw_text, unwrap_lists=(schema_hint is None))
