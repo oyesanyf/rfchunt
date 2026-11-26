@@ -129,6 +129,7 @@ def test_probe_optional_backends_all_unavailable_schema(
         "angr",
         "klee",
         "semgrep",
+        "rea",
     }
     assert set(res.keys()) == expected_keys
     for key in expected_keys:
@@ -165,7 +166,9 @@ def test_probe_optional_backends_available_tools_and_oracle(
     monkeypatch.setattr(
         lpr,
         "_safe_find_spec",
-        lambda mod: SimpleNamespace(origin=f"/site-packages/{mod}/__init__.py") if mod == "angr" else None,
+        lambda mod: SimpleNamespace(origin=f"/site-packages/{mod}/__init__.py")
+        if mod in ("angr", "engine.rea_integrator")
+        else None,
     )
     monkeypatch.setattr(
         lpr,
@@ -269,6 +272,7 @@ def test_probe_optional_backends_live_unmocked_bounded_latency():
         "angr",
         "klee",
         "semgrep",
+        "rea",
     }
 
 

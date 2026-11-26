@@ -157,6 +157,9 @@ def validate_mount_path(repo_path: Union[str, Path]) -> Tuple[bool, str]:
         return False, "Repository mount path is empty."
     if "\x00" in raw or raw.startswith("\\\\") or raw.startswith("//"):
         return False, f"Unsafe or UNC mount path rejected: {raw!r}"
+    raw_norm = raw.replace("\\", "/").lower()
+    if _WINDOWS_CRITICAL_RE.match(raw_norm):
+        return False, f"Critical Windows host directory cannot be mounted: {raw}"
     resolved = Path(raw).resolve()
     resolved_str = str(resolved)
     if resolved_str.startswith("\\\\") or resolved.as_posix().startswith("//"):
@@ -727,6 +730,7 @@ def probe_optional_backends(
     def _probe_rea() -> Dict[str, Any]:
         rea_spec = _safe_find_spec("engine.rea_integrator")
         rea_bin = shutil.which("rea-agents")
+        node_bin = shutil.which("node")
         repo_rea_mjs = (
             Path(__file__).resolve().parent.parent
             / "tools"
@@ -736,7 +740,7 @@ def probe_optional_backends(
             / "scripts"
             / "rea.mjs"
         )
-        cli_path = rea_bin or (str(repo_rea_mjs) if repo_rea_mjs.is_file() else None)
+        cli_path = rea_bin or (str(repo_rea_mjs) if (node_bin and repo_rea_mjs.is_file()) else None)
         if rea_spec is not None:
             detail = (
                 f"Module 21 REA offline analyzer loaded (CLI: {cli_path})."
