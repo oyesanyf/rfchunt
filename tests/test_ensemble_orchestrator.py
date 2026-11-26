@@ -146,6 +146,26 @@ def test_stage3_vendor_threat_model_gates_anthropic_macos_and_shopify() -> None:
     assert v_shop.passed is False
     assert "SHOPIFY_LOCAL_CLI_SELF_EXEC_OUT_OF_SCOPE" in v_shop.matched_rules
 
+    # 4. Anthropic intra-runner /tmp/ buffer hygiene without external credential exfil (#4239545)
+    v_tmp = evaluate_vendor_threat_model(
+        title="[hygiene_only] Predictable /tmp/inline-comments-buffer.jsonl on self-hosted runner",
+        summary="Same-job /tmp/ write and symlink race.",
+        file_path="src/entrypoints/post-buffered-inline-comments.ts",
+        program="anthropic",
+    )
+    assert v_tmp.passed is False
+    assert "ANTHROPIC_INTRA_RUNNER_HYGIENE_NON_BOUNDARY" in v_tmp.matched_rules
+
+    # 5. Vercel example/test code exclusion
+    v_vercel = evaluate_vendor_threat_model(
+        title="Unsanitized input in example app",
+        summary="Demo handler issue.",
+        file_path="examples/next-openai/app/api/chat/route.ts",
+        program="vercel",
+    )
+    assert v_vercel.passed is False
+    assert "VERCEL_NON_PRODUCTION_EXAMPLE_OR_TEST_CODE" in v_vercel.matched_rules
+
 
 def test_deterministic_override_immunity_and_artifact_export(tmp_path: Path) -> None:
     findings = [

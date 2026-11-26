@@ -422,6 +422,31 @@ def evaluate_vendor_threat_model(
                 "Anthropic threat model excludes cross-session access between processes sharing "
                 "the same srt-sandbox boundary; must cross sandbox -> host or bypass domain allowlist."
             )
+        # Intra-runner /tmp manipulation, symlink/FIFO races, env-var tampering in same job, or self-hosted runner persistence (#4239545)
+        if (
+            any(k in blob for k in ("/tmp/", "self-hosted runner", "tmp buffer", "symlink race", "fifo", "hygiene_only"))
+            and not any(k in blob for k in ("anthropic_api_key exfil", "cloud credential leak", "untrusted external rce", "github_token exfil"))
+        ):
+            matched_rules.append("ANTHROPIC_INTRA_RUNNER_HYGIENE_NON_BOUNDARY")
+            reasons.append(
+                "Anthropic threat model excludes intra-runner /tmp manipulation, symlink/FIFO races, "
+                "same-job env tampering, and non-ephemeral self-hosted runner persistence. Focus on "
+                "pre-execution trigger boundaries, unauthorized run starts, or external credential exfiltration."
+            )
+
+    elif prog == "vercel":
+        if any(k in blob for k in ("examples/", "/examples/", "test/", "__tests__/", "fixtures/", "hygiene_only")):
+            matched_rules.append("VERCEL_NON_PRODUCTION_EXAMPLE_OR_TEST_CODE")
+            reasons.append(
+                "Vercel OSS policy excludes findings solely in example, test, or fixture code."
+            )
+
+    elif prog == "cloudflare":
+        if any(k in blob for k in ("hygiene_only", "open redirect", "turnstile bypass", "subdomain takeover")):
+            matched_rules.append("CLOUDFLARE_OUT_OF_SCOPE_CLASS")
+            reasons.append(
+                "Cloudflare policy excludes hygiene-only issues, open redirects, Turnstile bypasses, and subdomain takeovers."
+            )
 
     elif prog == "shopify":
         # Local CLI self-execution where caller already controls local execution (#06 ucp-cli)

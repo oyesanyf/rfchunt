@@ -82,6 +82,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ens.add_argument("--program", default="generic", help="Vendor threat-model profile (shopify, anthropic, arc-bbp, cloudflare, coinbase, generic).")
     p_ens.add_argument("--freshness-hours", type=int, default=72, help="Freshness lookback window in hours (default: 72).")
     p_ens.add_argument("--quorum", type=int, default=2, help="Minimum independent engines for static corroboration.")
+    p_ens.add_argument("--proxy", default=None, help="Optional local/authorized proxy URL for traffic inspection.")
+    p_ens.add_argument("--ensemble", "--essemble", action="store_true", default=True, help="Enable exhaustive multi-engine ensemble fusion (default: enabled).")
     p_ens.add_argument("--out", default="out/ensemble_audit", help="Output directory for JSON/MD/SARIF.")
     p_ens.add_argument("--package-client", default=None, help="Optional client name to also emit 5-file ClientAuditPackager bundle.")
 

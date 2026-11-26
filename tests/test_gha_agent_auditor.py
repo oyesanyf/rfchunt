@@ -26,8 +26,16 @@ def test_detects_tmp_ipc_buffer_and_fail_open_bot_guard(tmp_path: Path) -> None:
         '}\n',
         encoding="utf-8",
     )
+    (src / "workflow.yml").write_text(
+        'jobs:\n  run:\n    steps:\n      - run: echo "${{ github.event.pull_request.title }}"\n',
+        encoding="utf-8",
+    )
 
     findings = audit_gha_agent_repository(tmp_path)
-    rule_ids = {f.rule_id for f in findings}
-    assert "GHA-AGENT-IPC-001" in rule_ids
-    assert "GHA-AGENT-BOT-002" in rule_ids
+    by_id = {f.rule_id: f for f in findings}
+    assert "GHA-TRIGGER-INJECT-001" in by_id
+    assert by_id["GHA-TRIGGER-INJECT-001"].hygiene_only is False
+    assert "GHA-AGENT-BOT-002" in by_id
+    assert by_id["GHA-AGENT-BOT-002"].hygiene_only is False
+    assert "GHA-AGENT-IPC-001" in by_id
+    assert by_id["GHA-AGENT-IPC-001"].hygiene_only is True
