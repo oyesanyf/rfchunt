@@ -222,6 +222,27 @@ cd rfchunt
 pip install -r requirements.txt
 ```
 
+### One-Command Antigravity IDE Integration (New / Second Computer)
+To replicate the full RFCHunt + Antigravity IDE setup on another Windows, macOS, or Linux workstation (zero Windows Registry and zero system `PATH` mutations):
+
+```bash
+git clone https://github.com/oyesanyf/rfchunt.git
+cd rfchunt
+python scripts/setup_antigravity_rfchunt_ide.py
+```
+
+This bootstrap script automatically:
+1. Installs Python dependencies from `requirements.txt` and `pytest` (pass `--skip-pip` to skip).
+2. Writes the global Antigravity threat-hunting & security-engineering rule to `~/.gemini/config/rules/bounty_threat_hunting_and_coding_protocol.md`.
+3. Updates `~/.gemini/config/local_models.json` with local Ollama security/abliterated models (including GLM-5.3 / GLM-4.7-Flash / GLM-4-9B abliterated variants) and Docker-based vLLM settings (`vllm/vllm-openai:latest` at `http://127.0.0.1:8000/v1`).
+4. Registers the `rfchunt-bugbounty` MCP server (`bugbounty_mcp_server.py`) in `~/.gemini/config/mcp_config.json` without overwriting existing servers.
+5. Seeds the local gitignored SQLite Program Eligibility Registry (`reports/ensemble_hunt/program_eligibility.sqlite3`).
+
+After running, restart Antigravity IDE and launch exhaustive scans using the default `--all --ensemble --proxy auto` pipeline:
+```bash
+python -u revenue_cli.py ensemble-audit --target <repo_path> --program <program> --all --ensemble --proxy auto --out reports/ensemble_hunt/out
+```
+
 ---
 
 ## Swarm Execution Modes & Workflows
