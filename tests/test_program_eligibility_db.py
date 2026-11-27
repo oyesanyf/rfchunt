@@ -21,8 +21,8 @@ def test_seed_baseline_and_fail_closed_eligibility(tmp_path: Path):
     base_time = datetime(2026, 11, 26, 16, 35, 0, tzinfo=timezone.utc)
     counts = db.seed_observed_hackerone_baseline(now=base_time)
 
-    assert counts["UNLOCKED"] == 5
-    assert counts["BLOCKED_SIGNAL"] >= 65
+    assert counts["UNLOCKED"] >= 9
+    assert counts["BLOCKED_SIGNAL"] >= 130
     assert counts["PAUSED"] == 2
     assert counts["NOT_FOUND"] == 7
 
@@ -30,6 +30,8 @@ def test_seed_baseline_and_fail_closed_eligibility(tmp_path: Path):
     assert db.is_eligible("amazonvrp") is True
     assert db.is_eligible("temu") is True
     assert db.is_eligible("common_codes") is True
+    assert db.is_eligible("henkel_vdp") is True
+    assert db.is_eligible("oppo_bbp") is True
 
     # Signal-blocked, paused, not-found, and unknown programs fail closed
     assert db.is_eligible("shopify") is False
