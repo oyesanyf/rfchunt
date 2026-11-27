@@ -2400,11 +2400,45 @@ class HackerOneComputerUsePorter:
                         try:
                             cu = page.evaluate(
                                 """async () => {
+                                    const csrf = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
+                                    try {
+                                        const gr = await fetch('/graphql', {
+                                            method: 'POST',
+                                            credentials: 'same-origin',
+                                            headers: {
+                                                'content-type': 'application/json',
+                                                ...(csrf ? {'x-csrf-token': csrf} : {}),
+                                            },
+                                            body: JSON.stringify({query: '{ me { id username signal impact reputation } }'}),
+                                        });
+                                        if (gr.ok) {
+                                            const gj = await gr.json();
+                                            const me = gj?.data?.me;
+                                            if (me && (me.username || me.id)) return me;
+                                        }
+                                    } catch (e) {}
+                                    try {
+                                        const br = await fetch('/bugs.json?subject=user&limit=1', {credentials: 'same-origin'});
+                                        if (br.ok) {
+                                            const bj = await br.json();
+                                            if (bj && typeof bj === 'object' && ('reports' in bj || 'count' in bj)) {
+                                                return {username: 'authenticated_hackerone_session'};
+                                            }
+                                        }
+                                    } catch (e) {}
                                     try {
                                         const r = await fetch('/current_user.json', {credentials: 'same-origin'});
-                                        if (!r.ok) return null;
-                                        return await r.json();
-                                    } catch (e) { return null; }
+                                        if (r.ok) {
+                                            const d = await r.json();
+                                            if (d && (d.username || d.id)) return d;
+                                        }
+                                    } catch (e) {}
+                                    const hasInbox = !!document.querySelector('a[href="/bugs"], a[href="/inbox"], [data-testid="topbar-inbox"]');
+                                    const hasSignIn = !!document.querySelector('a[href="/users/sign_in"], a[href*="/users/sign_in"]');
+                                    if (hasInbox && !hasSignIn) {
+                                        return {username: 'authenticated_hackerone_session'};
+                                    }
+                                    return null;
                                 }"""
                             )
                             if isinstance(cu, dict) and (cu.get("username") or cu.get("id")):
