@@ -88,7 +88,12 @@ _REPO_SLUG_RE = re.compile(
 _FENCED_BLOCK_RE = re.compile(r"(```[^\n]*\n)(.*?)(\n```)", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"(`+)([^`\n]+?)\1")
 _NUMBERED_CODE_LINE_RE = re.compile(r"^\s*(\d{1,5})\s*:\s?(.*)$")
-_LINE_RANGE_HEADER_RE = re.compile(r"\blines?\s+(\d{1,5})\s*(?:-|\u2013|\u2014)\s*(\d{1,5})\b", re.IGNORECASE)
+_LINE_RANGE_CLAUSE_RE = re.compile(
+    r"\blines?\s+((?:\d{1,5}(?:\s*(?:-|\u2013|\u2014)\s*\d{1,5})?)"
+    r"(?:\s*(?:,|&|/|and)\s*\d{1,5}(?:\s*(?:-|\u2013|\u2014)\s*\d{1,5})?)*)",
+    re.IGNORECASE,
+)
+_PAIR_RANGE_RE = re.compile(r"(\d{1,5})\s*(?:-|\u2013|\u2014)\s*(\d{1,5})")
 _DEFINE_INT_RE = re.compile(r"^\s*#\s*define\s+([A-Z][A-Z0-9_]{2,})\s+(0x[0-9a-fA-F]+|\d+)\b")
 _DEFINE_STR_RE = re.compile(r'^\s*#\s*define\s+([A-Z][A-Z0-9_]*FAMILY_NAME[A-Z0-9_]*)\s+"([^"]+)"')
 _GENL_FAMILY_CLAIM_RE = re.compile(
@@ -281,11 +286,13 @@ def _check_omitted_line_ranges(body: str) -> List[QADefect]:
     while i < len(lines):
         if lines[i].lstrip().startswith("```"):
             header_ctx = "\n".join(lines[max(0, i - 3) : i])
-            advertised = [
-                (int(m.group(1)), int(m.group(2)))
-                for m in _LINE_RANGE_HEADER_RE.finditer(header_ctx)
-                if int(m.group(2)) > int(m.group(1))
-            ]
+            advertised: List[Tuple[int, int]] = []
+            if not re.search(r"\b(?:selected\s+excerpts?|within\s+lines?|elided)\b", header_ctx, re.IGNORECASE):
+                for cm in _LINE_RANGE_CLAUSE_RE.finditer(header_ctx):
+                    for pm in _PAIR_RANGE_RE.finditer(cm.group(1)):
+                        s_ln, e_ln = int(pm.group(1)), int(pm.group(2))
+                        if e_ln > s_ln:
+                            advertised.append((s_ln, e_ln))
             end_i = i + 1
             block_nums: List[int] = []
             while end_i < len(lines) and not lines[end_i].lstrip().startswith("```"):
@@ -577,7 +584,7 @@ def audit_draft_text(
             )
 
     # 9. Netlink `nla->nla_len` accounting for NLA_HDRLEN
-    if re.search(r"nla->nla_len\s*(?:<|&lt;)", body) and not re.search(
+    if re.search(r"nla->nla_len\)?\s*(?:<|&lt;)", body) and not re.search(
         r"\bNLA_HDRLEN\b|\bnla_len\s*\(", body
     ):
         defects.append(

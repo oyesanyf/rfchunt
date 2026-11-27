@@ -402,7 +402,7 @@ class HackerOneReportDraft:
     vulnerability_information: str
     impact: str
     source_rule_id: str
-    source_scanner: str
+    source_scanner: str = "RFCHunt"
     scope_match_status: str = "manual_verify_required"  # in_scope | out_of_scope | manual_verify_required
     ai_disclosure_included: bool = False
     markdown_path: str = ""

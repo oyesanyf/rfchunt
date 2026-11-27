@@ -14,6 +14,7 @@ import sys
 from typing import Any, Dict, List, Optional
 import httpx
 
+from engine.ollama_concurrency_guard import get_shared_ollama_guard
 from engine.paid_model_provider import (
     PaidModelClient,
     PaidModelConfig,
@@ -23,6 +24,210 @@ from engine.paid_model_provider import (
 from ollama_manager import OllamaLifecycleManager, is_embedding_model
 
 logger = logging.getLogger("terminator.models")
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
+_FILE_PATH_RE = re.compile(
+    r"(?:^|[\s`'\"\(\[\{,:;])"
+    r"((?:\.github/|[A-Za-z0-9_.-]+/)[A-Za-z0-9_./-]*[A-Za-z0-9_-]"
+    r"\.(?:py|rs|ts|tsx|js|jsx|mjs|cjs|go|java|rb|php|c|cc|cpp|h|hpp|cs|yml|yaml|json|toml|sh|ps1|sql|html|xml|md|tf|kt|swift))"
+    r"(?:$|[\s`'\"\)\]\},:;\#])"
+)
+
+
+def strip_think_blocks(raw: str) -> str:
+    """Strips `<think>...</think>` blocks and dangling unclosed `<think>` tags."""
+    if not raw:
+        return ""
+    cleaned = _THINK_BLOCK_RE.sub("", raw)
+    lower = cleaned.lower()
+    if "</think>" in lower:
+        idx = lower.rfind("</think>")
+        cleaned = cleaned[idx + len("</think>") :]
+        lower = cleaned.lower()
+    if "<think>" in lower:
+        idx = lower.find("<think>")
+        before = cleaned[:idx].strip()
+        cleaned = before if before else ""
+    return cleaned.strip()
+
+
+def _has_repeated_char_stutter(text: str) -> bool:
+    prev = ""
+    run = 0
+    for ch in text:
+        if ch in "-=*#_~` \t\n\r":
+            prev = ""
+            run = 0
+            continue
+        if ch == prev:
+            run += 1
+            if run >= 24:
+                return True
+        else:
+            prev = ch
+            run = 1
+    return False
+
+
+def detect_repetition_loop(text: str) -> Optional[str]:
+    """Detects classic abliterated GGUF repetition / stutter loops."""
+    trimmed = (text or "").strip()
+    if not trimmed:
+        return None
+    if _has_repeated_char_stutter(trimmed):
+        return "character_stutter_loop"
+
+    line_counts: Dict[str, int] = {}
+    for line in trimmed.splitlines():
+        norm = line.strip().lower()
+        if len(norm) >= 20 and not norm.startswith("```") and not all(c in "-=*#_~| " for c in norm):
+            line_counts[norm] = line_counts.get(norm, 0) + 1
+            if line_counts[norm] >= 3:
+                return "repeated_line_loop"
+
+    words = [
+        re.sub(r"^[^a-z0-9_-]+|[^a-z0-9_-]+$", "", w.lower())
+        for w in trimmed.split()
+    ]
+    words = [w for w in words if w]
+    if len(words) >= 24:
+        ngram_counts: Dict[str, int] = {}
+        for i in range(len(words) - 5):
+            ng = " ".join(words[i : i + 6])
+            ngram_counts[ng] = ngram_counts.get(ng, 0) + 1
+            if ngram_counts[ng] >= 4:
+                return "repeated_ngram_loop"
+    if len(words) >= 50:
+        ratio = len(set(words)) / float(len(words))
+        if ratio < 0.20:
+            return f"low_lexical_diversity({ratio:.2f})"
+    return None
+
+
+def detect_meta_slop(text: str) -> Optional[str]:
+    """Detects generic meta-commentary / filler slop or verbatim prompt-stub echoes."""
+    lower = (text or "").strip().lower()
+    if not lower:
+        return "empty_response"
+    hard_markers = (
+        "in summary, the key steps to continue",
+        "the code snippet provided is well-structured",
+        "aligns with best practices",
+        "based on the judge analysis",
+        "the panel agrees that",
+        "i don't have access to your files",
+        "without access to the actual source code",
+        "here is a hypothetical example of how",
+    )
+    for m in hard_markers:
+        if m in lower:
+            return f"meta_slop:{m}"
+    if (
+        '"rationale": "..."' in lower
+        or '"raw_request": "..."' in lower
+        or "todo: fill in vulnerability" in lower
+    ):
+        return "placeholder_template_stub"
+    return None
+
+
+def extract_file_paths(text: str) -> List[str]:
+    """Extracts normalized relative source/workflow file paths mentioned in text."""
+    seen = set()
+    out: List[str] = []
+    for m in _FILE_PATH_RE.finditer(text or ""):
+        norm = m.group(1).lstrip("./").replace("\\", "/").lower()
+        if norm.startswith(("http/", "https/")):
+            continue
+        if norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+
+def validate_abliterated_output(
+    raw_text: str,
+    *,
+    allowed_file_paths: Optional[List[str]] = None,
+    require_json: bool = False,
+) -> Dict[str, Any]:
+    """
+    Deterministic Anti-Junk & Grounding Guard for abliterated local models.
+    Strips `<think>` blocks and rejects refusals, repetition loops, meta-slop,
+    invalid required JSON, and fabricated file paths not in `allowed_file_paths`.
+    """
+    reasons: List[str] = []
+    cleaned = strip_think_blocks(raw_text or "")
+    if len(cleaned) < 4:
+        return {
+            "accepted": False,
+            "cleaned_text": cleaned,
+            "rejection_reasons": ["empty_or_think_only"],
+            "hallucinated_paths": [],
+        }
+
+    if ModelFusionAdapter._is_refusal(cleaned):
+        reasons.append("safety_refusal")
+
+    loop_err = detect_repetition_loop(cleaned)
+    if loop_err:
+        reasons.append(loop_err)
+
+    slop_err = detect_meta_slop(cleaned)
+    if slop_err:
+        reasons.append(slop_err)
+
+    if require_json:
+        parsed_ok = False
+        cand = cleaned
+        if "```json" in cand:
+            cand = cand.split("```json", 1)[1].split("```", 1)[0].strip()
+        elif "```" in cand:
+            cand = cand.split("```", 1)[1].split("```", 1)[0].strip()
+        try:
+            json.loads(cand)
+            parsed_ok = True
+        except Exception:
+            for open_ch, close_ch in (("{", "}"), ("[", "]")):
+                s_idx = cand.find(open_ch)
+                e_idx = cand.rfind(close_ch)
+                if 0 <= s_idx < e_idx:
+                    try:
+                        json.loads(cand[s_idx : e_idx + 1])
+                        parsed_ok = True
+                        break
+                    except Exception:
+                        pass
+        if not parsed_ok:
+            reasons.append("invalid_required_json")
+
+    hallucinated: List[str] = []
+    grounded: List[str] = []
+    norm_allowed = [
+        p.strip().lstrip("./").replace("\\", "/").lower()
+        for p in (allowed_file_paths or [])
+        if p and str(p).strip()
+    ]
+    if norm_allowed:
+        allowed_bases = {p.rsplit("/", 1)[-1] for p in norm_allowed}
+        for cited in extract_file_paths(cleaned):
+            base = cited.rsplit("/", 1)[-1]
+            if (
+                any(cited == a or a.endswith(cited) or cited.endswith(a) for a in norm_allowed)
+                or base in allowed_bases
+            ):
+                grounded.append(cited)
+            else:
+                hallucinated.append(cited)
+        if hallucinated and (not grounded or (len(hallucinated) >= 2 and len(hallucinated) > len(grounded))):
+            reasons.append(f"hallucinated_file_paths({','.join(hallucinated[:4])})")
+
+    return {
+        "accepted": len(reasons) == 0,
+        "cleaned_text": cleaned,
+        "rejection_reasons": reasons,
+        "hallucinated_paths": hallucinated,
+    }
 
 
 class ModelFusionAdapter:
@@ -35,6 +240,7 @@ class ModelFusionAdapter:
     """
 
     DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434"
+    DEFAULT_MODELFUSION_ENDPOINT = "http://127.0.0.1:5000"
 
     def __init__(
         self,
@@ -44,8 +250,21 @@ class ModelFusionAdapter:
         sec_model: Optional[str] = None,
         env_local_path: Optional[str] = None,
         force_ollama: bool = False,
+        modelfusion_endpoint: Optional[str] = None,
+        use_modelfusion_server: Optional[bool] = None,
     ):
         self.endpoint = ollama_endpoint or os.environ.get("OLLAMA_ENDPOINT", self.DEFAULT_OLLAMA_ENDPOINT)
+        self.modelfusion_endpoint = (
+            modelfusion_endpoint
+            or os.environ.get("MODELFUSION_ENDPOINT")
+            or self.DEFAULT_MODELFUSION_ENDPOINT
+        ).rstrip("/")
+        if use_modelfusion_server is None:
+            self.use_modelfusion_server = os.environ.get("RFCHUNT_USE_MODELFUSION", "0").strip() == "1"
+        else:
+            self.use_modelfusion_server = bool(use_modelfusion_server)
+        self.modelfusion_server_ready = False
+        self.enable_anti_junk_guard = os.environ.get("RFCHUNT_ENABLE_ANTI_JUNK_GUARD", "1").strip() != "0"
         self.use_fusion = use_fusion if os.environ.get("USE_MODEL_FUSION") is None else (os.environ.get("USE_MODEL_FUSION") == "1")
         self.free_ram_gb = self._get_free_memory_gb()
         self.sized_qwen = self._size_qwen_for_free_memory(self.free_ram_gb)
@@ -110,6 +329,143 @@ class ModelFusionAdapter:
 
         self.active_model = self._resolve_model(self.preferred_model)
         self.client = httpx.Client(timeout=httpx.Timeout(self.timeout, connect=10.0))
+        if self.use_modelfusion_server and not force_ollama:
+            self.modelfusion_server_ready = self._probe_modelfusion_server()
+            if self.modelfusion_server_ready:
+                self.backend_mode = "modelfusion_http"
+                logger.info(
+                    "[ModelFusion] Local ModelFusion server active at %s (direct Ollama fallback ready)",
+                    self.modelfusion_endpoint,
+                )
+
+    def _probe_modelfusion_server(self, timeout_sec: float = 0.4) -> bool:
+        """Fast <=400ms health probe against ModelFusion local HTTP server (:5000)."""
+        eff_timeout = min(max(float(timeout_sec), 0.05), 0.4)
+        base = getattr(self, "modelfusion_endpoint", self.DEFAULT_MODELFUSION_ENDPOINT).rstrip("/")
+        for path in ("/health", "/api/health", "/api/status"):
+            try:
+                resp = httpx.get(f"{base}{path}", timeout=eff_timeout)
+                if 200 <= resp.status_code < 400:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _query_modelfusion_server(
+        self,
+        system_instruction: str,
+        user_prompt: str,
+        schema_hint: Optional[str] = None,
+        num_predict: int = 256,
+    ) -> List[Dict[str, Any]]:
+        """
+        Routes grounded consensus triage through ModelFusion's local HTTP server (`:5000`)
+        behind the shared `OllamaConcurrencyGuard` single-slot lock, applying the
+        deterministic Anti-Junk & Grounding Guard before returning structured JSON items.
+        """
+        if os.environ.get("RFCHUNT_OFFLINE") == "1":
+            base_low = self.modelfusion_endpoint.lower()
+            if not any(h in base_low for h in ("127.0.0.1", "localhost", "[::1]")):
+                return []
+
+        expected_schema = schema_hint or '{"probes": [{"rationale": "...", "raw_request": "...", "is_clean": false}]}'
+        combined_prompt = (
+            f"{system_instruction}\n\n{user_prompt}\n\n"
+            f"CRITICAL: Output ONLY valid JSON matching schema: {expected_schema}."
+        ).strip()
+        allowed_files = extract_file_paths(user_prompt)
+
+        payload_orchestrate = {
+            "prompt": combined_prompt,
+            "task": "code-vulnerability-detection",
+            "fusion": bool(self.use_fusion),
+            "model": self.active_model,
+            "temperature": 0.15,
+            "max_tokens": max(int(num_predict), 256),
+        }
+        payload_openai = {
+            "model": self.active_model,
+            "temperature": 0.15,
+            "max_tokens": max(int(num_predict), 256),
+            "messages": [
+                {"role": "system", "content": system_instruction or "You are a defensive security auditor. Output ONLY valid JSON."},
+                {"role": "user", "content": f"{user_prompt}\n\nCRITICAL: Output ONLY valid JSON matching schema: {expected_schema}."},
+            ],
+        }
+
+        guard = get_shared_ollama_guard()
+        if guard.is_circuit_open():
+            return []
+
+        raw_text = ""
+        with guard.acquire(timeout_sec=guard.acquire_timeout_sec) as acquired:
+            if not acquired:
+                return []
+            for path, body in (
+                ("/api/orchestrate", payload_orchestrate),
+                ("/orchestrate", payload_orchestrate),
+                ("/v1/chat/completions", payload_openai),
+            ):
+                try:
+                    resp = self.client.post(
+                        f"{self.modelfusion_endpoint}{path}",
+                        json=body,
+                        timeout=httpx.Timeout(self.timeout, connect=5.0),
+                    )
+                except Exception as exc:
+                    logger.debug("[ModelFusion] HTTP %s failed: %s", path, exc)
+                    continue
+                if resp.status_code == 404:
+                    continue
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        raw_text = (resp.text or "").strip()
+                        break
+                    if isinstance(data, dict):
+                        raw_text = str(
+                            data.get("content")
+                            or data.get("response")
+                            or data.get("result")
+                            or data.get("answer")
+                            or ((data.get("message") or {}).get("content") if isinstance(data.get("message"), dict) else "")
+                            or (
+                                (((data.get("choices") or [{}])[0].get("message") or {}).get("content"))
+                                if isinstance(data.get("choices"), list) and data.get("choices")
+                                else ""
+                            )
+                            or ""
+                        ).strip()
+                    break
+
+        if not raw_text:
+            return []
+
+        if getattr(self, "enable_anti_junk_guard", True):
+            verdict = validate_abliterated_output(
+                raw_text,
+                allowed_file_paths=allowed_files,
+                require_json=True,
+            )
+            if not verdict["accepted"]:
+                logger.warning(
+                    "[ModelFusion] Anti-junk guard rejected server output (%s); falling back to local Ollama panel.",
+                    verdict["rejection_reasons"],
+                )
+                return []
+            raw_text = verdict["cleaned_text"]
+
+        items = self._parse_json_array(raw_text, unwrap_lists=(schema_hint is None))
+        cleaned_items: List[Dict[str, Any]] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            if self._is_refusal(json.dumps(it, sort_keys=True)):
+                continue
+            it["fused_model"] = f"modelfusion:{self.active_model}"
+            cleaned_items.append(it)
+        return cleaned_items
 
     def close(self) -> None:
         paid_client = getattr(self, "paid_client", None)
@@ -285,6 +641,17 @@ class ModelFusionAdapter:
             "gemma-obliterated",
             "gemma4:12b-obliterated",
             "gemma-12b-obliterated",
+            "huihui_ai/foundation-sec-abliterated:8b",
+            "hf.co/audnai/penclaw-glm-5.3-abliterated",
+            "hf.co/msuiche/glm-5.3-abliterated-cyber-glp-77",
+            "hf.co/huihui-ai/glm-5.3-abliterated",
+            "huihui_ai/glm-4.7-flash-abliterated:latest",
+            "hf.co/huihui-ai/huihui-glm-4.7-flash-abliterated",
+            "hf.co/jsantillana/glm-4.7-flash-abliterated",
+            "huihui_ai/deepseek-r1-abliterated:8b",
+            "hf.co/bartowski/glm-4-9b-chat-abliterated-gguf:q4_k_m",
+            "hf.co/byroneverson/glm-4-9b-chat-abliterated",
+            "hf.co/byroneverson/longwriter-glm4-9b-abliterated",
         }
         obliterated_bases = {a.split(":")[0] for a in obliterated_aliases}
 
@@ -358,6 +725,18 @@ class ModelFusionAdapter:
                 schema_hint=schema_hint,
                 num_predict=num_predict,
             )
+
+        if getattr(self, "use_modelfusion_server", False):
+            if getattr(self, "modelfusion_server_ready", False) or self._probe_modelfusion_server():
+                self.modelfusion_server_ready = True
+                mf_res = self._query_modelfusion_server(
+                    system_instruction,
+                    user_prompt,
+                    schema_hint=schema_hint,
+                    num_predict=num_predict,
+                )
+                if mf_res:
+                    return mf_res
 
         if not self.available_tags:
             self.available_tags = self._fetch_available_tags()
@@ -515,13 +894,15 @@ class ModelFusionAdapter:
             "stream": False,
             "keep_alive": "60m",
             "options": {
-                "temperature": 0.7,
+                "temperature": 0.15 if schema_hint is not None else 0.4,
+                "repeat_penalty": 1.15,
                 "num_predict": effective_predict,
             },
         }
         if not is_r1:
             payload["format"] = "json"
 
+        allowed_files = extract_file_paths(user_prompt)
         try:
             resp = self.client.post(
                 f"{self.endpoint}/api/chat",
@@ -535,6 +916,20 @@ class ModelFusionAdapter:
                 raw_text = msg_content or str((data.get("response") if isinstance(data, dict) else "") or "").strip()
                 if self._is_refusal(raw_text):
                     return []
+                if getattr(self, "enable_anti_junk_guard", True):
+                    verdict = validate_abliterated_output(
+                        raw_text,
+                        allowed_file_paths=allowed_files if schema_hint is not None else None,
+                        require_json=False,
+                    )
+                    if not verdict["accepted"]:
+                        logger.info(
+                            "[ModelFusion] Anti-junk guard filtered response from %s (%s)",
+                            target_model,
+                            verdict["rejection_reasons"],
+                        )
+                        return []
+                    raw_text = verdict["cleaned_text"]
                 items = self._parse_json_array(raw_text, unwrap_lists=(schema_hint is None))
                 return [
                     it for it in items
