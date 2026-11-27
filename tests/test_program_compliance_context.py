@@ -7,16 +7,20 @@ and Zero Hardcoded Researcher Usernames.
 from __future__ import annotations
 
 import contextlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-from pathlib import Path
 import threading
 import time
-from typing import Any, Dict, List
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
 
+import revenue_cli
 from engine.atlas_llm_evaluator import AtlasLLMEvaluator, LLMTargetAdapter
-from engine.differential_oracle import MultiImplementationDifferentialOracle, TargetEndpoint
+from engine.differential_oracle import (
+    MultiImplementationDifferentialOracle,
+    TargetEndpoint,
+)
 from engine.hackerone_porter import (
     HackerOneCampaign,
     HackerOnePublicDirectoryClient,
@@ -32,12 +36,11 @@ from engine.request_hygiene import (
     TokenBucketRateLimiter,
     build_program_compliance_context,
 )
-import revenue_cli
 
 
 @contextlib.contextmanager
 def _scoped_env(**updates: str | None):
-    saved: Dict[str, str | None] = {}
+    saved: dict[str, str | None] = {}
     for k, v in updates.items():
         saved[k] = os.environ.get(k)
         if v is None:
@@ -56,11 +59,11 @@ def _scoped_env(**updates: str | None):
 
 @contextlib.contextmanager
 def _loopback_echo_server():
-    hits: List[Dict[str, Any]] = []
+    hits: list[dict[str, Any]] = []
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802
+        def do_GET(self) -> None:
             with lock:
                 hits.append(
                     {
@@ -76,7 +79,7 @@ def _loopback_echo_server():
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        def log_message(self, format: str, *args: Any) -> None:
             return
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -264,12 +267,12 @@ def test_atlas_llm_ai_gate_differential_oracle_roe_and_public_directory_sync(tmp
         in_scope_assets=["*.banned.example"],
     )
 
-    llm_hits: List[Dict[str, Any]] = []
-    graphql_hits: List[Dict[str, Any]] = []
+    llm_hits: list[dict[str, Any]] = []
+    graphql_hits: list[dict[str, Any]] = []
     lock = threading.Lock()
 
     class MultiHandler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802
+        def do_GET(self) -> None:
             with lock:
                 llm_hits.append({"method": "GET", "path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}})
             body = b"OK"
@@ -278,7 +281,7 @@ def test_atlas_llm_ai_gate_differential_oracle_roe_and_public_directory_sync(tmp
             self.end_headers()
             self.wfile.write(body)
 
-        def do_POST(self) -> None:  # noqa: N802
+        def do_POST(self) -> None:
             length = int(self.headers.get("Content-Length", "0") or 0)
             raw = self.rfile.read(length) if length > 0 else b"{}"
             hdrs = {k.lower(): v for k, v in self.headers.items()}
@@ -344,7 +347,7 @@ def test_atlas_llm_ai_gate_differential_oracle_roe_and_public_directory_sync(tmp
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        def log_message(self, format: str, *args: Any) -> None:
             return
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), MultiHandler)

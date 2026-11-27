@@ -11,20 +11,20 @@ Provides:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
-
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any
 
 _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _FORBIDDEN_HEADER_CHARS = ("\r", "\n", "\x00")
 _PROTECTED_FRAMING_HEADERS = frozenset({"host", "content-length", "transfer-encoding"})
 
 
-def parse_header_spec(raw: str) -> Tuple[str, str]:
+def parse_header_spec(raw: str) -> tuple[str, str]:
     """
     Parses a single `'Name: Value'` header specification and validates against
     CRLF / NUL injection and RFC 9110 token syntax.
@@ -43,7 +43,7 @@ def parse_header_spec(raw: str) -> Tuple[str, str]:
     return name_s, val_s
 
 
-def validate_user_agent(user_agent: Optional[str]) -> Optional[str]:
+def validate_user_agent(user_agent: str | None) -> str | None:
     if user_agent is None:
         return None
     ua = str(user_agent).strip()
@@ -123,20 +123,20 @@ class RequestHygieneConfig:
     and target `--max-rps` rate limit.
     """
 
-    headers: Tuple[Tuple[str, str], ...] = ()
-    user_agent: Optional[str] = None
+    headers: tuple[tuple[str, str], ...] = ()
+    user_agent: str | None = None
     max_rps: float = 0.0
 
     @classmethod
     def from_raw(
         cls,
-        headers: Optional[Sequence[Union[str, Tuple[str, str]]]] = None,
-        bounty_headers: Optional[Sequence[Union[str, Tuple[str, str]]]] = None,
-        user_agent: Optional[str] = None,
+        headers: Sequence[str | tuple[str, str]] | None = None,
+        bounty_headers: Sequence[str | tuple[str, str]] | None = None,
+        user_agent: str | None = None,
         max_rps: float = 0.0,
-    ) -> "RequestHygieneConfig":
-        parsed_pairs: List[Tuple[str, str]] = []
-        extracted_ua: Optional[str] = None
+    ) -> RequestHygieneConfig:
+        parsed_pairs: list[tuple[str, str]] = []
+        extracted_ua: str | None = None
 
         for seq in (headers or (), bounty_headers or ()):
             for item in seq:
@@ -159,11 +159,11 @@ class RequestHygieneConfig:
     @classmethod
     def from_cli(
         cls,
-        headers: Optional[Sequence[Union[str, Tuple[str, str]]]] = None,
-        bounty_headers: Optional[Sequence[Union[str, Tuple[str, str]]]] = None,
-        user_agent: Optional[str] = None,
+        headers: Sequence[str | tuple[str, str]] | None = None,
+        bounty_headers: Sequence[str | tuple[str, str]] | None = None,
+        user_agent: str | None = None,
         max_rps: float = 0.0,
-    ) -> "RequestHygieneConfig":
+    ) -> RequestHygieneConfig:
         return cls.from_raw(
             headers=headers,
             bounty_headers=bounty_headers,
@@ -177,12 +177,12 @@ class RequestHygieneConfig:
 
     def to_headers_dict(
         self,
-        base: Optional[Dict[str, str]] = None,
+        base: dict[str, str] | None = None,
         *,
-        default_ua: Optional[str] = None,
-    ) -> Dict[str, str]:
+        default_ua: str | None = None,
+    ) -> dict[str, str]:
         """Merges `base` headers with configured custom headers and `User-Agent`."""
-        out: Dict[str, str] = dict(base or {})
+        out: dict[str, str] = dict(base or {})
         for k, v in self.headers:
             # Replace existing case-insensitive match if present
             existing_key = next((ek for ek in out if ek.lower() == k.lower()), None)
@@ -199,7 +199,7 @@ class RequestHygieneConfig:
                 out["User-Agent"] = effective_ua
         return out
 
-    def to_cli_header_pairs(self) -> List[Tuple[str, str]]:
+    def to_cli_header_pairs(self) -> list[tuple[str, str]]:
         """Returns `(name, value)` pairs for `-H 'Name: Value'` external scanner flags."""
         pairs = list(self.headers)
         if self.user_agent:
@@ -210,7 +210,7 @@ class RequestHygieneConfig:
         self,
         raw_bytes: bytes,
         *,
-        default_ua: Optional[str] = None,
+        default_ua: str | None = None,
     ) -> bytes:
         """
         Non-destructively injects custom headers and `User-Agent` into raw HTTP/1.1
@@ -245,7 +245,7 @@ class RequestHygieneConfig:
         effective_ua = self.user_agent or default_ua
 
         # Filter or replace User-Agent if an explicit User-Agent override is configured
-        filtered_lines: List[bytes] = []
+        filtered_lines: list[bytes] = []
         custom_names_lower = {
             k.lower().encode("latin-1", errors="ignore")
             for k, _ in self.headers
@@ -282,12 +282,12 @@ class RequestHygieneConfig:
 
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE_HYGIENE: RequestHygieneConfig = RequestHygieneConfig()
-_ACTIVE_LIMITER: Optional[TokenBucketRateLimiter] = None
+_ACTIVE_LIMITER: TokenBucketRateLimiter | None = None
 
 
 def set_active_hygiene(
-    config: Optional[RequestHygieneConfig],
-    limiter: Optional[TokenBucketRateLimiter] = None,
+    config: RequestHygieneConfig | None,
+    limiter: TokenBucketRateLimiter | None = None,
 ) -> None:
     """Sets process-wide active hygiene config and shared token-bucket rate limiter."""
     global _ACTIVE_HYGIENE, _ACTIVE_LIMITER
@@ -301,35 +301,35 @@ def set_active_hygiene(
             _ACTIVE_LIMITER = None
 
 
-def get_active_hygiene() -> Tuple[RequestHygieneConfig, Optional[TokenBucketRateLimiter]]:
+def get_active_hygiene() -> tuple[RequestHygieneConfig, TokenBucketRateLimiter | None]:
     """Returns `(active_hygiene_config, active_rate_limiter)`."""
     with _ACTIVE_LOCK:
         return _ACTIVE_HYGIENE, _ACTIVE_LIMITER
 
 
-def set_active_rate_limiter(limiter: Optional[TokenBucketRateLimiter]) -> None:
+def set_active_rate_limiter(limiter: TokenBucketRateLimiter | None) -> None:
     """Sets process-wide active shared token-bucket rate limiter."""
     global _ACTIVE_LIMITER
     with _ACTIVE_LOCK:
         _ACTIVE_LIMITER = limiter
 
 
-def get_active_rate_limiter() -> Optional[TokenBucketRateLimiter]:
+def get_active_rate_limiter() -> TokenBucketRateLimiter | None:
     """Returns process-wide active shared token-bucket rate limiter."""
     with _ACTIVE_LOCK:
         return _ACTIVE_LIMITER
 
 
-def resolve_rate_limiter(rate_limiter: Optional[TokenBucketRateLimiter] = None) -> Optional[TokenBucketRateLimiter]:
+def resolve_rate_limiter(rate_limiter: TokenBucketRateLimiter | None = None) -> TokenBucketRateLimiter | None:
     """Resolves explicit `rate_limiter` or falls back to process-wide active limiter."""
     _, lim = resolve_hygiene(None, rate_limiter)
     return lim
 
 
 def resolve_hygiene(
-    hygiene_config: Optional[RequestHygieneConfig] = None,
-    rate_limiter: Optional[TokenBucketRateLimiter] = None,
-) -> Tuple[RequestHygieneConfig, Optional[TokenBucketRateLimiter]]:
+    hygiene_config: RequestHygieneConfig | None = None,
+    rate_limiter: TokenBucketRateLimiter | None = None,
+) -> tuple[RequestHygieneConfig, TokenBucketRateLimiter | None]:
     """Resolves explicit `hygiene_config` / `rate_limiter` or falls back to active process state."""
     if isinstance(hygiene_config, tuple) and len(hygiene_config) == 2:
         hygiene_config, rate_limiter = hygiene_config[0], (rate_limiter or hygiene_config[1])
@@ -342,7 +342,7 @@ def resolve_hygiene(
 
 
 def acquire_rate_limit(
-    rate_limiter: Optional[TokenBucketRateLimiter] = None,
+    rate_limiter: TokenBucketRateLimiter | None = None,
     tokens: float = 1.0,
 ) -> float:
     """Null-safe rate limit acquisition using explicit or active `TokenBucketRateLimiter`."""
@@ -375,10 +375,10 @@ class ProgramComplianceContext:
     automated_prohibited: bool
     effective_max_rps: float
     hygiene: RequestHygieneConfig
-    rate_limiter: Optional[TokenBucketRateLimiter]
-    in_scope_assets: Tuple[str, ...] = ()
-    in_scope_repos: Tuple[str, ...] = ()
-    out_of_scope_assets: Tuple[str, ...] = ()
+    rate_limiter: TokenBucketRateLimiter | None
+    in_scope_assets: tuple[str, ...] = ()
+    in_scope_repos: tuple[str, ...] = ()
+    out_of_scope_assets: tuple[str, ...] = ()
     no_out_of_scope_redirects: bool = True
     ai_disclosure_required: bool = False
 
@@ -388,7 +388,7 @@ class ProgramComplianceContext:
         *,
         allow_loopback: bool = True,
         require_declared_scope: bool = False,
-    ) -> Tuple[bool, str]:
+    ) -> tuple[bool, str]:
         """
         Fail-closed offline scope & IP-SSRF check for already-collected recon assets,
         JS bundles, and HTTP response logs (performs zero live DNS lookups or network I/O):
@@ -400,8 +400,12 @@ class ProgramComplianceContext:
             return False, self.reason
 
         import ipaddress
+
         from engine.program_eligibility_db import _normalize_hostname, is_host_in_scope
-        from engine.safe_network_validator import is_explicit_loopback_host, is_safe_target_ip
+        from engine.safe_network_validator import (
+            is_explicit_loopback_host,
+            is_safe_target_ip,
+        )
 
         host = _normalize_hostname(host_or_url)
         if not host:
@@ -435,7 +439,7 @@ class ProgramComplianceContext:
         *,
         allow_loopback: bool = True,
         require_declared_scope: bool = False,
-    ) -> Tuple[bool, str]:
+    ) -> tuple[bool, str]:
         """
         Fail-closed check before sending ANY live packet to `host_or_url`:
           - Verifies program eligibility & Tier 1 automation allowance
@@ -449,7 +453,10 @@ class ProgramComplianceContext:
             return False, self.reason
 
         from engine.program_eligibility_db import _normalize_hostname, is_host_in_scope
-        from engine.safe_network_validator import is_explicit_loopback_host, validate_target_host
+        from engine.safe_network_validator import (
+            is_explicit_loopback_host,
+            validate_target_host,
+        )
 
         host = _normalize_hostname(host_or_url)
         if not host:
@@ -470,10 +477,10 @@ class ProgramComplianceContext:
             return True, scope_reason
         return True, "eligible_no_host_scope_restriction"
 
-    def to_headers_dict(self, base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    def to_headers_dict(self, base: dict[str, str] | None = None) -> dict[str, str]:
         return self.hygiene.to_headers_dict(base)
 
-    def to_cli_header_pairs(self) -> List[Tuple[str, str]]:
+    def to_cli_header_pairs(self) -> list[tuple[str, str]]:
         return self.hygiene.to_cli_header_pairs()
 
 
@@ -481,16 +488,17 @@ def build_program_compliance_context(
     program_handle: str,
     *,
     eligibility_db: Any = None,
-    researcher_handle: Optional[str] = None,
-    max_rps_cap: Optional[float] = None,
-    extra_headers: Optional[Sequence[Union[str, Tuple[str, str]]]] = None,
-    user_agent_override: Optional[str] = None,
+    researcher_handle: str | None = None,
+    max_rps_cap: float | None = None,
+    extra_headers: Sequence[str | tuple[str, str]] | None = None,
+    user_agent_override: str | None = None,
 ) -> ProgramComplianceContext:
     """
     Constructs a fail-closed `ProgramComplianceContext` from `ProgramEligibilityDB`
     without relying on any hardcoded personal usernames.
     """
     import os
+
     from engine.program_eligibility_db import ProgramEligibilityDB
 
     prog = str(program_handle or "").strip().lower()
@@ -551,7 +559,7 @@ def build_program_compliance_context(
         )
 
     # Assemble program-mandated headers + dynamic researcher attribution
-    hdr_specs: List[Union[str, Tuple[str, str]]] = []
+    hdr_specs: list[str | tuple[str, str]] = []
     missing_placeholder = False
     for raw_h in rec.roe_required_headers:
         h_str = str(raw_h or "").strip()
@@ -568,8 +576,7 @@ def build_program_compliance_context(
     if not hdr_specs and clean_researcher:
         hdr_specs.append(("X-HackerOne", clean_researcher))
 
-    for eh in extra_headers or ():
-        hdr_specs.append(eh)
+    hdr_specs.extend(extra_headers or ())
 
     eff_ua = validate_user_agent(
         user_agent_override

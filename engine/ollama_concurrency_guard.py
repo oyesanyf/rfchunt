@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import contextlib
 import os
-from pathlib import Path
 import re
 import tempfile
 import threading
 import time
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from collections.abc import Iterator, Sequence
+from pathlib import Path
+from typing import Any
 
 if os.name == "nt":
     import msvcrt
@@ -27,10 +28,9 @@ else:
 
 from ollama_manager import is_embedding_model
 
-
 DEFAULT_LOCK_FILENAME = "rfchunt_ollama_slot.lock"
 
-OOM_ERROR_MARKERS: Tuple[str, ...] = (
+OOM_ERROR_MARKERS: tuple[str, ...] = (
     "out of memory",
     "oom",
     "vram",
@@ -50,7 +50,7 @@ OOM_ERROR_MARKERS: Tuple[str, ...] = (
     "internal server error",
 )
 
-_NON_OOM_500_MARKERS: Tuple[str, ...] = (
+_NON_OOM_500_MARKERS: tuple[str, ...] = (
     "invalid json",
     "json decode",
     "bad request",
@@ -60,7 +60,7 @@ _NON_OOM_500_MARKERS: Tuple[str, ...] = (
 
 _PARAM_SIZE_RE = re.compile(r"(?:^|[:\-_/])(\d+(?:\.\d+)?)\s*[bB](?=$|[:\-_/@])")
 
-_NAMED_SIZE_BILLIONS: Dict[str, float] = {
+_NAMED_SIZE_BILLIONS: dict[str, float] = {
     "nano": 1.0,
     "tiny": 1.1,
     "mini": 3.8,
@@ -71,7 +71,7 @@ _NAMED_SIZE_BILLIONS: Dict[str, float] = {
 }
 
 
-def parse_model_param_billions(model_tag: str) -> Optional[float]:
+def parse_model_param_billions(model_tag: str) -> float | None:
     tl = (model_tag or "").strip().lower()
     if not tl:
         return None
@@ -87,7 +87,7 @@ def parse_model_param_billions(model_tag: str) -> Optional[float]:
     return None
 
 
-def model_size_tier(model_tag: str, *, default_unknown_tier: int = 2) -> Tuple[int, float]:
+def model_size_tier(model_tag: str, *, default_unknown_tier: int = 2) -> tuple[int, float]:
     """
     Maps a model tag to `(tier_index, params_billions)`:
       - Tier 3: `> 7B`
@@ -118,7 +118,7 @@ class OllamaConcurrencyGuard:
     def __init__(
         self,
         *,
-        lock_path: Optional[Union[Path, str]] = None,
+        lock_path: Path | str | None = None,
         acquire_timeout_sec: float = 30.0,
         failure_threshold: int = 2,
         cooldown_sec: float = 60.0,
@@ -139,9 +139,9 @@ class OllamaConcurrencyGuard:
         self._state_lock = threading.RLock()
         self._os_lock_depth = 0
         self._consecutive_failures = 0
-        self._opened_at_monotonic: Optional[float] = None
+        self._opened_at_monotonic: float | None = None
 
-    def _acquire_os_lock(self, deadline: float) -> Optional[int]:
+    def _acquire_os_lock(self, deadline: float) -> int | None:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o666)
         try:
@@ -185,7 +185,7 @@ class OllamaConcurrencyGuard:
                 pass
 
     @contextlib.contextmanager
-    def acquire(self, timeout_sec: Optional[float] = None) -> Iterator[bool]:
+    def acquire(self, timeout_sec: float | None = None) -> Iterator[bool]:
         """
         Acquires the single-slot Ollama concurrency lock (in-process RLock + cross-process
         OS file lock). Yields `True` if acquired within `timeout_sec`, else `False`.
@@ -207,7 +207,7 @@ class OllamaConcurrencyGuard:
                 self._thread_lock.release()
             return
 
-        fd: Optional[int] = None
+        fd: int | None = None
         try:
             fd = self._acquire_os_lock(deadline)
         except Exception:
@@ -231,7 +231,7 @@ class OllamaConcurrencyGuard:
         self,
         failed_model: str,
         installed_models: Sequence[str],
-    ) -> List[str]:
+    ) -> list[str]:
         """
         Returns installed generative fallback models strictly smaller in parameter tier
         than `failed_model`, ordered along the ladder `>7B -> <=7B -> <=3B -> 1.5B`.
@@ -239,7 +239,7 @@ class OllamaConcurrencyGuard:
         failed_norm = (failed_model or "").strip().lower()
         failed_tier, _ = model_size_tier(failed_model, default_unknown_tier=3)
 
-        deduped: List[str] = []
+        deduped: list[str] = []
         seen: set[str] = set()
         for raw in installed_models:
             tag = str(raw or "").strip()
@@ -297,7 +297,7 @@ class OllamaConcurrencyGuard:
             self._consecutive_failures = 0
             self._opened_at_monotonic = None
 
-    def telemetry(self) -> Dict[str, Any]:
+    def telemetry(self) -> dict[str, Any]:
         with self._state_lock:
             return {
                 "lock_path": str(self.lock_path),
@@ -309,7 +309,7 @@ class OllamaConcurrencyGuard:
 
 
 _SHARED_GUARD_LOCK = threading.Lock()
-_SHARED_GUARD: Optional[OllamaConcurrencyGuard] = None
+_SHARED_GUARD: OllamaConcurrencyGuard | None = None
 
 
 def get_shared_ollama_guard() -> OllamaConcurrencyGuard:

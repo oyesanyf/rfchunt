@@ -14,10 +14,11 @@ import argparse
 import contextlib
 import json
 import os
-from pathlib import Path
 import sys
 import tempfile
-from typing import Any, Dict, List, Optional, Sequence
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
 
 from engine.client_audit_packager import ClientAuditPackager
 from engine.freshness_watcher import (
@@ -27,7 +28,6 @@ from engine.freshness_watcher import (
     render_fresh_hunt_queue_markdown,
 )
 from engine.linux_poc_runner import LinuxPocRunner, save_transcript_bundle
-
 
 REVENUE_SUBCOMMANDS = {
     "freshness-watch",
@@ -297,22 +297,22 @@ def _map_scanner_to_ensemble_engine(scanner: str) -> str:
 def unified_findings_to_engine_findings(
     raw_findings: Sequence[Any],
     *,
-    target_root: Optional[str] = None,
+    target_root: str | None = None,
     exclude_speculative_and_preflight: bool = False,
-) -> List[Any]:
+) -> list[Any]:
     """Convert `run_unified_all_scans` finding dicts into `EngineFinding` instances."""
     from engine.ensemble_orchestrator import EngineFinding
 
-    resolved_root: Optional[Path] = None
+    resolved_root: Path | None = None
     if target_root:
         try:
             cand = Path(str(target_root)).resolve(strict=False)
             if cand.is_dir():
                 resolved_root = cand
-        except Exception:
+        except Exception:  # noqa: BLE001
             resolved_root = None
 
-    converted: List[EngineFinding] = []
+    converted: list[EngineFinding] = []
     for item in raw_findings:
         if not isinstance(item, dict):
             continue
@@ -345,7 +345,7 @@ def unified_findings_to_engine_findings(
                     rel_fp = p_fp.resolve(strict=False).relative_to(resolved_root).as_posix()
                 else:
                     rel_fp = raw_fp.replace("\\", "/")
-            except Exception:
+            except Exception:  # noqa: BLE001
                 rel_fp = raw_fp.replace("\\", "/")
 
         if lane == "VERIFIED_EXPLOIT":
@@ -366,7 +366,7 @@ def unified_findings_to_engine_findings(
         except (TypeError, ValueError):
             line_num = 0
 
-        meta: Dict[str, Any] = {}
+        meta: dict[str, Any] = {}
         if isinstance(item.get("metadata"), dict):
             meta.update(item["metadata"])
         meta.setdefault("raw_scanner", scanner_raw)
@@ -396,7 +396,7 @@ def unified_findings_to_engine_findings(
     return converted
 
 
-def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
+def run_revenue_cli(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -408,7 +408,7 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
         if bool(getattr(args, "from_eligibility_db", False)) or (elig_path and str(elig_path).strip()):
             elig_db = ProgramEligibilityDB(str(elig_path).strip() if elig_path else None)
 
-        targets: List[WatchTarget] = []
+        targets: list[WatchTarget] = []
         if bool(getattr(args, "from_eligibility_db", False)):
             from engine.ml_diff_and_recon_ranker import build_unlocked_watchlist_from_db
 
@@ -506,10 +506,13 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
         return 0 if rep.status in ("machine_checked", "static_audited_lean_not_installed") else 1
 
     if args.command == "ensemble-audit":
-        from engine.ensemble_orchestrator import EnsembleOrchestrator, _finding_from_dict
+        from engine.ensemble_orchestrator import (
+            EnsembleOrchestrator,
+            _finding_from_dict,
+        )
 
         findings = None
-        all_scan_summary: Optional[Dict[str, Any]] = None
+        all_scan_summary: dict[str, Any] | None = None
         offline_mode = (
             os.environ.get("RFCHUNT_OFFLINE") == "1"
             or bool(os.environ.get("CI"))
@@ -537,7 +540,7 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
         cpu_workers_arg = getattr(args, "cpu_workers", None)
         bb_db_arg = getattr(args, "blackboard_db", None)
         resume_flag = bool(getattr(args, "resume", False))
-        bb_recovery: Optional[Dict[str, Any]] = None
+        bb_recovery: dict[str, Any] | None = None
         if bb_db_arg or resume_flag:
             from engine.async_blackboard_runtime import SqliteBlackboard
 
@@ -579,19 +582,21 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
                         if (bool(getattr(args, "no_external_scanners", False)) or offline_mode)
                         else None
                     )
-                    with tempfile.TemporaryDirectory(prefix="rfchunt_unified_") as unified_reports_dir:
-                        with (contextlib.redirect_stdout(sys.stderr) if args.json_out else contextlib.nullcontext()):
-                            all_res = run_unified_all_scans(
-                                repo=str(target_path),
-                                reports_dir=unified_reports_dir,
-                                quiet=True,
-                                enable_external_scanners=ext_flag,
-                                include_models=False,
-                                auto_install_tools=False,
-                                preflight_live=False,
-                                enable_h2_desync=False,
-                                confine_reports_to_workspace_root=False,
-                            )
+                    with (
+                        tempfile.TemporaryDirectory(prefix="rfchunt_unified_") as unified_reports_dir,
+                        contextlib.redirect_stdout(sys.stderr) if args.json_out else contextlib.nullcontext(),
+                    ):
+                        all_res = run_unified_all_scans(
+                            repo=str(target_path),
+                            reports_dir=unified_reports_dir,
+                            quiet=True,
+                            enable_external_scanners=ext_flag,
+                            include_models=False,
+                            auto_install_tools=False,
+                            preflight_live=False,
+                            enable_h2_desync=False,
+                            confine_reports_to_workspace_root=False,
+                        )
                     all_scan_summary = {
                         "status": "completed",
                         "target_path": all_res.get("target_path"),
@@ -621,7 +626,7 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
                     )
                     orch.last_telemetry = tele
                     findings = [*converted, *auto_findings]
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     all_scan_summary = {
                         "status": "degraded_unavailable",
                         "reason": str(exc),
@@ -719,9 +724,9 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
                 f"prod={prod_cnt}, noise_dropped={noise_cnt}, stage2_selected={sel_cnt}, "
                 f"clusters={len(res.get('clusters') or [])} -> {args.out}"
             )
-            ready_paths: List[str] = []
-            report_urls: List[str] = []
-            candidates: List[Dict[str, Any]] = [res]
+            ready_paths: list[str] = []
+            report_urls: list[str] = []
+            candidates: list[dict[str, Any]] = [res]
             if isinstance(res.get("submission"), dict):
                 candidates.append(res["submission"])
             if isinstance(res.get("loop4"), dict):
@@ -777,6 +782,7 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.command == "check-drafts":
         import time as _time
+
         from engine.draft_qa_checker import DraftQATrackerDB
         from engine.draft_submit_checker import DraftSubmitChecker, DraftSubmitTrackerDB
 
@@ -882,7 +888,7 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
 
         qa_db = DraftQATrackerDB(args.db)
         qa_checker = DraftQAChecker(db=qa_db)
-        snapshots: List[Dict[str, Any]] = []
+        snapshots: list[dict[str, Any]] = []
 
         if args.snapshot_json:
             raw_snap = json.loads(Path(args.snapshot_json).read_text(encoding="utf-8"))
@@ -980,8 +986,8 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
         from engine.program_eligibility_db import ProgramEligibilityDB
 
         db = ProgramEligibilityDB(db_path=args.db)
-        upserted: List[str] = []
-        errors_list: List[str] = []
+        upserted: list[str] = []
+        errors_list: list[str] = []
         if args.snapshot_json:
             raw_data = json.loads(Path(args.snapshot_json).read_text(encoding="utf-8"))
             items = raw_data.get("programs", raw_data) if isinstance(raw_data, dict) else raw_data
@@ -1057,7 +1063,7 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
                 try:
                     client.fetch_campaign_scope(camp.handle, eligibility_db=db)
                     upserted.append(camp.handle)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     errors_list.append(f"{camp.handle}: {exc}")
 
         out_payload = {
@@ -1077,8 +1083,8 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
         from engine.ml_diff_and_recon_ranker import ReconAssetClusterer
 
         raw_txt = Path(args.input).read_text(encoding="utf-8").strip()
-        assets_in: List[Dict[str, Any]] = []
-        if raw_txt.startswith("[") or raw_txt.startswith("{"):
+        assets_in: list[dict[str, Any]] = []
+        if raw_txt.startswith(("[", "{")):
             parsed = json.loads(raw_txt)
             if isinstance(parsed, dict):
                 parsed = parsed.get("assets") or parsed.get("endpoints") or parsed.get("items") or []
@@ -1127,7 +1133,7 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
         from engine.ml_diff_and_recon_ranker import JavaScriptBundleAnalyzer
 
         in_path = Path(args.input)
-        bundles_in: List[Dict[str, Any]] = []
+        bundles_in: list[dict[str, Any]] = []
         if in_path.is_dir():
             for p_js in sorted(in_path.rglob("*")):
                 if p_js.is_file() and (
@@ -1208,22 +1214,22 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
 _ENSEMBLE_TRIGGER_FLAGS = {"--ensemble", "--essemble", "--essample", "--embedded", "--embeded"}
 
 
-def _translate_swarm_argv_to_ensemble(argv: Sequence[str]) -> tuple[List[str], bool]:
+def _translate_swarm_argv_to_ensemble(argv: Sequence[str]) -> tuple[list[str], bool]:
     """Translates `rfc_hunt_swarm.py --all [--ensemble|--essemble|--essample] [--embedded|--embeded]` into `ensemble-audit` args."""
     tokens = list(argv)
-    target: Optional[str] = None
+    target: str | None = None
     out_dir: str = "out/ensemble_audit"
-    sarif_out: Optional[str] = None
+    sarif_out: str | None = None
     program: str = "generic"
     freshness_hours: str = "72"
     quorum: str = "2"
-    model: Optional[str] = None
-    findings_json: Optional[str] = None
-    package_client: Optional[str] = None
-    cpu_workers: Optional[str] = None
-    blackboard_db: Optional[str] = None
+    model: str | None = None
+    findings_json: str | None = None
+    package_client: str | None = None
+    cpu_workers: str | None = None
+    blackboard_db: str | None = None
     resume = False
-    proxy: Optional[str] = "auto"
+    proxy: str | None = "auto"
     embedded = False
     no_llm = False
     gha_only = False
@@ -1333,7 +1339,7 @@ def _translate_swarm_argv_to_ensemble(argv: Sequence[str]) -> tuple[List[str], b
         else:
             i += 1
 
-    mapped: List[str] = [
+    mapped: list[str] = [
         "ensemble-audit",
         "--target",
         target or ".",
@@ -1377,7 +1383,7 @@ def _translate_swarm_argv_to_ensemble(argv: Sequence[str]) -> tuple[List[str], b
     return mapped, dry_run
 
 
-def maybe_dispatch_revenue_cli(argv: Sequence[str]) -> Optional[int]:
+def maybe_dispatch_revenue_cli(argv: Sequence[str]) -> int | None:
     """Early non-invasive hook for `rfc_hunt_swarm.py` when invoked with a revenue subcommand or ensemble/embedded flags."""
     if not argv:
         return None

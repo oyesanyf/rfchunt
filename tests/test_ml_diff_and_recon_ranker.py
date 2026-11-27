@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import revenue_cli
 from bugbounty_mcp_server import BugBountyMCPServer
 from engine.ml_diff_and_recon_ranker import (
     CommitDiffRanker,
@@ -23,7 +24,6 @@ from engine.ml_diff_and_recon_ranker import (
 )
 from engine.program_eligibility_db import ProgramEligibilityDB
 from engine.request_hygiene import build_program_compliance_context
-import revenue_cli
 
 
 def test_welford_scaler_and_commit_velocity_burst_detector() -> None:

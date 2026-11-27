@@ -18,17 +18,18 @@ Provides:
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import ipaddress
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import yaml
@@ -47,7 +48,6 @@ from engine.safe_network_validator import (
     is_safe_target_ip,
     validate_target_host,
 )
-
 
 _SKIP_DIRS: frozenset[str] = frozenset(
     {
@@ -70,7 +70,7 @@ _CODE_EXTS: frozenset[str] = frozenset(
 _SPEC_EXTS: frozenset[str] = frozenset({".yaml", ".yml", ".json"})
 _MAX_FILE_BYTES = 1_048_576
 
-_SENSITIVE_OPENAPI_PATHS: Tuple[str, ...] = (
+_SENSITIVE_OPENAPI_PATHS: tuple[str, ...] = (
     "/admin",
     "/internal",
     "/status-lists",
@@ -93,9 +93,9 @@ def _make_finding(
     file_path: str,
     line: int,
     summary: str,
-    metadata: Optional[Dict[str, Any]] = None,
+    metadata: dict[str, Any] | None = None,
     is_live: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     noise = False if is_live else is_non_production_noise(file_path)
     meta = dict(metadata or {})
     meta["non_production_noise"] = noise
@@ -116,9 +116,9 @@ def _make_finding(
     }
 
 
-def _audit_code_file(rel_path: str, text: str) -> List[Dict[str, Any]]:
-    findings: List[Dict[str, Any]] = []
-    seen: set[Tuple[str, int]] = set()
+def _audit_code_file(rel_path: str, text: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
 
     def _emit(rule_id: str, title: str, cwe: str, severity: str, conf: float, pos: int, summary: str) -> None:
         line_no = text[:pos].count("\n") + 1
@@ -141,7 +141,7 @@ def _audit_code_file(rel_path: str, text: str) -> List[Dict[str, Any]]:
 
     def _extract_balanced_call(src: str, start_idx: int, open_paren_idx: int, max_chars: int = 600) -> str:
         depth = 0
-        in_quote: Optional[str] = None
+        in_quote: str | None = None
         escaped = False
         limit = min(len(src), start_idx + max_chars)
         for idx in range(open_paren_idx, limit):
@@ -248,18 +248,21 @@ def _audit_code_file(rel_path: str, text: str) -> List[Dict[str, Any]]:
                 f"Disabled claim validation (`{m.group(0)}`) in {rel_path}.",
             )
 
-    if re.search(r"""(?:openid4vci|openid4vp|oid4vci|c_nonce)""", text, re.IGNORECASE):
-        if "jwt" in text.lower() and not re.search(r"""\b(?:nonce|c_nonce)\b""", text):
-            pos = text.lower().find("oid4vci") if "oid4vci" in text.lower() else text.lower().find("openid4vci")
-            _emit(
-                "JWT-CLAIMS-MISSING-003",
-                "OID4VCI/OID4VP verification handler missing `nonce`/`c_nonce` check",
-                "CWE-287",
-                "HIGH",
-                0.80,
-                max(0, pos),
-                f"OID4VCI/VP flow in {rel_path} lacks explicit `nonce`/`c_nonce` verification.",
-            )
+    if (
+        re.search(r"""(?:openid4vci|openid4vp|oid4vci|c_nonce)""", text, re.IGNORECASE)
+        and "jwt" in text.lower()
+        and not re.search(r"""\b(?:nonce|c_nonce)\b""", text)
+    ):
+        pos = text.lower().find("oid4vci") if "oid4vci" in text.lower() else text.lower().find("openid4vci")
+        _emit(
+            "JWT-CLAIMS-MISSING-003",
+            "OID4VCI/OID4VP verification handler missing `nonce`/`c_nonce` check",
+            "CWE-287",
+            "HIGH",
+            0.80,
+            max(0, pos),
+            f"OID4VCI/VP flow in {rel_path} lacks explicit `nonce`/`c_nonce` verification.",
+        )
 
     # 4. JWT-HEADER-SSRF-004
     for pat, msg in (
@@ -310,14 +313,14 @@ def _audit_code_file(rel_path: str, text: str) -> List[Dict[str, Any]]:
     return findings
 
 
-def _audit_openapi_spec(rel_path: str, text: str) -> List[Dict[str, Any]]:
-    findings: List[Dict[str, Any]] = []
+def _audit_openapi_spec(rel_path: str, text: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
     try:
         if rel_path.lower().endswith(".json"):
             doc = json.loads(text)
         else:
             doc = yaml.safe_load(text)
-    except Exception:
+    except (json.JSONDecodeError, TypeError, ValueError):
         return findings
 
     if not isinstance(doc, dict):
@@ -336,7 +339,7 @@ def _audit_openapi_spec(rel_path: str, text: str) -> List[Dict[str, Any]]:
                 return idx
         return 1
 
-    def _is_ssrf_server_target(raw_target: str) -> Tuple[bool, str, str]:
+    def _is_ssrf_server_target(raw_target: str) -> tuple[bool, str, str]:
         s = str(raw_target or "").strip()
         if not s or (s.startswith("/") and not s.startswith("//")):
             return False, "", ""
@@ -466,7 +469,7 @@ def _which_is_unmocked() -> bool:
     )
 
 
-def _resolve_go_tool(name: str) -> Optional[str]:
+def _resolve_go_tool(name: str) -> str | None:
     cand = shutil.which(name)
     if cand:
         return cand
@@ -490,7 +493,7 @@ def _resolve_go_tool(name: str) -> Optional[str]:
     return None
 
 
-def _resolve_pd_httpx() -> Optional[str]:
+def _resolve_pd_httpx() -> str | None:
     cand = shutil.which("httpx")
     if cand:
         if not _is_python_httpx_cli_binary(cand):
@@ -521,7 +524,7 @@ def _resolve_pd_httpx() -> Optional[str]:
     return None
 
 
-def _resolve_schemathesis_argv() -> Optional[List[str]]:
+def _resolve_schemathesis_argv() -> list[str] | None:
     cand = shutil.which("schemathesis")
     if cand:
         return [cand]
@@ -594,7 +597,7 @@ def _is_valid_live_target(
         try:
             if not rust_authorize(cand_host):
                 return False
-        except Exception:
+        except Exception:  # noqa: BLE001
             return False
     return True
 
@@ -605,8 +608,8 @@ def _parse_subfinder_jsonl(
     base_host: str,
     allow_private: bool,
     rust_authorize: Any = None,
-) -> List[str]:
-    out: List[str] = []
+) -> list[str]:
+    out: list[str] = []
     seen: set[str] = set()
     for raw_line in (stdout or "").splitlines():
         line = raw_line.strip()
@@ -638,7 +641,7 @@ def _parse_subfinder_jsonl(
     return out
 
 
-_OPENAPI_SPEC_SUFFIXES: Tuple[str, ...] = (
+_OPENAPI_SPEC_SUFFIXES: tuple[str, ...] = (
     "openapi.json",
     "openapi.yaml",
     "openapi.yml",
@@ -655,9 +658,9 @@ def _parse_httpx_jsonl(
     base_host: str,
     allow_private: bool,
     rust_authorize: Any = None,
-) -> Tuple[List[Dict[str, Any]], List[str]]:
-    findings: List[Dict[str, Any]] = []
-    live_spec_urls: List[str] = []
+) -> tuple[list[dict[str, Any]], list[str]]:
+    findings: list[dict[str, Any]] = []
+    live_spec_urls: list[str] = []
     for raw_line in (stdout or "").splitlines():
         line = raw_line.strip()
         if not line or not line.startswith("{"):
@@ -678,7 +681,7 @@ def _parse_httpx_jsonl(
             continue
         raw_sc = rec.get("status_code") if rec.get("status_code") is not None else rec.get("status-code")
         try:
-            status_code: Optional[int] = int(raw_sc) if raw_sc is not None else None
+            status_code: int | None = int(raw_sc) if raw_sc is not None else None
         except (TypeError, ValueError):
             status_code = None
         title = str(rec.get("title") or "").strip()
@@ -723,13 +726,15 @@ def _parse_httpx_jsonl(
                     is_live=True,
                 )
             )
-            if any(tok in url_path or tok in title.lower() for tok in ("openapi", "swagger", "api-docs")):
-                if rec_url not in live_spec_urls:
-                    live_spec_urls.append(rec_url)
+            if (
+                any(tok in url_path or tok in title.lower() for tok in ("openapi", "swagger", "api-docs"))
+                and rec_url not in live_spec_urls
+            ):
+                live_spec_urls.append(rec_url)
 
         if isinstance(raw_hdrs, dict) and len(raw_hdrs) > 0 and (status_code is None or 200 <= status_code < 400):
             hdr_map = {str(k).lower(): str(v) for k, v in raw_hdrs.items()}
-            missing: List[str] = []
+            missing: list[str] = []
             if "content-security-policy" not in hdr_map:
                 missing.append("Content-Security-Policy")
             if "x-content-type-options" not in hdr_map:
@@ -769,9 +774,9 @@ def _parse_katana_jsonl(
     base_host: str,
     allow_private: bool,
     rust_authorize: Any = None,
-) -> Tuple[List[Dict[str, Any]], List[str]]:
-    findings: List[Dict[str, Any]] = []
-    live_spec_urls: List[str] = []
+) -> tuple[list[dict[str, Any]], list[str]]:
+    findings: list[dict[str, Any]] = []
+    live_spec_urls: list[str] = []
     for raw_line in (stdout or "").splitlines():
         line = raw_line.strip()
         if not line or not line.startswith("{"):
@@ -801,7 +806,7 @@ def _parse_katana_jsonl(
             else (resp.get("status-code") if resp.get("status-code") is not None else rec.get("status_code"))
         )
         try:
-            status_code: Optional[int] = int(raw_sc) if raw_sc is not None else None
+            status_code: int | None = int(raw_sc) if raw_sc is not None else None
         except (TypeError, ValueError):
             status_code = None
 
@@ -872,8 +877,8 @@ def _parse_schemathesis_output(
     returncode: int,
     *,
     spec_label: str,
-) -> List[Dict[str, Any]]:
-    findings: List[Dict[str, Any]] = []
+) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
     seen_routes: set[str] = set()
 
     for raw_line in (stdout or "").splitlines():
@@ -947,7 +952,7 @@ def _is_openapi_spec_file(path: Path) -> bool:
             doc = json.loads(text)
         else:
             doc = yaml.safe_load(text)
-    except Exception:
+    except (json.JSONDecodeError, TypeError, ValueError):
         return False
     if not isinstance(doc, dict):
         return False
@@ -963,10 +968,10 @@ def _run_authorized_live_pipeline(
     target_hosts: Sequence[str],
     eligibility_db: Any,
     max_rps: float,
-    spec_targets: Sequence[Union[Path, str]] = (),
-    repo_root: Optional[Path] = None,
-    researcher_handle: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+    spec_targets: Sequence[Path | str] = (),
+    repo_root: Path | None = None,
+    researcher_handle: str | None = None,
+) -> list[dict[str, Any]]:
     """
     Strictly fail-closed live API surface pipeline (`subfinder` -> `httpx` -> `katana` -> `schemathesis`).
     Hydrates `ProgramComplianceContext` to enforce Tier 1 prohibitions, exact DNS label-boundary
@@ -986,16 +991,16 @@ def _run_authorized_live_pipeline(
 
     limiter = ctx.rate_limiter
     eff_rps = ctx.effective_max_rps
-    pd_rate_args: List[str] = (
-        ["-rlm", str(max(1, int(round(eff_rps * 60.0))))]
+    pd_rate_args: list[str] = (
+        ["-rlm", str(max(1, round(eff_rps * 60.0)))]
         if eff_rps < 1.0
         else ["-rl", str(max(1, int(eff_rps)))]
     )
-    cli_header_args: List[str] = []
+    cli_header_args: list[str] = []
     for hk, hv in ctx.to_cli_header_pairs():
         cli_header_args.extend(["-H", f"{hk}: {hv}"])
 
-    safe_hosts: List[str] = []
+    safe_hosts: list[str] = []
     for raw_host in target_hosts:
         h = str(raw_host or "").strip()
         if not h or "@" in h:
@@ -1023,10 +1028,10 @@ def _run_authorized_live_pipeline(
     except ImportError:
         _rust_authorize = None
 
-    findings: List[Dict[str, Any]] = []
-    seen_finding_keys: set[Tuple[str, str, int]] = set()
+    findings: list[dict[str, Any]] = []
+    seen_finding_keys: set[tuple[str, str, int]] = set()
 
-    def _add_live_findings(items: Sequence[Dict[str, Any]]) -> None:
+    def _add_live_findings(items: Sequence[dict[str, Any]]) -> None:
         for item in items:
             key = (str(item.get("rule_id", "")), str(item.get("file_path", "")), int(item.get("line", 1)))
             if key not in seen_finding_keys:
@@ -1047,12 +1052,12 @@ def _run_authorized_live_pipeline(
             try:
                 if not _rust_authorize(base_host):
                     continue
-            except Exception:
+            except Exception:  # noqa: BLE001, S112
                 continue
 
         initial_url = host if host.startswith(("http://", "https://")) else f"https://{host}"
-        discovered_urls: List[str] = [initial_url]
-        live_spec_urls: List[str] = []
+        discovered_urls: list[str] = [initial_url]
+        live_spec_urls: list[str] = []
 
         is_ip_literal = False
         try:
@@ -1186,7 +1191,7 @@ def _run_authorized_live_pipeline(
                         pass
 
         if schemathesis_argv:
-            schemathesis_targets: List[Tuple[str, Optional[str]]] = []
+            schemathesis_targets: list[tuple[str, str | None]] = []
             seen_specs: set[str] = set()
             for sp_url in live_spec_urls[:3]:
                 if sp_url not in seen_specs:
@@ -1207,7 +1212,7 @@ def _run_authorized_live_pipeline(
                         schemathesis_targets.append((p_str, primary_base))
                         local_added += 1
 
-            sch_rate = f"{max(1, int(round(eff_rps * 60.0)))}/m" if eff_rps < 1.0 else f"{int(eff_rps)}/s"
+            sch_rate = f"{max(1, round(eff_rps * 60.0))}/m" if eff_rps < 1.0 else f"{int(eff_rps)}/s"
             for spec_target, base_url_opt in schemathesis_targets[:3]:
                 target_check = base_url_opt if base_url_opt is not None else spec_target
                 if not _is_valid_live_target(
@@ -1262,7 +1267,7 @@ def _run_authorized_live_pipeline(
 
 
 def audit_api_and_jwt(
-    repo_path: Union[Path, str],
+    repo_path: Path | str,
     *,
     program: str = "",
     embedded: bool = False,
@@ -1270,10 +1275,10 @@ def audit_api_and_jwt(
     allow_live: bool = False,
     eligibility_db: Any = None,
     max_rps: float = 2.0,
-    target_hosts: Optional[Sequence[str]] = None,
-    target_files: Optional[Sequence[Union[Path, str]]] = None,
-    researcher_handle: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+    target_hosts: Sequence[str] | None = None,
+    target_files: Sequence[Path | str] | None = None,
+    researcher_handle: str | None = None,
+) -> list[dict[str, Any]]:
     """
     Runs offline JWT/JWS/SD-JWT/OID4VCI and OpenAPI authentication auditing across `repo_path`
     (or strictly scoped to `target_files` when provided for fast `<72h` diff scanning).
@@ -1285,8 +1290,8 @@ def audit_api_and_jwt(
         return []
     root = Path(resolved_repo)
 
-    code_targets: List[Path] = []
-    spec_targets: List[Path] = []
+    code_targets: list[Path] = []
+    spec_targets: list[Path] = []
     if target_files is not None:
         seen_paths: set[Path] = set()
         for raw_f in target_files:
@@ -1315,7 +1320,7 @@ def audit_api_and_jwt(
                 elif ext in _SPEC_EXTS:
                     spec_targets.append(fpath)
 
-    def _scan_path(fpath: Path, is_spec: bool) -> List[Dict[str, Any]]:
+    def _scan_path(fpath: Path, is_spec: bool) -> list[dict[str, Any]]:
         try:
             rel = fpath.relative_to(root).as_posix()
             if fpath.stat().st_size > _MAX_FILE_BYTES:
@@ -1326,7 +1331,7 @@ def audit_api_and_jwt(
         return _audit_openapi_spec(rel, text) if is_spec else _audit_code_file(rel, text)
 
     max_workers = min(8, max(2, os.cpu_count() or 4))
-    findings: List[Dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
     if code_targets or spec_targets:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [pool.submit(_scan_path, p, False) for p in code_targets] + [

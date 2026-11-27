@@ -17,16 +17,16 @@ Design Invariants:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import math
 import random
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
-
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import Any
 
 # Objective directions: True = maximize, False = minimize
 # Index: 0=metric, 1=train_time, 2=memory, 3=latency, 4=risk, 5=robustness_drop
-OBJECTIVE_DIRECTIONS: Tuple[bool, ...] = (
+OBJECTIVE_DIRECTIONS: tuple[bool, ...] = (
     True,   # 0: metric (higher is better)
     False,  # 1: log(train_time) (lower is better)
     False,  # 2: log(peak_mem) (lower is better)
@@ -35,7 +35,7 @@ OBJECTIVE_DIRECTIONS: Tuple[bool, ...] = (
     False,  # 5: robustness_drop (lower is better)
 )
 
-OBJECTIVE_NAMES: Tuple[str, ...] = (
+OBJECTIVE_NAMES: tuple[str, ...] = (
     "metric",
     "log_train_time",
     "log_peak_mem",
@@ -44,7 +44,7 @@ OBJECTIVE_NAMES: Tuple[str, ...] = (
     "robustness_drop",
 )
 
-_SEVERITY_RANK: Dict[str, float] = {
+_SEVERITY_RANK: dict[str, float] = {
     "CRITICAL": 1.0,
     "HIGH": 0.80,
     "MEDIUM": 0.55,
@@ -52,7 +52,7 @@ _SEVERITY_RANK: Dict[str, float] = {
     "INFO": 0.10,
 }
 
-_DEFAULT_ENGINE_WEIGHTS: Dict[str, float] = {
+_DEFAULT_ENGINE_WEIGHTS: dict[str, float] = {
     "z3_formal": 0.92,
     "lean4": 0.95,
     "trufflehog": 0.90,
@@ -115,11 +115,11 @@ class CandidateResult:
     peak_mem_mb: float
     latency_ms_per_row: float
     risk_penalty: float
-    objectives: Tuple[float, ...]
-    meta: Dict[str, Any] = field(default_factory=dict)
+    objectives: tuple[float, ...]
+    meta: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
-        result: Dict[str, Any] = {
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
             "name": self.name,
             "metric": self.metric,
             "train_time_s": self.train_time_s,
@@ -178,9 +178,9 @@ def dominates(a: CandidateResult, b: CandidateResult) -> bool:
     return better_or_equal and strictly_better
 
 
-def pareto_front(candidates: Sequence[CandidateResult]) -> List[CandidateResult]:
+def pareto_front(candidates: Sequence[CandidateResult]) -> list[CandidateResult]:
     """Extract all non-dominated candidates from `candidates`."""
-    front: List[CandidateResult] = []
+    front: list[CandidateResult] = []
     for c in candidates:
         is_dominated = any(dominates(o, c) for o in candidates if o is not c)
         if not is_dominated:
@@ -193,7 +193,7 @@ def _normalize_axis(
     *,
     higher_better: bool,
     min_scale: float,
-) -> List[float]:
+) -> list[float]:
     n = len(values)
     finite_vals = [v for v in values if math.isfinite(v)]
     if not finite_vals:
@@ -308,7 +308,7 @@ def knee_point_selection(
         for i in range(len(working))
     ]
 
-    def _q(val: Any, decimals: Optional[int] = None) -> float:
+    def _q(val: Any, decimals: int | None = None) -> float:
         f = float(val)
         if not math.isfinite(f):
             return float("inf")
@@ -322,7 +322,7 @@ def knee_point_selection(
             return -f
         return -round(f / m_tie_scale, 8)
 
-    def tie_key(i: int) -> Tuple[float, float, float, float, float, float, str]:
+    def tie_key(i: int) -> tuple[float, float, float, float, float, float, str]:
         c = working[i]
         return (
             _q_metric(c.metric),
@@ -383,15 +383,15 @@ def knee_point_selection(
 
 def filter_by_constraints(
     candidates: Sequence[CandidateResult],
-    max_train_time_s: Optional[float] = None,
-    max_peak_mem_mb: Optional[float] = None,
-    max_latency_ms_per_row: Optional[float] = None,
-) -> Tuple[List[CandidateResult], List[Dict[str, Any]]]:
+    max_train_time_s: float | None = None,
+    max_peak_mem_mb: float | None = None,
+    max_latency_ms_per_row: float | None = None,
+) -> tuple[list[CandidateResult], list[dict[str, Any]]]:
     """Filter candidates by runtime/memory/latency constraints."""
-    passing: List[CandidateResult] = []
-    pruned: List[Dict[str, Any]] = []
+    passing: list[CandidateResult] = []
+    pruned: list[dict[str, Any]] = []
     for c in candidates:
-        violations: List[str] = []
+        violations: list[str] = []
         if max_train_time_s is not None and c.train_time_s > max_train_time_s:
             violations.append(f"train_time={c.train_time_s:.2f}s > {max_train_time_s}s")
         if max_peak_mem_mb is not None and c.peak_mem_mb > max_peak_mem_mb:
@@ -427,12 +427,12 @@ class MultiObjectiveCandidate:
     """
 
     name: str
-    objectives: Tuple[float, ...]
-    directions: Tuple[bool, ...]
-    raw_metrics: Dict[str, Any] = field(default_factory=dict)
-    meta: Dict[str, Any] = field(default_factory=dict)
+    objectives: tuple[float, ...]
+    directions: tuple[bool, ...]
+    raw_metrics: dict[str, Any] = field(default_factory=dict)
+    meta: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "objectives": list(self.objectives),
@@ -445,7 +445,7 @@ class MultiObjectiveCandidate:
 def generalized_dominates(
     a: MultiObjectiveCandidate,
     b: MultiObjectiveCandidate,
-    directions: Optional[Sequence[bool]] = None,
+    directions: Sequence[bool] | None = None,
 ) -> bool:
     """Return True if `a` Pareto-dominates `b` across explicit per-axis `directions`."""
     dirs = tuple(directions) if directions is not None else a.directions
@@ -482,10 +482,10 @@ def generalized_dominates(
 
 def generalized_pareto_front(
     candidates: Sequence[MultiObjectiveCandidate],
-    directions: Optional[Sequence[bool]] = None,
-) -> List[MultiObjectiveCandidate]:
+    directions: Sequence[bool] | None = None,
+) -> list[MultiObjectiveCandidate]:
     """Extracts the exact non-dominated Pareto front for domain-agnostic objective vectors."""
-    front: List[MultiObjectiveCandidate] = []
+    front: list[MultiObjectiveCandidate] = []
     for c in candidates:
         if not any(generalized_dominates(o, c, directions=directions) for o in candidates if o is not c):
             front.append(c)
@@ -495,12 +495,12 @@ def generalized_pareto_front(
 def select_pareto_knee(
     front: Sequence[MultiObjectiveCandidate],
     *,
-    directions: Optional[Sequence[bool]] = None,
-    min_scales: Optional[Sequence[float]] = None,
-    weights: Optional[Sequence[float]] = None,
+    directions: Sequence[bool] | None = None,
+    min_scales: Sequence[float] | None = None,
+    weights: Sequence[float] | None = None,
     benefit_indices: Sequence[int] = (0,),
     preference: str = "balanced",
-) -> Tuple[MultiObjectiveCandidate, Dict[str, float]]:
+) -> tuple[MultiObjectiveCandidate, dict[str, float]]:
     """
     Domain-agnostic Pareto knee-point selector (chord distance to utopia `(1.0, 0.0)`
     with weighted L2 utopia fallback). Applies NO hidden `log1p` transform to caller
@@ -521,7 +521,7 @@ def select_pareto_knee(
         eff_weights.extend([1.0 / max(1, n_obj)] * (n_obj - len(eff_weights)))
 
     # Normalize every objective onto [0, 1] where 1.0 is utopia (best)
-    norm_cols: List[List[float]] = []
+    norm_cols: list[list[float]] = []
     for j in range(n_obj):
         col = [float(c.objectives[j]) if j < len(c.objectives) else 0.0 for c in front]
         norm_cols.append(_normalize_axis(col, higher_better=bool(dirs[j]), min_scale=float(eff_scales[j])))
@@ -534,11 +534,11 @@ def select_pareto_knee(
     ben_w_sum = sum(eff_weights[i] for i in ben_set) or 1.0
     cost_w_sum = sum(eff_weights[i] for i in cost_idxs) or 1.0
 
-    benefit: List[float] = [
+    benefit: list[float] = [
         sum(eff_weights[j] * norm_cols[j][i] for j in ben_set) / ben_w_sum
         for i in range(len(front))
     ]
-    costrisk: List[float] = [
+    costrisk: list[float] = [
         (1.0 - sum(eff_weights[j] * norm_cols[j][i] for j in cost_idxs) / cost_w_sum)
         if cost_idxs
         else (1.0 - benefit[i])
@@ -555,12 +555,12 @@ def select_pareto_knee(
     else:
         w_ben, w_cost = 0.60, 0.40
 
-    def _tie_key(i: int) -> Tuple[float, float, str]:
+    def _tie_key(i: int) -> tuple[float, float, str]:
         return (-round(benefit[i], 8), round(costrisk[i], 8), str(front[i].name))
 
     # Compute weighted utopia proximity score for every candidate (higher = better, in [0, 1])
-    scores_by_name: Dict[str, float] = {}
-    udists: List[float] = []
+    scores_by_name: dict[str, float] = {}
+    udists: list[float] = []
     for i, c in enumerate(front):
         ud = math.sqrt(w_ben * (1.0 - benefit[i]) ** 2 + w_cost * costrisk[i] ** 2)
         udists.append(ud)
@@ -595,12 +595,12 @@ def select_pareto_knee(
 # ---------------------------------------------------------------------------
 
 
-def _extract_feature_matrix(rows: Sequence[Dict[str, Any]]) -> List[List[float]]:
+def _extract_feature_matrix(rows: Sequence[dict[str, Any]]) -> list[list[float]]:
     """Convert heterogeneous finding/metric dicts into a clean finite numeric matrix."""
     if not rows:
         return []
 
-    extra_num_keys: List[str] = []
+    extra_num_keys: list[str] = []
     seen_extra: set[str] = set()
     reserved = {
         "confidence",
@@ -629,7 +629,7 @@ def _extract_feature_matrix(rows: Sequence[Dict[str, Any]]) -> List[List[float]]
                 extra_num_keys.append(k)
     extra_num_keys.sort()
 
-    matrix: List[List[float]] = []
+    matrix: list[list[float]] = []
     for row in rows:
         if not isinstance(row, dict):
             row = {}
@@ -657,7 +657,7 @@ def _extract_feature_matrix(rows: Sequence[Dict[str, Any]]) -> List[List[float]]
         ) else 0.0
         noise_flag = 1.0 if bool(row.get("non_production_noise", meta.get("non_production_noise", False))) else 0.0
 
-        vec: List[float] = [
+        vec: list[float] = [
             conf,
             sev_rank,
             freshness,
@@ -677,7 +677,7 @@ def _extract_feature_matrix(rows: Sequence[Dict[str, Any]]) -> List[List[float]]
     return matrix
 
 
-def _standardize_matrix(matrix: List[List[float]]) -> List[List[float]]:
+def _standardize_matrix(matrix: list[list[float]]) -> list[list[float]]:
     if not matrix:
         return []
     n_rows = len(matrix)
@@ -706,7 +706,7 @@ class ACDSOAnomalyScorer:
     def __init__(
         self,
         *,
-        contamination: Union[str, float] = "auto",
+        contamination: str | float = "auto",
         random_state: int = 42,
         prefer_sklearn: bool = True,
     ) -> None:
@@ -714,9 +714,9 @@ class ACDSOAnomalyScorer:
         self.random_state = int(random_state)
         self.prefer_sklearn = bool(prefer_sklearn)
         self.last_backend: str = "uninitialized"
-        self.last_audit_trail: Dict[str, Any] = {}
+        self.last_audit_trail: dict[str, Any] = {}
 
-    def _row_heuristic_score(self, row: Dict[str, Any]) -> float:
+    def _row_heuristic_score(self, row: dict[str, Any]) -> float:
         if not isinstance(row, dict):
             return 0.5
         meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
@@ -738,7 +738,7 @@ class ACDSOAnomalyScorer:
         if n_rows < 2:
             return 0.0
         q = 0.05 if self.contamination == "auto" else max(0.01, min(0.5, float(self.contamination)))
-        k_tail = max(1, min(n_rows - 1, int(round(q * n_rows))))
+        k_tail = max(1, min(n_rows - 1, round(q * n_rows)))
         sorted_anom = sorted(anom_scores)
         bulk = sorted_anom[:-k_tail]
         tail = sorted_anom[-k_tail:]
@@ -753,14 +753,14 @@ class ACDSOAnomalyScorer:
             penalty += 2.0 * abs(anom_rate - float(self.contamination))
         return float(separation - penalty)
 
-    def _fit_score_sklearn(self, std_mat: List[List[float]]) -> Optional[Tuple[List[float], str]]:
+    def _fit_score_sklearn(self, std_mat: list[list[float]]) -> tuple[list[float], str] | None:
         if not self.prefer_sklearn:
             return None
         try:
             import numpy as np  # type: ignore
             from sklearn.ensemble import IsolationForest  # type: ignore
             from sklearn.neighbors import LocalOutlierFactor  # type: ignore
-        except Exception:
+        except Exception:  # noqa: BLE001
             return None
 
         X_np = np.asarray(std_mat, dtype=np.float64)
@@ -769,10 +769,10 @@ class ACDSOAnomalyScorer:
         if n_rows < 2:
             return None
 
-        candidates: List[Tuple[float, int, str, List[float]]] = []
+        candidates: list[tuple[float, int, str, list[float]]] = []
         # 1. IsolationForest
         try:
-            if_contam: Union[str, float] = (
+            if_contam: str | float = (
                 self.contamination if self.contamination == "auto" else max(0.01, min(0.49, float(self.contamination)))
             )
             iforest = IsolationForest(
@@ -787,14 +787,14 @@ class ACDSOAnomalyScorer:
             rate = float(np.mean(preds == -1))
             obj = self._score_tail_separation(anom, rate)
             candidates.append((obj, 2, "sklearn_iforest", anom))
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
         # 2. LocalOutlierFactor (novelty=True) when n_rows >= 3
         if n_rows >= 3:
             try:
                 eff_nn = max(1, min(20, n_rows - 1))
-                lof_contam: Union[str, float] = (
+                lof_contam: str | float = (
                     self.contamination if self.contamination == "auto" else max(0.01, min(0.49, float(self.contamination)))
                 )
                 lof = LocalOutlierFactor(
@@ -809,7 +809,7 @@ class ACDSOAnomalyScorer:
                 rate = float(np.mean(preds == -1))
                 obj = self._score_tail_separation(anom, rate)
                 candidates.append((obj, 1, "sklearn_lof", anom))
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
 
         if not candidates:
@@ -825,7 +825,7 @@ class ACDSOAnomalyScorer:
             normed = [round(max(0.0, min(1.0, (v - lo) / span)), 6) for v in best_anom]
         return normed, best_name
 
-    def _fit_score_python_parity(self, std_mat: List[List[float]]) -> List[float]:
+    def _fit_score_python_parity(self, std_mat: list[list[float]]) -> list[float]:
         n_rows = len(std_mat)
         n_cols = len(std_mat[0]) if n_rows else 0
         if n_rows == 0:
@@ -850,11 +850,11 @@ class ACDSOAnomalyScorer:
         else:
             ref_indices = list(range(n_rows))
 
-        raw_scores: List[float] = []
+        raw_scores: list[float] = []
         for i in range(n_rows):
             row = std_mat[i]
             robust_dev = sum(abs(row[j] - col_medians[j]) / col_mads[j] for j in range(n_cols)) / float(n_cols)
-            dists: List[float] = []
+            dists: list[float] = []
             for p in ref_indices:
                 if p == i:
                     continue
@@ -872,7 +872,7 @@ class ACDSOAnomalyScorer:
             return [0.5] * n_rows
         return [round(max(0.0, min(1.0, (s - lo) / span)), 6) for s in raw_scores]
 
-    def fit_score(self, rows: Sequence[Dict[str, Any]]) -> List[float]:
+    def fit_score(self, rows: Sequence[dict[str, Any]]) -> list[float]:
         """Fit unsupervised outlier model on `rows` and return normalized anomaly scores in [0, 1]."""
         if not rows:
             self.last_backend = "empty"
@@ -897,7 +897,7 @@ class ACDSOAnomalyScorer:
 
         # Blend unsupervised isolation score with domain severity/confidence signal
         # so high-severity deterministic defects are prioritized over benign outliers.
-        blended: List[float] = []
+        blended: list[float] = []
         for idx, row in enumerate(rows):
             heur = self._row_heuristic_score(row if isinstance(row, dict) else {})
             val = 0.45 * anom_scores[idx] + 0.55 * heur
@@ -913,12 +913,12 @@ class ACDSOAnomalyScorer:
 
 
 def rank_stage2_candidates(
-    candidates: Sequence[Dict[str, Any]],
+    candidates: Sequence[dict[str, Any]],
     *,
     top_k: int = 5,
     min_keep: int = 3,
     preference: str = "balanced",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Stage 2 ACDSO Pareto + Anomaly triage funnel.
 
@@ -939,8 +939,8 @@ def rank_stage2_candidates(
     scorer = ACDSOAnomalyScorer()
     anom_scores = scorer.fit_score(cand_list)
 
-    cand_objs: List[CandidateResult] = []
-    idx_by_name: Dict[str, int] = {}
+    cand_objs: list[CandidateResult] = []
+    idx_by_name: dict[str, int] = {}
     for idx, row in enumerate(cand_list):
         meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
         is_noise = bool(row.get("non_production_noise", meta.get("non_production_noise", False)))
@@ -997,7 +997,7 @@ def rank_stage2_candidates(
     eff_k = min(len(cand_list), max(1, int(top_k)))
     _ = min_keep
 
-    selected_objs: List[CandidateResult] = []
+    selected_objs: list[CandidateResult] = []
     if front:
         knee = knee_point_selection(front, preference=preference)
         selected_objs.append(knee)
@@ -1025,7 +1025,7 @@ def rank_stage2_candidates(
             selected_objs.append(c)
             seen_names.add(c.name)
 
-    selected_dicts: List[Dict[str, Any]] = []
+    selected_dicts: list[dict[str, Any]] = []
     front_names = {c.name for c in front}
     for rank_idx, obj in enumerate(selected_objs, start=1):
         orig_idx = idx_by_name[obj.name]
@@ -1061,11 +1061,11 @@ class PolicyResult:
 
     policy: Any
     mean_reward: float = 0.0
-    reward_history: List[float] = field(default_factory=list)
+    reward_history: list[float] = field(default_factory=list)
     best_iteration: int = 0
-    action_distribution: Dict[int, float] = field(default_factory=dict)
-    feature_importance: Dict[str, float] = field(default_factory=dict)
-    config: Dict[str, Any] = field(default_factory=dict)
+    action_distribution: dict[int, float] = field(default_factory=dict)
+    feature_importance: dict[str, float] = field(default_factory=dict)
+    config: dict[str, Any] = field(default_factory=dict)
     n_actions: int = 2
 
     def get_action(self, observation: Sequence[float]) -> int:
@@ -1076,7 +1076,7 @@ class PolicyResult:
             return int(pred[0])
         raise ValueError("Policy does not support action computation")
 
-    def get_action_probs(self, observation: Sequence[float]) -> List[float]:
+    def get_action_probs(self, observation: Sequence[float]) -> list[float]:
         if hasattr(self.policy, "predict_proba"):
             probs = self.policy.predict_proba([list(observation)])[0]
             return [float(p) for p in probs]
@@ -1102,14 +1102,14 @@ class ContextualBanditEnv:
         self,
         X: Sequence[Sequence[float]],
         rewards: Sequence[Sequence[float]],
-        feature_names: Optional[List[str]] = None,
-        action_names: Optional[List[str]] = None,
+        feature_names: list[str] | None = None,
+        action_names: list[str] | None = None,
         seed: int = 42,
     ) -> None:
-        self.X: List[List[float]] = [
+        self.X: list[list[float]] = [
             [_safe_float(v, 0.0) for v in row] for row in X
         ]
-        self.rewards: List[List[float]] = [
+        self.rewards: list[list[float]] = [
             [_safe_float(v, 0.0) for v in row] for row in rewards
         ]
         if not self.X or not self.rewards:
@@ -1128,13 +1128,13 @@ class ContextualBanditEnv:
         self._current_idx = 0
         self._rng = random.Random(seed)
 
-    def reset(self, seed: Optional[int] = None) -> Tuple[List[float], Dict[str, Any]]:
+    def reset(self, seed: int | None = None) -> tuple[list[float], dict[str, Any]]:
         if seed is not None:
             self._rng = random.Random(seed)
         self._current_idx = self._rng.randrange(0, self.n_samples)
         return list(self.X[self._current_idx]), {"idx": self._current_idx}
 
-    def step(self, action: int) -> Tuple[List[float], float, bool, bool, Dict[str, Any]]:
+    def step(self, action: int) -> tuple[list[float], float, bool, bool, dict[str, Any]]:
         eff_action = max(0, min(self.n_actions - 1, int(action)))
         reward = float(self.rewards[self._current_idx][eff_action])
         obs = list(self.X[self._current_idx])
@@ -1158,10 +1158,10 @@ class _PurePythonBanditPolicy:
         probs: Sequence[float],
         best_action: int,
         *,
-        weights_matrix: Optional[Sequence[Sequence[float]]] = None,
-        biases: Optional[Sequence[float]] = None,
-        means: Optional[Sequence[float]] = None,
-        stds: Optional[Sequence[float]] = None,
+        weights_matrix: Sequence[Sequence[float]] | None = None,
+        biases: Sequence[float] | None = None,
+        means: Sequence[float] | None = None,
+        stds: Sequence[float] | None = None,
     ) -> None:
         self.n_actions = max(1, int(n_actions))
         total = sum(max(0.0, float(p)) for p in probs)
@@ -1170,20 +1170,20 @@ class _PurePythonBanditPolicy:
         else:
             self._probs = [max(0.0, float(p)) / total for p in probs]
         self._best_action = max(0, min(self.n_actions - 1, int(best_action)))
-        self._W: Optional[List[List[float]]] = (
+        self._W: list[list[float]] | None = (
             [[float(v) for v in row] for row in weights_matrix]
             if weights_matrix is not None and len(weights_matrix) == self.n_actions
             else None
         )
-        self._b: Optional[List[float]] = (
+        self._b: list[float] | None = (
             [float(v) for v in biases]
             if biases is not None and len(biases) == self.n_actions
             else None
         )
-        self._means: List[float] = [float(v) for v in (means or ())]
-        self._stds: List[float] = [max(1e-6, float(v)) for v in (stds or ())]
+        self._means: list[float] = [float(v) for v in (means or ())]
+        self._stds: list[float] = [max(1e-6, float(v)) for v in (stds or ())]
 
-    def _row_probs(self, row: Sequence[float]) -> List[float]:
+    def _row_probs(self, row: Sequence[float]) -> list[float]:
         if self._W is None or self._b is None or not self._means:
             return list(self._probs)
         n_feat = len(self._means)
@@ -1191,7 +1191,7 @@ class _PurePythonBanditPolicy:
             ((_safe_float(row[j], 0.0) if j < len(row) else 0.0) - self._means[j]) / self._stds[j]
             for j in range(n_feat)
         ]
-        logits: List[float] = []
+        logits: list[float] = []
         for a in range(self.n_actions):
             w_row = self._W[a]
             dot = self._b[a] + sum(w_row[j] * x_s[j] for j in range(min(len(w_row), n_feat)))
@@ -1201,28 +1201,28 @@ class _PurePythonBanditPolicy:
         tot = sum(exps) or 1.0
         return [e / tot for e in exps]
 
-    def predict(self, X: Sequence[Sequence[float]]) -> List[int]:
-        out: List[int] = []
+    def predict(self, X: Sequence[Sequence[float]]) -> list[int]:
+        out: list[int] = []
         for row in X:
             p = self._row_probs(row)
             out.append(max(range(self.n_actions), key=lambda a: (p[a], -a)))
         return out
 
-    def predict_proba(self, X: Sequence[Sequence[float]]) -> List[List[float]]:
+    def predict_proba(self, X: Sequence[Sequence[float]]) -> list[list[float]]:
         return [self._row_probs(row) for row in X]
 
 
 class _SklearnWrappedPolicy:
     """Safe wrapper around sklearn LogisticRegression ensuring full n_actions probability vectors."""
 
-    def __init__(self, clf: Any, means: List[float], stds: List[float], n_actions: int) -> None:
+    def __init__(self, clf: Any, means: list[float], stds: list[float], n_actions: int) -> None:
         self.clf = clf
         self.means = means
         self.stds = stds
         self.n_actions = n_actions
 
-    def _transform(self, X: Sequence[Sequence[float]]) -> List[List[float]]:
-        out: List[List[float]] = []
+    def _transform(self, X: Sequence[Sequence[float]]) -> list[list[float]]:
+        out: list[list[float]] = []
         for row in X:
             r_len = len(row)
             out.append(
@@ -1233,15 +1233,15 @@ class _SklearnWrappedPolicy:
             )
         return out
 
-    def predict(self, X: Sequence[Sequence[float]]) -> List[int]:
+    def predict(self, X: Sequence[Sequence[float]]) -> list[int]:
         X_s = self._transform(X)
         return [int(v) for v in self.clf.predict(X_s)]
 
-    def predict_proba(self, X: Sequence[Sequence[float]]) -> List[List[float]]:
+    def predict_proba(self, X: Sequence[Sequence[float]]) -> list[list[float]]:
         X_s = self._transform(X)
         raw_probs = self.clf.predict_proba(X_s)
         classes = [int(c) for c in getattr(self.clf, "classes_", [])]
-        result: List[List[float]] = []
+        result: list[list[float]] = []
         for row_p in raw_probs:
             full = [0.0] * self.n_actions
             for cls_id, prob in zip(classes, row_p):
@@ -1269,7 +1269,7 @@ class PolicyLearner:
         self,
         env: ContextualBanditEnv,
         algorithm: str = "PPO",
-        config: Optional[Dict[str, Any]] = None,
+        config: dict[str, Any] | None = None,
         *,
         seed: int = 42,
         prefer_sklearn: bool = True,
@@ -1279,7 +1279,7 @@ class PolicyLearner:
         self.config = dict(config or {})
         self.seed = int(seed)
         self.prefer_sklearn = bool(prefer_sklearn)
-        self._result: Optional[PolicyResult] = None
+        self._result: PolicyResult | None = None
 
     def train(
         self,
@@ -1292,9 +1292,9 @@ class PolicyLearner:
         n_actions = self.env.n_actions
         rollouts = max(n_actions * 4, int(n_iterations) * 10)
 
-        observations: List[List[float]] = []
-        actions: List[int] = []
-        rewards: List[float] = []
+        observations: list[list[float]] = []
+        actions: list[int] = []
+        rewards: list[float] = []
         counts = [0] * n_actions
         reward_sums = [0.0] * n_actions
 
@@ -1355,7 +1355,7 @@ class PolicyLearner:
                 clf.fit(X_scaled, y_arr, sample_weight=w_arr)
                 wrapped_policy = _SklearnWrappedPolicy(clf, means, stds, n_actions)
                 backend = "sklearn_logreg"
-            except Exception:
+            except Exception:  # noqa: BLE001
                 wrapped_policy = None
 
         if wrapped_policy is None:
@@ -1376,10 +1376,10 @@ class PolicyLearner:
 
             # Fit pure-Python context-aware L2 weighted multinomial logistic regression
             n_feat = self.env.n_features
-            w_mat: Optional[List[List[float]]] = None
-            b_vec: Optional[List[float]] = None
-            means_py: List[float] = []
-            stds_py: List[float] = []
+            w_mat: list[list[float]] | None = None
+            b_vec: list[float] | None = None
+            means_py: list[float] = []
+            stds_py: list[float] = []
             if len(unique_actions) >= 2 and n_feat > 0 and observations:
                 means_py = [_mean([obs[j] for obs in observations]) for j in range(n_feat)]
                 stds_py = [_std([obs[j] for obs in observations], floor=1e-6) for j in range(n_feat)]
@@ -1445,10 +1445,10 @@ class PolicyLearner:
         )
         return self._result
 
-    def evaluate(self, n_episodes: int = 50) -> Dict[str, float]:
+    def evaluate(self, n_episodes: int = 50) -> dict[str, float]:
         if self._result is None:
             raise RuntimeError("Must train policy before evaluation")
-        rewards: List[float] = []
+        rewards: list[float] = []
         for _ in range(max(1, int(n_episodes))):
             obs, _ = self.env.reset()
             action = self._result.get_action(obs)
@@ -1496,9 +1496,9 @@ class TwoLanePolicyScheduler:
         queue_capacity: int,
         *,
         signal_score: float,
-        lane1_reward_history: Optional[Sequence[float]] = None,
-        lane2_reward_history: Optional[Sequence[float]] = None,
-    ) -> Dict[str, Any]:
+        lane1_reward_history: Sequence[float] | None = None,
+        lane2_reward_history: Sequence[float] | None = None,
+    ) -> dict[str, Any]:
         cap = max(0, int(queue_capacity))
         sig = _safe_float(signal_score, 0.0)
         if cap == 0:
@@ -1545,7 +1545,7 @@ class TwoLanePolicyScheduler:
             [sig_ratio, l1_mean, l2_mean, float(len(self.lane2_programs))]
         )
         p_lane1 = _safe_float(probs[0] if len(probs) >= 1 else 0.5, 0.5)
-        learned_lane1 = int(round(cap * p_lane1))
+        learned_lane1 = round(cap * p_lane1)
 
         reserved_floor = math.ceil(cap * 0.5) if sig < self.signal_threshold else 0
         if sig < self.signal_threshold:
@@ -1576,19 +1576,19 @@ class TwoLanePolicyScheduler:
 __all__ = [
     "OBJECTIVE_DIRECTIONS",
     "OBJECTIVE_NAMES",
+    "ACDSOAnomalyScorer",
     "CandidateResult",
+    "ContextualBanditEnv",
     "MultiObjectiveCandidate",
+    "PolicyLearner",
+    "PolicyResult",
+    "TwoLanePolicyScheduler",
     "dominates",
-    "pareto_front",
-    "knee_point_selection",
+    "filter_by_constraints",
     "generalized_dominates",
     "generalized_pareto_front",
-    "select_pareto_knee",
-    "filter_by_constraints",
-    "ACDSOAnomalyScorer",
+    "knee_point_selection",
+    "pareto_front",
     "rank_stage2_candidates",
-    "PolicyResult",
-    "ContextualBanditEnv",
-    "PolicyLearner",
-    "TwoLanePolicyScheduler",
+    "select_pareto_knee",
 ]

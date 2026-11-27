@@ -18,17 +18,21 @@ GitHub Actions workflows alongside deterministic scanners (`zizmor`, `actionlint
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
 import os
-from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 import httpx
 
 from engine.execution_policy import sanitize_for_llm_prompt
-from engine.ollama_concurrency_guard import OllamaConcurrencyGuard, get_shared_ollama_guard
+from engine.ollama_concurrency_guard import (
+    OllamaConcurrencyGuard,
+    get_shared_ollama_guard,
+)
 from engine.paid_model_provider import (
     PaidModelClient,
     PaidModelConfig,
@@ -126,10 +130,10 @@ class GhaLlmResolution:
     status: str  # "ready" | "skipped_embedded" | "skipped_offline" | "skipped_unreachable" | "skipped_no_models"
     model: str = ""
     endpoint: str = ""
-    available_models: List[str] = field(default_factory=list)
-    paid_client: Optional[PaidModelClient] = None
+    available_models: list[str] = field(default_factory=list)
+    paid_client: PaidModelClient | None = None
 
-    def to_telemetry(self) -> Dict[str, Any]:
+    def to_telemetry(self) -> dict[str, Any]:
         return {
             "backend": self.backend,
             "status": self.status,
@@ -140,7 +144,7 @@ class GhaLlmResolution:
 
 
 # Catalog of abliterated GLM security/cyber models for local Ollama/llama.cpp/vLLM fusion
-ABLITERATED_GLM_FUSION_CATALOG: Tuple[Dict[str, Any], ...] = (
+ABLITERATED_GLM_FUSION_CATALOG: tuple[dict[str, Any], ...] = (
     {
         "repo": "audnai/penclaw-GLM-5.3-abliterated",
         "tier": "local_security",
@@ -213,9 +217,9 @@ ABLITERATED_GLM_FUSION_CATALOG: Tuple[Dict[str, Any], ...] = (
 def select_preferred_ollama_security_model(
     tags: Sequence[str],
     *,
-    explicit_model: Optional[str] = None,
-    free_ram_gb: Optional[float] = None,
-) -> Tuple[str, List[str]]:
+    explicit_model: str | None = None,
+    free_ram_gb: float | None = None,
+) -> tuple[str, list[str]]:
     """
     Selects the best security / abliterated generative Ollama model from `tags`,
     excluding embedding models. Returns `(primary_model, fallback_models)`.
@@ -236,11 +240,9 @@ def select_preferred_ollama_security_model(
         tl = tag.lower()
         if ram < 48.0 and any(sz in tl for sz in ("70b", "72b", "405b", "432b", "671b", "744b", "755b", "glm-5.2", "glm-5-abliterated")):
             return False
-        if ram < 16.0 and any(sz in tl for sz in ("30b", "31b", "32b", "34b", "27b")):
-            return False
-        return True
+        return not (ram < 16.0 and any(sz in tl for sz in ("30b", "31b", "32b", "34b", "27b")))
 
-    def _rank(tag: str) -> Tuple[int, str]:
+    def _rank(tag: str) -> tuple[int, str]:
         tl = tag.lower()
         fits = 0 if _fits_ram(tag) else 10
         is_abl = ("abliterat" in tl) or ("obliterat" in tl)
@@ -264,7 +266,7 @@ def select_preferred_ollama_security_model(
     return ranked[0], ranked[1:]
 
 
-def _is_explicit_ollama_model(explicit_model: Optional[str], paid_cfg: PaidModelConfig) -> bool:
+def _is_explicit_ollama_model(explicit_model: str | None, paid_cfg: PaidModelConfig) -> bool:
     """
     Returns True when an explicit `--model` / `RFCHUNT_LLM_MODEL` specifies a local Ollama tag
     (e.g. `huihui_ai/foundation-sec-abliterated:8b`, `llama3:8b`, `ollama/...`) rather than a
@@ -318,23 +320,21 @@ def _is_explicit_ollama_model(explicit_model: Optional[str], paid_cfg: PaidModel
 
     if ":" in raw:
         return True
-    if "/" in raw and "openrouter" not in paid_cfg.providers:
-        return True
-    return False
+    return bool("/" in raw and "openrouter" not in paid_cfg.providers)
 
 
 def resolve_gha_llm_backend(
     *,
-    model: Optional[str] = None,
+    model: str | None = None,
     embedded: bool = False,
-    offline: Optional[bool] = None,
-    ollama_endpoint: Optional[str] = None,
+    offline: bool | None = None,
+    ollama_endpoint: str | None = None,
     probe_timeout_sec: float = HEALTH_PROBE_MAX_TIMEOUT_SEC,
-    env_local_path: Optional[Union[str, Path]] = None,
+    env_local_path: str | Path | None = None,
     force_ollama: bool = False,
-    guard: Optional[OllamaConcurrencyGuard] = None,
-    modelfusion_endpoint: Optional[str] = None,
-    use_modelfusion: Optional[bool] = None,
+    guard: OllamaConcurrencyGuard | None = None,
+    modelfusion_endpoint: str | None = None,
+    use_modelfusion: bool | None = None,
 ) -> GhaLlmResolution:
     """
     Resolves the LLM verification backend honoring precedence:
@@ -396,7 +396,7 @@ def resolve_gha_llm_backend(
                     if 200 <= h_resp.status_code < 400:
                         mf_reachable = True
                         break
-                except Exception:
+                except Exception:  # noqa: BLE001, S112
                     continue
             if mf_reachable:
                 chosen_mf_model = explicit_model or "huihui_ai/foundation-sec-abliterated:8b"
@@ -420,7 +420,7 @@ def resolve_gha_llm_backend(
     if eff_guard.is_circuit_open():
         return GhaLlmResolution(backend="ollama", status="skipped_circuit_open", endpoint=ep_url)
 
-    tags: Optional[List[str]] = None
+    tags: list[str] | None = None
     try:
         resp = httpx.get(f"{ep_url}/api/tags", timeout=eff_timeout)
         if resp.status_code == 200:
@@ -430,7 +430,7 @@ def resolve_gha_llm_backend(
                 for m in (payload.get("models") or [])
                 if isinstance(m, dict) and m.get("name")
             ]
-    except Exception:
+    except Exception:  # noqa: BLE001
         tags = None
 
     if tags is None:
@@ -454,7 +454,7 @@ def resolve_gha_llm_backend(
     )
 
 
-def _extract_json_payload(raw_text: str) -> Optional[Dict[str, Any]]:
+def _extract_json_payload(raw_text: str) -> dict[str, Any] | None:
     text = (raw_text or "").strip()
     if not text:
         return None
@@ -483,7 +483,7 @@ def _call_ollama_chat(
     user_prompt: str,
     *,
     timeout_sec: float = 25.0,
-    guard: Optional[OllamaConcurrencyGuard] = None,
+    guard: OllamaConcurrencyGuard | None = None,
 ) -> str:
     url = f"{endpoint.rstrip('/')}/api/chat"
     payload = {
@@ -536,7 +536,7 @@ def _call_modelfusion_orchestrate(
     user_prompt: str,
     *,
     timeout_sec: float = 25.0,
-    guard: Optional[OllamaConcurrencyGuard] = None,
+    guard: OllamaConcurrencyGuard | None = None,
 ) -> str:
     """Invokes local ModelFusion HTTP server (:5000) under the shared OllamaConcurrencyGuard."""
     base = endpoint.rstrip("/")
@@ -587,7 +587,7 @@ def _call_modelfusion_orchestrate(
             eff_guard.record_success()
             try:
                 data = resp.json()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 return (resp.text or "").strip()
             if isinstance(data, dict):
                 txt = str(
@@ -627,21 +627,21 @@ def _is_grounded_file_path(file_path: str, allowed_paths: Sequence[str]) -> bool
 
 
 def verify_gha_findings_with_llm(
-    target_path: Union[str, Path],
+    target_path: str | Path,
     static_findings: Sequence[Any],
     *,
-    model: Optional[str] = None,
+    model: str | None = None,
     embedded: bool = False,
-    offline: Optional[bool] = None,
-    ollama_endpoint: Optional[str] = None,
+    offline: bool | None = None,
+    ollama_endpoint: str | None = None,
     probe_timeout_sec: float = HEALTH_PROBE_MAX_TIMEOUT_SEC,
     request_timeout_sec: float = 25.0,
-    env_local_path: Optional[Union[str, Path]] = None,
+    env_local_path: str | Path | None = None,
     force_ollama: bool = False,
-    guard: Optional[OllamaConcurrencyGuard] = None,
-    modelfusion_endpoint: Optional[str] = None,
-    use_modelfusion: Optional[bool] = None,
-) -> Tuple[List[Any], Dict[str, Any]]:
+    guard: OllamaConcurrencyGuard | None = None,
+    modelfusion_endpoint: str | None = None,
+    use_modelfusion: bool | None = None,
+) -> tuple[list[Any], dict[str, Any]]:
     """
     Runs defensive semantic verification and multi-step attack-chain correlation over
     GitHub Actions workflows & deterministic static findings.
@@ -679,8 +679,8 @@ def verify_gha_findings_with_llm(
         return [], telemetry
 
     # Build sanitized context for up to 8 workflow files
-    wf_sections: List[str] = []
-    allowed_file_paths: List[str] = []
+    wf_sections: list[str] = []
+    allowed_file_paths: list[str] = []
     for wf in wf_files[:8]:
         try:
             rel = str(wf.relative_to(root)).replace("\\", "/")
@@ -694,7 +694,7 @@ def verify_gha_findings_with_llm(
         fenced_yaml = sanitize_for_llm_prompt(raw_yaml, max_chars=4500, source=f"gha_workflow:{rel}")
         wf_sections.append(f"Workflow `{rel}`:\n{fenced_yaml}")
 
-    compact_findings: List[Dict[str, Any]] = []
+    compact_findings: list[dict[str, Any]] = []
     for f in static_findings[:40]:
         meta = getattr(f, "metadata", None) or {}
         f_path = str(getattr(f, "file_path", "") or "")
@@ -744,7 +744,7 @@ def verify_gha_findings_with_llm(
 
     raw_response = ""
     used_model = resolution.model
-    anti_junk_rejections: List[Dict[str, Any]] = []
+    anti_junk_rejections: list[dict[str, Any]] = []
     try:
         if resolution.backend == "paid_api" and resolution.paid_client is not None:
             raw_response = resolution.paid_client.generate(
@@ -779,8 +779,8 @@ def verify_gha_findings_with_llm(
         elif resolution.backend == "ollama":
             queue = list(dict.fromkeys([resolution.model, *resolution.available_models]))
             tried: set[str] = set()
-            downshifted_from: List[str] = []
-            last_exc: Optional[Exception] = None
+            downshifted_from: list[str] = []
+            last_exc: Exception | None = None
             while queue:
                 if eff_guard.is_circuit_open():
                     telemetry["status"] = "skipped_circuit_open"
@@ -826,7 +826,7 @@ def verify_gha_findings_with_llm(
                             telemetry["downshifted_from"] = downshifted_from
                         return [], telemetry
                     continue
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     last_exc = exc
                     if eff_guard.is_circuit_open():
                         telemetry["status"] = "skipped_circuit_open"
@@ -852,7 +852,7 @@ def verify_gha_findings_with_llm(
                 telemetry["downshifted_from"] = downshifted_from
             if not raw_response and last_exc is not None and len(tried) == 1 and len(resolution.available_models) <= 1:
                 telemetry["error"] = str(last_exc)[:240]
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         telemetry["status"] = "error_graceful_skip"
         telemetry["error"] = str(exc)[:240]
         return [], telemetry
@@ -869,7 +869,7 @@ def verify_gha_findings_with_llm(
         telemetry["model"] = used_model
         return [], telemetry
 
-    out_findings: List[EngineFinding] = []
+    out_findings: list[EngineFinding] = []
     dropped_hallucinated_verdicts = 0
     for v in parsed.get("verdicts") or []:
         if not isinstance(v, dict):

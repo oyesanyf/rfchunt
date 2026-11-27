@@ -24,12 +24,12 @@ import argparse
 import importlib.util
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
-from typing import Any, Dict, List, Optional, Sequence
-
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GEMINI_CONFIG_DIR = Path.home() / ".gemini" / "config"
@@ -61,7 +61,7 @@ RULE_CONTENT = """# Bug Bounty Threat Hunting & Security Tooling Engineering Pro
 - Never spawn unbounded concurrent PowerShell/pytest/cargo processes; always pass `-o addopts="" --basetemp <isolated_dir>` to `pytest` and never mutate Windows Registry or system `PATH`.
 """
 
-DEFAULT_LOCAL_MODELS: Dict[str, Any] = {
+DEFAULT_LOCAL_MODELS: dict[str, Any] = {
     "schema_version": 1,
     "default_backend": "auto",
     "ollama": {
@@ -140,7 +140,7 @@ def write_local_models_config() -> Path:
     if LOCAL_MODELS_PATH.is_file():
         try:
             existing = json.loads(LOCAL_MODELS_PATH.read_text(encoding="utf-8"))
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError):
             existing = {}
     else:
         existing = {}
@@ -165,7 +165,7 @@ def register_mcp_server(python_exe: str) -> Path:
     if MCP_CONFIG_PATH.is_file():
         try:
             cfg = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError):
             cfg = {}
     else:
         cfg = {}
@@ -217,9 +217,9 @@ GO_INSTALL_PACKAGES: Sequence[tuple[str, str]] = (
 )
 
 
-def _process_tool_search_dirs() -> List[Path]:
+def _process_tool_search_dirs() -> list[Path]:
     """Build process-local candidate binary directories (Go bin + repo bin) without mutating PATH."""
-    candidates: List[Path] = [Path.home() / "go" / "bin"]
+    candidates: list[Path] = [Path.home() / "go" / "bin"]
     for env_key in ("HOME", "USERPROFILE"):
         raw = os.environ.get(env_key, "").strip()
         if raw:
@@ -230,7 +230,7 @@ def _process_tool_search_dirs() -> List[Path]:
     candidates.append(Path(r"C:\Program Files\Go\bin"))
     candidates.append(REPO_ROOT / "bin")
 
-    deduped: List[Path] = []
+    deduped: list[Path] = []
     seen: set[str] = set()
     for d in candidates:
         key = str(d)
@@ -247,33 +247,35 @@ def _is_python_httpx_binary(candidate: str) -> bool:
         from engine.external_scanners import _is_python_httpx_cli_binary
 
         return bool(_is_python_httpx_cli_binary(candidate))
-    except Exception:
+    except Exception:  # noqa: BLE001
         low = str(candidate).replace("\\", "/").lower()
         return "/scripts/httpx" in low or "python" in low
 
 
-def probe_external_cli_tools() -> Dict[str, Optional[str]]:
+def probe_external_cli_tools() -> dict[str, str | None]:
     """Probe the 6 external CLI tools using PATH plus in-memory ~/go/bin and Go program dirs."""
     search_dirs = _process_tool_search_dirs()
     suffixes = (".exe", "") if os.name == "nt" else ("",)
-    found: Dict[str, Optional[str]] = {}
+    found: dict[str, str | None] = {}
 
     for tool in EXTERNAL_CLI_TOOLS:
         aliases = ("jadx", "jadx-gui") if tool == "jadx" else (tool,)
-        resolved: Optional[str] = None
+        resolved: str | None = None
 
         for alias in aliases:
             cand = shutil.which(alias)
             if cand:
                 if tool == "httpx" and _is_python_httpx_binary(cand):
                     try:
-                        from engine.external_scanners import _find_non_python_httpx_on_path
+                        from engine.external_scanners import (
+                            _find_non_python_httpx_on_path,
+                        )
 
                         alt = _find_non_python_httpx_on_path(cand)
                         if alt:
                             resolved = alt
                             break
-                    except Exception:
+                    except Exception:  # noqa: BLE001, S110
                         pass
                     continue
                 resolved = cand
@@ -311,7 +313,7 @@ def probe_external_cli_tools() -> Dict[str, Optional[str]]:
     return found
 
 
-def install_go_tools() -> Dict[str, Any]:
+def install_go_tools() -> dict[str, Any]:
     """Install ProjectDiscovery Go tools into ~/go/bin when `go` is on PATH (process-scoped env only)."""
     go_bin = shutil.which("go")
     if not go_bin:
@@ -320,8 +322,8 @@ def install_go_tools() -> Dict[str, Any]:
 
     proc_env = os.environ.copy()
     proc_env.setdefault("GOPATH", str(Path.home() / "go"))
-    installed: List[str] = []
-    failed: List[str] = []
+    installed: list[str] = []
+    failed: list[str] = []
 
     for tool_name, pkg in GO_INSTALL_PACKAGES:
         print(f"[*] Installing {tool_name} via `{go_bin} install {pkg}`...")

@@ -12,18 +12,19 @@ Audits Android (`AndroidManifest.xml`, `network_security_config.xml`, `.kt`, `.j
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 import os
-from pathlib import Path
 import plistlib
 import re
 import shutil
 import subprocess
 import tempfile
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import xml.etree.ElementTree as StdET
 import zipfile
 import zlib
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
 
 try:
     import defusedxml.ElementTree as _DefusedET  # type: ignore[import-not-found]
@@ -33,8 +34,10 @@ except ImportError:
 from engine.host_containment import silent_subprocess_run
 from engine.linux_poc_runner import validate_command_tokens, validate_mount_path
 from engine.parity_invariant_auditor import is_non_production_noise
-from engine.safe_network_validator import is_explicit_loopback_host, validate_target_host
-
+from engine.safe_network_validator import (
+    is_explicit_loopback_host,
+    validate_target_host,
+)
 
 _SKIP_DIRS: frozenset[str] = frozenset(
     {
@@ -88,7 +91,7 @@ def _safe_parse_plist(raw_bytes: bytes) -> Any:
     return plistlib.loads(raw_bytes)
 
 
-def _find_line(lines: List[str], *tokens: str, default: int = 1) -> int:
+def _find_line(lines: list[str], *tokens: str, default: int = 1) -> int:
     for tok in tokens:
         if not tok:
             continue
@@ -109,8 +112,8 @@ def _make_finding(
     file_path: str,
     line: int,
     summary: str,
-    metadata: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     noise = is_non_production_noise(file_path)
     meta = dict(metadata or {})
     meta["non_production_noise"] = noise
@@ -131,12 +134,12 @@ def _make_finding(
     }
 
 
-def _android_attr(elem: StdET.Element, name: str) -> Optional[str]:
+def _android_attr(elem: StdET.Element, name: str) -> str | None:
     return elem.attrib.get(f"{_ANDROID_NS}{name}") or elem.attrib.get(f"android:{name}") or elem.attrib.get(name)
 
 
-def _audit_android_manifest(rel_path: str, raw_xml: str) -> List[Dict[str, Any]]:
-    findings: List[Dict[str, Any]] = []
+def _audit_android_manifest(rel_path: str, raw_xml: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
     lines = raw_xml.splitlines()
     try:
         root = _safe_parse_xml(raw_xml)
@@ -248,8 +251,8 @@ def _audit_android_manifest(rel_path: str, raw_xml: str) -> List[Dict[str, Any]]
     return findings
 
 
-def _audit_network_security_config(rel_path: str, raw_xml: str) -> List[Dict[str, Any]]:
-    findings: List[Dict[str, Any]] = []
+def _audit_network_security_config(rel_path: str, raw_xml: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
     lines = raw_xml.splitlines()
     try:
         root = _safe_parse_xml(raw_xml)
@@ -286,13 +289,13 @@ def _audit_network_security_config(rel_path: str, raw_xml: str) -> List[Dict[str
     return findings
 
 
-def _audit_info_plist(rel_path: str, raw_bytes: bytes) -> List[Dict[str, Any]]:
-    findings: List[Dict[str, Any]] = []
+def _audit_info_plist(rel_path: str, raw_bytes: bytes) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
     text = raw_bytes.decode("utf-8", errors="replace")
     lines = text.splitlines()
     try:
         data = _safe_parse_plist(raw_bytes)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return findings
     if not isinstance(data, dict):
         return findings
@@ -347,8 +350,8 @@ def _audit_info_plist(rel_path: str, raw_bytes: bytes) -> List[Dict[str, Any]]:
     return findings
 
 
-def _audit_android_code(rel_path: str, text: str) -> List[Dict[str, Any]]:
-    findings: List[Dict[str, Any]] = []
+def _audit_android_code(rel_path: str, text: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
     lines = text.splitlines()
 
     has_js_enabled = bool(re.search(r"setJavaScriptEnabled\s*\(\s*true\s*\)", text))
@@ -468,25 +471,27 @@ def _audit_android_code(rel_path: str, text: str) -> List[Dict[str, Any]]:
     return findings
 
 
-def _audit_ios_code(rel_path: str, text: str) -> List[Dict[str, Any]]:
-    findings: List[Dict[str, Any]] = []
+def _audit_ios_code(rel_path: str, text: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
 
-    if re.search(r"(?:application\s*\([^)]*open\s+url:|func\s+scene\([^)]*openURLContexts|\.onOpenURL\b)", text):
-        if not re.search(r"(?:allowedHosts|allowedSchemes|url\.scheme\s*==|host\s*==)", text):
-            m = re.search(r"(?:open\s+url:|openURLContexts|\.onOpenURL)", text)
-            line_no = text[: m.start()].count("\n") + 1 if m else 1
-            findings.append(
-                _make_finding(
-                    rule_id="MOBILE-IOS-DEEPLINK-009",
-                    title="iOS deep-link handler lacks explicit scheme/host allowlist",
-                    cwe="CWE-939",
-                    severity="HIGH",
-                    confidence=0.81,
-                    file_path=rel_path,
-                    line=line_no,
-                    summary=f"iOS URL open handler at {rel_path}:{line_no} omits scheme/host validation.",
-                )
+    if (
+        re.search(r"(?:application\s*\([^)]*open\s+url:|func\s+scene\([^)]*openURLContexts|\.onOpenURL\b)", text)
+        and not re.search(r"(?:allowedHosts|allowedSchemes|url\.scheme\s*==|host\s*==)", text)
+    ):
+        m = re.search(r"(?:open\s+url:|openURLContexts|\.onOpenURL)", text)
+        line_no = text[: m.start()].count("\n") + 1 if m else 1
+        findings.append(
+            _make_finding(
+                rule_id="MOBILE-IOS-DEEPLINK-009",
+                title="iOS deep-link handler lacks explicit scheme/host allowlist",
+                cwe="CWE-939",
+                severity="HIGH",
+                confidence=0.81,
+                file_path=rel_path,
+                line=line_no,
+                summary=f"iOS URL open handler at {rel_path}:{line_no} omits scheme/host validation.",
             )
+        )
 
     for pat, desc in (
         (r"\bUIWebView\b", "Deprecated insecure UIWebView usage"),
@@ -527,8 +532,8 @@ def _audit_ios_code(rel_path: str, text: str) -> List[Dict[str, Any]]:
     return findings
 
 
-def _audit_archive(rel_path: str, archive_path: Path, use_jadx: bool) -> List[Dict[str, Any]]:
-    findings: List[Dict[str, Any]] = []
+def _audit_archive(rel_path: str, archive_path: Path, use_jadx: bool) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
     try:
         with zipfile.ZipFile(archive_path, "r") as zf:
             for info in zf.infolist():
@@ -598,11 +603,12 @@ def _audit_archive(rel_path: str, archive_path: Path, use_jadx: bool) -> List[Di
     return findings
 
 
-def _probe_mobsf_api(mobsf_url: str) -> Optional[Dict[str, Any]]:
+def _probe_mobsf_api(mobsf_url: str) -> dict[str, Any] | None:
     api_key = os.environ.get("MOBSF_API_KEY", "").strip()
     if not api_key:
         return None
     from urllib.parse import urlparse
+
     import httpx
 
     base_url = mobsf_url.strip().rstrip("/")
@@ -634,7 +640,7 @@ def _probe_mobsf_api(mobsf_url: str) -> Optional[Dict[str, Any]]:
         if not isinstance(scan_items, list):
             scan_items = payload.get("scans")
         if isinstance(scan_items, list):
-            fetched_reports: List[Dict[str, Any]] = []
+            fetched_reports: list[dict[str, Any]] = []
             for entry in scan_items[:5]:
                 if not isinstance(entry, dict):
                     continue
@@ -656,17 +662,17 @@ def _probe_mobsf_api(mobsf_url: str) -> Optional[Dict[str, Any]]:
                         rep_json = rep.json()
                         if isinstance(rep_json, dict):
                             fetched_reports.append(rep_json)
-                except Exception:
+                except Exception:  # noqa: BLE001, S112
                     continue
             if fetched_reports:
                 payload = dict(payload)
                 payload["_fetched_reports"] = fetched_reports
         return payload
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
 
-def _map_mobsf_severity(raw_sev: Any, default: str = "MEDIUM") -> Optional[str]:
+def _map_mobsf_severity(raw_sev: Any, default: str = "MEDIUM") -> str | None:
     s = str(raw_sev or "").strip().lower()
     if s in ("info", "secure", "good", "pass", "passed", "normal"):
         return None
@@ -682,14 +688,14 @@ def _map_mobsf_severity(raw_sev: Any, default: str = "MEDIUM") -> Optional[str]:
 
 
 def _mobsf_payload_to_findings(
-    payload: Dict[str, Any],
+    payload: dict[str, Any],
     *,
     source_label: str = "mobsf://api",
     _include_fetched: bool = True,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     if not isinstance(payload, dict):
         return []
-    findings: List[Dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
 
     def _emit_mobsf(
         *,
@@ -701,7 +707,7 @@ def _mobsf_payload_to_findings(
         file_path: str,
         line: int,
         summary: str,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         findings.append(
             _make_finding(
@@ -779,7 +785,7 @@ def _mobsf_payload_to_findings(
                 )
 
     man_raw = payload.get("manifest_analysis")
-    man_list: List[Any] = []
+    man_list: list[Any] = []
     if isinstance(man_raw, dict):
         mf = man_raw.get("manifest_findings")
         if isinstance(mf, list):
@@ -807,7 +813,7 @@ def _mobsf_payload_to_findings(
         )
 
     code_raw = payload.get("code_analysis")
-    code_items: List[Tuple[str, Dict[str, Any]]] = []
+    code_items: list[tuple[str, dict[str, Any]]] = []
     if isinstance(code_raw, dict):
         inner = code_raw.get("findings")
         if isinstance(inner, dict):
@@ -860,7 +866,7 @@ def _mobsf_payload_to_findings(
         )
 
     ats_raw = payload.get("ats_analysis")
-    ats_list: List[Any] = []
+    ats_list: list[Any] = []
     if isinstance(ats_raw, dict):
         af = ats_raw.get("ats_findings")
         if not isinstance(af, list):
@@ -908,13 +914,13 @@ def _mobsf_payload_to_findings(
     return findings
 
 
-def _collect_mobsf_findings(mobsf_url: str) -> List[Dict[str, Any]]:
+def _collect_mobsf_findings(mobsf_url: str) -> list[dict[str, Any]]:
     payload = _probe_mobsf_api(mobsf_url)
     if not payload:
         return []
     raw_findings = _mobsf_payload_to_findings(payload)
-    deduped: List[Dict[str, Any]] = []
-    seen: set[Tuple[str, str, int, str]] = set()
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, int, str]] = set()
     for item in raw_findings:
         key = (
             str(item.get("rule_id") or ""),
@@ -928,7 +934,7 @@ def _collect_mobsf_findings(mobsf_url: str) -> List[Dict[str, Any]]:
     return deduped
 
 
-def _audit_single_file(repo_root: Path, fpath: Path, use_jadx: bool) -> List[Dict[str, Any]]:
+def _audit_single_file(repo_root: Path, fpath: Path, use_jadx: bool) -> list[dict[str, Any]]:
     try:
         rel = fpath.relative_to(repo_root).as_posix()
         size = fpath.stat().st_size
@@ -967,13 +973,13 @@ def _audit_single_file(repo_root: Path, fpath: Path, use_jadx: bool) -> List[Dic
 
 
 def audit_mobile_app(
-    repo_path: Union[Path, str],
+    repo_path: Path | str,
     *,
     embedded: bool = False,
     no_external_scanners: bool = False,
-    mobsf_url: Optional[str] = None,
-    target_files: Optional[Sequence[Union[Path, str]]] = None,
-) -> List[Dict[str, Any]]:
+    mobsf_url: str | None = None,
+    target_files: Sequence[Path | str] | None = None,
+) -> list[dict[str, Any]]:
     """
     Audits Android and iOS repositories/archives (`AndroidManifest.xml`, `Info.plist`,
     `.kt`, `.java`, `.swift`, `.m`, `.apk`, `.ipa`) with XXE-safe parsing and optional
@@ -989,7 +995,7 @@ def audit_mobile_app(
 
     _mobile_names = ("androidmanifest.xml", "network_security_config.xml", "info.plist")
     _mobile_exts = (".kt", ".java", ".swift", ".m", ".mm", ".apk", ".ipa")
-    targets: List[Path] = []
+    targets: list[Path] = []
     if target_files is not None:
         seen_paths: set[Path] = set()
         for raw_f in target_files:
@@ -1019,7 +1025,7 @@ def audit_mobile_app(
         return mobsf_findings
 
     max_workers = min(8, max(2, os.cpu_count() or 4))
-    findings: List[Dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         for hits in pool.map(lambda p: _audit_single_file(root, p, use_jadx=use_external), targets):
             findings.extend(hits)

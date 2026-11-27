@@ -30,23 +30,23 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
 import subprocess
 import sys
-from typing import List, Optional, Sequence
+from collections.abc import Sequence
+from pathlib import Path
 
 RFCHUNT_ROOT = Path(__file__).resolve().parent
 if str(RFCHUNT_ROOT) not in sys.path:
     sys.path.insert(0, str(RFCHUNT_ROOT))
 
-from scripts.autonomous_hunt import main as autonomous_hunt_main  # noqa: E402
+from scripts.autonomous_hunt import main as autonomous_hunt_main
 
 DEFAULT_TASK_NAME = "RFCHunt-Autonomous-Defensive-Hunt"
 
 
-def build_hunt_argv(ns: argparse.Namespace) -> List[str]:
+def build_hunt_argv(ns: argparse.Namespace) -> list[str]:
     """Translates simple `hunt.py` flags into full `scripts/autonomous_hunt.py` argv."""
-    argv: List[str] = ["--start-modelfusion"]
+    argv: list[str] = ["--start-modelfusion"]
 
     if getattr(ns, "sync_public_directory", False):
         argv.append("--sync-public-directory")
@@ -113,7 +113,7 @@ def manage_os_schedule(ns: argparse.Namespace) -> int:
                 print(f"[INFO] Task '{task_name}' not removed: {(proc.stderr or proc.stdout).strip()}")
             return 0 if proc.returncode == 0 else 1
 
-        interval = max(5, int(round(float(ns.interval_minutes))))
+        interval = max(5, round(float(ns.interval_minutes)))
         run_flags = ["--once"]
         if ns.targets:
             for t in ns.targets:
@@ -160,7 +160,7 @@ def manage_os_schedule(ns: argparse.Namespace) -> int:
         return 0
 
     # POSIX / Linux / macOS crontab line
-    interval = max(5, int(round(float(ns.interval_minutes))))
+    interval = max(5, round(float(ns.interval_minutes)))
     cron_line = f"*/{interval} * * * * cd {RFCHUNT_ROOT} && {sys.executable} {RFCHUNT_ROOT / 'hunt.py'} --once"
     if ns.uninstall_schedule:
         print(f"[INFO] Remove this line from `crontab -e`:\n  {cron_line}")
@@ -201,7 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     ns = parser.parse_args(argv)
 

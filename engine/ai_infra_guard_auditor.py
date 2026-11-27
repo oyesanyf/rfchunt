@@ -17,15 +17,15 @@ source-code trust boundaries:
 from __future__ import annotations
 
 import ast
-from concurrent.futures import ThreadPoolExecutor
 import os
-from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
 
 from engine.linux_poc_runner import validate_mount_path
 from engine.parity_invariant_auditor import is_non_production_noise
-
 
 _SKIP_DIRS: frozenset[str] = frozenset(
     {
@@ -63,7 +63,7 @@ _SANITIZER_EXACT_CALLS: frozenset[str] = frozenset(
         "re.escape",
     }
 )
-_SANITIZER_LEAF_PREFIXES: Tuple[str, ...] = (
+_SANITIZER_LEAF_PREFIXES: tuple[str, ...] = (
     "sanitize",
     "escape",
     "validate_target",
@@ -80,8 +80,8 @@ def _make_finding(
     file_path: str,
     line: int,
     summary: str,
-    metadata: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     noise = is_non_production_noise(file_path)
     meta = dict(metadata or {})
     meta["non_production_noise"] = noise
@@ -102,8 +102,8 @@ def _make_finding(
     }
 
 
-def _scan_ai_bind_configs(rel_path: str, text: str) -> List[Dict[str, Any]]:
-    findings: List[Dict[str, Any]] = []
+def _scan_ai_bind_configs(rel_path: str, text: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
     lines = text.splitlines()
     for line_no, line in enumerate(lines, start=1):
         low = line.lower()
@@ -179,8 +179,8 @@ def _scan_ai_bind_configs(rel_path: str, text: str) -> List[Dict[str, Any]]:
     return findings
 
 
-def _scan_k8s_and_docker(rel_path: str, text: str) -> List[Dict[str, Any]]:
-    findings: List[Dict[str, Any]] = []
+def _scan_k8s_and_docker(rel_path: str, text: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
     name_l = Path(rel_path).name.lower()
     lines = text.splitlines()
 
@@ -304,7 +304,7 @@ def _call_name(node: ast.Call) -> str:
     return ""
 
 
-def _expr_uses_names(node: ast.AST, names: Set[str]) -> bool:
+def _expr_uses_names(node: ast.AST, names: set[str]) -> bool:
     for sub in ast.walk(node):
         if isinstance(sub, ast.Name) and sub.id in names:
             return True
@@ -328,7 +328,7 @@ def _contains_sanitizer_call(node: ast.AST) -> bool:
 def _expr_has_direct_source(node: ast.AST) -> bool:
     try:
         src_low = ast.unparse(node).lower()
-    except Exception:
+    except Exception:  # noqa: BLE001
         src_low = ""
     return any(
         src in src_low
@@ -344,8 +344,8 @@ def _expr_has_direct_source(node: ast.AST) -> bool:
     )
 
 
-def _expr_has_unsanitized_taint(node: ast.AST, tainted_names: Set[str]) -> bool:
-    stack: List[ast.AST] = [node]
+def _expr_has_unsanitized_taint(node: ast.AST, tainted_names: set[str]) -> bool:
+    stack: list[ast.AST] = [node]
     while stack:
         cur = stack.pop()
         if isinstance(cur, ast.Call) and _is_sanitizer_call(cur):
@@ -355,7 +355,7 @@ def _expr_has_unsanitized_taint(node: ast.AST, tainted_names: Set[str]) -> bool:
         if isinstance(cur, (ast.Attribute, ast.Subscript)):
             try:
                 src_low = ast.unparse(cur).lower()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 src_low = ""
             if any(
                 src in src_low
@@ -366,25 +366,25 @@ def _expr_has_unsanitized_taint(node: ast.AST, tainted_names: Set[str]) -> bool:
     return False
 
 
-def _extract_target_names(target: ast.AST) -> List[str]:
+def _extract_target_names(target: ast.AST) -> list[str]:
     if isinstance(target, ast.Name):
         return [target.id]
     if isinstance(target, (ast.Tuple, ast.List)):
-        names: List[str] = []
+        names: list[str] = []
         for elt in target.elts:
             names.extend(_extract_target_names(elt))
         return names
     return []
 
 
-def _scan_python_ast(rel_path: str, text: str) -> List[Dict[str, Any]]:
-    findings: List[Dict[str, Any]] = []
+def _scan_python_ast(rel_path: str, text: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError):
         return findings
 
-    seen: Set[Tuple[str, int]] = set()
+    seen: set[tuple[str, int]] = set()
 
     def _emit(rule_id: str, title: str, cwe: str, severity: str, conf: float, line: int, summary: str) -> None:
         key = (rule_id, line)
@@ -497,14 +497,18 @@ def _scan_python_ast(rel_path: str, text: str) -> List[Dict[str, Any]]:
     for fn_node in ast.walk(tree):
         if not isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        tainted: Set[str] = {
+        tainted: set[str] = {
             arg.arg
             for arg in fn_node.args.args + fn_node.args.kwonlyargs
             if arg.arg.lower() in _TAINT_SOURCES or any(s in arg.arg.lower() for s in ("prompt", "user_input", "tool_arg"))
         }
-        sanitized: Set[str] = set()
+        sanitized: set[str] = set()
 
-        def _check_expr_sinks(expr_node: ast.AST, t_state: Set[str]) -> None:
+        def _check_expr_sinks(
+            expr_node: ast.AST,
+            t_state: set[str],
+            _fn: ast.FunctionDef | ast.AsyncFunctionDef = fn_node,
+        ) -> None:
             for sub in ast.walk(expr_node):
                 if not isinstance(sub, ast.Call):
                     continue
@@ -523,15 +527,15 @@ def _scan_python_ast(rel_path: str, text: str) -> List[Dict[str, Any]]:
                         cwe,
                         "HIGH",
                         0.87,
-                        getattr(sub, "lineno", fn_node.lineno),
-                        f"Untrusted input flows into `{cname}` without sanitization in `{fn_node.name}` ({rel_path}).",
+                        getattr(sub, "lineno", _fn.lineno),
+                        f"Untrusted input flows into `{cname}` without sanitization in `{_fn.name}` ({rel_path}).",
                     )
 
         def _apply_assignment(
-            targets: List[ast.AST],
-            rhs: Optional[ast.AST],
-            t_state: Set[str],
-            s_state: Set[str],
+            targets: list[ast.AST],
+            rhs: ast.AST | None,
+            t_state: set[str],
+            s_state: set[str],
             *,
             is_aug: bool = False,
         ) -> None:
@@ -541,7 +545,7 @@ def _scan_python_ast(rel_path: str, text: str) -> List[Dict[str, Any]]:
                 _expr_has_direct_source(rhs) and not _contains_sanitizer_call(rhs)
             )
             rhs_is_sanitized = _contains_sanitizer_call(rhs) and not _expr_has_unsanitized_taint(rhs, t_state)
-            target_names: List[str] = []
+            target_names: list[str] = []
             for t in targets:
                 target_names.extend(_extract_target_names(t))
             if rhs_has_taint:
@@ -554,10 +558,10 @@ def _scan_python_ast(rel_path: str, text: str) -> List[Dict[str, Any]]:
                     t_state.discard(name)
 
         def _walk_stmts(
-            stmts: List[ast.stmt],
-            in_tainted: Set[str],
-            in_sanitized: Set[str],
-        ) -> Tuple[Set[str], Set[str]]:
+            stmts: list[ast.stmt],
+            in_tainted: set[str],
+            in_sanitized: set[str],
+        ) -> tuple[set[str], set[str]]:
             t_state = set(in_tainted)
             s_state = set(in_sanitized)
             for stmt in stmts:
@@ -652,15 +656,15 @@ def _scan_python_ast(rel_path: str, text: str) -> List[Dict[str, Any]]:
 
                     handler_entry_t = base_t | body_t
                     handler_entry_s = base_s & body_s
-                    handler_ts: List[Set[str]] = []
-                    handler_ss: List[Set[str]] = []
+                    handler_ts: list[set[str]] = []
+                    handler_ss: list[set[str]] = []
                     for handler in stmt.handlers:
                         h_t, h_s = _walk_stmts(handler.body, handler_entry_t, handler_entry_s)
                         handler_ts.append(h_t)
                         handler_ss.append(h_s)
 
-                    post_t_sets: List[Set[str]] = [orelse_t, *handler_ts]
-                    post_s_sets: List[Set[str]] = [orelse_s, *handler_ss]
+                    post_t_sets: list[set[str]] = [orelse_t, *handler_ts]
+                    post_s_sets: list[set[str]] = [orelse_s, *handler_ss]
                     joined_t = set().union(*post_t_sets)
                     joined_s = set.intersection(*post_s_sets) if post_s_sets else set()
                     if stmt.finalbody:
@@ -678,8 +682,8 @@ def _scan_python_ast(rel_path: str, text: str) -> List[Dict[str, Any]]:
                         and case.pattern.pattern is None
                         for case in stmt.cases
                     )
-                    case_t_sets: List[Set[str]] = []
-                    case_s_sets: List[Set[str]] = []
+                    case_t_sets: list[set[str]] = []
+                    case_s_sets: list[set[str]] = []
                     for case in stmt.cases:
                         if getattr(case, "guard", None) is not None:
                             _check_expr_sinks(case.guard, base_t)
@@ -700,8 +704,8 @@ def _scan_python_ast(rel_path: str, text: str) -> List[Dict[str, Any]]:
     return findings
 
 
-def _scan_js_ts_taint_and_eval(rel_path: str, text: str) -> List[Dict[str, Any]]:
-    findings: List[Dict[str, Any]] = []
+def _scan_js_ts_taint_and_eval(rel_path: str, text: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
     for m in re.finditer(
         r"""(?:req\.body|req\.query|prompt|userInput)[\s\S]{0,200}?(?:execSync|exec|eval|fetch)\s*\(""",
         text,
@@ -725,7 +729,7 @@ def _scan_js_ts_taint_and_eval(rel_path: str, text: str) -> List[Dict[str, Any]]
     return findings
 
 
-def _audit_single_file(repo_root: Path, fpath: Path) -> List[Dict[str, Any]]:
+def _audit_single_file(repo_root: Path, fpath: Path) -> list[dict[str, Any]]:
     try:
         rel = fpath.relative_to(repo_root).as_posix()
         if fpath.stat().st_size > _MAX_FILE_BYTES:
@@ -734,7 +738,7 @@ def _audit_single_file(repo_root: Path, fpath: Path) -> List[Dict[str, Any]]:
     except OSError:
         return []
 
-    hits: List[Dict[str, Any]] = []
+    hits: list[dict[str, Any]] = []
     hits.extend(_scan_ai_bind_configs(rel, text))
     hits.extend(_scan_k8s_and_docker(rel, text))
     ext = fpath.suffix.lower()
@@ -746,10 +750,10 @@ def _audit_single_file(repo_root: Path, fpath: Path) -> List[Dict[str, Any]]:
 
 
 def audit_ai_infra(
-    repo_path: Union[Path, str],
+    repo_path: Path | str,
     *,
-    target_files: Optional[Sequence[Union[Path, str]]] = None,
-) -> List[Dict[str, Any]]:
+    target_files: Sequence[Path | str] | None = None,
+) -> list[dict[str, Any]]:
     """
     Multithreaded pure-Python static auditor for AI serving configs, deserialization,
     prompt SSTI, container/Kubernetes escapes, and source-to-sink taint flows.
@@ -760,7 +764,7 @@ def audit_ai_infra(
         return []
     root = Path(resolved_repo)
 
-    targets: List[Path] = []
+    targets: list[Path] = []
     if target_files is not None:
         seen_paths: set[Path] = set()
         for raw_f in target_files:
@@ -789,7 +793,7 @@ def audit_ai_infra(
         return []
 
     max_workers = min(8, max(2, os.cpu_count() or 4))
-    findings: List[Dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         for file_hits in pool.map(lambda p: _audit_single_file(root, p), targets):
             findings.extend(file_hits)

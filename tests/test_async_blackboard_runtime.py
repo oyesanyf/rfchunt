@@ -10,14 +10,14 @@ repositories, and real `ProgramEligibilityDB` instances.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import math
-from pathlib import Path
 import sqlite3
 import threading
-from typing import Any, Dict, List
+from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -57,7 +57,7 @@ def _start_loop1_loopback_server(now_utc: datetime) -> HTTPServer:
     fresh_ts = (now_utc - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     older_ts = (now_utc - timedelta(hours=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    routes: Dict[str, Any] = {
+    routes: dict[str, Any] = {
         "/repos/anthropics/sandbox-runtime/releases?per_page=5": (
             '"etag-anth-rel"',
             [
@@ -238,9 +238,9 @@ def test_windows_spawn_process_pool_multi_pid_formal_and_differential(tmp_path: 
         "0\r\n\r\n"
     )
 
-    seeds: List[Dict[str, Any]] = []
+    seeds: list[dict[str, Any]] = []
     for idx in range(8):
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "cpu_work_iters": 120000,
             "propagate_siblings": False,
         }
@@ -542,7 +542,7 @@ def test_sibling_discovery_rejects_path_traversal_and_external_paths(tmp_path: P
 
 
 def test_loop1_async_etag_poller_skips_blocked_and_304(tmp_path: Path) -> None:
-    now_utc = datetime(2026, 11, 27, 4, 0, 0, tzinfo=timezone.utc)
+    now_utc = datetime(2026, 11, 27, 4, 0, 0, tzinfo=UTC)
     server = _start_loop1_loopback_server(now_utc)
     elig_db = ProgramEligibilityDB(tmp_path / "elig.sqlite3")
     elig_db.seed_observed_hackerone_baseline(now=now_utc)
@@ -622,7 +622,7 @@ def test_loop1_40char_sha_non304_dedup_and_security_fix_surface_scores(tmp_path:
 
     full_sha_pr = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
     full_sha_commit = "fedcba9876543210fedcba9876543210fedcba98"
-    now_utc = datetime(2026, 11, 27, 4, 0, 0, tzinfo=timezone.utc)
+    now_utc = datetime(2026, 11, 27, 4, 0, 0, tzinfo=UTC)
     fresh_ts = (now_utc - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     poll_count = {"pulls": 0}
 
@@ -829,9 +829,9 @@ def test_async_runtime_enforces_stage3_single_slot_and_net_concurrency(tmp_path:
     db_path = tmp_path / "conc_bb.sqlite3"
     active_calls = 0
     peak_active = 0
-    evaluated_titles: List[str] = []
+    evaluated_titles: list[str] = []
 
-    async def real_async_evaluator(cand: Dict[str, Any]) -> Dict[str, Any]:
+    async def real_async_evaluator(cand: dict[str, Any]) -> dict[str, Any]:
         nonlocal active_calls, peak_active
         active_calls += 1
         peak_active = max(peak_active, active_calls)

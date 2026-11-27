@@ -7,27 +7,30 @@ Scanners + SurfaceToScannerRouter), and B4 (Async Blackboard `remote_dispatcher`
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-from pathlib import Path
 import threading
-from typing import Any, Dict, List
+from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
 
 from engine.ai_infra_guard_auditor import audit_ai_infra
 from engine.api_jwt_sdjwt_auditor import audit_api_and_jwt
-from engine.async_blackboard_runtime import run_local_rfchunt_async, run_stage1_cpu_check
+from engine.async_blackboard_runtime import (
+    run_local_rfchunt_async,
+    run_stage1_cpu_check,
+)
 from engine.freshness_watcher import AsyncFreshnessPoller, FreshnessWatcher, WatchTarget
 from engine.mobile_app_auditor import audit_mobile_app
 from engine.trufflehog_scanner import scan_secrets_with_trufflehog
 
 
 def _start_advancing_clock_github_server(commit_ts: str):
-    requests_seen: List[Dict[str, Any]] = []
+    requests_seen: list[dict[str, Any]] = []
     lock = threading.Lock()
     sha_val = "abcdef1234567890abcdef1234567890abcdef12"
 
-    routes: Dict[str, Any] = {
+    routes: dict[str, Any] = {
         "/repos/acme/core/releases?per_page=5": ('"rel-etag-1"', []),
         "/repos/acme/core/pulls?state=closed&sort=updated&direction=desc&per_page=10": ('"pr-etag-1"', []),
         "/repos/acme/core/commits?per_page=10": (
@@ -59,7 +62,7 @@ def _start_advancing_clock_github_server(commit_ts: str):
     }
 
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802
+        def do_GET(self) -> None:
             inm = self.headers.get("If-None-Match")
             with lock:
                 requests_seen.append({"path": self.path, "if_none_match": inm})
@@ -82,7 +85,7 @@ def _start_advancing_clock_github_server(commit_ts: str):
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        def log_message(self, format: str, *args: Any) -> None:
             return
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -94,7 +97,7 @@ def _start_advancing_clock_github_server(commit_ts: str):
 def test_b1_invariant_commits_url_hits_304_on_advancing_clock_and_extracts_patch(
     tmp_path: Path,
 ) -> None:
-    t1 = datetime(2026, 11, 27, 10, 0, 0, tzinfo=timezone.utc)
+    t1 = datetime(2026, 11, 27, 10, 0, 0, tzinfo=UTC)
     commit_ts = (t1 - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     server, reqs = _start_advancing_clock_github_server(commit_ts)
     try:
@@ -236,9 +239,9 @@ def test_b2_diff_scoped_target_files_across_all_4_stage1_scanners(tmp_path: Path
 
 
 def test_b4_async_blackboard_remote_dispatcher_executes_remote_intents(tmp_path: Path) -> None:
-    dispatched: List[str] = []
+    dispatched: list[str] = []
 
-    async def _dispatcher(intent: Dict[str, Any]) -> Dict[str, Any]:
+    async def _dispatcher(intent: dict[str, Any]) -> dict[str, Any]:
         dispatched.append(str(intent.get("program") or ""))
         return {
             "status": "dispatched_remote",

@@ -12,13 +12,13 @@ Provides:
 
 from __future__ import annotations
 
+import os
+import re
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-import os
 from pathlib import Path
-import re
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
-
+from typing import Any
 
 NOISE_DIR_SEGMENTS: frozenset[str] = frozenset(
     {
@@ -99,7 +99,7 @@ _CONTAINER_ROOTS: frozenset[str] = frozenset(
     }
 )
 
-GUARD_PATTERNS: Dict[str, Tuple[re.Pattern[str], str, str]] = {
+GUARD_PATTERNS: dict[str, tuple[re.Pattern[str], str, str]] = {
     "sanitize_escape": (
         re.compile(
             r"\b(?:sanitize[A-Za-z0-9_]*|escapeHtml|escape_html|escape[A-Z][A-Za-z0-9_]*|"
@@ -167,7 +167,7 @@ _GO_FUNC_RE = re.compile(
 _RUST_FN_RE = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[<(]"
 )
-_JS_FN_PATTERNS: Tuple[re.Pattern[str], ...] = (
+_JS_FN_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\("
     ),
@@ -192,7 +192,7 @@ _NON_FN_KEYWORDS: frozenset[str] = frozenset(
 
 def is_non_production_noise(
     file_path: str,
-    metadata: Optional[Dict[str, Any]] = None,
+    metadata: dict[str, Any] | None = None,
     *,
     rule_id: str = "",
     summary: str = "",
@@ -201,14 +201,13 @@ def is_non_production_noise(
     Returns True if a finding comes from tests, fixtures, examples, docs,
     docstrings, or pure lint/hygiene metadata rather than production code.
     """
-    if isinstance(metadata, dict):
-        if (
-            metadata.get("non_production_noise") is True
-            or metadata.get("hygiene_only") is True
-            or metadata.get("in_docstring") is True
-            or metadata.get("is_comment_only") is True
-        ):
-            return True
+    if isinstance(metadata, dict) and (
+        metadata.get("non_production_noise") is True
+        or metadata.get("hygiene_only") is True
+        or metadata.get("in_docstring") is True
+        or metadata.get("is_comment_only") is True
+    ):
+        return True
 
     fp = (file_path or "").strip().replace("\\", "/").lower()
     while fp.startswith("./"):
@@ -243,13 +242,7 @@ def is_non_production_noise(
         return True
 
     summ = (summary or "").strip().lower()
-    if any(
-        tok in summ
-        for tok in ("[hygiene_only]", "hygiene_only", "lint hygiene", "in docstring", "comment-only")
-    ):
-        return True
-
-    return False
+    return bool(any(tok in summ for tok in ("[hygiene_only]", "hygiene_only", "lint hygiene", "in docstring", "comment-only")))
 
 
 def _extract_item_attr(item: Any, key: str, default: Any = None) -> Any:
@@ -269,7 +262,7 @@ def _set_noise_tag(item: Any, is_noise: bool) -> None:
         if isinstance(meta, dict):
             meta["non_production_noise"] = is_noise
         try:
-            setattr(item, "non_production_noise", is_noise)
+            item.non_production_noise = is_noise
         except (AttributeError, TypeError):
             pass
 
@@ -287,13 +280,13 @@ def _coerce_strict_bool(val: Any) -> bool:
 
 def filter_production_candidates(
     findings: Sequence[Any],
-) -> Tuple[List[Any], List[Any]]:
+) -> tuple[list[Any], list[Any]]:
     """
     Partitions findings into `(production_findings, noise_findings)`.
     Findings with `poc_verified == True` ALWAYS remain in `production_findings`.
     """
-    production: List[Any] = []
-    noise: List[Any] = []
+    production: list[Any] = []
+    noise: list[Any] = []
     for item in findings:
         meta = _extract_item_attr(item, "metadata", None)
         if not isinstance(meta, dict):
@@ -328,11 +321,11 @@ class _ExtractedFunction:
     group_root: str
     pkg_name: str
     is_handler: bool
-    guards: Set[str]
+    guards: set[str]
     non_production_noise: bool
 
 
-def _sibling_group_and_pkg(rel_path: str) -> Tuple[str, str]:
+def _sibling_group_and_pkg(rel_path: str) -> tuple[str, str]:
     parts = [p for p in rel_path.replace("\\", "/").split("/") if p]
     if len(parts) < 2:
         return "", ""
@@ -341,10 +334,9 @@ def _sibling_group_and_pkg(rel_path: str) -> Tuple[str, str]:
         if parts[1] in ("apps", "plugins", "sdks", "sdk", "modules") or parts[1].startswith("@"):
             return f"{parts[0]}/{parts[1]}", parts[2]
         return parts[0], parts[1]
-    if parts[0] in _CONTAINER_ROOTS and len(parts) >= 2:
+    if parts[0] in _CONTAINER_ROOTS and len(parts) >= 2 and (len(parts) >= 3 or "." not in parts[1]):
         # e.g. external_plugins/foo/... -> group="external_plugins", pkg="foo"
-        if len(parts) >= 3 or "." not in parts[1]:
-            return parts[0], parts[1]
+        return parts[0], parts[1]
     if len(parts) >= 3 and parts[0] == "src" and parts[1] in _CONTAINER_ROOTS:
         return f"src/{parts[1]}", parts[2] if len(parts) >= 4 else ""
     return "", ""
@@ -353,7 +345,7 @@ def _sibling_group_and_pkg(rel_path: str) -> Tuple[str, str]:
 def _extract_brace_body(lines: Sequence[str], start_idx: int, max_lines: int = 300) -> str:
     depth = 0
     saw_open = False
-    collected: List[str] = []
+    collected: list[str] = []
     limit = min(len(lines), start_idx + max_lines)
     for idx in range(start_idx, limit):
         line = lines[idx]
@@ -373,7 +365,7 @@ def _extract_brace_body(lines: Sequence[str], start_idx: int, max_lines: int = 3
 
 
 def _extract_indent_body(lines: Sequence[str], start_idx: int, base_indent: int, max_lines: int = 300) -> str:
-    collected: List[str] = [lines[start_idx]]
+    collected: list[str] = [lines[start_idx]]
     limit = min(len(lines), start_idx + max_lines)
     for idx in range(start_idx + 1, limit):
         line = lines[idx]
@@ -433,30 +425,30 @@ def _strip_signature_header(body: str, ext: str = "") -> str:
     return body
 
 
-def _detect_guards(body: str, ext: str = "") -> Set[str]:
+def _detect_guards(body: str, ext: str = "") -> set[str]:
     body_only = _strip_signature_header(body, ext=ext)
     cleaned = _strip_comments_preserve_strings(body_only, ext=ext)
-    found: Set[str] = set()
+    found: set[str] = set()
     for gname, (pat, _, _) in GUARD_PATTERNS.items():
         if pat.search(cleaned):
             found.add(gname)
     return found
 
 
-def _extract_functions_from_file(rel_path: str, text: str) -> List[_ExtractedFunction]:
+def _extract_functions_from_file(rel_path: str, text: str) -> list[_ExtractedFunction]:
     ext = Path(rel_path).suffix.lower()
     lines = text.splitlines()
     group_root, pkg_name = _sibling_group_and_pkg(rel_path)
     is_noise = is_non_production_noise(rel_path)
-    out: List[_ExtractedFunction] = []
-    seen_lines: Set[int] = set()
+    out: list[_ExtractedFunction] = []
+    seen_lines: set[int] = set()
 
     for idx, line in enumerate(lines):
         line_no = idx + 1
         if line_no in seen_lines:
             continue
 
-        fn_name: Optional[str] = None
+        fn_name: str | None = None
         body: str = ""
         is_handler = False
 
@@ -533,8 +525,8 @@ def _extract_functions_from_file(rel_path: str, text: str) -> List[_ExtractedFun
     return out
 
 
-def _collect_repo_files(repo_root: Path, include_noise: bool) -> List[Tuple[str, Path]]:
-    files: List[Tuple[str, Path]] = []
+def _collect_repo_files(repo_root: Path, include_noise: bool) -> list[tuple[str, Path]]:
+    files: list[tuple[str, Path]] = []
     for root, dirs, filenames in os.walk(repo_root):
         dirs[:] = sorted(d for d in dirs if d not in _SKIP_SCAN_DIRS and not d.startswith(".git"))
         for fname in sorted(filenames):
@@ -554,10 +546,10 @@ def _collect_repo_files(repo_root: Path, include_noise: bool) -> List[Tuple[str,
 
 
 def audit_parity_and_invariants(
-    repo_path: Union[Path, str],
+    repo_path: Path | str,
     *,
-    target_files: Optional[Sequence[str]] = None,
-) -> List[Dict[str, Any]]:
+    target_files: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
     """
     Scans `repo_path` for:
       - `PARITY-SIBLING-GUARD-001`: sibling packages/SDKs with matching security-critical
@@ -569,7 +561,7 @@ def audit_parity_and_invariants(
     if not root.exists() or not root.is_dir():
         return []
 
-    norm_targets: Optional[Set[str]] = None
+    norm_targets: set[str] | None = None
     if target_files is not None:
         norm_targets = set()
         for tf in target_files:
@@ -589,7 +581,7 @@ def audit_parity_and_invariants(
     if not candidates:
         return []
 
-    def _scan_one(item: Tuple[str, Path]) -> List[_ExtractedFunction]:
+    def _scan_one(item: tuple[str, Path]) -> list[_ExtractedFunction]:
         rel, fpath = item
         if is_non_production_noise(rel) and (not norm_targets or rel not in norm_targets):
             return []
@@ -600,16 +592,16 @@ def audit_parity_and_invariants(
         return _extract_functions_from_file(rel, text)
 
     max_workers = min(8, max(2, os.cpu_count() or 4))
-    all_funcs: List[_ExtractedFunction] = []
+    all_funcs: list[_ExtractedFunction] = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         for fn_list in pool.map(_scan_one, candidates):
             all_funcs.extend(fn_list)
 
-    findings: List[Dict[str, Any]] = []
-    seen_keys: Set[Tuple[str, str, int, str]] = set()
+    findings: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str, int, str]] = set()
 
     # 1. Sibling package / SDK parity
-    sibling_groups: Dict[Tuple[str, str], List[_ExtractedFunction]] = {}
+    sibling_groups: dict[tuple[str, str], list[_ExtractedFunction]] = {}
     for fn in all_funcs:
         if fn.group_root and fn.pkg_name and not fn.non_production_noise:
             sibling_groups.setdefault((fn.group_root, fn.norm_name), []).append(fn)
@@ -618,7 +610,7 @@ def audit_parity_and_invariants(
         distinct_pkgs = {f.pkg_name for f in fns}
         if len(distinct_pkgs) < 2:
             continue
-        union_guards: Dict[str, List[str]] = {}
+        union_guards: dict[str, list[str]] = {}
         for f in fns:
             for g in f.guards:
                 union_guards.setdefault(g, [])
@@ -665,15 +657,15 @@ def audit_parity_and_invariants(
             )
 
     # 2. Same-file handler asymmetry
-    by_file: Dict[str, List[_ExtractedFunction]] = {}
+    by_file: dict[str, list[_ExtractedFunction]] = {}
     for fn in all_funcs:
         if fn.is_handler:
             by_file.setdefault(fn.file_path, []).append(fn)
 
-    for rel_path, handlers in by_file.items():
+    for handlers in by_file.values():
         if len(handlers) < 2:
             continue
-        guard_holders: Dict[str, List[str]] = {}
+        guard_holders: dict[str, list[str]] = {}
         for h in handlers:
             for g in h.guards:
                 guard_holders.setdefault(g, []).append(h.name)

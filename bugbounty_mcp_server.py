@@ -16,9 +16,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any
 
 from engine.client_audit_packager import ClientAuditPackager
 from engine.freshness_watcher import (
@@ -28,7 +28,11 @@ from engine.freshness_watcher import (
     render_fresh_hunt_queue_markdown,
 )
 from engine.host_containment import silent_subprocess_run
-from engine.linux_poc_runner import LinuxPocRunner, save_transcript_bundle, validate_command_tokens
+from engine.linux_poc_runner import (
+    LinuxPocRunner,
+    save_transcript_bundle,
+    validate_command_tokens,
+)
 
 
 def build_rfchunt_all_argv(
@@ -41,10 +45,10 @@ def build_rfchunt_all_argv(
     freshness_hours: int = 72,
     ensemble_quorum: int = 2,
     embedded: bool = False,
-    model: Optional[str] = None,
-    extra_flags: Optional[List[str]] = None,
-    swarm_script: Optional[Path] = None,
-) -> List[str]:
+    model: str | None = None,
+    extra_flags: list[str] | None = None,
+    swarm_script: Path | None = None,
+) -> list[str]:
     """Builds a fail-closed argv invoking `rfc_hunt_swarm.py --all [--ensemble] [--embedded] <target>` (`shell=False`)."""
     t = str(target or "").strip()
     if not t:
@@ -103,14 +107,14 @@ _ALL_TOOLCHAIN_KEYS = (
 )
 
 
-def _probe_toolchain_status_safe(lean_dir: Optional[Path], embedded: bool) -> Dict[str, Any]:
+def _probe_toolchain_status_safe(lean_dir: Path | None, embedded: bool) -> dict[str, Any]:
     """Return non-destructive backend availability status, degrading gracefully on probe errors."""
     if embedded:
         try:
             from engine.ensemble_orchestrator import _embedded_toolchain_status
 
             return _embedded_toolchain_status()
-        except Exception:
+        except Exception:  # noqa: BLE001
             return {
                 name: {
                     "available": False,
@@ -125,7 +129,7 @@ def _probe_toolchain_status_safe(lean_dir: Optional[Path], embedded: bool) -> Di
 
         eff_lean = lean_dir if (lean_dir is not None and lean_dir.is_dir()) else None
         return probe_optional_backends(lean_dir=eff_lean, timeout_sec=2.5)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {
             name: {
                 "available": False,
@@ -138,9 +142,9 @@ def _probe_toolchain_status_safe(lean_dir: Optional[Path], embedded: bool) -> Di
 
 
 def _merge_lean_domain_enrichment(
-    base_lean: Optional[Dict[str, Any]],
-    ens_lean: Optional[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
+    base_lean: dict[str, Any] | None,
+    ens_lean: dict[str, Any] | None,
+) -> dict[str, Any] | None:
     """Merge counterexamples/domain_checks into base Lean workspace report without overwriting base fields."""
     if not isinstance(ens_lean, dict):
         return base_lean
@@ -163,11 +167,11 @@ def run_rfchunt_all_scan(
     freshness_hours: int = 72,
     ensemble_quorum: int = 2,
     embedded: bool = False,
-    model: Optional[str] = None,
+    model: str | None = None,
     include_lean_verify: bool = True,
     timeout_sec: float = 300.0,
-    extra_flags: Optional[List[str]] = None,
-) -> Dict[str, Any]:
+    extra_flags: list[str] | None = None,
+) -> dict[str, Any]:
     """Executes RFCHunt `--all` (optionally `--ensemble` / `--embedded`) safely (`shell=False`) plus Lean 4 check."""
     try:
         if isinstance(freshness_hours, bool) or isinstance(ensemble_quorum, bool):
@@ -197,7 +201,7 @@ def run_rfchunt_all_scan(
         extra_flags=extra_flags,
     )
     lean_dir = Path(__file__).resolve().parent / "formal" / "lean4"
-    lean_summary: Optional[Dict[str, Any]] = None
+    lean_summary: dict[str, Any] | None = None
     if include_lean_verify:
         from engine.lean_formal_verifier import verify_lean_workspace
         if lean_dir.is_dir():
@@ -208,7 +212,7 @@ def run_rfchunt_all_scan(
         mode = f"{mode} --embedded"
     if dry_run:
         tc_status = _probe_toolchain_status_safe(lean_dir, bool(embedded))
-        dry_payload: Dict[str, Any] = {
+        dry_payload: dict[str, Any] = {
             "status": "dry_run_ready",
             "mode": mode,
             "argv": argv,
@@ -279,7 +283,7 @@ def run_rfchunt_all_scan(
         errors="replace",
         timeout=eff_timeout_sec,
     )
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "status": "completed" if proc.returncode == 0 else "failed",
         "mode": mode,
         "exit_code": proc.returncode,
@@ -290,7 +294,7 @@ def run_rfchunt_all_scan(
         "stderr_tail": (proc.stderr or "")[-2000:],
         "lean_verification": lean_summary,
     }
-    ens_data: Optional[Dict[str, Any]] = None
+    ens_data: dict[str, Any] | None = None
     if ensemble and proc.returncode == 0:
         out_path = Path(output_dir)
         ens_report_path = out_path / "ensemble_report.json"
@@ -300,21 +304,21 @@ def run_rfchunt_all_scan(
                 loaded = json.loads(ens_report_path.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
                     ens_data = loaded
-            except Exception:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 ens_data = None
         if ens_data is None and combined_json_path.is_file():
             try:
                 comb = json.loads(combined_json_path.read_text(encoding="utf-8"))
                 if isinstance(comb, dict) and isinstance(comb.get("ensemble"), dict):
                     ens_data = comb["ensemble"]
-            except Exception:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 ens_data = None
         if ens_data is None and (proc.stdout or "").strip():
             try:
                 parsed_stdout = json.loads((proc.stdout or "").strip())
                 if isinstance(parsed_stdout, dict) and isinstance(parsed_stdout.get("ensemble"), dict):
                     ens_data = parsed_stdout["ensemble"]
-            except Exception:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 ens_data = None
 
     if isinstance(ens_data, dict):
@@ -379,13 +383,13 @@ def _redact_draft_text(text: str) -> str:
         from engine.advisory_exporter import _redact_inline_tokens
 
         raw = _redact_inline_tokens(raw)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     try:
         from engine.hackerone_porter import _scrub_secrets_and_phi
 
         raw = _scrub_secrets_and_phi(raw)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return raw
 
@@ -402,11 +406,11 @@ def validate_and_stage_hackerone_draft(
     poc_verified: Any,
     out_path: str,
     require_verified_poc: bool = True,
-    eligibility_db: Optional[Any] = None,
-    eligibility_db_path: Optional[str] = None,
+    eligibility_db: Any | None = None,
+    eligibility_db_path: str | None = None,
     poc_transcript: str = "",
-    report_id: Optional[str] = None,
-) -> Dict[str, Any]:
+    report_id: str | None = None,
+) -> dict[str, Any]:
     """
     Validates a bug bounty draft against strict signal-protection and ProgramEligibilityDB
     fail-closed gates before staging it for browser review/submission.
@@ -419,7 +423,7 @@ def validate_and_stage_hackerone_draft(
     impact_clean = _redact_draft_text(str(impact or ""))
     transcript_clean = _redact_draft_text(str(poc_transcript or ""))
 
-    issues: List[str] = []
+    issues: list[str] = []
     elig_blocked = False
     is_valid_handle = bool(
         handle_clean
@@ -448,7 +452,7 @@ def validate_and_stage_hackerone_draft(
                 issues.append(
                     f"Program {handle_clean!r} is not UNLOCKED in ProgramEligibilityDB (blocked by signal/eligibility gate)."
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             elig_blocked = True
             issues.append(f"ProgramEligibilityDB fail-closed block for {handle_clean!r}: {exc}")
 
@@ -493,14 +497,14 @@ def validate_and_stage_hackerone_draft(
     else:
         status = "blocked_quality_gate"
 
-    eff_report_id: Optional[str] = None
-    report_url: Optional[str] = None
+    eff_report_id: str | None = None
+    report_url: str | None = None
     if status == "staged_ready":
         if report_id and str(report_id).strip():
             eff_report_id = str(report_id).strip()
         else:
             digest = hashlib.sha256(
-                f"{handle_clean}|{asset_clean}|{title_clean}".encode("utf-8")
+                f"{handle_clean}|{asset_clean}|{title_clean}".encode()
             ).hexdigest()[:10]
             eff_report_id = f"draft-{digest}"
         report_url = f"https://hackerone.com/reports/{eff_report_id}"
@@ -541,9 +545,9 @@ def build_browser_handoff_spec(
     platform: str,
     program_handle: str,
     action: str,
-    staged_draft_path: Optional[str] = None,
-    existing_draft_url: Optional[str] = None,
-) -> Dict[str, Any]:
+    staged_draft_path: str | None = None,
+    existing_draft_url: str | None = None,
+) -> dict[str, Any]:
     """
     Emits a structured `/browser` subagent handoff specification for authorized bug bounty
     UI workflows (scope reading, inbox triage check, or draft staging).
@@ -587,7 +591,7 @@ def build_browser_handoff_spec(
     }
 
 
-TOOLS_SCHEMA: List[Dict[str, Any]] = [
+TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
         "name": "bb_freshness_watch",
         "description": "Poll in-scope GitHub repositories for fresh releases, merged PRs, and commits landed within the last 24-72 hours, ranked by high-bounty attack surface.",
@@ -880,7 +884,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
 class BugBountyMCPServer:
     """In-process & stdio JSON-RPC 2.0 MCP server for RFCHunt bug bounty workflows."""
 
-    def handle_request(self, req: Dict[str, Any]) -> Dict[str, Any]:
+    def handle_request(self, req: dict[str, Any]) -> dict[str, Any]:
         req_id = req.get("id")
         method = req.get("method", "")
         params = req.get("params") or {}
@@ -916,7 +920,7 @@ class BugBountyMCPServer:
                         "isError": False,
                     },
                 }
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 return {
                     "jsonrpc": "2.0",
                     "id": req_id,
@@ -932,9 +936,9 @@ class BugBountyMCPServer:
             "error": {"code": -32601, "message": f"Method not found: {method}"},
         }
 
-    def _dispatch_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    def _dispatch_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name == "bb_freshness_watch":
-            targets: List[WatchTarget] = []
+            targets: list[WatchTarget] = []
             if args.get("watchlist_path"):
                 targets.extend(load_watchlist(args["watchlist_path"]))
             for slug in args.get("repos") or []:
@@ -1252,7 +1256,7 @@ def serve_stdio() -> None:
         try:
             req = json.loads(stripped)
             resp = server.handle_request(req)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             resp = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}
         sys.stdout.write(json.dumps(resp) + "\n")
         sys.stdout.flush()

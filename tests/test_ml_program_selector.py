@@ -10,18 +10,19 @@ and zero `unittest.mock` / `MagicMock` / `monkeypatch`.
 from __future__ import annotations
 
 import contextlib
-from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
 import os
-from pathlib import Path
 import threading
-from typing import Any, Dict, List
+from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
 
 import pytest
 
-from bugbounty_mcp_server import BugBountyMCPServer, TOOLS_SCHEMA
+import revenue_cli
+from bugbounty_mcp_server import TOOLS_SCHEMA, BugBountyMCPServer
 from engine.acdso_bridge import (
     ContextualBanditEnv,
     MultiObjectiveCandidate,
@@ -51,12 +52,11 @@ from engine.program_eligibility_db import (
     ProgramEligibilityDB,
     parse_scope_prose_metadata,
 )
-import revenue_cli
 
 
 @contextlib.contextmanager
 def _scoped_env(**updates: str | None):
-    saved: Dict[str, str | None] = {}
+    saved: dict[str, str | None] = {}
     for k, v in updates.items():
         saved[k] = os.environ.get(k)
         if v is None:
@@ -75,11 +75,11 @@ def _scoped_env(**updates: str | None):
 
 @contextlib.contextmanager
 def _modelfusion_loopback_server(decision_winner: str, reject_slop: bool = False):
-    calls: List[Dict[str, Any]] = []
+    calls: list[dict[str, Any]] = []
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802
+        def do_GET(self) -> None:
             if self.path == "/health":
                 body = json.dumps({"status": "ok", "engine": "modelfusion"}).encode("utf-8")
                 self.send_response(200)
@@ -91,7 +91,7 @@ def _modelfusion_loopback_server(decision_winner: str, reject_slop: bool = False
             self.send_response(404)
             self.end_headers()
 
-        def do_POST(self) -> None:  # noqa: N802
+        def do_POST(self) -> None:
             if self.path == "/api/decision":
                 length = int(self.headers.get("Content-Length", "0") or 0)
                 raw = self.rfile.read(length) if length > 0 else b"{}"
@@ -113,7 +113,7 @@ def _modelfusion_loopback_server(decision_winner: str, reject_slop: bool = False
             self.send_response(404)
             self.end_headers()
 
-        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        def log_message(self, format: str, *args: Any) -> None:
             return
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -161,7 +161,7 @@ def test_schema_v2_migration_scope_backfill_and_unlock_distance(tmp_path: Path) 
 
 def test_classify_program_lane_and_efficiency_deferral(tmp_path: Path) -> None:
     db = ProgramEligibilityDB(tmp_path / "lanes.sqlite3")
-    now = datetime(2026, 11, 27, 12, 0, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 11, 27, 12, 0, 0, tzinfo=UTC)
     db.upsert(
         "fresh_vdp",
         "UNLOCKED",
@@ -339,36 +339,38 @@ def test_two_phase_knapsack_lane1_floor_and_online_bandit_and_policy_learner(tmp
 
 
 def test_boost_adapter_tie_break_and_deterministic_proof_preservation() -> None:
-    with _modelfusion_loopback_server(decision_winner="prog_b", reject_slop=True) as (mf_url, calls):
-        with _scoped_env(RFCHUNT_OFFLINE=None, CI=None):
-            probe = probe_modelfusion_decision_api(mf_url, timeout_sec=0.4)
-            assert probe["available"] is True
+    with (
+        _modelfusion_loopback_server(decision_winner="prog_b", reject_slop=True) as (mf_url, calls),
+        _scoped_env(RFCHUNT_OFFLINE=None, CI=None),
+    ):
+        probe = probe_modelfusion_decision_api(mf_url, timeout_sec=0.4)
+        assert probe["available"] is True
 
-            adapter = BoostDecisionAdapter(modelfusion_url=mf_url, embedded=False)
-            tied = [
-                {"handle": "prog_a", "score": 0.850, "program_age_days": 400, "response_efficiency_pct": 85},
-                {"handle": "prog_b", "score": 0.842, "program_age_days": 30, "response_efficiency_pct": 98},
-            ]
-            tb = adapter.tie_break_pareto_knee(tied, margin=0.02)
-            assert tb["tie_broken"] is True
-            assert tb["backend"] == "modelfusion"
-            assert tb["winner"] == "prog_b"
-            assert tb["ordered"][0]["handle"] == "prog_b"
-            assert len(calls) >= 1
+        adapter = BoostDecisionAdapter(modelfusion_url=mf_url, embedded=False)
+        tied = [
+            {"handle": "prog_a", "score": 0.850, "program_age_days": 400, "response_efficiency_pct": 85},
+            {"handle": "prog_b", "score": 0.842, "program_age_days": 30, "response_efficiency_pct": 98},
+        ]
+        tb = adapter.tie_break_pareto_knee(tied, margin=0.02)
+        assert tb["tie_broken"] is True
+        assert tb["backend"] == "modelfusion"
+        assert tb["winner"] == "prog_b"
+        assert tb["ordered"][0]["handle"] == "prog_b"
+        assert len(calls) >= 1
 
-            # Deterministic proof (poc_verified=True & lean4) MUST NEVER be demoted even when critic rejects slop
-            stress = adapter.stress_test_stage3_candidates(
-                [
-                    {"title": "Verified PoC bypass", "file_path": "src/auth.py", "line": 42, "poc_verified": True, "engine": "api_jwt_sdjwt"},
-                    {"title": "Lean4 RFC 9112 counterexample", "file_path": "src/http.rs", "line": 12, "poc_verified": False, "engine": "lean4", "confirmed": True},
-                    {"title": "Potentially vulnerable header", "file_path": "tests/test_a.py", "line": 1, "poc_verified": False, "engine": "heuristic", "confidence": 0.2},
-                ],
-                top_k=3,
-                program="common_codes",
-            )
-            assert stress["deterministic_preserved"] == 2
-            assert stress["kept_count"] == 2
-            assert stress["demoted_count"] == 1
+        # Deterministic proof (poc_verified=True & lean4) MUST NEVER be demoted even when critic rejects slop
+        stress = adapter.stress_test_stage3_candidates(
+            [
+                {"title": "Verified PoC bypass", "file_path": "src/auth.py", "line": 42, "poc_verified": True, "engine": "api_jwt_sdjwt"},
+                {"title": "Lean4 RFC 9112 counterexample", "file_path": "src/http.rs", "line": 12, "poc_verified": False, "engine": "lean4", "confirmed": True},
+                {"title": "Potentially vulnerable header", "file_path": "tests/test_a.py", "line": 1, "poc_verified": False, "engine": "heuristic", "confidence": 0.2},
+            ],
+            top_k=3,
+            program="common_codes",
+        )
+        assert stress["deterministic_preserved"] == 2
+        assert stress["kept_count"] == 2
+        assert stress["demoted_count"] == 1
 
 
 def test_end_to_end_rank_programs_cli_sync_outcome_and_mcp(
@@ -376,7 +378,7 @@ def test_end_to_end_rank_programs_cli_sync_outcome_and_mcp(
 ) -> None:
     db_path = tmp_path / "cli_elig.sqlite3"
     snap_path = tmp_path / "h1_snapshot.json"
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     snap_path.write_text(
         json.dumps(
             {

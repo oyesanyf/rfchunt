@@ -19,14 +19,14 @@ Hard Engineering & Safety Invariants:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
 import os
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
 import urllib.error
 import urllib.request
-
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import Any
 
 HEALTH_PROBE_TIMEOUT_SEC: float = 0.4
 DECISION_CALL_TIMEOUT_SEC: float = 0.4
@@ -35,7 +35,7 @@ _DETERMINISTIC_PROOF_ENGINES = frozenset(
     {"lean4", "z3_formal", "z3", "differential_oracle", "linux_poc"}
 )
 
-_SLOP_MARKERS: Tuple[str, ...] = (
+_SLOP_MARKERS: tuple[str, ...] = (
     "potentially vulnerable",
     "might allow",
     "could theoretically",
@@ -46,7 +46,7 @@ _SLOP_MARKERS: Tuple[str, ...] = (
     "outdated banner",
 )
 
-_NOISE_PATH_MARKERS: Tuple[str, ...] = (
+_NOISE_PATH_MARKERS: tuple[str, ...] = (
     "/tests/",
     "/test/",
     "/__tests__/",
@@ -68,13 +68,13 @@ def _http_json_request(
     url: str,
     *,
     method: str = "GET",
-    payload: Optional[Dict[str, Any]] = None,
+    payload: dict[str, Any] | None = None,
     timeout_sec: float = HEALTH_PROBE_TIMEOUT_SEC,
-) -> Tuple[bool, int, Optional[Dict[str, Any]], str]:
+) -> tuple[bool, int, dict[str, Any] | None, str]:
     """Bounded stdlib HTTP JSON helper with proxies disabled (loopback-safe)."""
     eff_timeout = max(0.05, min(float(timeout_sec), 2.0))
     headers = {"Accept": "application/json", "User-Agent": "RFCHunt-BoostAdapter/1.0"}
-    data: Optional[bytes] = None
+    data: bytes | None = None
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -94,7 +94,7 @@ def _http_json_request(
                 return (200 <= status < 300), status, {"raw": raw[:256]}, ""
     except urllib.error.HTTPError as exc:
         return False, int(exc.code), None, f"http_{exc.code}"
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return False, 0, None, str(exc)[:160]
 
 
@@ -102,7 +102,7 @@ def probe_modelfusion_decision_api(
     base_url: str = "http://127.0.0.1:5000",
     *,
     timeout_sec: float = HEALTH_PROBE_TIMEOUT_SEC,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Probes local ModelFusion HTTP `/health` within <= 400ms without crashing."""
     t0 = time.monotonic()
     clean_base = str(base_url or "http://127.0.0.1:5000").rstrip("/")
@@ -122,13 +122,13 @@ def probe_ollama_tags(
     base_url: str = "http://127.0.0.1:11434",
     *,
     timeout_sec: float = HEALTH_PROBE_TIMEOUT_SEC,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Probes local Ollama `/api/tags` within <= 400ms and lists installed models."""
     t0 = time.monotonic()
     clean_base = str(base_url or "http://127.0.0.1:11434").rstrip("/")
     eff_timeout = min(float(timeout_sec), HEALTH_PROBE_TIMEOUT_SEC)
     ok, code, body, err = _http_json_request(f"{clean_base}/api/tags", timeout_sec=eff_timeout)
-    models: List[str] = []
+    models: list[str] = []
     if ok and isinstance(body, dict):
         for item in body.get("models") or ():
             if isinstance(item, dict) and item.get("name"):
@@ -157,9 +157,9 @@ class BoostDecisionAdapter:
     ollama_url: str = "http://127.0.0.1:11434"
     probe_timeout_sec: float = HEALTH_PROBE_TIMEOUT_SEC
     embedded: bool = False
-    _last_probe: Dict[str, Any] = field(default_factory=dict, repr=False)
+    _last_probe: dict[str, Any] = field(default_factory=dict, repr=False)
 
-    def health_check(self) -> Dict[str, Any]:
+    def health_check(self) -> dict[str, Any]:
         if self.embedded or _is_offline_env():
             status = {
                 "mode": "offline_deterministic",
@@ -179,7 +179,7 @@ class BoostDecisionAdapter:
         return status
 
     @staticmethod
-    def _extract_score(item: Dict[str, Any]) -> float:
+    def _extract_score(item: dict[str, Any]) -> float:
         for key in (
             "combined_rank_score",
             "expected_value",
@@ -197,7 +197,7 @@ class BoostDecisionAdapter:
         return 0.0
 
     @staticmethod
-    def _deterministic_tie_key(item: Dict[str, Any]) -> Tuple[float, float, float, str]:
+    def _deterministic_tie_key(item: dict[str, Any]) -> tuple[float, float, float, str]:
         """
         Deterministic HackerOne tie-breaker:
           1. Newer launch (smaller `program_age_days` / `launch_age_days` -> higher recency score)
@@ -223,11 +223,11 @@ class BoostDecisionAdapter:
 
     def tie_break_pareto_knee(
         self,
-        candidates: Sequence[Dict[str, Any]],
+        candidates: Sequence[dict[str, Any]],
         *,
         top_k: int = 3,
         margin: float = 0.02,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Resolves near-ties among the top `<= top_k` Pareto-knee candidates when their
         primary scores differ by `<= margin`.
@@ -258,7 +258,7 @@ class BoostDecisionAdapter:
             }
 
         backend = "local_deterministic"
-        winner_handle: Optional[str] = None
+        winner_handle: str | None = None
         if not self.embedded and not _is_offline_env():
             mf_probe = probe_modelfusion_decision_api(
                 self.modelfusion_url, timeout_sec=self.probe_timeout_sec
@@ -321,7 +321,7 @@ class BoostDecisionAdapter:
         }
 
     @staticmethod
-    def _is_deterministic_proof(cand: Dict[str, Any]) -> bool:
+    def _is_deterministic_proof(cand: dict[str, Any]) -> bool:
         if cand.get("poc_verified") is True:
             return True
         engine = str(cand.get("engine") or cand.get("source_engine") or "").strip().lower()
@@ -330,17 +330,15 @@ class BoostDecisionAdapter:
                 return bool(cand.get("confirmed", True) or cand.get("deterministic", True))
             return True
         meta = cand.get("metadata") if isinstance(cand.get("metadata"), dict) else {}
-        if meta.get("lean4_proven") is True or meta.get("z3_sat") is True:
-            return True
-        return False
+        return bool(meta.get("lean4_proven") is True or meta.get("z3_sat") is True)
 
     def stress_test_stage3_candidates(
         self,
-        candidates: Sequence[Dict[str, Any]],
+        candidates: Sequence[dict[str, Any]],
         *,
         top_k: int = 3,
         program: str = "generic",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Anti-slop stress test for ONLY the top `<= 3` Stage 3 findings.
         Deterministic proofs (`poc_verified=True`, Lean4, Z3, differential oracle)
@@ -360,9 +358,9 @@ class BoostDecisionAdapter:
             if mf_available:
                 backend = "modelfusion"
 
-        evaluated: List[Dict[str, Any]] = []
-        kept: List[Dict[str, Any]] = []
-        demoted: List[Dict[str, Any]] = []
+        evaluated: list[dict[str, Any]] = []
+        kept: list[dict[str, Any]] = []
+        demoted: list[dict[str, Any]] = []
         deterministic_preserved = 0
 
         for idx, cand in enumerate(slice_items):
@@ -378,7 +376,7 @@ class BoostDecisionAdapter:
                 kept.append(entry)
                 continue
 
-            reasons: List[str] = []
+            reasons: list[str] = []
             fp = str(cand.get("file_path") or "").replace("\\", "/").lower()
             title = str(cand.get("title") or "")
             summary = str(cand.get("summary") or cand.get("description") or "")
@@ -448,9 +446,9 @@ class BoostDecisionAdapter:
 
 
 __all__ = [
-    "HEALTH_PROBE_TIMEOUT_SEC",
     "DECISION_CALL_TIMEOUT_SEC",
+    "HEALTH_PROBE_TIMEOUT_SEC",
+    "BoostDecisionAdapter",
     "probe_modelfusion_decision_api",
     "probe_ollama_tags",
-    "BoostDecisionAdapter",
 ]

@@ -11,16 +11,16 @@ online ML learning, and `account_state` (Signal establishment & daily submission
 from __future__ import annotations
 
 import contextlib
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
 import json
 import os
-from pathlib import Path
 import re
 import sqlite3
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
-
 
 DEFAULT_ELIGIBILITY_DB_PATH = (
     Path(__file__).resolve().parent.parent
@@ -30,7 +30,7 @@ DEFAULT_ELIGIBILITY_DB_PATH = (
 )
 
 
-def resolve_eligibility_db_path(db_path: Optional[Union[str, Path]] = None) -> Path:
+def resolve_eligibility_db_path(db_path: str | Path | None = None) -> Path:
     """Resolves the SQLite eligibility DB path, honoring `RFCHUNT_ELIGIBILITY_DB` when `db_path` is None."""
     if db_path is not None:
         raw = str(db_path).strip()
@@ -45,14 +45,14 @@ def resolve_eligibility_db_path(db_path: Optional[Union[str, Path]] = None) -> P
 VALID_STATUSES = frozenset({"UNLOCKED", "BLOCKED_SIGNAL", "PAUSED", "NOT_FOUND"})
 VALID_OUTCOMES = frozenset({"TRIAGED", "RESOLVED", "BOUNTY", "DUPLICATE", "INFORMATIVE", "NA", "NO_FINDING"})
 
-DEFAULT_RECHECK_HOURS: Dict[str, int] = {
+DEFAULT_RECHECK_HOURS: dict[str, int] = {
     "UNLOCKED": 24,
     "BLOCKED_SIGNAL": 48,
     "PAUSED": 168,
     "NOT_FOUND": 336,
 }
 
-_SCHEMA_V2_COLUMNS: Tuple[Tuple[str, str], ...] = (
+_SCHEMA_V2_COLUMNS: tuple[tuple[str, str], ...] = (
     ("launched_at_utc", "TEXT NOT NULL DEFAULT ''"),
     ("response_efficiency_pct", "REAL"),
     ("first_response_hours", "REAL"),
@@ -148,7 +148,7 @@ def host_matches_scope_pattern(host: str, pattern: str) -> bool:
         h_labels = h.split(".")
         p_labels = pat.split(".")
         # Match DNS labels with `*` matching >= 1 whole DNS label
-        memo: Dict[Tuple[int, int], bool] = {}
+        memo: dict[tuple[int, int], bool] = {}
 
         def _dp(pi: int, hi: int) -> bool:
             key = (pi, hi)
@@ -190,7 +190,7 @@ def is_host_in_scope(
     host: str,
     in_scope_assets: Sequence[str],
     out_of_scope_assets: Sequence[str] = (),
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """
     Fail-closed scope validator using strict DNS label-boundary matching.
     Out-of-scope rules always override in-scope rules.
@@ -210,7 +210,7 @@ def is_host_in_scope(
     return False, "not_in_scope"
 
 
-def _json_load_list(raw: Any) -> Tuple[str, ...]:
+def _json_load_list(raw: Any) -> tuple[str, ...]:
     if isinstance(raw, (list, tuple)):
         return tuple(str(x).strip() for x in raw if str(x or "").strip())
     if isinstance(raw, str) and raw.strip():
@@ -218,14 +218,14 @@ def _json_load_list(raw: Any) -> Tuple[str, ...]:
             parsed = json.loads(raw)
             if isinstance(parsed, list):
                 return tuple(str(x).strip() for x in parsed if str(x or "").strip())
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
     return ()
 
 
-def _json_load_dict(raw: Any) -> Dict[str, int]:
+def _json_load_dict(raw: Any) -> dict[str, int]:
     if isinstance(raw, dict):
-        out: Dict[str, int] = {}
+        out: dict[str, int] = {}
         for k, v in raw.items():
             try:
                 out[str(k)] = int(v)
@@ -237,7 +237,7 @@ def _json_load_dict(raw: Any) -> Dict[str, int]:
             parsed = json.loads(raw)
             if isinstance(parsed, dict):
                 return {str(k): int(v) for k, v in parsed.items() if isinstance(v, (int, float))}
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
     return {}
 
@@ -247,8 +247,8 @@ def parse_scope_prose_metadata(
     scope_summary: str,
     notes: str = "",
     *,
-    bounty_max_usd: Optional[int] = None,
-) -> Dict[str, Any]:
+    bounty_max_usd: int | None = None,
+) -> dict[str, Any]:
     """
     Deterministically backfills structured Schema v2 columns from observed HackerOne
     baseline prose summaries (launch date, efficiency %, response latency, resolved count,
@@ -256,7 +256,7 @@ def parse_scope_prose_metadata(
     """
     blob = f"{scope_summary or ''} {notes or ''}".strip()
     low = blob.lower()
-    meta: Dict[str, Any] = {}
+    meta: dict[str, Any] = {}
 
     # Launch date (`launched MM/YYYY` or `launched YYYY-MM`)
     m_launch = re.search(r"launched\s+(\d{1,2})/(\d{4})", low)
@@ -297,7 +297,7 @@ def parse_scope_prose_metadata(
     # VDP vs BBP classification
     has_cash = (bounty_max_usd is not None and int(bounty_max_usd) > 0)
     is_vdp = (not has_cash) and (
-        "vdp" in low or "non-monetary" in low or handle.endswith("_vdp") or handle.endswith("-vdp") or "disclosure" in handle
+        "vdp" in low or "non-monetary" in low or handle.endswith(("_vdp", "-vdp")) or "disclosure" in handle
     )
     meta["offers_bounties"] = bool(has_cash)
     meta["is_vdp"] = bool(is_vdp or not has_cash)
@@ -337,7 +337,7 @@ def parse_scope_prose_metadata(
     ai_count = int(m_ai.group(1)) if m_ai else (1 if any(k in low for k in ("genai", "claude", "ai models", "llm", "mcp")) else 0)
 
     # Source repos
-    in_scope_repos: List[str] = []
+    in_scope_repos: list[str] = []
     for m_gh in re.finditer(r"(?:https?://)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.*-]+)", blob):
         owner, repo = m_gh.group(1), m_gh.group(2).rstrip(".,;)")
         if repo != "*":
@@ -397,9 +397,9 @@ class ProgramEligibilityRecord:
     handle: str
     platform: str
     status: str
-    signal_required: Optional[float]
-    bounty_min_usd: Optional[int]
-    bounty_max_usd: Optional[int]
+    signal_required: float | None
+    bounty_min_usd: int | None
+    bounty_max_usd: int | None
     submit_url: str
     scope_summary: str
     last_checked_utc: str
@@ -407,10 +407,10 @@ class ProgramEligibilityRecord:
     notes: str = ""
     # Schema v2 directory, scope & RoE fields (backwards-compatible defaults)
     launched_at_utc: str = ""
-    response_efficiency_pct: Optional[float] = None
-    first_response_hours: Optional[float] = None
-    triage_hours: Optional[float] = None
-    bounty_hours: Optional[float] = None
+    response_efficiency_pct: float | None = None
+    first_response_hours: float | None = None
+    triage_hours: float | None = None
+    bounty_hours: float | None = None
     resolved_count: int = 0
     offers_bounties: bool = False
     is_vdp: bool = False
@@ -425,19 +425,19 @@ class ProgramEligibilityRecord:
     source_repo_count: int = 0
     ai_asset_count: int = 0
     bounty_eligible_asset_count: int = 0
-    in_scope_assets: Tuple[str, ...] = ()
-    in_scope_repos: Tuple[str, ...] = ()
-    out_of_scope_assets: Tuple[str, ...] = ()
-    scope_asset_types: Dict[str, int] = field(default_factory=dict)
+    in_scope_assets: tuple[str, ...] = ()
+    in_scope_repos: tuple[str, ...] = ()
+    out_of_scope_assets: tuple[str, ...] = ()
+    scope_asset_types: dict[str, int] = field(default_factory=dict)
     roe_automation_tier: str = "in_scope_only_manual_verify"
     roe_automated_prohibited: bool = False
     roe_max_rps: float = 2.0
-    roe_required_headers: Tuple[str, ...] = ()
+    roe_required_headers: tuple[str, ...] = ()
     roe_user_agent: str = ""
     roe_ai_disclosure_required: bool = False
     roe_no_oos_redirects: bool = True
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["in_scope_assets"] = list(self.in_scope_assets)
         d["in_scope_repos"] = list(self.in_scope_repos)
@@ -458,39 +458,39 @@ class HuntOutcomeRecord:
     outcome: str
     signal_delta: float = 0.0
     bounty_usd: float = 0.0
-    triage_hours_observed: Optional[float] = None
+    triage_hours_observed: float | None = None
     cycle_id: str = ""
-    features: Dict[str, Any] = field(default_factory=dict)
+    features: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 @dataclass(frozen=True)
 class AccountSignalState:
     signal_established: bool = False
-    signal_score: Optional[float] = None
+    signal_score: float | None = None
     trial_reports_remaining: int = 0
     daily_submissions_count: int = 0
     daily_submissions_date_utc: str = ""
     updated_at_utc: str = ""
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
-def _utc_now(now: Optional[datetime] = None) -> datetime:
+def _utc_now(now: datetime | None = None) -> datetime:
     if now is None:
-        return datetime.now(timezone.utc)
+        return datetime.now(UTC)
     if now.tzinfo is None:
-        return now.replace(tzinfo=timezone.utc)
-    return now.astimezone(timezone.utc)
+        return now.replace(tzinfo=UTC)
+    return now.astimezone(UTC)
 
 
 class ProgramEligibilityDB:
     """Thread-safe SQLite store tracking unlocked vs Signal-blocked bounty programs & ML outcomes."""
 
-    def __init__(self, db_path: Optional[Union[str, Path]] = None) -> None:
+    def __init__(self, db_path: str | Path | None = None) -> None:
         self.db_path = resolve_eligibility_db_path(db_path)
         if str(self.db_path) != ":memory:":
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -505,151 +505,150 @@ class ProgramEligibilityDB:
         return conn
 
     def _init_schema(self) -> None:
-        with contextlib.closing(self._connect()) as conn:
-            with conn:
+        with contextlib.closing(self._connect()) as conn, conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS program_eligibility (
+                    handle TEXT PRIMARY KEY,
+                    platform TEXT NOT NULL DEFAULT 'hackerone',
+                    status TEXT NOT NULL,
+                    signal_required REAL,
+                    bounty_min_usd INTEGER,
+                    bounty_max_usd INTEGER,
+                    submit_url TEXT NOT NULL DEFAULT '',
+                    scope_summary TEXT NOT NULL DEFAULT '',
+                    last_checked_utc TEXT NOT NULL,
+                    next_recheck_utc TEXT NOT NULL,
+                    notes TEXT NOT NULL DEFAULT ''
+                );
+                """
+            )
+            existing_cols = {
+                str(r["name"])
+                for r in conn.execute("PRAGMA table_info(program_eligibility)").fetchall()
+            }
+            for col_name, col_ddl in _SCHEMA_V2_COLUMNS:
+                if col_name not in existing_cols:
+                    conn.execute(f"ALTER TABLE program_eligibility ADD COLUMN {col_name} {col_ddl};")
+
+            # Deterministic v1 -> v2 prose backfill for legacy rows missing structured v2 metadata
+            legacy_rows = conn.execute(
+                """
+                SELECT handle, status, bounty_max_usd, scope_summary, notes
+                FROM program_eligibility
+                WHERE (scope_summary != '' OR notes != '')
+                  AND scope_asset_types_json = '{}'
+                  AND in_scope_repos_json = '[]'
+                  AND in_scope_assets_json = '[]'
+                """
+            ).fetchall()
+            for row in legacy_rows:
+                parsed = parse_scope_prose_metadata(
+                    str(row["handle"]),
+                    str(row["scope_summary"] or ""),
+                    str(row["notes"] or ""),
+                    bounty_max_usd=row["bounty_max_usd"],
+                )
+                if not parsed:
+                    continue
                 conn.execute(
                     """
-                    CREATE TABLE IF NOT EXISTS program_eligibility (
-                        handle TEXT PRIMARY KEY,
-                        platform TEXT NOT NULL DEFAULT 'hackerone',
-                        status TEXT NOT NULL,
-                        signal_required REAL,
-                        bounty_min_usd INTEGER,
-                        bounty_max_usd INTEGER,
-                        submit_url TEXT NOT NULL DEFAULT '',
-                        scope_summary TEXT NOT NULL DEFAULT '',
-                        last_checked_utc TEXT NOT NULL,
-                        next_recheck_utc TEXT NOT NULL,
-                        notes TEXT NOT NULL DEFAULT ''
-                    );
-                    """
-                )
-                existing_cols = {
-                    str(r["name"])
-                    for r in conn.execute("PRAGMA table_info(program_eligibility)").fetchall()
-                }
-                for col_name, col_ddl in _SCHEMA_V2_COLUMNS:
-                    if col_name not in existing_cols:
-                        conn.execute(f"ALTER TABLE program_eligibility ADD COLUMN {col_name} {col_ddl};")
-
-                # Deterministic v1 -> v2 prose backfill for legacy rows missing structured v2 metadata
-                legacy_rows = conn.execute(
-                    """
-                    SELECT handle, status, bounty_max_usd, scope_summary, notes
-                    FROM program_eligibility
-                    WHERE (scope_summary != '' OR notes != '')
-                      AND scope_asset_types_json = '{}'
-                      AND in_scope_repos_json = '[]'
-                      AND in_scope_assets_json = '[]'
-                    """
-                ).fetchall()
-                for row in legacy_rows:
-                    parsed = parse_scope_prose_metadata(
+                    UPDATE program_eligibility
+                    SET launched_at_utc = CASE WHEN launched_at_utc = '' THEN ? ELSE launched_at_utc END,
+                        response_efficiency_pct = COALESCE(response_efficiency_pct, ?),
+                        first_response_hours = COALESCE(first_response_hours, ?),
+                        resolved_count = CASE WHEN resolved_count = 0 THEN ? ELSE resolved_count END,
+                        offers_bounties = ?,
+                        is_vdp = ?,
+                        gold_standard = CASE WHEN gold_standard = 0 THEN ? ELSE gold_standard END,
+                        fast_payments = CASE WHEN fast_payments = 0 THEN ? ELSE fast_payments END,
+                        wildcard_count = ?,
+                        domain_count = ?,
+                        api_asset_count = ?,
+                        mobile_asset_count = ?,
+                        source_repo_count = ?,
+                        ai_asset_count = ?,
+                        bounty_eligible_asset_count = ?,
+                        in_scope_assets_json = ?,
+                        in_scope_repos_json = ?,
+                        scope_asset_types_json = ?
+                    WHERE handle = ?
+                    """,
+                    (
+                        str(parsed.get("launched_at_utc") or ""),
+                        parsed.get("response_efficiency_pct"),
+                        parsed.get("first_response_hours"),
+                        int(parsed.get("resolved_count") or 0),
+                        1 if parsed.get("offers_bounties") else 0,
+                        1 if parsed.get("is_vdp") else 0,
+                        1 if parsed.get("gold_standard") else 0,
+                        1 if parsed.get("fast_payments") else 0,
+                        int(parsed.get("wildcard_count") or 0),
+                        int(parsed.get("domain_count") or 0),
+                        int(parsed.get("api_asset_count") or 0),
+                        int(parsed.get("mobile_asset_count") or 0),
+                        int(parsed.get("source_repo_count") or 0),
+                        int(parsed.get("ai_asset_count") or 0),
+                        int(parsed.get("bounty_eligible_asset_count") or 0),
+                        json.dumps(list(parsed.get("in_scope_assets") or ()), sort_keys=False),
+                        json.dumps(list(parsed.get("in_scope_repos") or ()), sort_keys=False),
+                        json.dumps(dict(parsed.get("scope_asset_types") or {}), sort_keys=True),
                         str(row["handle"]),
-                        str(row["scope_summary"] or ""),
-                        str(row["notes"] or ""),
-                        bounty_max_usd=row["bounty_max_usd"],
-                    )
-                    if not parsed:
-                        continue
-                    conn.execute(
-                        """
-                        UPDATE program_eligibility
-                        SET launched_at_utc = CASE WHEN launched_at_utc = '' THEN ? ELSE launched_at_utc END,
-                            response_efficiency_pct = COALESCE(response_efficiency_pct, ?),
-                            first_response_hours = COALESCE(first_response_hours, ?),
-                            resolved_count = CASE WHEN resolved_count = 0 THEN ? ELSE resolved_count END,
-                            offers_bounties = ?,
-                            is_vdp = ?,
-                            gold_standard = CASE WHEN gold_standard = 0 THEN ? ELSE gold_standard END,
-                            fast_payments = CASE WHEN fast_payments = 0 THEN ? ELSE fast_payments END,
-                            wildcard_count = ?,
-                            domain_count = ?,
-                            api_asset_count = ?,
-                            mobile_asset_count = ?,
-                            source_repo_count = ?,
-                            ai_asset_count = ?,
-                            bounty_eligible_asset_count = ?,
-                            in_scope_assets_json = ?,
-                            in_scope_repos_json = ?,
-                            scope_asset_types_json = ?
-                        WHERE handle = ?
-                        """,
-                        (
-                            str(parsed.get("launched_at_utc") or ""),
-                            parsed.get("response_efficiency_pct"),
-                            parsed.get("first_response_hours"),
-                            int(parsed.get("resolved_count") or 0),
-                            1 if parsed.get("offers_bounties") else 0,
-                            1 if parsed.get("is_vdp") else 0,
-                            1 if parsed.get("gold_standard") else 0,
-                            1 if parsed.get("fast_payments") else 0,
-                            int(parsed.get("wildcard_count") or 0),
-                            int(parsed.get("domain_count") or 0),
-                            int(parsed.get("api_asset_count") or 0),
-                            int(parsed.get("mobile_asset_count") or 0),
-                            int(parsed.get("source_repo_count") or 0),
-                            int(parsed.get("ai_asset_count") or 0),
-                            int(parsed.get("bounty_eligible_asset_count") or 0),
-                            json.dumps(list(parsed.get("in_scope_assets") or ()), sort_keys=False),
-                            json.dumps(list(parsed.get("in_scope_repos") or ()), sort_keys=False),
-                            json.dumps(dict(parsed.get("scope_asset_types") or {}), sort_keys=True),
-                            str(row["handle"]),
-                        ),
-                    )
+                    ),
+                )
 
-                conn.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_program_status_recheck
-                    ON program_eligibility(status, next_recheck_utc);
-                    """
-                )
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS hunt_outcomes (
-                        outcome_id TEXT PRIMARY KEY,
-                        handle TEXT NOT NULL,
-                        repo TEXT NOT NULL DEFAULT '',
-                        commit_sha TEXT NOT NULL DEFAULT '',
-                        lane INTEGER NOT NULL DEFAULT 1,
-                        discovered_at_utc TEXT NOT NULL,
-                        target_age_hours REAL NOT NULL DEFAULT 0.0,
-                        outcome TEXT NOT NULL,
-                        signal_delta REAL NOT NULL DEFAULT 0.0,
-                        bounty_usd REAL NOT NULL DEFAULT 0.0,
-                        triage_hours_observed REAL,
-                        cycle_id TEXT NOT NULL DEFAULT '',
-                        features_json TEXT NOT NULL DEFAULT '{}'
-                    );
-                    """
-                )
-                conn.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_hunt_outcomes_handle_ts
-                    ON hunt_outcomes(handle, discovered_at_utc);
-                    """
-                )
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS account_state (
-                        id INTEGER PRIMARY KEY CHECK (id = 1),
-                        signal_established INTEGER NOT NULL DEFAULT 0,
-                        signal_score REAL,
-                        trial_reports_remaining INTEGER NOT NULL DEFAULT 0,
-                        daily_submissions_count INTEGER NOT NULL DEFAULT 0,
-                        daily_submissions_date_utc TEXT NOT NULL DEFAULT '',
-                        updated_at_utc TEXT NOT NULL DEFAULT ''
-                    );
-                    """
-                )
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO account_state (
-                        id, signal_established, signal_score, trial_reports_remaining,
-                        daily_submissions_count, daily_submissions_date_utc, updated_at_utc
-                    ) VALUES (1, 0, NULL, 0, 0, '', '');
-                    """
-                )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_program_status_recheck
+                ON program_eligibility(status, next_recheck_utc);
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS hunt_outcomes (
+                    outcome_id TEXT PRIMARY KEY,
+                    handle TEXT NOT NULL,
+                    repo TEXT NOT NULL DEFAULT '',
+                    commit_sha TEXT NOT NULL DEFAULT '',
+                    lane INTEGER NOT NULL DEFAULT 1,
+                    discovered_at_utc TEXT NOT NULL,
+                    target_age_hours REAL NOT NULL DEFAULT 0.0,
+                    outcome TEXT NOT NULL,
+                    signal_delta REAL NOT NULL DEFAULT 0.0,
+                    bounty_usd REAL NOT NULL DEFAULT 0.0,
+                    triage_hours_observed REAL,
+                    cycle_id TEXT NOT NULL DEFAULT '',
+                    features_json TEXT NOT NULL DEFAULT '{}'
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_hunt_outcomes_handle_ts
+                ON hunt_outcomes(handle, discovered_at_utc);
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS account_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    signal_established INTEGER NOT NULL DEFAULT 0,
+                    signal_score REAL,
+                    trial_reports_remaining INTEGER NOT NULL DEFAULT 0,
+                    daily_submissions_count INTEGER NOT NULL DEFAULT 0,
+                    daily_submissions_date_utc TEXT NOT NULL DEFAULT '',
+                    updated_at_utc TEXT NOT NULL DEFAULT ''
+                );
+                """
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO account_state (
+                    id, signal_established, signal_score, trial_reports_remaining,
+                    daily_submissions_count, daily_submissions_date_utc, updated_at_utc
+                ) VALUES (1, 0, NULL, 0, 0, '', '');
+                """
+            )
 
     def upsert(
         self,
@@ -657,45 +656,45 @@ class ProgramEligibilityDB:
         status: str,
         *,
         platform: str = "hackerone",
-        signal_required: Optional[float] = None,
-        bounty_min_usd: Optional[int] = None,
-        bounty_max_usd: Optional[int] = None,
+        signal_required: float | None = None,
+        bounty_min_usd: int | None = None,
+        bounty_max_usd: int | None = None,
         submit_url: str = "",
         scope_summary: str = "",
         notes: str = "",
-        recheck_hours: Optional[int] = None,
-        now: Optional[datetime] = None,
+        recheck_hours: int | None = None,
+        now: datetime | None = None,
         # Optional Schema v2 fields
-        launched_at_utc: Optional[str] = None,
-        response_efficiency_pct: Optional[float] = None,
-        first_response_hours: Optional[float] = None,
-        triage_hours: Optional[float] = None,
-        bounty_hours: Optional[float] = None,
-        resolved_count: Optional[int] = None,
-        offers_bounties: Optional[bool] = None,
-        is_vdp: Optional[bool] = None,
-        gold_standard: Optional[bool] = None,
-        fast_payments: Optional[bool] = None,
-        submission_state: Optional[str] = None,
-        signal_established_required: Optional[bool] = None,
-        wildcard_count: Optional[int] = None,
-        domain_count: Optional[int] = None,
-        api_asset_count: Optional[int] = None,
-        mobile_asset_count: Optional[int] = None,
-        source_repo_count: Optional[int] = None,
-        ai_asset_count: Optional[int] = None,
-        bounty_eligible_asset_count: Optional[int] = None,
-        in_scope_assets: Optional[Sequence[str]] = None,
-        in_scope_repos: Optional[Sequence[str]] = None,
-        out_of_scope_assets: Optional[Sequence[str]] = None,
-        scope_asset_types: Optional[Dict[str, int]] = None,
-        roe_automation_tier: Optional[str] = None,
-        roe_automated_prohibited: Optional[bool] = None,
-        roe_max_rps: Optional[float] = None,
-        roe_required_headers: Optional[Sequence[str]] = None,
-        roe_user_agent: Optional[str] = None,
-        roe_ai_disclosure_required: Optional[bool] = None,
-        roe_no_oos_redirects: Optional[bool] = None,
+        launched_at_utc: str | None = None,
+        response_efficiency_pct: float | None = None,
+        first_response_hours: float | None = None,
+        triage_hours: float | None = None,
+        bounty_hours: float | None = None,
+        resolved_count: int | None = None,
+        offers_bounties: bool | None = None,
+        is_vdp: bool | None = None,
+        gold_standard: bool | None = None,
+        fast_payments: bool | None = None,
+        submission_state: str | None = None,
+        signal_established_required: bool | None = None,
+        wildcard_count: int | None = None,
+        domain_count: int | None = None,
+        api_asset_count: int | None = None,
+        mobile_asset_count: int | None = None,
+        source_repo_count: int | None = None,
+        ai_asset_count: int | None = None,
+        bounty_eligible_asset_count: int | None = None,
+        in_scope_assets: Sequence[str] | None = None,
+        in_scope_repos: Sequence[str] | None = None,
+        out_of_scope_assets: Sequence[str] | None = None,
+        scope_asset_types: dict[str, int] | None = None,
+        roe_automation_tier: str | None = None,
+        roe_automated_prohibited: bool | None = None,
+        roe_max_rps: float | None = None,
+        roe_required_headers: Sequence[str] | None = None,
+        roe_user_agent: str | None = None,
+        roe_ai_disclosure_required: bool | None = None,
+        roe_no_oos_redirects: bool | None = None,
     ) -> ProgramEligibilityRecord:
         norm_handle = handle.strip().lower()
         norm_status = status.strip().upper()
@@ -842,116 +841,115 @@ class ProgramEligibilityDB:
             roe_no_oos_redirects=eff_roe_no_redir,
         )
 
-        with contextlib.closing(self._connect()) as conn:
-            with conn:
-                conn.execute(
-                    """
-                    INSERT INTO program_eligibility (
-                        handle, platform, status, signal_required,
-                        bounty_min_usd, bounty_max_usd, submit_url,
-                        scope_summary, last_checked_utc, next_recheck_utc, notes,
-                        launched_at_utc, response_efficiency_pct, first_response_hours,
-                        triage_hours, bounty_hours, resolved_count, offers_bounties,
-                        is_vdp, gold_standard, fast_payments, submission_state,
-                        signal_established_required, wildcard_count, domain_count,
-                        api_asset_count, mobile_asset_count, source_repo_count,
-                        ai_asset_count, bounty_eligible_asset_count,
-                        in_scope_assets_json, in_scope_repos_json, out_of_scope_assets_json,
-                        scope_asset_types_json, roe_automation_tier, roe_automated_prohibited,
-                        roe_max_rps, roe_required_headers_json, roe_user_agent,
-                        roe_ai_disclosure_required, roe_no_oos_redirects
-                    ) VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?
-                    )
-                    ON CONFLICT(handle) DO UPDATE SET
-                        platform=excluded.platform,
-                        status=excluded.status,
-                        signal_required=excluded.signal_required,
-                        bounty_min_usd=COALESCE(excluded.bounty_min_usd, program_eligibility.bounty_min_usd),
-                        bounty_max_usd=COALESCE(excluded.bounty_max_usd, program_eligibility.bounty_max_usd),
-                        submit_url=CASE WHEN excluded.submit_url != '' THEN excluded.submit_url ELSE program_eligibility.submit_url END,
-                        scope_summary=CASE WHEN excluded.scope_summary != '' THEN excluded.scope_summary ELSE program_eligibility.scope_summary END,
-                        last_checked_utc=excluded.last_checked_utc,
-                        next_recheck_utc=excluded.next_recheck_utc,
-                        notes=excluded.notes,
-                        launched_at_utc=CASE WHEN excluded.launched_at_utc != '' THEN excluded.launched_at_utc ELSE program_eligibility.launched_at_utc END,
-                        response_efficiency_pct=COALESCE(excluded.response_efficiency_pct, program_eligibility.response_efficiency_pct),
-                        first_response_hours=COALESCE(excluded.first_response_hours, program_eligibility.first_response_hours),
-                        triage_hours=COALESCE(excluded.triage_hours, program_eligibility.triage_hours),
-                        bounty_hours=COALESCE(excluded.bounty_hours, program_eligibility.bounty_hours),
-                        resolved_count=CASE WHEN excluded.resolved_count > 0 THEN excluded.resolved_count ELSE program_eligibility.resolved_count END,
-                        offers_bounties=excluded.offers_bounties,
-                        is_vdp=excluded.is_vdp,
-                        gold_standard=CASE WHEN excluded.gold_standard = 1 THEN 1 ELSE program_eligibility.gold_standard END,
-                        fast_payments=CASE WHEN excluded.fast_payments = 1 THEN 1 ELSE program_eligibility.fast_payments END,
-                        submission_state=excluded.submission_state,
-                        signal_established_required=excluded.signal_established_required,
-                        wildcard_count=CASE WHEN excluded.wildcard_count > 0 THEN excluded.wildcard_count ELSE program_eligibility.wildcard_count END,
-                        domain_count=CASE WHEN excluded.domain_count > 0 THEN excluded.domain_count ELSE program_eligibility.domain_count END,
-                        api_asset_count=CASE WHEN excluded.api_asset_count > 0 THEN excluded.api_asset_count ELSE program_eligibility.api_asset_count END,
-                        mobile_asset_count=CASE WHEN excluded.mobile_asset_count > 0 THEN excluded.mobile_asset_count ELSE program_eligibility.mobile_asset_count END,
-                        source_repo_count=CASE WHEN excluded.source_repo_count > 0 THEN excluded.source_repo_count ELSE program_eligibility.source_repo_count END,
-                        ai_asset_count=CASE WHEN excluded.ai_asset_count > 0 THEN excluded.ai_asset_count ELSE program_eligibility.ai_asset_count END,
-                        bounty_eligible_asset_count=CASE WHEN excluded.bounty_eligible_asset_count > 0 THEN excluded.bounty_eligible_asset_count ELSE program_eligibility.bounty_eligible_asset_count END,
-                        in_scope_assets_json=CASE WHEN excluded.in_scope_assets_json != '[]' THEN excluded.in_scope_assets_json ELSE program_eligibility.in_scope_assets_json END,
-                        in_scope_repos_json=CASE WHEN excluded.in_scope_repos_json != '[]' THEN excluded.in_scope_repos_json ELSE program_eligibility.in_scope_repos_json END,
-                        out_of_scope_assets_json=CASE WHEN excluded.out_of_scope_assets_json != '[]' THEN excluded.out_of_scope_assets_json ELSE program_eligibility.out_of_scope_assets_json END,
-                        scope_asset_types_json=CASE WHEN excluded.scope_asset_types_json != '{}' THEN excluded.scope_asset_types_json ELSE program_eligibility.scope_asset_types_json END,
-                        roe_automation_tier=CASE WHEN excluded.roe_automation_tier != 'in_scope_only_manual_verify' THEN excluded.roe_automation_tier ELSE program_eligibility.roe_automation_tier END,
-                        roe_automated_prohibited=excluded.roe_automated_prohibited,
-                        roe_max_rps=excluded.roe_max_rps,
-                        roe_required_headers_json=CASE WHEN excluded.roe_required_headers_json != '[]' THEN excluded.roe_required_headers_json ELSE program_eligibility.roe_required_headers_json END,
-                        roe_user_agent=CASE WHEN excluded.roe_user_agent != '' THEN excluded.roe_user_agent ELSE program_eligibility.roe_user_agent END,
-                        roe_ai_disclosure_required=excluded.roe_ai_disclosure_required,
-                        roe_no_oos_redirects=excluded.roe_no_oos_redirects;
-                    """,
-                    (
-                        rec.handle,
-                        rec.platform,
-                        rec.status,
-                        rec.signal_required,
-                        rec.bounty_min_usd,
-                        rec.bounty_max_usd,
-                        rec.submit_url,
-                        rec.scope_summary,
-                        rec.last_checked_utc,
-                        rec.next_recheck_utc,
-                        rec.notes,
-                        rec.launched_at_utc,
-                        rec.response_efficiency_pct,
-                        rec.first_response_hours,
-                        rec.triage_hours,
-                        rec.bounty_hours,
-                        rec.resolved_count,
-                        1 if rec.offers_bounties else 0,
-                        1 if rec.is_vdp else 0,
-                        1 if rec.gold_standard else 0,
-                        1 if rec.fast_payments else 0,
-                        rec.submission_state,
-                        1 if rec.signal_established_required else 0,
-                        rec.wildcard_count,
-                        rec.domain_count,
-                        rec.api_asset_count,
-                        rec.mobile_asset_count,
-                        rec.source_repo_count,
-                        rec.ai_asset_count,
-                        rec.bounty_eligible_asset_count,
-                        json.dumps(list(rec.in_scope_assets)),
-                        json.dumps(list(rec.in_scope_repos)),
-                        json.dumps(list(rec.out_of_scope_assets)),
-                        json.dumps(rec.scope_asset_types, sort_keys=True),
-                        rec.roe_automation_tier,
-                        1 if rec.roe_automated_prohibited else 0,
-                        rec.roe_max_rps,
-                        json.dumps(list(rec.roe_required_headers)),
-                        rec.roe_user_agent,
-                        1 if rec.roe_ai_disclosure_required else 0,
-                        1 if rec.roe_no_oos_redirects else 0,
-                    ),
+        with contextlib.closing(self._connect()) as conn, conn:
+            conn.execute(
+                """
+                INSERT INTO program_eligibility (
+                    handle, platform, status, signal_required,
+                    bounty_min_usd, bounty_max_usd, submit_url,
+                    scope_summary, last_checked_utc, next_recheck_utc, notes,
+                    launched_at_utc, response_efficiency_pct, first_response_hours,
+                    triage_hours, bounty_hours, resolved_count, offers_bounties,
+                    is_vdp, gold_standard, fast_payments, submission_state,
+                    signal_established_required, wildcard_count, domain_count,
+                    api_asset_count, mobile_asset_count, source_repo_count,
+                    ai_asset_count, bounty_eligible_asset_count,
+                    in_scope_assets_json, in_scope_repos_json, out_of_scope_assets_json,
+                    scope_asset_types_json, roe_automation_tier, roe_automated_prohibited,
+                    roe_max_rps, roe_required_headers_json, roe_user_agent,
+                    roe_ai_disclosure_required, roe_no_oos_redirects
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?
                 )
+                ON CONFLICT(handle) DO UPDATE SET
+                    platform=excluded.platform,
+                    status=excluded.status,
+                    signal_required=excluded.signal_required,
+                    bounty_min_usd=COALESCE(excluded.bounty_min_usd, program_eligibility.bounty_min_usd),
+                    bounty_max_usd=COALESCE(excluded.bounty_max_usd, program_eligibility.bounty_max_usd),
+                    submit_url=CASE WHEN excluded.submit_url != '' THEN excluded.submit_url ELSE program_eligibility.submit_url END,
+                    scope_summary=CASE WHEN excluded.scope_summary != '' THEN excluded.scope_summary ELSE program_eligibility.scope_summary END,
+                    last_checked_utc=excluded.last_checked_utc,
+                    next_recheck_utc=excluded.next_recheck_utc,
+                    notes=excluded.notes,
+                    launched_at_utc=CASE WHEN excluded.launched_at_utc != '' THEN excluded.launched_at_utc ELSE program_eligibility.launched_at_utc END,
+                    response_efficiency_pct=COALESCE(excluded.response_efficiency_pct, program_eligibility.response_efficiency_pct),
+                    first_response_hours=COALESCE(excluded.first_response_hours, program_eligibility.first_response_hours),
+                    triage_hours=COALESCE(excluded.triage_hours, program_eligibility.triage_hours),
+                    bounty_hours=COALESCE(excluded.bounty_hours, program_eligibility.bounty_hours),
+                    resolved_count=CASE WHEN excluded.resolved_count > 0 THEN excluded.resolved_count ELSE program_eligibility.resolved_count END,
+                    offers_bounties=excluded.offers_bounties,
+                    is_vdp=excluded.is_vdp,
+                    gold_standard=CASE WHEN excluded.gold_standard = 1 THEN 1 ELSE program_eligibility.gold_standard END,
+                    fast_payments=CASE WHEN excluded.fast_payments = 1 THEN 1 ELSE program_eligibility.fast_payments END,
+                    submission_state=excluded.submission_state,
+                    signal_established_required=excluded.signal_established_required,
+                    wildcard_count=CASE WHEN excluded.wildcard_count > 0 THEN excluded.wildcard_count ELSE program_eligibility.wildcard_count END,
+                    domain_count=CASE WHEN excluded.domain_count > 0 THEN excluded.domain_count ELSE program_eligibility.domain_count END,
+                    api_asset_count=CASE WHEN excluded.api_asset_count > 0 THEN excluded.api_asset_count ELSE program_eligibility.api_asset_count END,
+                    mobile_asset_count=CASE WHEN excluded.mobile_asset_count > 0 THEN excluded.mobile_asset_count ELSE program_eligibility.mobile_asset_count END,
+                    source_repo_count=CASE WHEN excluded.source_repo_count > 0 THEN excluded.source_repo_count ELSE program_eligibility.source_repo_count END,
+                    ai_asset_count=CASE WHEN excluded.ai_asset_count > 0 THEN excluded.ai_asset_count ELSE program_eligibility.ai_asset_count END,
+                    bounty_eligible_asset_count=CASE WHEN excluded.bounty_eligible_asset_count > 0 THEN excluded.bounty_eligible_asset_count ELSE program_eligibility.bounty_eligible_asset_count END,
+                    in_scope_assets_json=CASE WHEN excluded.in_scope_assets_json != '[]' THEN excluded.in_scope_assets_json ELSE program_eligibility.in_scope_assets_json END,
+                    in_scope_repos_json=CASE WHEN excluded.in_scope_repos_json != '[]' THEN excluded.in_scope_repos_json ELSE program_eligibility.in_scope_repos_json END,
+                    out_of_scope_assets_json=CASE WHEN excluded.out_of_scope_assets_json != '[]' THEN excluded.out_of_scope_assets_json ELSE program_eligibility.out_of_scope_assets_json END,
+                    scope_asset_types_json=CASE WHEN excluded.scope_asset_types_json != '{}' THEN excluded.scope_asset_types_json ELSE program_eligibility.scope_asset_types_json END,
+                    roe_automation_tier=CASE WHEN excluded.roe_automation_tier != 'in_scope_only_manual_verify' THEN excluded.roe_automation_tier ELSE program_eligibility.roe_automation_tier END,
+                    roe_automated_prohibited=excluded.roe_automated_prohibited,
+                    roe_max_rps=excluded.roe_max_rps,
+                    roe_required_headers_json=CASE WHEN excluded.roe_required_headers_json != '[]' THEN excluded.roe_required_headers_json ELSE program_eligibility.roe_required_headers_json END,
+                    roe_user_agent=CASE WHEN excluded.roe_user_agent != '' THEN excluded.roe_user_agent ELSE program_eligibility.roe_user_agent END,
+                    roe_ai_disclosure_required=excluded.roe_ai_disclosure_required,
+                    roe_no_oos_redirects=excluded.roe_no_oos_redirects;
+                """,
+                (
+                    rec.handle,
+                    rec.platform,
+                    rec.status,
+                    rec.signal_required,
+                    rec.bounty_min_usd,
+                    rec.bounty_max_usd,
+                    rec.submit_url,
+                    rec.scope_summary,
+                    rec.last_checked_utc,
+                    rec.next_recheck_utc,
+                    rec.notes,
+                    rec.launched_at_utc,
+                    rec.response_efficiency_pct,
+                    rec.first_response_hours,
+                    rec.triage_hours,
+                    rec.bounty_hours,
+                    rec.resolved_count,
+                    1 if rec.offers_bounties else 0,
+                    1 if rec.is_vdp else 0,
+                    1 if rec.gold_standard else 0,
+                    1 if rec.fast_payments else 0,
+                    rec.submission_state,
+                    1 if rec.signal_established_required else 0,
+                    rec.wildcard_count,
+                    rec.domain_count,
+                    rec.api_asset_count,
+                    rec.mobile_asset_count,
+                    rec.source_repo_count,
+                    rec.ai_asset_count,
+                    rec.bounty_eligible_asset_count,
+                    json.dumps(list(rec.in_scope_assets)),
+                    json.dumps(list(rec.in_scope_repos)),
+                    json.dumps(list(rec.out_of_scope_assets)),
+                    json.dumps(rec.scope_asset_types, sort_keys=True),
+                    rec.roe_automation_tier,
+                    1 if rec.roe_automated_prohibited else 0,
+                    rec.roe_max_rps,
+                    json.dumps(list(rec.roe_required_headers)),
+                    rec.roe_user_agent,
+                    1 if rec.roe_ai_disclosure_required else 0,
+                    1 if rec.roe_no_oos_redirects else 0,
+                ),
+            )
         return rec
 
     @staticmethod
@@ -1001,7 +999,7 @@ class ProgramEligibilityDB:
             roe_no_oos_redirects=bool(row["roe_no_oos_redirects"]) if "roe_no_oos_redirects" in keys else True,
         )
 
-    def get(self, handle: str) -> Optional[ProgramEligibilityRecord]:
+    def get(self, handle: str) -> ProgramEligibilityRecord | None:
         norm = handle.strip().lower()
         with contextlib.closing(self._connect()) as conn:
             row = conn.execute(
@@ -1018,7 +1016,7 @@ class ProgramEligibilityDB:
             and (rec.submission_state or "open").strip().lower() == "open"
         )
 
-    def list_by_status(self, status: str) -> List[ProgramEligibilityRecord]:
+    def list_by_status(self, status: str) -> list[ProgramEligibilityRecord]:
         norm = status.strip().upper()
         with contextlib.closing(self._connect()) as conn:
             rows = conn.execute(
@@ -1031,10 +1029,10 @@ class ProgramEligibilityDB:
             ).fetchall()
         return [self._row_to_record(r) for r in rows]
 
-    def list_unlocked(self) -> List[ProgramEligibilityRecord]:
+    def list_unlocked(self) -> list[ProgramEligibilityRecord]:
         return self.list_by_status("UNLOCKED")
 
-    def list_all(self) -> List[ProgramEligibilityRecord]:
+    def list_all(self) -> list[ProgramEligibilityRecord]:
         with contextlib.closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT * FROM program_eligibility ORDER BY status ASC, COALESCE(bounty_max_usd, 0) DESC, handle ASC"
@@ -1046,8 +1044,8 @@ class ProgramEligibilityDB:
         *,
         statuses: Sequence[str] = ("BLOCKED_SIGNAL", "PAUSED"),
         limit: int = 20,
-        now: Optional[datetime] = None,
-    ) -> List[ProgramEligibilityRecord]:
+        now: datetime | None = None,
+    ) -> list[ProgramEligibilityRecord]:
         """Returns blocked/paused programs whose `next_recheck_utc <= now` to test if restrictions lifted."""
         now_iso = _utc_now(now).isoformat()
         norm_statuses = [s.strip().upper() for s in statuses if s.strip()]
@@ -1067,7 +1065,7 @@ class ProgramEligibilityDB:
             ).fetchall()
         return [self._row_to_record(r) for r in rows]
 
-    def summary_counts(self) -> Dict[str, int]:
+    def summary_counts(self) -> dict[str, int]:
         with contextlib.closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT status, COUNT(*) AS cnt FROM program_eligibility GROUP BY status"
@@ -1087,11 +1085,11 @@ class ProgramEligibilityDB:
         target_age_hours: float = 0.0,
         signal_delta: float = 0.0,
         bounty_usd: float = 0.0,
-        triage_hours_observed: Optional[float] = None,
+        triage_hours_observed: float | None = None,
         cycle_id: str = "",
-        features: Optional[Dict[str, Any]] = None,
-        outcome_id: Optional[str] = None,
-        discovered_at_utc: Optional[str] = None,
+        features: dict[str, Any] | None = None,
+        outcome_id: str | None = None,
+        discovered_at_utc: str | None = None,
     ) -> HuntOutcomeRecord:
         norm_handle = handle.strip().lower()
         norm_outcome = outcome.strip().upper()
@@ -1116,40 +1114,39 @@ class ProgramEligibilityDB:
             cycle_id=str(cycle_id or "").strip(),
             features=dict(features or {}),
         )
-        with contextlib.closing(self._connect()) as conn:
-            with conn:
-                conn.execute(
-                    """
+        with contextlib.closing(self._connect()) as conn, conn:
+            conn.execute(
+                """
                     INSERT OR REPLACE INTO hunt_outcomes (
                         outcome_id, handle, repo, commit_sha, lane, discovered_at_utc,
                         target_age_hours, outcome, signal_delta, bounty_usd,
                         triage_hours_observed, cycle_id, features_json
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (
-                        rec.outcome_id,
-                        rec.handle,
-                        rec.repo,
-                        rec.commit_sha,
-                        rec.lane,
-                        rec.discovered_at_utc,
-                        rec.target_age_hours,
-                        rec.outcome,
-                        rec.signal_delta,
-                        rec.bounty_usd,
-                        rec.triage_hours_observed,
-                        rec.cycle_id,
-                        json.dumps(rec.features, sort_keys=True),
-                    ),
-                )
+                (
+                    rec.outcome_id,
+                    rec.handle,
+                    rec.repo,
+                    rec.commit_sha,
+                    rec.lane,
+                    rec.discovered_at_utc,
+                    rec.target_age_hours,
+                    rec.outcome,
+                    rec.signal_delta,
+                    rec.bounty_usd,
+                    rec.triage_hours_observed,
+                    rec.cycle_id,
+                    json.dumps(rec.features, sort_keys=True),
+                ),
+            )
         return rec
 
     def list_hunt_outcomes(
         self,
         *,
-        handle: Optional[str] = None,
+        handle: str | None = None,
         limit: int = 500,
-    ) -> List[HuntOutcomeRecord]:
+    ) -> list[HuntOutcomeRecord]:
         with contextlib.closing(self._connect()) as conn:
             if handle:
                 rows = conn.execute(
@@ -1161,14 +1158,14 @@ class ProgramEligibilityDB:
                     "SELECT * FROM hunt_outcomes ORDER BY discovered_at_utc ASC LIMIT ?",
                     (max(1, int(limit)),),
                 ).fetchall()
-        out: List[HuntOutcomeRecord] = []
+        out: list[HuntOutcomeRecord] = []
         for r in rows:
-            feats: Dict[str, Any] = {}
+            feats: dict[str, Any] = {}
             try:
                 parsed = json.loads(str(r["features_json"] or "{}"))
                 if isinstance(parsed, dict):
                     feats = parsed
-            except Exception:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 feats = {}
             out.append(
                 HuntOutcomeRecord(
@@ -1208,10 +1205,10 @@ class ProgramEligibilityDB:
     def update_account_state(
         self,
         *,
-        signal_established: Optional[bool] = None,
-        signal_score: Optional[float] = None,
-        trial_reports_remaining: Optional[int] = None,
-        now: Optional[datetime] = None,
+        signal_established: bool | None = None,
+        signal_score: float | None = None,
+        trial_reports_remaining: int | None = None,
+        now: datetime | None = None,
     ) -> AccountSignalState:
         cur = self.get_account_state()
         eff_est = cur.signal_established if signal_established is None else bool(signal_established)
@@ -1220,10 +1217,9 @@ class ProgramEligibilityDB:
             eff_est = True
         eff_trials = cur.trial_reports_remaining if trial_reports_remaining is None else max(0, int(trial_reports_remaining))
         ts_iso = _utc_now(now).isoformat()
-        with contextlib.closing(self._connect()) as conn:
-            with conn:
-                conn.execute(
-                    """
+        with contextlib.closing(self._connect()) as conn, conn:
+            conn.execute(
+                """
                     UPDATE account_state
                     SET signal_established = ?,
                         signal_score = ?,
@@ -1231,11 +1227,11 @@ class ProgramEligibilityDB:
                         updated_at_utc = ?
                     WHERE id = 1
                     """,
-                    (1 if eff_est else 0, eff_sig, eff_trials, ts_iso),
-                )
+                (1 if eff_est else 0, eff_sig, eff_trials, ts_iso),
+            )
         return self.get_account_state()
 
-    def can_submit_today(self, *, max_per_day: int = 2, now: Optional[datetime] = None) -> Tuple[bool, int]:
+    def can_submit_today(self, *, max_per_day: int = 2, now: datetime | None = None) -> tuple[bool, int]:
         """Returns `(allowed, remaining_slots)` enforcing safe daily submission pacing."""
         cap = max(1, int(max_per_day))
         today = _utc_now(now).strftime("%Y-%m-%d")
@@ -1244,28 +1240,27 @@ class ProgramEligibilityDB:
         rem = max(0, cap - used)
         return rem > 0, rem
 
-    def record_daily_submission(self, *, count: int = 1, now: Optional[datetime] = None) -> AccountSignalState:
+    def record_daily_submission(self, *, count: int = 1, now: datetime | None = None) -> AccountSignalState:
         ts = _utc_now(now)
         today = ts.strftime("%Y-%m-%d")
         st = self.get_account_state()
         new_count = (st.daily_submissions_count if st.daily_submissions_date_utc == today else 0) + max(1, int(count))
-        with contextlib.closing(self._connect()) as conn:
-            with conn:
-                conn.execute(
-                    """
+        with contextlib.closing(self._connect()) as conn, conn:
+            conn.execute(
+                """
                     UPDATE account_state
                     SET daily_submissions_count = ?,
                         daily_submissions_date_utc = ?,
                         updated_at_utc = ?
                     WHERE id = 1
                     """,
-                    (new_count, today, ts.isoformat()),
-                )
+                (new_count, today, ts.isoformat()),
+            )
         return self.get_account_state()
 
-    def seed_observed_hackerone_baseline(self, *, now: Optional[datetime] = None) -> Dict[str, int]:
+    def seed_observed_hackerone_baseline(self, *, now: datetime | None = None) -> dict[str, int]:
         """Seeds the database with live browser-verified HackerOne program eligibility states."""
-        unlocked_entries: Sequence[Tuple[str, int, int, str, str]] = (
+        unlocked_entries: Sequence[tuple[str, int, int, str, str]] = (
             (
                 "amazonvrp",
                 200,
@@ -1362,7 +1357,7 @@ class ProgramEligibilityDB:
                 now=now,
             )
 
-        blocked_signal: Sequence[Tuple[str, float]] = (
+        blocked_signal: Sequence[tuple[str, float]] = (
             ("shopify", 1.0),
             ("vercel", 1.0),
             ("cloudflare", 1.0),

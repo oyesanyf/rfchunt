@@ -31,13 +31,14 @@ Core Components (adapted cleanly from ACDSO):
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
 import hashlib
 import math
 import random
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from typing import Any
 
 from engine.acdso_bridge import (
     MultiObjectiveCandidate,
@@ -51,8 +52,7 @@ from engine.program_eligibility_db import (
     ProgramEligibilityRecord,
 )
 
-
-TIER1_FEATURE_NAMES: Tuple[str, ...] = (
+TIER1_FEATURE_NAMES: tuple[str, ...] = (
     "freshness_decay",
     "response_efficiency_norm",
     "inv_triage_latency",
@@ -68,7 +68,7 @@ TIER1_FEATURE_NAMES: Tuple[str, ...] = (
 )
 
 # Positive/negative outcome reward grades for LTR & bandit learning
-OUTCOME_REWARD_MAP: Dict[str, float] = {
+OUTCOME_REWARD_MAP: dict[str, float] = {
     "BOUNTY": 1.0,
     "RESOLVED": 0.90,
     "TRIAGED": 0.78,
@@ -79,7 +79,7 @@ OUTCOME_REWARD_MAP: Dict[str, float] = {
 }
 
 # Cold-start calibrated feature weights by optimization preset
-_COLD_PRIOR_WEIGHTS: Dict[str, Tuple[float, ...]] = {
+_COLD_PRIOR_WEIGHTS: dict[str, tuple[float, ...]] = {
     "signal_fast": (
         0.22,  # freshness_decay
         0.24,  # response_efficiency_norm
@@ -147,7 +147,7 @@ def signed_log1p(x: float) -> float:
     return math.copysign(math.log1p(abs(f)), f)
 
 
-def _parse_iso_utc(raw: str) -> Optional[datetime]:
+def _parse_iso_utc(raw: str) -> datetime | None:
     s = str(raw or "").strip()
     if not s:
         return None
@@ -156,20 +156,20 @@ def _parse_iso_utc(raw: str) -> Optional[datetime]:
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
     except ValueError:
         return None
 
 
-def signed_hash_features(text: str, *, dim: int = 12) -> List[float]:
+def signed_hash_features(text: str, *, dim: int = 12) -> list[float]:
     """Stateless signed SHA-256 feature hashing of word & bigram tokens (zero external deps)."""
     d = max(1, int(dim))
     vec = [0.0] * d
     tokens = re.findall(r"[a-z0-9_./*-]{2,}", (text or "").lower())
     if not tokens:
         return vec
-    grams: List[str] = list(tokens[:120])
+    grams: list[str] = list(tokens[:120])
     for i in range(min(len(tokens) - 1, 80)):
         grams.append(f"{tokens[i]}|{tokens[i + 1]}")
     for g in grams:
@@ -192,16 +192,16 @@ def compute_empirical_bayes_yield(
     outcomes: Sequence[HuntOutcomeRecord],
     *,
     smoothing_m: float = 5.0,
-) -> Tuple[Dict[str, float], Dict[int, float]]:
+) -> tuple[dict[str, float], dict[int, float]]:
     """
     Smoothed empirical Bayes target encoding of program yield (adapted from ACDSO
     `auto_preprocessing.TargetEncoder`): `(sum_y + m * prior) / (n + m)`.
     """
-    lane_sums: Dict[int, float] = {1: 0.0, 2: 0.0}
-    lane_cnts: Dict[int, int] = {1: 0, 2: 0}
-    prog_sums: Dict[str, float] = {}
-    prog_cnts: Dict[str, int] = {}
-    prog_lane: Dict[str, int] = {}
+    lane_sums: dict[int, float] = {1: 0.0, 2: 0.0}
+    lane_cnts: dict[int, int] = {1: 0, 2: 0}
+    prog_sums: dict[str, float] = {}
+    prog_cnts: dict[str, int] = {}
+    prog_lane: dict[str, int] = {}
 
     for o in outcomes:
         y = OUTCOME_REWARD_MAP.get(o.outcome.upper(), 0.1)
@@ -213,11 +213,11 @@ def compute_empirical_bayes_yield(
         prog_cnts[h] = prog_cnts.get(h, 0) + 1
         prog_lane[h] = ln
 
-    lane_priors: Dict[int, float] = {
+    lane_priors: dict[int, float] = {
         1: (lane_sums[1] / lane_cnts[1]) if lane_cnts[1] > 0 else 0.55,
         2: (lane_sums[2] / lane_cnts[2]) if lane_cnts[2] > 0 else 0.45,
     }
-    eb_by_handle: Dict[str, float] = {}
+    eb_by_handle: dict[str, float] = {}
     for h, s in prog_sums.items():
         n = prog_cnts[h]
         prior = lane_priors[prog_lane.get(h, 1)]
@@ -229,7 +229,7 @@ def classify_program_lane(
     rec: ProgramEligibilityRecord,
     *,
     min_efficiency_pct: float = 80.0,
-) -> Tuple[str, str]:
+) -> tuple[str, str]:
     """
     Fail-closed HackerOne lane classifier:
       - `BLOCKED` if not `UNLOCKED` or `submission_state != 'open'`
@@ -257,7 +257,7 @@ def classify_program_lane(
 def compute_unlock_distance(
     rec: ProgramEligibilityRecord,
     account_state: AccountSignalState,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Computes exact unlock distance accounting for unestablished Signal (`signal_score=None`):
     On a new HackerOne account with `signal_established=False` and `trial_reports_remaining=0`,
@@ -281,7 +281,7 @@ def compute_unlock_distance(
         return {
             "unlocked": False,
             "distance": 1.0 + sig_req,
-            "estimated_vdp_reports_needed": max(2, int(math.ceil(1.0 + sig_req))),
+            "estimated_vdp_reports_needed": max(2, math.ceil(1.0 + sig_req)),
             "reason": f"unestablished_signal_and_min_{sig_req}",
         }
 
@@ -290,7 +290,7 @@ def compute_unlock_distance(
     return {
         "unlocked": gap <= 0.0,
         "distance": round(gap, 3),
-        "estimated_vdp_reports_needed": int(math.ceil(gap)),
+        "estimated_vdp_reports_needed": math.ceil(gap),
         "reason": "signal_gap" if gap > 0.0 else "ready_for_recheck",
     }
 
@@ -300,9 +300,9 @@ class ExtractedProgramFeatures:
     handle: str
     lane: str
     lane_reason: str
-    tier1_vector: List[float]
-    tier2_text_vector: List[float]
-    feature_map: Dict[str, float]
+    tier1_vector: list[float]
+    tier2_text_vector: list[float]
+    feature_map: dict[str, float]
     launch_age_days: float
     total_assets: int
     estimated_scan_minutes: float
@@ -315,9 +315,9 @@ class ProgramFeatureExtractor:
         self,
         outcomes: Sequence[HuntOutcomeRecord] = (),
         *,
-        now: Optional[datetime] = None,
+        now: datetime | None = None,
     ) -> None:
-        self.now = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+        self.now = now.astimezone(UTC) if now is not None else datetime.now(UTC)
         self.eb_by_handle, self.lane_priors = compute_empirical_bayes_yield(outcomes)
 
     def extract(
@@ -436,7 +436,7 @@ def concordance_index(
         return 0.5
 
     # Compress risk_scores to 1-based ranks
-    uniq_scores = sorted(set(float(risk_scores[i]) for i in range(n)))
+    uniq_scores = sorted({float(risk_scores[i]) for i in range(n)})
     rank_of = {val: idx + 1 for idx, val in enumerate(uniq_scores)}
     m = len(uniq_scores)
 
@@ -493,7 +493,7 @@ class ProgramSurvivalModel:
     """
 
     # Higher hazard eta -> faster saturation / higher duplicate risk
-    _COLD_BETA: Tuple[float, ...] = (
+    _COLD_BETA: tuple[float, ...] = (
         -0.95,  # freshness_decay (newer -> lower saturation hazard)
         -0.15,  # response_efficiency_norm (faster triage -> lower duplicate collision)
         -0.25,  # inv_triage_latency
@@ -510,7 +510,7 @@ class ProgramSurvivalModel:
 
     def __init__(self, *, l2: float = 1.0) -> None:
         self.l2 = max(1e-3, float(l2))
-        self.beta: List[float] = list(self._COLD_BETA)
+        self.beta: list[float] = list(self._COLD_BETA)
         self.baseline_h0_72h: float = 0.35
         self.fitted_on_outcomes: bool = False
         self.c_index_cv: float = 0.5
@@ -522,7 +522,7 @@ class ProgramSurvivalModel:
         times: Sequence[float],
         events: Sequence[int],
         l2: float,
-    ) -> Tuple[float, List[float]]:
+    ) -> tuple[float, list[float]]:
         n = len(X)
         d = len(beta)
         order = sorted(range(n), key=lambda i: -float(times[i]))
@@ -576,7 +576,7 @@ class ProgramSurvivalModel:
         X: Sequence[Sequence[float]],
         times: Sequence[float],
         events: Sequence[int],
-    ) -> "ProgramSurvivalModel":
+    ) -> ProgramSurvivalModel:
         """Fits L2 Breslow Cox PH when n >= 20 and >= 2 duplicate events exist."""
         n = min(len(X), len(times), len(events))
         if n < 20 or sum(1 for e in events[:n] if int(e) == 1) < 2:
@@ -677,7 +677,7 @@ class ProgramRanker:
         self.preset = preset if preset in _COLD_PRIOR_WEIGHTS else "balanced"
         self.l2 = max(0.05, float(l2))
         self.tier_active: int = 0
-        self.weights: List[float] = list(_COLD_PRIOR_WEIGHTS[self.preset])
+        self.weights: list[float] = list(_COLD_PRIOR_WEIGHTS[self.preset])
         self.cv_ndcg_prior: float = 0.0
         self.cv_ndcg_learned: float = 0.0
 
@@ -689,12 +689,12 @@ class ProgramRanker:
         l2: float = 1.0,
         steps: int = 60,
         lr: float = 0.25,
-    ) -> List[float]:
+    ) -> list[float]:
         n = min(len(X), len(y))
         if n < 2:
             return []
         d = len(X[0])
-        pairs: List[Tuple[List[float], float]] = []
+        pairs: list[tuple[list[float], float]] = []
         for i in range(n):
             for j in range(i + 1, n):
                 diff_y = float(y[i]) - float(y[j])
@@ -722,13 +722,13 @@ class ProgramRanker:
 
     def fit_from_outcomes(
         self,
-        extracted_by_handle: Dict[str, ExtractedProgramFeatures],
+        extracted_by_handle: dict[str, ExtractedProgramFeatures],
         outcomes: Sequence[HuntOutcomeRecord],
-    ) -> "ProgramRanker":
-        rows_x1: List[List[float]] = []
-        rows_x2: List[List[float]] = []
-        rows_y: List[float] = []
-        rows_groups: List[str] = []
+    ) -> ProgramRanker:
+        rows_x1: list[list[float]] = []
+        rows_x2: list[list[float]] = []
+        rows_y: list[float] = []
+        rows_groups: list[str] = []
 
         for o in outcomes:
             ef = extracted_by_handle.get(o.handle.lower())
@@ -756,8 +756,8 @@ class ProgramRanker:
         k_folds = min(3, len(uniq_groups))
         fold_of = {g: idx % k_folds for idx, g in enumerate(uniq_groups)}
 
-        prior_ndcgs: List[float] = []
-        learned_ndcgs: List[float] = []
+        prior_ndcgs: list[float] = []
+        learned_ndcgs: list[float] = []
         for f_id in range(k_folds):
             tr_idx = [i for i, g in enumerate(rows_groups) if fold_of[g] != f_id]
             va_idx = [i for i, g in enumerate(rows_groups) if fold_of[g] == f_id]
@@ -789,7 +789,7 @@ class ProgramRanker:
             self.weights = prior_w
         return self
 
-    def score_and_explain(self, ef: ExtractedProgramFeatures) -> Tuple[float, Dict[str, float]]:
+    def score_and_explain(self, ef: ExtractedProgramFeatures) -> tuple[float, dict[str, float]]:
         vec = (ef.tier1_vector + ef.tier2_text_vector) if self.tier_active == 2 else ef.tier1_vector
         d = min(len(self.weights), len(vec))
         raw = sum(self.weights[j] * vec[j] for j in range(d))
@@ -826,12 +826,12 @@ class OnlineProgramBandit:
         self.weekly_decay = max(0.5, min(1.0, float(weekly_decay)))
         self._rng = random.Random(seed)
         # Disjoint LinUCB per lane (lane 1 -> arm 0, lane 2 -> arm 1)
-        self._A_inv: List[List[List[float]]] = [
+        self._A_inv: list[list[list[float]]] = [
             [[1.0 if i == j else 0.0 for j in range(self.d_ctx)] for i in range(self.d_ctx)]
             for _ in range(2)
         ]
-        self._b: List[List[float]] = [[0.0] * self.d_ctx for _ in range(2)]
-        self._beta_params: Dict[str, Tuple[float, float]] = {}
+        self._b: list[list[float]] = [[0.0] * self.d_ctx for _ in range(2)]
+        self._beta_params: dict[str, tuple[float, float]] = {}
 
     def _sherman_morrison_update(self, arm: int, x: Sequence[float], reward: float) -> None:
         A_inv = self._A_inv[arm]
@@ -851,11 +851,11 @@ class OnlineProgramBandit:
         self,
         outcomes: Sequence[HuntOutcomeRecord],
         *,
-        now: Optional[datetime] = None,
-    ) -> "OnlineProgramBandit":
-        ref_now = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
-        alpha_map: Dict[str, float] = {}
-        beta_map: Dict[str, float] = {}
+        now: datetime | None = None,
+    ) -> OnlineProgramBandit:
+        ref_now = now.astimezone(UTC) if now is not None else datetime.now(UTC)
+        alpha_map: dict[str, float] = {}
+        beta_map: dict[str, float] = {}
 
         for o in outcomes:
             y = OUTCOME_REWARD_MAP.get(o.outcome.upper(), 0.1)
@@ -879,10 +879,10 @@ class OnlineProgramBandit:
             self._beta_params[h] = (alpha_map.get(h, 1.5), beta_map.get(h, 1.5))
         return self
 
-    def lane_ucb_scores(self, context: Sequence[float]) -> Tuple[float, float]:
+    def lane_ucb_scores(self, context: Sequence[float]) -> tuple[float, float]:
         d = self.d_ctx
         xv = [float(context[i]) if i < len(context) else 0.0 for i in range(d)]
-        scores: List[float] = []
+        scores: list[float] = []
         for arm in range(2):
             A_inv = self._A_inv[arm]
             b = self._b[arm]
@@ -915,7 +915,7 @@ class PortfolioItem:
     pareto_knee_score: float
     survival_72h: float
     bounty_max_usd: int
-    response_efficiency_pct: Optional[float]
+    response_efficiency_pct: float | None
     ai_in_scope: bool
 
 
@@ -936,9 +936,9 @@ class DailyHuntPortfolioOptimizer:
         *,
         capacity: int = 6,
         budget_minutes: float = 120.0,
-        account_state: Optional[AccountSignalState] = None,
+        account_state: AccountSignalState | None = None,
         signal_threshold: float = 1.0,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         cap = max(0, int(capacity))
         budget = max(1.0, float(budget_minutes))
         st = account_state or AccountSignalState()
@@ -959,14 +959,14 @@ class DailyHuntPortfolioOptimizer:
                 "low_signal_regime": low_signal,
             }
 
-        def _roi(it: PortfolioItem) -> Tuple[float, float, str]:
+        def _roi(it: PortfolioItem) -> tuple[float, float, str]:
             cost = max(1.0, float(it.scan_cost_minutes))
             return (-(it.expected_value / cost), -it.expected_value, it.handle)
 
         lane1_pool = sorted([it for it in eligible if it.lane == "LANE_1_VDP_FAST_SIGNAL"], key=_roi)
         lane1_floor = min(math.ceil(cap * 0.5), len(lane1_pool)) if low_signal else 0
 
-        selected: List[PortfolioItem] = []
+        selected: list[PortfolioItem] = []
         selected_handles: set[str] = set()
         used_budget = 0.0
 
@@ -1010,7 +1010,7 @@ class DailyHuntPortfolioOptimizer:
 # ---------------------------------------------------------------------------
 
 
-_PROGRAM_OBJ_DIRECTIONS: Tuple[bool, ...] = (
+_PROGRAM_OBJ_DIRECTIONS: tuple[bool, ...] = (
     True,   # 0: expected_value (MAX)
     False,  # 1: launch_staleness_log (MIN — newest launch wins)
     False,  # 2: saturation_log (MIN — least saturated wins)
@@ -1019,21 +1019,21 @@ _PROGRAM_OBJ_DIRECTIONS: Tuple[bool, ...] = (
     False,  # 5: narrow_scope_penalty (MIN — wide wildcards/APIs/mobile/OSS wins)
 )
 
-_PROGRAM_OBJ_SCALES: Tuple[float, ...] = (0.05, 0.25, 0.25, 0.20, 0.08, 0.08)
+_PROGRAM_OBJ_SCALES: tuple[float, ...] = (0.05, 0.25, 0.25, 0.20, 0.08, 0.08)
 
 
 def rank_hackerone_programs(
     *,
-    eligibility_db: Optional[ProgramEligibilityDB] = None,
-    db_path: Optional[str] = None,
+    eligibility_db: ProgramEligibilityDB | None = None,
+    db_path: str | None = None,
     min_efficiency_pct: float = 80.0,
-    preset: Optional[str] = None,
+    preset: str | None = None,
     capacity: int = 6,
     budget_minutes: float = 120.0,
     include_deferred: bool = False,
     deterministic_bandit: bool = True,
-    now: Optional[datetime] = None,
-) -> Dict[str, Any]:
+    now: datetime | None = None,
+) -> dict[str, Any]:
     """
     End-to-end ACDSO-adapted ML HackerOne program ranking & portfolio optimization.
     Auto-selects `signal_fast` preset when Signal is unestablished or < 1.0,
@@ -1057,8 +1057,8 @@ def rank_hackerone_programs(
         eff_preset = "balanced"
 
     extractor = ProgramFeatureExtractor(outcomes, now=now)
-    extracted_all: Dict[str, ExtractedProgramFeatures] = {}
-    records_by_handle: Dict[str, ProgramEligibilityRecord] = {}
+    extracted_all: dict[str, ExtractedProgramFeatures] = {}
+    records_by_handle: dict[str, ProgramEligibilityRecord] = {}
     for rec in all_records:
         records_by_handle[rec.handle.lower()] = rec
         extracted_all[rec.handle.lower()] = extractor.extract(rec, min_efficiency_pct=min_efficiency_pct)
@@ -1066,9 +1066,9 @@ def rank_hackerone_programs(
     # Fit survival model & 3-tier curriculum LTR on observed hunt_outcomes
     surv_model = ProgramSurvivalModel()
     if outcomes:
-        s_X: List[List[float]] = []
-        s_t: List[float] = []
-        s_e: List[int] = []
+        s_X: list[list[float]] = []
+        s_t: list[float] = []
+        s_e: list[int] = []
         for o in outcomes:
             ef = extracted_all.get(o.handle.lower())
             if ef is None:
@@ -1086,9 +1086,9 @@ def rank_hackerone_programs(
     )
 
     # Filter unlocked candidates (always exclude BLOCKED; optionally include DEFERRED_LOW_EFFICIENCY)
-    active_handles: List[str] = []
-    deferred_programs: List[Dict[str, Any]] = []
-    blocked_summary: List[Dict[str, Any]] = []
+    active_handles: list[str] = []
+    deferred_programs: list[dict[str, Any]] = []
+    blocked_summary: list[dict[str, Any]] = []
     for h, ef in extracted_all.items():
         rec = records_by_handle[h]
         if ef.lane == "BLOCKED":
@@ -1120,8 +1120,8 @@ def rank_hackerone_programs(
     if not active_handles and deferred_programs:
         active_handles = [d["handle"].lower() for d in deferred_programs]
 
-    pareto_candidates: List[MultiObjectiveCandidate] = []
-    prelim_rows: Dict[str, Dict[str, Any]] = {}
+    pareto_candidates: list[MultiObjectiveCandidate] = []
+    prelim_rows: dict[str, dict[str, Any]] = {}
 
     for h in active_handles:
         rec = records_by_handle[h]
@@ -1188,7 +1188,7 @@ def rank_hackerone_programs(
     front = generalized_pareto_front(pareto_candidates, directions=_PROGRAM_OBJ_DIRECTIONS)
     front_names = {c.name for c in front}
     knee_winner_name = ""
-    knee_scores: Dict[str, float] = {}
+    knee_scores: dict[str, float] = {}
     if front:
         # Score ALL active candidates for smooth ranking, while marking Pareto-optimal ones
         winner_c, front_scores = select_pareto_knee(
@@ -1206,8 +1206,8 @@ def rank_hackerone_programs(
         )
         knee_scores = {**all_scores, **front_scores}
 
-    ranked: List[Dict[str, Any]] = []
-    portfolio_inputs: List[PortfolioItem] = []
+    ranked: list[dict[str, Any]] = []
+    portfolio_inputs: list[PortfolioItem] = []
     for h, row in prelim_rows.items():
         k_score = float(knee_scores.get(row["handle"], row["expected_value"]))
         is_front = row["handle"] in front_names
@@ -1275,21 +1275,21 @@ def rank_hackerone_programs(
 
 
 __all__ = [
-    "TIER1_FEATURE_NAMES",
     "OUTCOME_REWARD_MAP",
-    "signed_log1p",
-    "signed_hash_features",
-    "compute_empirical_bayes_yield",
-    "classify_program_lane",
-    "compute_unlock_distance",
+    "TIER1_FEATURE_NAMES",
+    "DailyHuntPortfolioOptimizer",
     "ExtractedProgramFeatures",
-    "ProgramFeatureExtractor",
-    "concordance_index",
-    "ProgramSurvivalModel",
-    "ndcg_at_k",
-    "ProgramRanker",
     "OnlineProgramBandit",
     "PortfolioItem",
-    "DailyHuntPortfolioOptimizer",
+    "ProgramFeatureExtractor",
+    "ProgramRanker",
+    "ProgramSurvivalModel",
+    "classify_program_lane",
+    "compute_empirical_bayes_yield",
+    "compute_unlock_distance",
+    "concordance_index",
+    "ndcg_at_k",
     "rank_hackerone_programs",
+    "signed_hash_features",
+    "signed_log1p",
 ]

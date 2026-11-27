@@ -23,24 +23,25 @@ Design Invariants:
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ProcessPoolExecutor
-from datetime import datetime, timezone
 import hashlib
 import inspect
 import json
 import multiprocessing
 import os
-from pathlib import Path
 import re
 import sqlite3
 import threading
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 import uuid
-
+from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ProcessPoolExecutor
+from datetime import UTC, datetime
+from pathlib import Path
+from types import TracebackType
+from typing import Any, Self
 
 # Loop 2 Constants (PROJECT.md §5)
-SECURITY_FIX_KEYWORDS: Tuple[str, ...] = (
+SECURITY_FIX_KEYWORDS: tuple[str, ...] = (
     "sanitize",
     "o_nofollow",
     "symlink",
@@ -51,7 +52,7 @@ SECURITY_FIX_KEYWORDS: Tuple[str, ...] = (
     "verify",
 )
 
-SIBLING_SDK_LANGUAGES: Tuple[str, ...] = (
+SIBLING_SDK_LANGUAGES: tuple[str, ...] = (
     "TS",
     "Python",
     "Go",
@@ -61,7 +62,7 @@ SIBLING_SDK_LANGUAGES: Tuple[str, ...] = (
 )
 
 # Loop 5 Default Lanes (PROJECT.md §5 — real VDPs in Lane 1 for Signal building)
-LANE1_DEFAULT_PROGRAMS: Tuple[str, ...] = (
+LANE1_DEFAULT_PROGRAMS: tuple[str, ...] = (
     "henkel_vdp",
     "servicenow-disclosure",
     "rails",
@@ -71,7 +72,7 @@ LANE1_DEFAULT_PROGRAMS: Tuple[str, ...] = (
     "common_codes",
 )
 
-LANE2_DEFAULT_PROGRAMS: Tuple[str, ...] = (
+LANE2_DEFAULT_PROGRAMS: tuple[str, ...] = (
     "anthropic",
     "common_codes",
     "oppo_bbp",
@@ -79,7 +80,7 @@ LANE2_DEFAULT_PROGRAMS: Tuple[str, ...] = (
     "temu",
 )
 
-_SDK_DIR_ALIASES: Dict[str, Tuple[str, ...]] = {
+_SDK_DIR_ALIASES: dict[str, tuple[str, ...]] = {
     "TS": ("ts", "typescript", "js", "javascript", "node", "sdk-ts", "ts-sdk"),
     "Python": ("python", "py", "sdk-python", "python-sdk"),
     "Go": ("go", "golang", "sdk-go", "go-sdk"),
@@ -88,14 +89,14 @@ _SDK_DIR_ALIASES: Dict[str, Tuple[str, ...]] = {
     "Rust": ("rust", "rs", "cargo", "sdk-rust", "rust-sdk"),
 }
 
-_DEFAULT_UNLOCK_REPOS: Dict[str, Tuple[str, ...]] = {
+_DEFAULT_UNLOCK_REPOS: dict[str, tuple[str, ...]] = {
     "shopify": ("Shopify/shopify-app-js", "Shopify/function-runner", "Shopify/hydrogen"),
     "vercel": ("vercel/next.js", "vercel/vercel"),
     "cloudflare": ("cloudflare/pingora", "cloudflare/workers-sdk"),
     "anthropic": ("anthropics/sandbox-runtime", "anthropics/claude-code"),
 }
 
-_NOISE_PATH_PARTS: Tuple[str, ...] = (
+_NOISE_PATH_PARTS: tuple[str, ...] = (
     "/tests/",
     "/test/",
     "/__tests__/",
@@ -108,7 +109,7 @@ _NOISE_PATH_PARTS: Tuple[str, ...] = (
     "/benchmarks/",
 )
 
-_NOISE_FILE_SUFFIXES: Tuple[str, ...] = (
+_NOISE_FILE_SUFFIXES: tuple[str, ...] = (
     "_test.go",
     "_test.py",
     "_spec.rb",
@@ -127,7 +128,7 @@ _NOISE_FILE_SUFFIXES: Tuple[str, ...] = (
 
 
 def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _coerce_strict_bool(val: Any) -> bool:
@@ -141,7 +142,7 @@ def _coerce_strict_bool(val: Any) -> bool:
     return False
 
 
-def default_cpu_workers(requested: Optional[int] = None) -> int:
+def default_cpu_workers(requested: int | None = None) -> int:
     """Bounded CPU worker count (`min(8, max(2, cpu_count // 2))` by default)."""
     if requested is not None:
         return max(1, min(16, int(requested)))
@@ -151,8 +152,8 @@ def default_cpu_workers(requested: Optional[int] = None) -> int:
 def _sanitize_safe_rel_path(
     raw_path: Any,
     *,
-    repo_root: Optional[Path] = None,
-) -> Optional[str]:
+    repo_root: Path | None = None,
+) -> str | None:
     """
     Validate and normalize a repository-relative path, rejecting traversal (`..`),
     absolute paths, drive letters (`:`), UNC paths (`\\\\`), null bytes, and
@@ -220,7 +221,7 @@ def _has_js_ts_assets(
 
 def _fallback_is_non_production_noise(
     file_path: str,
-    metadata: Optional[Dict[str, Any]] = None,
+    metadata: dict[str, Any] | None = None,
     *,
     rule_id: str = "",
     summary: str = "",
@@ -241,9 +242,7 @@ def _fallback_is_non_production_noise(
     if any(tok in rid for tok in ("docstring", "lint-only", "formatting", "style-only")):
         return True
     sum_low = str(summary or "").strip().lower()
-    if any(tok in sum_low for tok in ("docstring only", "lint noise", "formatting only")):
-        return True
-    return False
+    return bool(any(tok in sum_low for tok in ("docstring only", "lint noise", "formatting only")))
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +259,7 @@ class SqliteBlackboard:
     helper methods via `asyncio.to_thread(...)`.
     """
 
-    def __init__(self, db_path: Union[str, Path]) -> None:
+    def __init__(self, db_path: str | Path) -> None:
         self.raw_db_path = str(db_path)
         self.is_memory = self.raw_db_path == ":memory:"
         if not self.is_memory:
@@ -292,7 +291,7 @@ class SqliteBlackboard:
                 self._conn.execute("PRAGMA journal_mode=WAL;")
 
     def _run_with_retry(self, fn: Callable[[], Any]) -> Any:
-        last_exc: Optional[Exception] = None
+        last_exc: Exception | None = None
         for attempt in range(6):
             try:
                 with self._lock:
@@ -377,10 +376,15 @@ class SqliteBlackboard:
 
         self._run_with_retry(_create)
 
-    def __enter__(self) -> "SqliteBlackboard":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def close(self) -> None:
@@ -390,24 +394,24 @@ class SqliteBlackboard:
                 if not self.is_memory:
                     try:
                         self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                    except Exception:
+                    except Exception:  # noqa: BLE001, S110
                         pass
                 try:
                     self._conn.close()
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
 
     def __del__(self) -> None:
         try:
             self.close()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
     # -- Facts --
 
     def add_fact(
         self,
-        title: Union[str, Dict[str, Any]] = "",
+        title: str | dict[str, Any] = "",
         *,
         task_id: str = "default",
         program: str = "",
@@ -420,9 +424,9 @@ class SqliteBlackboard:
         poc_verified: bool = False,
         merkle_leaf_hash: str = "",
         source_engine: str = "",
-        payload: Optional[Dict[str, Any]] = None,
+        payload: dict[str, Any] | None = None,
         parent_intent_id: str = "",
-        fact_id: Optional[str] = None,
+        fact_id: str | None = None,
     ) -> str:
         if isinstance(title, dict):
             raw = dict(title)
@@ -490,13 +494,13 @@ class SqliteBlackboard:
     def list_facts(
         self,
         *,
-        task_id: Optional[str] = None,
-        program: Optional[str] = None,
-        domain: Optional[str] = None,
+        task_id: str | None = None,
+        program: str | None = None,
+        domain: str | None = None,
         limit: int = 200,
-    ) -> List[Dict[str, Any]]:
-        clauses: List[str] = []
-        params: List[Any] = []
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
         if task_id is not None:
             clauses.append("task_id = ?")
             params.append(task_id)
@@ -509,18 +513,18 @@ class SqliteBlackboard:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(max(1, int(limit)))
 
-        def _query() -> List[Dict[str, Any]]:
+        def _query() -> list[dict[str, Any]]:
             rows = self._conn.execute(
                 f"SELECT * FROM facts {where} ORDER BY rowid ASC LIMIT ?",
                 params,
             ).fetchall()
-            out: List[Dict[str, Any]] = []
+            out: list[dict[str, Any]] = []
             for r in rows:
                 d = dict(r)
                 d["poc_verified"] = _coerce_strict_bool(d.get("poc_verified", 0))
                 try:
                     d["payload"] = json.loads(d.get("payload_json") or "{}")
-                except Exception:
+                except (json.JSONDecodeError, TypeError, ValueError):
                     d["payload"] = {}
                 out.append(d)
             return out
@@ -532,7 +536,7 @@ class SqliteBlackboard:
     def enqueue_intent(
         self,
         intent_type: str = "stage1_cpu",
-        payload: Optional[Dict[str, Any]] = None,
+        payload: dict[str, Any] | None = None,
         *,
         task_id: str = "default",
         program: str = "",
@@ -540,8 +544,8 @@ class SqliteBlackboard:
         lane: int = 2,
         priority: float = 0.0,
         max_retries: int = 3,
-        dedup_key: Optional[str] = None,
-        intent_id: Optional[str] = None,
+        dedup_key: str | None = None,
+        intent_id: str | None = None,
     ) -> str:
         eff_id = intent_id or f"intent_{uuid.uuid4().hex[:12]}"
         eff_lane = 1 if int(lane) == 1 else 2
@@ -592,15 +596,15 @@ class SqliteBlackboard:
 
         return str(self._run_with_retry(_enqueue))
 
-    def _decode_intent_row(self, row: sqlite3.Row) -> Dict[str, Any]:
+    def _decode_intent_row(self, row: sqlite3.Row) -> dict[str, Any]:
         d = dict(row)
         try:
             d["payload"] = json.loads(d.get("payload_json") or "{}")
-        except Exception:
+        except Exception:  # noqa: BLE001
             d["payload"] = {}
         try:
             d["result"] = json.loads(d.get("result_json") or "{}")
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError):
             d["result"] = {}
         return d
 
@@ -609,15 +613,15 @@ class SqliteBlackboard:
         worker_id: str,
         *,
         lease_sec: float = 120.0,
-        lane: Optional[int] = None,
-        task_id: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
+        lane: int | None = None,
+        task_id: str | None = None,
+    ) -> dict[str, Any] | None:
         now_epoch = time.time()
         lease_exp = now_epoch + max(1.0, float(lease_sec))
         now_iso = _utc_iso()
 
         clauses = ["status = 'PENDING'"]
-        params: List[Any] = []
+        params: list[Any] = []
         if lane is not None:
             clauses.append("lane = ?")
             params.append(1 if int(lane) == 1 else 2)
@@ -626,7 +630,7 @@ class SqliteBlackboard:
             params.append(task_id)
         where = " AND ".join(clauses)
 
-        def _claim() -> Optional[Dict[str, Any]]:
+        def _claim() -> dict[str, Any] | None:
             self._conn.execute("BEGIN IMMEDIATE;")
             try:
                 row = self._conn.execute(
@@ -705,7 +709,7 @@ class SqliteBlackboard:
     def complete_intent(
         self,
         intent_id: str,
-        result: Optional[Dict[str, Any]] = None,
+        result: dict[str, Any] | None = None,
     ) -> bool:
         now_iso = _utc_iso()
         res_str = json.dumps(result or {}, ensure_ascii=False)
@@ -761,8 +765,8 @@ class SqliteBlackboard:
         self,
         *,
         force_all_in_progress: bool = False,
-        now_epoch: Optional[float] = None,
-    ) -> Dict[str, Any]:
+        now_epoch: float | None = None,
+    ) -> dict[str, Any]:
         """
         Reset stale `IN_PROGRESS` intents back to `PENDING` (or `FAILED` if
         `retry_count + 1 > max_retries`). Never deletes or alters `facts`.
@@ -770,7 +774,7 @@ class SqliteBlackboard:
         eff_now = time.time() if now_epoch is None else float(now_epoch)
         now_iso = _utc_iso()
 
-        def _recover() -> Dict[str, Any]:
+        def _recover() -> dict[str, Any]:
             self._conn.execute("BEGIN IMMEDIATE;")
             try:
                 if force_all_in_progress:
@@ -789,8 +793,8 @@ class SqliteBlackboard:
                         (eff_now,),
                     ).fetchall()
 
-                recovered_ids: List[str] = []
-                failed_ids: List[str] = []
+                recovered_ids: list[str] = []
+                failed_ids: list[str] = []
                 for r in rows:
                     iid = str(r["intent_id"])
                     new_retry = int(r["retry_count"]) + 1
@@ -842,13 +846,13 @@ class SqliteBlackboard:
     def list_intents(
         self,
         *,
-        status: Optional[str] = None,
-        lane: Optional[int] = None,
-        task_id: Optional[str] = None,
+        status: str | None = None,
+        lane: int | None = None,
+        task_id: str | None = None,
         limit: int = 200,
-    ) -> List[Dict[str, Any]]:
-        clauses: List[str] = []
-        params: List[Any] = []
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
         if status is not None:
             clauses.append("status = ?")
             params.append(status.strip().upper())
@@ -861,7 +865,7 @@ class SqliteBlackboard:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(max(1, int(limit)))
 
-        def _query() -> List[Dict[str, Any]]:
+        def _query() -> list[dict[str, Any]]:
             rows = self._conn.execute(
                 f"SELECT * FROM intents {where} ORDER BY lane ASC, priority DESC, rowid ASC LIMIT ?",
                 params,
@@ -881,8 +885,8 @@ class SqliteBlackboard:
         source: str = "",
         priority: float = 0.0,
         active: bool = True,
-        payload: Optional[Dict[str, Any]] = None,
-        hint_id: Optional[str] = None,
+        payload: dict[str, Any] | None = None,
+        hint_id: str | None = None,
     ) -> str:
         eff_id = hint_id or f"hint_{uuid.uuid4().hex[:12]}"
         now = _utc_iso()
@@ -921,13 +925,13 @@ class SqliteBlackboard:
     def list_hints(
         self,
         *,
-        task_id: Optional[str] = None,
-        domain: Optional[str] = None,
+        task_id: str | None = None,
+        domain: str | None = None,
         active_only: bool = True,
         limit: int = 200,
-    ) -> List[Dict[str, Any]]:
-        clauses: List[str] = []
-        params: List[Any] = []
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
         if task_id is not None:
             clauses.append("task_id = ?")
             params.append(task_id)
@@ -939,18 +943,18 @@ class SqliteBlackboard:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(max(1, int(limit)))
 
-        def _query() -> List[Dict[str, Any]]:
+        def _query() -> list[dict[str, Any]]:
             rows = self._conn.execute(
                 f"SELECT * FROM hints {where} ORDER BY priority DESC, rowid ASC LIMIT ?",
                 params,
             ).fetchall()
-            out: List[Dict[str, Any]] = []
+            out: list[dict[str, Any]] = []
             for r in rows:
                 d = dict(r)
                 d["active"] = bool(d.get("active", 1))
                 try:
                     d["payload"] = json.loads(d.get("payload_json") or "{}")
-                except Exception:
+                except (json.JSONDecodeError, TypeError, ValueError):
                     d["payload"] = {}
                 out.append(d)
             return out
@@ -962,13 +966,13 @@ class SqliteBlackboard:
     async def aadd_fact(self, *args: Any, **kwargs: Any) -> str:
         return await asyncio.to_thread(self.add_fact, *args, **kwargs)
 
-    async def alist_facts(self, **kwargs: Any) -> List[Dict[str, Any]]:
+    async def alist_facts(self, **kwargs: Any) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self.list_facts, **kwargs)
 
     async def aenqueue_intent(self, *args: Any, **kwargs: Any) -> str:
         return await asyncio.to_thread(self.enqueue_intent, *args, **kwargs)
 
-    async def aclaim_intent(self, *args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
+    async def aclaim_intent(self, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
         return await asyncio.to_thread(self.claim_intent, *args, **kwargs)
 
     async def acomplete_intent(self, *args: Any, **kwargs: Any) -> bool:
@@ -977,7 +981,7 @@ class SqliteBlackboard:
     async def afail_intent(self, *args: Any, **kwargs: Any) -> bool:
         return await asyncio.to_thread(self.fail_intent, *args, **kwargs)
 
-    async def arecover_stale_intents(self, **kwargs: Any) -> Dict[str, Any]:
+    async def arecover_stale_intents(self, **kwargs: Any) -> dict[str, Any]:
         return await asyncio.to_thread(self.recover_stale_intents, **kwargs)
 
 
@@ -998,9 +1002,9 @@ def _coerce_probe_bytes(raw_probe: Any) -> bytes:
     return b""
 
 
-def _discover_formal_spec_files(repo_root: Path, max_files: int = 8) -> Dict[str, List[Path]]:
+def _discover_formal_spec_files(repo_root: Path, max_files: int = 8) -> dict[str, list[Path]]:
     """Bounded discovery of OpenAPI / IAM / StateMachine spec files in a repo."""
-    discovered: Dict[str, List[Path]] = {"openapi": [], "iam": [], "state_machine": []}
+    discovered: dict[str, list[Path]] = {"openapi": [], "iam": [], "state_machine": []}
     if not repo_root.is_dir():
         return discovered
 
@@ -1027,7 +1031,7 @@ def _discover_formal_spec_files(repo_root: Path, max_files: int = 8) -> Dict[str
     return discovered
 
 
-def _normalize_finding_dict(item: Any, *, default_engine: str = "stage1_cpu") -> Dict[str, Any]:
+def _normalize_finding_dict(item: Any, *, default_engine: str = "stage1_cpu") -> dict[str, Any]:
     if hasattr(item, "to_dict") and callable(item.to_dict):
         d = dict(item.to_dict())
     elif isinstance(item, dict):
@@ -1052,7 +1056,7 @@ def _normalize_finding_dict(item: Any, *, default_engine: str = "stage1_cpu") ->
     return d
 
 
-def run_formal_and_differential_check(intent_payload: Dict[str, Any]) -> Dict[str, Any]:
+def run_formal_and_differential_check(intent_payload: dict[str, Any]) -> dict[str, Any]:
     """
     Top-level Windows-spawn-picklable worker running Z3 formal verification,
     Lean 4 domain checks, and 4-parser differential matrix analysis.
@@ -1060,11 +1064,11 @@ def run_formal_and_differential_check(intent_payload: Dict[str, Any]) -> Dict[st
     t0 = time.monotonic()
     payload = dict(intent_payload or {})
     worker_pid = os.getpid()
-    findings: List[Dict[str, Any]] = []
-    z3_report_dict: Optional[Dict[str, Any]] = None
-    lean_checks: List[Dict[str, Any]] = []
-    differential_out: Optional[Dict[str, Any]] = None
-    errors: List[str] = []
+    findings: list[dict[str, Any]] = []
+    z3_report_dict: dict[str, Any] | None = None
+    lean_checks: list[dict[str, Any]] = []
+    differential_out: dict[str, Any] | None = None
+    errors: list[str] = []
 
     openapi_spec = payload.get("openapi_spec")
     iam_policy = payload.get("iam_policy")
@@ -1095,7 +1099,7 @@ def run_formal_and_differential_check(intent_payload: Dict[str, Any]) -> Dict[st
             z3_report_dict = rep.to_dict()
             for ef in rep.to_engine_findings(include_proven=False):
                 findings.append(_normalize_finding_dict(ef, default_engine="z3_formal"))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             errors.append(f"z3_formal_verification: {exc}")
 
     # 2. Lean 4 Domain Checks (http_framing / policy_guard / dotnet_pe / evaluate_lean_domains)
@@ -1115,7 +1119,7 @@ def run_formal_and_differential_check(intent_payload: Dict[str, Any]) -> Dict[st
                 verify_policy_guard_invariant,
             )
 
-            counterexamples: List[Any] = []
+            counterexamples: list[Any] = []
             if isinstance(http_framing, dict):
                 pv_raw = http_framing.get("proxy_verdict")
                 pv = tuple(pv_raw) if isinstance(pv_raw, (list, tuple)) and len(pv_raw) == 2 else None
@@ -1184,7 +1188,7 @@ def run_formal_and_differential_check(intent_payload: Dict[str, Any]) -> Dict[st
                             default_engine="lean4",
                         )
                     )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             errors.append(f"lean_formal_verifier: {exc}")
 
     # 3. 4-Parser Differential Matrix
@@ -1224,7 +1228,7 @@ def run_formal_and_differential_check(intent_payload: Dict[str, Any]) -> Dict[st
                         default_engine="differential_oracle",
                     )
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             errors.append(f"differential_oracle: {exc}")
 
     # 4. Deterministic CPU verification jitter/work if requested for multi-worker scheduling tests
@@ -1250,7 +1254,7 @@ def run_formal_and_differential_check(intent_payload: Dict[str, Any]) -> Dict[st
     }
 
 
-def run_stage1_cpu_check(intent_payload: Dict[str, Any]) -> Dict[str, Any]:
+def run_stage1_cpu_check(intent_payload: dict[str, Any]) -> dict[str, Any]:
     """
     Top-level Windows-spawn-picklable Stage 1 worker (0 LLM calls).
 
@@ -1274,10 +1278,10 @@ def run_stage1_cpu_check(intent_payload: Dict[str, Any]) -> Dict[str, Any]:
     has_explicit_targets = bool(target_files)
     skip_repo_wide_walkers = bool(is_sibling_parity and has_explicit_targets)
 
-    scanners_run: List[str] = []
-    scanners_unavailable: List[str] = []
-    raw_findings: List[Dict[str, Any]] = []
-    errors: List[str] = []
+    scanners_run: list[str] = []
+    scanners_unavailable: list[str] = []
+    raw_findings: list[dict[str, Any]] = []
+    errors: list[str] = []
 
     # 1. Production Noise Filter (reconcile M1 parity_invariant_auditor + M2 fallback)
     try:
@@ -1286,8 +1290,8 @@ def run_stage1_cpu_check(intent_payload: Dict[str, Any]) -> Dict[str, Any]:
         is_non_production_noise = _fallback_is_non_production_noise
 
     # Filter target_files ahead of expensive checks when explicit file list provided
-    dropped_files: List[str] = []
-    active_target_files: List[str] = []
+    dropped_files: list[str] = []
+    active_target_files: list[str] = []
     for tf in target_files:
         if bool(is_non_production_noise(tf) or _fallback_is_non_production_noise(tf)):
             dropped_files.append(tf)
@@ -1305,7 +1309,7 @@ def run_stage1_cpu_check(intent_payload: Dict[str, Any]) -> Dict[str, Any]:
     if repo_exists and repo_root is not None:
         parity_targets = active_target_files if has_explicit_targets else None
         raw_allowed = payload.get("allowed_scanners")
-        allowed_set: Optional[Set[str]] = (
+        allowed_set: set[str] | None = (
             {str(s).strip().lower() for s in raw_allowed if str(s).strip()}
             if isinstance(raw_allowed, (list, tuple, set)) and raw_allowed
             else None
@@ -1324,7 +1328,7 @@ def run_stage1_cpu_check(intent_payload: Dict[str, Any]) -> Dict[str, Any]:
                 rec_scanners = routed.get("recommended_scanners") if isinstance(routed, dict) else routed
                 if rec_scanners:
                     allowed_set = {str(s).strip().lower() for s in rec_scanners if str(s).strip()}
-            except Exception:
+            except Exception:  # noqa: BLE001
                 allowed_set = None
 
         def _scanner_enabled(name: str) -> bool:
@@ -1344,7 +1348,7 @@ def run_stage1_cpu_check(intent_payload: Dict[str, Any]) -> Dict[str, Any]:
                     raw_findings.append(_normalize_finding_dict(item, default_engine="parity_auditor"))
             except ImportError:
                 scanners_unavailable.append("parity_auditor")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 errors.append(f"parity_auditor: {exc}")
 
         if not skip_repo_wide_walkers:
@@ -1364,7 +1368,7 @@ def run_stage1_cpu_check(intent_payload: Dict[str, Any]) -> Dict[str, Any]:
                         raw_findings.append(_normalize_finding_dict(item, default_engine="trufflehog"))
                 except ImportError:
                     scanners_unavailable.append("trufflehog")
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     errors.append(f"trufflehog: {exc}")
 
             # 4. M1 Mobile App Auditor (diff-scoped when parity_targets provided)
@@ -1383,7 +1387,7 @@ def run_stage1_cpu_check(intent_payload: Dict[str, Any]) -> Dict[str, Any]:
                         raw_findings.append(_normalize_finding_dict(item, default_engine="mobile_mobsf"))
                 except ImportError:
                     scanners_unavailable.append("mobile_mobsf")
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     errors.append(f"mobile_mobsf: {exc}")
 
             # 5. M1 API Surface & JWT/SD-JWT Auditor (always allow_live=False in Stage 1, diff-scoped)
@@ -1404,7 +1408,7 @@ def run_stage1_cpu_check(intent_payload: Dict[str, Any]) -> Dict[str, Any]:
                         raw_findings.append(_normalize_finding_dict(item, default_engine="api_jwt_sdjwt"))
                 except ImportError:
                     scanners_unavailable.append("api_jwt_sdjwt")
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     errors.append(f"api_jwt_sdjwt: {exc}")
 
             # 6. M1 AI-Infra-Guard & DeepAudit Auditor (diff-scoped when parity_targets provided)
@@ -1418,7 +1422,7 @@ def run_stage1_cpu_check(intent_payload: Dict[str, Any]) -> Dict[str, Any]:
                         raw_findings.append(_normalize_finding_dict(item, default_engine="ai_infra_guard"))
                 except ImportError:
                     scanners_unavailable.append("ai_infra_guard")
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     errors.append(f"ai_infra_guard: {exc}")
 
             # 7. Existing deterministic REA hook (only when JS/TS assets exist, write_reports=False)
@@ -1431,7 +1435,7 @@ def run_stage1_cpu_check(intent_payload: Dict[str, Any]) -> Dict[str, Any]:
                     rea_res = run_rea_hook(repo_root)
                     for item in rea_res.get("findings") or ():
                         raw_findings.append(_normalize_finding_dict(item, default_engine="rea"))
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 errors.append(f"rea: {exc}")
 
             # 8. Bounded Formal spec check if OpenAPI/IAM/StateMachine files exist in repo_root
@@ -1448,7 +1452,7 @@ def run_stage1_cpu_check(intent_payload: Dict[str, Any]) -> Dict[str, Any]:
                         }
                     )
                     raw_findings.extend(formal_sub.get("findings") or [])
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 errors.append(f"z3_formal: {exc}")
 
     # 9. Also run formal/differential subcheck if explicit formal inputs were supplied
@@ -1462,8 +1466,8 @@ def run_stage1_cpu_check(intent_payload: Dict[str, Any]) -> Dict[str, Any]:
         errors.extend(formal_res.get("errors") or [])
 
     # 10. Partition findings strictly into production vs noise
-    production_findings: List[Dict[str, Any]] = []
-    noise_findings: List[Dict[str, Any]] = []
+    production_findings: list[dict[str, Any]] = []
+    noise_findings: list[dict[str, Any]] = []
     for f in raw_findings:
         meta = f.get("metadata") if isinstance(f.get("metadata"), dict) else {}
         fp_str = str(f.get("file_path", ""))
@@ -1484,7 +1488,7 @@ def run_stage1_cpu_check(intent_payload: Dict[str, Any]) -> Dict[str, Any]:
     # Optional CPU digest for deterministic multi-worker verification
     cpu_work_iters = int(payload.get("cpu_work_iters", 0) or 0)
     if cpu_work_iters > 0:
-        acc = hashlib.sha256(f"{worker_pid}:{repo_path_str}".encode("utf-8")).digest()
+        acc = hashlib.sha256(f"{worker_pid}:{repo_path_str}".encode()).digest()
         for _ in range(min(250_000, cpu_work_iters)):
             acc = hashlib.sha256(acc).digest()
 
@@ -1509,13 +1513,13 @@ def run_stage1_cpu_check(intent_payload: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def detect_security_fix_signal(commit_message: str, diff_text: str = "") -> List[str]:
+def detect_security_fix_signal(commit_message: str, diff_text: str = "") -> list[str]:
     """
     Detect security-fix signals (`sanitize`, `o_nofollow`, `symlink`, `allowfrom`,
     `csp`, `ssrf`, `authz`, `verify`) in commit messages or diffs.
     """
     blob = f"{commit_message or ''}\n{diff_text or ''}".lower()
-    matched: List[str] = []
+    matched: list[str] = []
     for kw in SECURITY_FIX_KEYWORDS:
         if kw == "csp":
             if re.search(r"\bcsp\b|content-security-policy", blob):
@@ -1534,19 +1538,19 @@ def detect_security_fix_signal(commit_message: str, diff_text: str = "") -> List
 def _discover_sibling_targets(
     repo_root: Path,
     changed_files: Sequence[str],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Bounded discovery of sibling packages, sibling handlers, and sibling SDK languages."""
-    norm_changed: List[str] = []
+    norm_changed: list[str] = []
     for f in changed_files:
         clean = _sanitize_safe_rel_path(f, repo_root=repo_root)
         if clean is not None:
             norm_changed.append(clean)
     changed_set = set(norm_changed)
 
-    sibling_packages: Dict[str, List[str]] = {}
-    sibling_handlers: List[str] = []
-    sdk_dirs: Dict[str, List[str]] = {}
-    sdk_roots_by_lang: Dict[str, Set[str]] = {}
+    sibling_packages: dict[str, list[str]] = {}
+    sibling_handlers: list[str] = []
+    sdk_dirs: dict[str, list[str]] = {}
+    sdk_roots_by_lang: dict[str, set[str]] = {}
 
     if not norm_changed or not repo_root.is_dir():
         return {
@@ -1560,7 +1564,7 @@ def _discover_sibling_targets(
     resolved_root = repo_root.resolve()
 
     # 1. Sibling packages under common monorepo containers
-    changed_pkg_roots: Set[str] = set()
+    changed_pkg_roots: set[str] = set()
     for cf in norm_changed:
         parts = cf.split("/")
         if len(parts) >= 2 and parts[0].lower() in ("packages", "apps", "crates", "plugins", "external_plugins", "services"):
@@ -1576,7 +1580,7 @@ def _discover_sibling_targets(
             rel = f"{container}/{child.name}"
             if rel in changed_pkg_roots:
                 continue
-            files: List[str] = []
+            files: list[str] = []
             for p in sorted(child.rglob("*")):
                 if p.is_file():
                     try:
@@ -1593,7 +1597,7 @@ def _discover_sibling_targets(
                 sibling_packages[rel] = files
 
     # 2. Sibling handlers in same directories or handler/route folders
-    candidate_handler_dirs: Set[Path] = set()
+    candidate_handler_dirs: set[Path] = set()
     for cf in norm_changed:
         cf_abs = repo_root / cf
         try:
@@ -1652,7 +1656,7 @@ def _discover_sibling_targets(
             cname = child.name.lower()
             for lang, aliases in _SDK_DIR_ALIASES.items():
                 if cname in aliases or any(cname.startswith(f"{a}-") or cname.endswith(f"-{a}") for a in aliases):
-                    files: List[str] = []
+                    files: list[str] = []
                     for p in sorted(child.rglob("*")):
                         if p.is_file():
                             try:
@@ -1696,7 +1700,7 @@ def _discover_sibling_targets(
 def emit_sibling_parity_intents(
     blackboard: SqliteBlackboard,
     *,
-    repo_path: Union[str, Path],
+    repo_path: str | Path,
     changed_files: Sequence[str],
     trigger_reason: str,
     parent_intent_id: str = "",
@@ -1708,7 +1712,7 @@ def emit_sibling_parity_intents(
     repo: str = "",
     lane: int = 2,
     priority: float = 0.75,
-) -> List[str]:
+) -> list[str]:
     """
     Loop 2 Sibling Parity Fan-Out:
     Emits bounded `sibling_parity` `Intents` onto `SqliteBlackboard` across
@@ -1722,14 +1726,14 @@ def emit_sibling_parity_intents(
 
     repo_root = Path(repo_path)
     discovered = _discover_sibling_targets(repo_root, changed_files)
-    norm_changed: List[str] = list(discovered.get("norm_changed") or ())
+    norm_changed: list[str] = list(discovered.get("norm_changed") or ())
     if not norm_changed:
         return []
 
-    enqueued_ids: List[str] = []
+    enqueued_ids: list[str] = []
     next_depth = int(depth) + 1
     repo_str = str(repo_root)
-    discovered_sdk_langs: List[str] = list(discovered.get("sdk_languages") or ())
+    discovered_sdk_langs: list[str] = list(discovered.get("sdk_languages") or ())
 
     trigger_sig = json.dumps(
         {
@@ -1746,7 +1750,7 @@ def emit_sibling_parity_intents(
         if len(enqueued_ids) >= max_intents:
             return
         dedup = hashlib.sha256(
-            f"{task_id}:{repo_str}:{sibling_kind}:{scope_label}:{next_depth}:{trigger_digest}".encode("utf-8")
+            f"{task_id}:{repo_str}:{sibling_kind}:{scope_label}:{next_depth}:{trigger_digest}".encode()
         ).hexdigest()[:24]
         iid = blackboard.enqueue_intent(
             "sibling_parity",
@@ -1784,7 +1788,7 @@ def emit_sibling_parity_intents(
             _emit_one(f"sibling_handler:{handler_file}", "handler", [handler_file])
 
     # Fan out strictly across on-disk discovered sibling SDKs
-    sdk_dirs: Dict[str, List[str]] = discovered["sdk_dirs"]
+    sdk_dirs: dict[str, list[str]] = discovered["sdk_dirs"]
     for lang in discovered_sdk_langs:
         lang_files = sdk_dirs.get(lang, [])
         if lang_files:
@@ -1804,8 +1808,8 @@ class TwoLaneBountyQueue:
     `ProgramEligibilityDB`, and `SqliteBlackboard`.
     """
 
-    LANE1_DEFAULT_PROGRAMS: Tuple[str, ...] = LANE1_DEFAULT_PROGRAMS
-    LANE2_DEFAULT_PROGRAMS: Tuple[str, ...] = LANE2_DEFAULT_PROGRAMS
+    LANE1_DEFAULT_PROGRAMS: tuple[str, ...] = LANE1_DEFAULT_PROGRAMS
+    LANE2_DEFAULT_PROGRAMS: tuple[str, ...] = LANE2_DEFAULT_PROGRAMS
 
     def __init__(
         self,
@@ -1834,13 +1838,13 @@ class TwoLaneBountyQueue:
         self,
         *,
         queue_capacity: int = 10,
-        signal_score: Optional[float] = None,
-        program_repos: Optional[Dict[str, Sequence[str]]] = None,
+        signal_score: float | None = None,
+        program_repos: dict[str, Sequence[str]] | None = None,
         task_id: str = "default",
-        lane1_reward_history: Optional[Sequence[float]] = None,
-        lane2_reward_history: Optional[Sequence[float]] = None,
+        lane1_reward_history: Sequence[float] | None = None,
+        lane2_reward_history: Sequence[float] | None = None,
         cycle_id: str = "cycle_0",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         eff_signal = self.signal_score if signal_score is None else float(signal_score)
         alloc = self.scheduler.allocate_slots(
             queue_capacity,
@@ -1854,10 +1858,12 @@ class TwoLaneBountyQueue:
         unlocked_by_handle = {r.handle: r for r in unlocked_records}
 
         eligible_l1 = [p for p in self.lane1_programs if self.eligibility_db.is_eligible(p)]
-        eligible_l2: List[str] = [p for p in self.lane2_programs if self.eligibility_db.is_eligible(p)]
+        eligible_l2: list[str] = [p for p in self.lane2_programs if self.eligibility_db.is_eligible(p)]
         try:
-            from engine.ml_program_selector import classify_program_lane as _classify_lane
-        except Exception:
+            from engine.ml_program_selector import (
+                classify_program_lane as _classify_lane,
+            )
+        except Exception:  # noqa: BLE001
             _classify_lane = None  # type: ignore[assignment]
 
         for rec in unlocked_records:
@@ -1870,12 +1876,12 @@ class TwoLaneBountyQueue:
             elif h not in self.lane1_programs:
                 eligible_l2.append(h)
 
-        l1_queued: List[str] = []
-        l2_queued: List[str] = []
-        queued_intent_ids: List[str] = []
+        l1_queued: list[str] = []
+        l2_queued: list[str] = []
+        queued_intent_ids: list[str] = []
         repos_map = program_repos or {}
 
-        def _repos_for(prog_handle: str) -> List[str]:
+        def _repos_for(prog_handle: str) -> list[str]:
             if prog_handle in repos_map:
                 return list(repos_map[prog_handle])
             rec = unlocked_by_handle.get(prog_handle)
@@ -1937,7 +1943,7 @@ class TwoLaneBountyQueue:
         }
 
 
-def _infer_program_from_draft(raw: Dict[str, Any], file_path: Path) -> str:
+def _infer_program_from_draft(raw: dict[str, Any], file_path: Path) -> str:
     for key in ("program_handle", "program", "handle"):
         val = str(raw.get(key) or "").strip().lower()
         if val:
@@ -1963,7 +1969,7 @@ def _infer_program_from_draft(raw: Dict[str, Any], file_path: Path) -> str:
     return ""
 
 
-def _is_draft_poc_verified(raw: Dict[str, Any]) -> bool:
+def _is_draft_poc_verified(raw: dict[str, Any]) -> bool:
     if "poc_verified" in raw:
         return _coerce_strict_bool(raw.get("poc_verified"))
     lane = str(raw.get("evidence_lane", "")).strip().upper()
@@ -1995,14 +2001,14 @@ def _scrub_draft_text(text: Any) -> str:
 
 def sync_eligibility_and_stage_unlocks(
     eligibility_db: Any,
-    blackboard: Optional[SqliteBlackboard] = None,
-    drafts_dir: Union[str, Path] = Path("reports/ensemble_hunt"),
+    blackboard: SqliteBlackboard | None = None,
+    drafts_dir: str | Path = Path("reports/ensemble_hunt"),
     *,
-    previously_unlocked: Optional[Iterable[str]] = None,
-    program_repos: Optional[Dict[str, Sequence[str]]] = None,
-    out_dir: Optional[Union[str, Path]] = None,
+    previously_unlocked: Iterable[str] | None = None,
+    program_repos: dict[str, Sequence[str]] | None = None,
+    out_dir: str | Path | None = None,
     task_id: str = "default",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Loop 5 Auto-Unlock Watcher:
     1. Reads `ProgramEligibilityDB.list_unlocked()` and detects newly unlocked programs
@@ -2015,7 +2021,7 @@ def sync_eligibility_and_stage_unlocks(
     unlocked_records = eligibility_db.list_unlocked()
     current_unlocked = {r.handle.strip().lower() for r in unlocked_records if getattr(r, "handle", "")}
 
-    prev_set: Optional[Set[str]] = None
+    prev_set: set[str] | None = None
     if previously_unlocked is not None:
         prev_set = {str(h).strip().lower() for h in previously_unlocked if str(h).strip()}
     elif blackboard is not None:
@@ -2034,7 +2040,7 @@ def sync_eligibility_and_stage_unlocks(
     else:
         newly_unlocked = sorted(current_unlocked - prev_set)
 
-    queued_intents: List[str] = []
+    queued_intents: list[str] = []
     repos_map = program_repos or {}
     if blackboard is not None:
         for handle in newly_unlocked:
@@ -2067,7 +2073,7 @@ def sync_eligibility_and_stage_unlocks(
         )
 
     # Scan saved draft JSON files
-    draft_search_dirs: List[Path] = []
+    draft_search_dirs: list[Path] = []
     primary_drafts = Path(drafts_dir)
     if primary_drafts.exists():
         draft_search_dirs.append(primary_drafts)
@@ -2075,7 +2081,7 @@ def sync_eligibility_and_stage_unlocks(
     if primary_drafts == Path("reports/ensemble_hunt") and default_h1_dir.exists():
         draft_search_dirs.append(default_h1_dir)
 
-    candidate_files: List[Path] = []
+    candidate_files: list[Path] = []
     for ddir in draft_search_dirs:
         if ddir.is_file() and ddir.suffix.lower() == ".json":
             candidate_files.append(ddir)
@@ -2085,14 +2091,14 @@ def sync_eligibility_and_stage_unlocks(
                     continue
                 candidate_files.append(p)
 
-    staged_drafts: List[Dict[str, Any]] = []
-    blocked_drafts: List[Dict[str, Any]] = []
+    staged_drafts: list[dict[str, Any]] = []
+    blocked_drafts: list[dict[str, Any]] = []
     eff_out_dir = Path(out_dir) if out_dir is not None else (primary_drafts if primary_drafts.is_dir() else primary_drafts.parent)
 
     for jf in candidate_files:
         try:
             raw_obj = json.loads(jf.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception:  # noqa: BLE001, S112
             continue
 
         entries = raw_obj if isinstance(raw_obj, list) else (
@@ -2121,10 +2127,12 @@ def sync_eligibility_and_stage_unlocks(
             poc_val = _scrub_draft_text(entry.get("poc") or entry.get("poc_transcript") or "")
 
             tm_passed = True
-            tm_reasons: List[str] = []
+            tm_reasons: list[str] = []
             if prog and eligible_ok and poc_ok:
                 try:
-                    from engine.ensemble_orchestrator import evaluate_vendor_threat_model
+                    from engine.ensemble_orchestrator import (
+                        evaluate_vendor_threat_model,
+                    )
 
                     tm_verdict = evaluate_vendor_threat_model(
                         title=title_val,
@@ -2141,7 +2149,7 @@ def sync_eligibility_and_stage_unlocks(
                     pass
 
             if not eligible_ok or not poc_ok or not tm_passed:
-                reasons: List[str] = []
+                reasons: list[str] = []
                 if not prog:
                     reasons.append("missing_program_handle")
                 elif not eligible_ok:
@@ -2182,7 +2190,7 @@ def sync_eligibility_and_stage_unlocks(
                     "Verify `poc_verified == true` before submitting.",
                 ],
             }
-            staged_item: Dict[str, Any] = {
+            staged_item: dict[str, Any] = {
                 "status": "staged_ready",
                 "program_handle": prog,
                 "asset": asset_val,
@@ -2211,7 +2219,7 @@ def sync_eligibility_and_stage_unlocks(
             if blackboard is not None:
                 draft_id_key = str(report_id or jf)
                 det_fact_hash = hashlib.sha256(
-                    f"{task_id}:{prog}:{draft_id_key}:{pkg_val}".encode("utf-8")
+                    f"{task_id}:{prog}:{draft_id_key}:{pkg_val}".encode()
                 ).hexdigest()[:16]
                 det_fact_id = f"fact_unlock_{det_fact_hash}"
                 existing_fact_ids = {
@@ -2260,7 +2268,7 @@ def sync_eligibility_and_stage_unlocks(
 
 
 async def run_local_rfchunt_async(
-    seed_intents: Sequence[Dict[str, Any]] | None = None,
+    seed_intents: Sequence[dict[str, Any]] | None = None,
     *,
     repo_path: str | Path = ".",
     db_path: str | Path = "reports/ensemble_hunt/blackboard.sqlite3",
@@ -2271,7 +2279,7 @@ async def run_local_rfchunt_async(
     eligibility_db_path: str | Path | None = None,
     ollama_evaluator: Callable[..., Any] | None = None,
     remote_dispatcher: Callable[..., Any] | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Crash-recoverable Async SQLite WAL Blackboard + Windows-spawn-safe
     `ProcessPoolExecutor` runtime unifying Loop 2, Loop 5, Stage 1 CPU triage,
@@ -2285,7 +2293,7 @@ async def run_local_rfchunt_async(
 
     blackboard = SqliteBlackboard(db_path)
     try:
-        recovery_summary: Dict[str, Any] = {
+        recovery_summary: dict[str, Any] = {
             "recovered_to_pending": 0,
             "exhausted_to_failed": 0,
             "intent_ids": [],
@@ -2327,7 +2335,7 @@ async def run_local_rfchunt_async(
         scheduler = TwoLanePolicyScheduler()
         lane_allocation = scheduler.allocate_slots(10, signal_score=float(signal_score))
 
-        eligibility_sync: Optional[Dict[str, Any]] = None
+        eligibility_sync: dict[str, Any] | None = None
         if eligibility_db_path is not None:
             try:
                 from engine.program_eligibility_db import ProgramEligibilityDB
@@ -2348,15 +2356,15 @@ async def run_local_rfchunt_async(
                         queue_capacity=10,
                         signal_score=float(signal_score),
                     )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 eligibility_sync = {"error": str(exc)}
 
-        worker_pids: Set[int] = set()
-        stage1_production_findings: List[Dict[str, Any]] = []
+        worker_pids: set[int] = set()
+        stage1_production_findings: list[dict[str, Any]] = []
         stage1_noise_count = 0
         intents_completed = 0
         intents_failed = 0
-        loop2_emitted: List[str] = []
+        loop2_emitted: list[str] = []
         state_lock = asyncio.Lock()
         work_cond = asyncio.Condition()
         in_flight_workers = 0
@@ -2379,7 +2387,7 @@ async def run_local_rfchunt_async(
                             break
                         try:
                             await asyncio.wait_for(work_cond.wait(), timeout=0.05)
-                        except asyncio.TimeoutError:
+                        except TimeoutError:
                             pass
                         continue
                     in_flight_workers += 1
@@ -2540,7 +2548,7 @@ async def run_local_rfchunt_async(
                         await blackboard.acomplete_intent(iid, res)
                         async with state_lock:
                             intents_completed += 1
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     await blackboard.afail_intent(iid, str(exc))
                     async with state_lock:
                         intents_failed += 1
@@ -2557,18 +2565,17 @@ async def run_local_rfchunt_async(
         stage2_selected = list(stage2_result.get("selected") or [])
 
         # Stage 3 Single-Slot LLM evaluation (bounded by both max_net_concurrency and stage3_sem=1)
-        stage3_results: List[Dict[str, Any]] = []
+        stage3_results: list[dict[str, Any]] = []
         if ollama_evaluator is not None and stage2_selected:
-            async def _eval_one(cand: Dict[str, Any]) -> Dict[str, Any]:
-                async with net_sem:
-                    async with stage3_sem:
-                        if inspect.iscoroutinefunction(ollama_evaluator):
-                            out = await ollama_evaluator(cand)
-                        else:
-                            out = await asyncio.to_thread(ollama_evaluator, cand)
-                            if inspect.isawaitable(out):
-                                out = await out
-                        return out if isinstance(out, dict) else {"result": out}
+            async def _eval_one(cand: dict[str, Any]) -> dict[str, Any]:
+                async with net_sem, stage3_sem:
+                    if inspect.iscoroutinefunction(ollama_evaluator):
+                        out = await ollama_evaluator(cand)
+                    else:
+                        out = await asyncio.to_thread(ollama_evaluator, cand)
+                        if inspect.isawaitable(out):
+                            out = await out
+                    return out if isinstance(out, dict) else {"result": out}
 
             stage3_results = list(
                 await asyncio.gather(*[_eval_one(c) for c in stage2_selected])
@@ -2600,17 +2607,17 @@ async def run_local_rfchunt_async(
 
 
 __all__ = [
-    "SECURITY_FIX_KEYWORDS",
-    "SIBLING_SDK_LANGUAGES",
     "LANE1_DEFAULT_PROGRAMS",
     "LANE2_DEFAULT_PROGRAMS",
-    "default_cpu_workers",
+    "SECURITY_FIX_KEYWORDS",
+    "SIBLING_SDK_LANGUAGES",
     "SqliteBlackboard",
-    "run_formal_and_differential_check",
-    "run_stage1_cpu_check",
+    "TwoLaneBountyQueue",
+    "default_cpu_workers",
     "detect_security_fix_signal",
     "emit_sibling_parity_intents",
-    "TwoLaneBountyQueue",
-    "sync_eligibility_and_stage_unlocks",
+    "run_formal_and_differential_check",
     "run_local_rfchunt_async",
+    "run_stage1_cpu_check",
+    "sync_eligibility_and_stage_unlocks",
 ]

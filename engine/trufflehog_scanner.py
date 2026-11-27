@@ -12,22 +12,22 @@ across repositories:
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
 
 from engine.advisory_exporter import _redact_inline_tokens
 from engine.host_containment import silent_subprocess_run
 from engine.linux_poc_runner import validate_command_tokens, validate_mount_path
 from engine.parity_invariant_auditor import is_non_production_noise
-
 
 _SKIP_DIRS: frozenset[str] = frozenset(
     {
@@ -79,7 +79,7 @@ _TEXT_EXTS: frozenset[str] = frozenset(
     }
 )
 
-_PLACEHOLDER_MARKERS: Tuple[str, ...] = (
+_PLACEHOLDER_MARKERS: tuple[str, ...] = (
     "example",
     "your_",
     "placeholder",
@@ -94,7 +94,7 @@ _PLACEHOLDER_MARKERS: Tuple[str, ...] = (
     "os.environ",
 )
 
-_SECRET_RULES: Tuple[Tuple[str, str, str, float, re.Pattern[str]], ...] = (
+_SECRET_RULES: tuple[tuple[str, str, str, float, re.Pattern[str]], ...] = (
     (
         "TRUFFLEHOG-AWS-KEY-001",
         "Exposed AWS Access Key ID",
@@ -162,7 +162,7 @@ def shannon_entropy(data: str) -> float:
     if not data:
         return 0.0
     length = len(data)
-    counts: Dict[str, int] = {}
+    counts: dict[str, int] = {}
     for ch in data:
         counts[ch] = counts.get(ch, 0) + 1
     entropy = 0.0
@@ -197,12 +197,10 @@ def _is_placeholder_secret(val: str) -> bool:
         return True
     if ("<" in val and ">" in val) or "${" in val or "{{" in val:
         return True
-    if "xxxx" in low or "000000" in low or "12345678" in low:
-        return True
-    return False
+    return bool("xxxx" in low or "000000" in low or "12345678" in low)
 
 
-def _resolve_trufflehog_binary() -> Optional[str]:
+def _resolve_trufflehog_binary() -> str | None:
     found = shutil.which("trufflehog")
     if found:
         return found
@@ -226,7 +224,7 @@ def _run_native_trufflehog(
     resolved_repo: str,
     repo_root: Path,
     only_verified: bool,
-) -> Optional[List[Dict[str, Any]]]:
+) -> list[dict[str, Any]] | None:
     cmd = [bin_path, "filesystem", "--json", "--no-update"]
     if only_verified:
         cmd.append("--only-verified")
@@ -248,7 +246,7 @@ def _run_native_trufflehog(
     if proc.returncode not in (0, 183):
         return None
 
-    findings: List[Dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
     for raw_line in (proc.stdout or "").splitlines():
         line_s = raw_line.strip()
         if not line_s.startswith("{"):
@@ -313,7 +311,7 @@ def _is_scannable_file(fpath: Path) -> bool:
     return fpath.suffix.lower() in _TEXT_EXTS
 
 
-def _scan_file_offline(repo_root: Path, fpath: Path) -> List[Dict[str, Any]]:
+def _scan_file_offline(repo_root: Path, fpath: Path) -> list[dict[str, Any]]:
     try:
         rel = fpath.relative_to(repo_root).as_posix()
         if fpath.stat().st_size > _MAX_FILE_BYTES:
@@ -323,8 +321,8 @@ def _scan_file_offline(repo_root: Path, fpath: Path) -> List[Dict[str, Any]]:
         return []
 
     noise = is_non_production_noise(rel)
-    out: List[Dict[str, Any]] = []
-    seen: set[Tuple[str, int, str]] = set()
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, str]] = set()
 
     for line_no, line in enumerate(text.splitlines(), start=1):
         for rule_id, title, sev, conf, pat in _SECRET_RULES:
@@ -401,13 +399,13 @@ def _scan_file_offline(repo_root: Path, fpath: Path) -> List[Dict[str, Any]]:
 
 
 def scan_secrets_with_trufflehog(
-    repo_path: Union[Path, str],
+    repo_path: Path | str,
     *,
     embedded: bool = False,
     no_external_scanners: bool = False,
     only_verified: bool = False,
-    target_files: Optional[Sequence[Union[Path, str]]] = None,
-) -> List[Dict[str, Any]]:
+    target_files: Sequence[Path | str] | None = None,
+) -> list[dict[str, Any]]:
     """
     Scans `repo_path` (or strictly `target_files` when supplied for fast `<72h` diff scanning)
     for exposed credentials via native `trufflehog` CLI (when permitted and installed) or
@@ -431,7 +429,7 @@ def scan_secrets_with_trufflehog(
     if only_verified:
         return []
 
-    targets: List[Path] = []
+    targets: list[Path] = []
     if target_files is not None:
         seen_paths: set[Path] = set()
         for raw_f in target_files:
@@ -458,7 +456,7 @@ def scan_secrets_with_trufflehog(
         return []
 
     max_workers = min(8, max(2, os.cpu_count() or 4))
-    findings: List[Dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         for file_hits in pool.map(lambda p: _scan_file_offline(root, p), targets):
             findings.extend(file_hits)

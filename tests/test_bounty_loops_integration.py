@@ -20,15 +20,15 @@ from __future__ import annotations
 
 import ast
 import contextlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -36,20 +36,27 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import bugbounty_mcp_server  # noqa: E402
-from bugbounty_mcp_server import BugBountyMCPServer, TOOLS_SCHEMA, _probe_toolchain_status_safe  # noqa: E402
-from engine.advisory_exporter import _redact_inline_tokens  # noqa: E402
-from engine.async_blackboard_runtime import SqliteBlackboard  # noqa: E402
-from engine.ensemble_orchestrator import EnsembleOrchestrator, evaluate_and_stage_submission  # noqa: E402
-from engine.linux_poc_runner import LinuxPocRunner, probe_optional_backends  # noqa: E402
-from engine.ollama_concurrency_guard import get_shared_ollama_guard  # noqa: E402
-from engine.program_eligibility_db import ProgramEligibilityDB  # noqa: E402
-import revenue_cli  # noqa: E402
+import bugbounty_mcp_server
+import revenue_cli
+from bugbounty_mcp_server import (
+    TOOLS_SCHEMA,
+    BugBountyMCPServer,
+    _probe_toolchain_status_safe,
+)
+from engine.advisory_exporter import _redact_inline_tokens
+from engine.async_blackboard_runtime import SqliteBlackboard
+from engine.ensemble_orchestrator import (
+    EnsembleOrchestrator,
+    evaluate_and_stage_submission,
+)
+from engine.linux_poc_runner import LinuxPocRunner, probe_optional_backends
+from engine.ollama_concurrency_guard import get_shared_ollama_guard
+from engine.program_eligibility_db import ProgramEligibilityDB
 
 
 @contextlib.contextmanager
-def _scoped_env(**updates: Optional[str]):
-    saved: Dict[str, Optional[str]] = {k: os.environ.get(k) for k in updates}
+def _scoped_env(**updates: str | None):
+    saved: dict[str, str | None] = {k: os.environ.get(k) for k in updates}
     try:
         for k, v in updates.items():
             if v is None:
@@ -76,7 +83,7 @@ def _git(repo: Path, *args: str) -> None:
     assert proc.returncode == 0
 
 
-def _init_git_repo(repo: Path, files: Dict[str, str], *, commit_msg: str = "init") -> Path:
+def _init_git_repo(repo: Path, files: dict[str, str], *, commit_msg: str = "init") -> Path:
     repo.mkdir(parents=True, exist_ok=True)
     _git(repo, "init")
     _git(repo, "config", "user.email", "integration@rfchunt.local")
@@ -91,9 +98,9 @@ def _init_git_repo(repo: Path, files: Dict[str, str], *, commit_msg: str = "init
 
 
 @contextlib.contextmanager
-def _ollama_loopback_server(config: Dict[str, Any]):
+def _ollama_loopback_server(config: dict[str, Any]):
     """Real loopback ThreadingHTTPServer speaking Ollama `/api/tags` and `/api/chat`."""
-    state: Dict[str, Any] = {
+    state: dict[str, Any] = {
         "chat_calls": [],
         "inflight": 0,
         "max_inflight": 0,
@@ -101,7 +108,7 @@ def _ollama_loopback_server(config: Dict[str, Any]):
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802
+        def do_GET(self) -> None:
             if self.path.startswith("/api/tags"):
                 models = [{"name": m} for m in config.get("models", ["qwen2.5:7b"])]
                 raw = json.dumps({"models": models}).encode("utf-8")
@@ -114,7 +121,7 @@ def _ollama_loopback_server(config: Dict[str, Any]):
             self.send_response(404)
             self.end_headers()
 
-        def do_POST(self) -> None:  # noqa: N802
+        def do_POST(self) -> None:
             if self.path != "/api/chat":
                 self.send_response(404)
                 self.end_headers()
@@ -123,14 +130,13 @@ def _ollama_loopback_server(config: Dict[str, Any]):
             req_raw = self.rfile.read(length) if length > 0 else b"{}"
             try:
                 req_json = json.loads(req_raw.decode("utf-8"))
-            except Exception:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 req_json = {}
             model = str(req_json.get("model") or "")
 
             with lock:
                 state["inflight"] += 1
-                if state["inflight"] > state["max_inflight"]:
-                    state["max_inflight"] = state["inflight"]
+                state["max_inflight"] = max(state["max_inflight"], state["inflight"])
                 state["chat_calls"].append({"model": model, "ts": time.monotonic()})
 
             try:
@@ -184,7 +190,7 @@ def _ollama_loopback_server(config: Dict[str, Any]):
                 with lock:
                     state["inflight"] -= 1
 
-        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        def log_message(self, format: str, *args: Any) -> None:
             return
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -202,11 +208,11 @@ def _ollama_loopback_server(config: Dict[str, Any]):
 @contextlib.contextmanager
 def _sandbox_target_server():
     """Real loopback ThreadingHTTPServer recording request headers and timestamps."""
-    records: List[Dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802
+        def do_GET(self) -> None:
             with lock:
                 records.append(
                     {
@@ -222,7 +228,7 @@ def _sandbox_target_server():
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        def log_message(self, format: str, *args: Any) -> None:
             return
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -305,7 +311,7 @@ def test_program_eligibility_db_env_override_and_unlock_flip(tmp_path: Path) -> 
 def test_loop3_fast_parallel_ooda_stage1_noise_drop_spawn_pids_and_stage2_under_1s(
     tmp_path: Path,
 ) -> None:
-    files: Dict[str, str] = {}
+    files: dict[str, str] = {}
     for i in range(6):
         files[f"tests/test_noise_{i}.py"] = f"import pickle\npickle.loads(b'{i}')\n"
     for i in range(6):
@@ -356,20 +362,19 @@ def test_loop3_stage3_loopback_ollama_guard_oom_downshift_and_circuit_breaker(
                 "verdict_file": "src/prod_0.py",
                 "chat_delay_sec": 0.02,
             }
-        ) as (endpoint, state):
-            with _scoped_env(OLLAMA_HOST=endpoint, RFCHUNT_OFFLINE=None):
-                orch = EnsembleOrchestrator(
-                    program="common_codes",
-                    embedded=False,
-                    model="gemma-4-12b-abliterated",
-                )
-                res_down = orch.run_fast_parallel_ooda(
-                    repo,
-                    program="common_codes",
-                    blackboard_db=tmp_path / "bb_down.sqlite3",
-                    max_cpu_workers=2,
-                    eligibility_db=elig,
-                )
+        ) as (endpoint, state), _scoped_env(OLLAMA_HOST=endpoint, RFCHUNT_OFFLINE=None):
+            orch = EnsembleOrchestrator(
+                program="common_codes",
+                embedded=False,
+                model="gemma-4-12b-abliterated",
+            )
+            res_down = orch.run_fast_parallel_ooda(
+                repo,
+                program="common_codes",
+                blackboard_db=tmp_path / "bb_down.sqlite3",
+                max_cpu_workers=2,
+                eligibility_db=elig,
+            )
         assert res_down.get("status") == "completed"
         assert state["max_inflight"] <= 1
         assert 1 <= len(state["chat_calls"]) <= 5
@@ -378,23 +383,25 @@ def test_loop3_stage3_loopback_ollama_guard_oom_downshift_and_circuit_breaker(
         assert "qwen2.5:7b" in called_models
 
         guard.reset()
-        with _ollama_loopback_server({"models": ["qwen2.5:7b"], "always_oom": True}) as (
-            ep_oom,
-            _state_oom,
+        with (
+            _ollama_loopback_server({"models": ["qwen2.5:7b"], "always_oom": True}) as (
+                ep_oom,
+                _state_oom,
+            ),
+            _scoped_env(OLLAMA_HOST=ep_oom, RFCHUNT_OFFLINE=None),
         ):
-            with _scoped_env(OLLAMA_HOST=ep_oom, RFCHUNT_OFFLINE=None):
-                orch_oom = EnsembleOrchestrator(
-                    program="common_codes",
-                    embedded=False,
-                    model="qwen2.5:7b",
-                )
-                res_cb = orch_oom.run_fast_parallel_ooda(
-                    repo,
-                    program="common_codes",
-                    blackboard_db=tmp_path / "bb_cb.sqlite3",
-                    max_cpu_workers=2,
-                    eligibility_db=elig,
-                )
+            orch_oom = EnsembleOrchestrator(
+                program="common_codes",
+                embedded=False,
+                model="qwen2.5:7b",
+            )
+            res_cb = orch_oom.run_fast_parallel_ooda(
+                repo,
+                program="common_codes",
+                blackboard_db=tmp_path / "bb_cb.sqlite3",
+                max_cpu_workers=2,
+                eligibility_db=elig,
+            )
         assert res_cb.get("status") == "completed"
         assert len(res_cb.get("facts") or res_cb.get("clusters") or []) >= 1
     finally:

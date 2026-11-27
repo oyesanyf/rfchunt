@@ -18,13 +18,13 @@ from __future__ import annotations
 import ast
 import asyncio
 import gc
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-from pathlib import Path
 import sys
 import threading
 import time
 import warnings
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
@@ -32,43 +32,43 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from bugbounty_mcp_server import (  # noqa: E402
+import revenue_cli
+from bugbounty_mcp_server import (
     BugBountyMCPServer,
     validate_and_stage_hackerone_draft,
 )
-from engine.advisory_exporter import (  # noqa: E402
+from engine.advisory_exporter import (
     AdvisoryExporter,
     _redact_inline_tokens,
     neutralize_csv_cell,
 )
-from engine.async_blackboard_runtime import (  # noqa: E402
+from engine.async_blackboard_runtime import (
     SqliteBlackboard,
     run_local_rfchunt_async,
     run_stage1_cpu_check,
     sync_eligibility_and_stage_unlocks,
 )
-from engine.ensemble_orchestrator import (  # noqa: E402
+from engine.ensemble_orchestrator import (
     EngineFinding,
     EnsembleConsensusVoter,
     EnsembleOrchestrator,
     _finding_from_dict,
     evaluate_and_stage_submission,
 )
-from engine.freshness_watcher import (  # noqa: E402
+from engine.freshness_watcher import (
     AsyncFreshnessPoller,
     FreshnessStateStore,
     FreshnessWatcher,
 )
-from engine.gha_llm_verifier import verify_gha_findings_with_llm  # noqa: E402
-from engine.linux_poc_runner import LinuxPocRunner  # noqa: E402
-from engine.ollama_concurrency_guard import OllamaConcurrencyGuard  # noqa: E402
-from engine.parity_invariant_auditor import filter_production_candidates  # noqa: E402
-from engine.program_eligibility_db import ProgramEligibilityDB  # noqa: E402
-from engine.z3_formal_verifier import (  # noqa: E402
+from engine.gha_llm_verifier import verify_gha_findings_with_llm
+from engine.linux_poc_runner import LinuxPocRunner
+from engine.ollama_concurrency_guard import OllamaConcurrencyGuard
+from engine.parity_invariant_auditor import filter_production_candidates
+from engine.program_eligibility_db import ProgramEligibilityDB
+from engine.z3_formal_verifier import (
     ScopeGateDeniedError,
     run_z3_formal_verification,
 )
-import revenue_cli  # noqa: E402
 
 
 def _make_fake_openai_proj_key() -> str:
@@ -506,16 +506,15 @@ def test_tier5_sqlite_context_manager_wal_checkpoint_no_resource_warnings(tmp_pa
             assert len(bb.list_facts()) == 1
 
         # Exception path still closes cleanly and checkpoints WAL
-        with pytest.raises(RuntimeError, match="boom"):
-            with SqliteBlackboard(bb_db) as bb:
-                bb.add_fact(
-                    source_engine="parity_auditor",
-                    title="Exception path fact",
-                    file_path="src/b.py",
-                    line=9,
-                    severity="HIGH",
-                )
-                raise RuntimeError("boom")
+        with pytest.raises(RuntimeError, match="boom"), SqliteBlackboard(bb_db) as bb:
+            bb.add_fact(
+                source_engine="parity_auditor",
+                title="Exception path fact",
+                file_path="src/b.py",
+                line=9,
+                severity="HIGH",
+            )
+            raise RuntimeError("boom")
 
         # FreshnessStateStore normal + exception lifecycle
         with FreshnessStateStore(fresh_db) as store:
@@ -523,10 +522,9 @@ def test_tier5_sqlite_context_manager_wal_checkpoint_no_resource_warnings(tmp_pa
             store.mark_seen("github:org/repo", "sha-1")
             assert store.is_seen("github:org/repo", "sha-1") is True
 
-        with pytest.raises(ValueError, match="abort"):
-            with FreshnessStateStore(fresh_db) as store:
-                store.mark_seen("github:org/repo", "sha-2")
-                raise ValueError("abort")
+        with pytest.raises(ValueError, match="abort"), FreshnessStateStore(fresh_db) as store:
+            store.mark_seen("github:org/repo", "sha-2")
+            raise ValueError("abort")
 
         # FreshnessWatcher & AsyncFreshnessPoller context manager lifecycle
         with FreshnessWatcher(state_db=fresh_db) as watcher:

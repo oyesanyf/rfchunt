@@ -20,20 +20,20 @@ Solves the three core failure modes in bug bounty & security audit triage:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import shlex
 import subprocess
 import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 from engine.ensemble_whiteboard import (
     EnsembleWhiteboard,
@@ -51,7 +51,7 @@ from engine.linux_poc_runner import (
 )
 
 # Engine reliability weights for independent-family consensus fusion
-ENGINE_WEIGHTS: Dict[str, float] = {
+ENGINE_WEIGHTS: dict[str, float] = {
     "lean4": 0.95,
     "linux_poc": 0.95,
     "z3_formal": 0.92,
@@ -77,7 +77,7 @@ ENGINE_WEIGHTS: Dict[str, float] = {
 }
 
 # Disposition priority order (lower number = higher priority in final report)
-DISPOSITION_RANK: Dict[str, int] = {
+DISPOSITION_RANK: dict[str, int] = {
     "SUBMISSION_READY": 0,
     "ENSEMBLE_CORROBORATED_STATIC": 1,
     "SINGLE_ENGINE_CORROBORATE": 2,
@@ -85,7 +85,7 @@ DISPOSITION_RANK: Dict[str, int] = {
     "HELD_OUT_OF_THREAT_MODEL": 4,
 }
 
-FRESHNESS_RANK: Dict[str, int] = {
+FRESHNESS_RANK: dict[str, int] = {
     "FRESH_UNDER_72H": 0,
     "RECENT_UNDER_14D": 1,
     "STALE_DUPLICATE_RISK": 2,
@@ -93,7 +93,7 @@ FRESHNESS_RANK: Dict[str, int] = {
     "EMBEDDED_OFFLINE": 3,
 }
 
-SEVERITY_RANK: Dict[str, int] = {
+SEVERITY_RANK: dict[str, int] = {
     "CRITICAL": 0,
     "HIGH": 1,
     "MEDIUM": 2,
@@ -110,13 +110,13 @@ class RepoFreshnessSnapshot:
     is_git_repo: bool
     head_commit: str = ""
     head_timestamp_iso: str = ""
-    head_age_hours: Optional[float] = None
+    head_age_hours: float | None = None
     freshness_hours_window: int = 72
     freshness_status: str = "UNKNOWN_FRESHNESS"
-    fresh_files: List[str] = field(default_factory=list)
-    recent_files: List[str] = field(default_factory=list)
+    fresh_files: list[str] = field(default_factory=list)
+    recent_files: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -139,9 +139,9 @@ class EngineFinding:
     target_os_required: str = ""  # e.g. "macos", "android", "windows", "linux"
     non_production_noise: bool = False
     poc_verified: bool = False
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -163,7 +163,7 @@ def _finding_from_dict(d: Any, default_engine: str = "") -> EngineFinding:
     if not isinstance(d, dict):
         return EngineFinding(engine=default_engine or "unknown", title=str(d or ""))
     raw_meta = d.get("metadata")
-    meta: Dict[str, Any] = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+    meta: dict[str, Any] = dict(raw_meta) if isinstance(raw_meta, dict) else {}
     eff_noise = bool(d.get("non_production_noise", False)) or bool(meta.get("non_production_noise", False))
     if eff_noise and "non_production_noise" not in meta:
         meta["non_production_noise"] = True
@@ -204,10 +204,10 @@ class ThreatModelVerdict:
 
     program: str
     passed: bool
-    matched_rules: List[str] = field(default_factory=list)
-    reasons: List[str] = field(default_factory=list)
+    matched_rules: list[str] = field(default_factory=list)
+    reasons: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -222,7 +222,7 @@ class EnsembleCluster:
     line: int
     cwe_family: str
     severity: str
-    engines: List[str]
+    engines: list[str]
     engine_count: int
     ensemble_confidence: float
     disposition: str
@@ -236,23 +236,23 @@ class EnsembleCluster:
     )
     poc_verified: bool = False
     poc_target_os: str = ""
-    poc_transcript: Optional[Dict[str, Any]] = None
-    atlas_techniques: List[str] = field(default_factory=list)
+    poc_transcript: dict[str, Any] | None = None
+    atlas_techniques: list[str] = field(default_factory=list)
     summary: str = ""
-    member_findings: List[Dict[str, Any]] = field(default_factory=list)
+    member_findings: list[dict[str, Any]] = field(default_factory=list)
     gha_class: str = ""
     attack_chain_id: str = ""
-    attack_chain_steps: List[str] = field(default_factory=list)
-    related_clusters: List[str] = field(default_factory=list)
-    lean_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
-    counterexamples: List[Dict[str, Any]] = field(default_factory=list)
-    whiteboard_hypothesis_ids: List[str] = field(default_factory=list)
+    attack_chain_steps: list[str] = field(default_factory=list)
+    related_clusters: list[str] = field(default_factory=list)
+    lean_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    counterexamples: list[dict[str, Any]] = field(default_factory=list)
+    whiteboard_hypothesis_ids: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         return d
 
-    def to_sarif_result(self) -> Dict[str, Any]:
+    def to_sarif_result(self) -> dict[str, Any]:
         level_map = {
             "CRITICAL": "error",
             "HIGH": "error",
@@ -260,7 +260,7 @@ class EnsembleCluster:
             "LOW": "note",
             "INFO": "note",
         }
-        props: Dict[str, Any] = {
+        props: dict[str, Any] = {
             "cluster_id": self.cluster_id,
             "disposition": self.disposition,
             "freshness_status": self.freshness_status,
@@ -318,18 +318,18 @@ class EnsembleReport:
     program: str
     quorum: int
     freshness: RepoFreshnessSnapshot
-    clusters: List[EnsembleCluster] = field(default_factory=list)
-    counts_by_disposition: Dict[str, int] = field(default_factory=dict)
-    whiteboard: Dict[str, Any] = field(default_factory=dict)
-    lean_verification: Dict[str, Any] = field(default_factory=dict)
-    toolchain_status: Dict[str, Any] = field(default_factory=dict)
-    proxy: Optional[str] = None
-    all_scan_summary: Optional[Dict[str, Any]] = None
+    clusters: list[EnsembleCluster] = field(default_factory=list)
+    counts_by_disposition: dict[str, int] = field(default_factory=dict)
+    whiteboard: dict[str, Any] = field(default_factory=dict)
+    lean_verification: dict[str, Any] = field(default_factory=dict)
+    toolchain_status: dict[str, Any] = field(default_factory=dict)
+    proxy: str | None = None
+    all_scan_summary: dict[str, Any] | None = None
     generated_at_utc: str = field(
-        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+        default_factory=lambda: datetime.now(UTC).isoformat()
     )
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "target": self.target,
             "program": self.program,
@@ -346,7 +346,7 @@ class EnsembleReport:
             "all_scan_summary": self.all_scan_summary,
         }
 
-    def to_sarif(self) -> Dict[str, Any]:
+    def to_sarif(self) -> dict[str, Any]:
         level_map = {
             "CRITICAL": "error",
             "HIGH": "error",
@@ -354,8 +354,8 @@ class EnsembleReport:
             "LOW": "note",
             "INFO": "note",
         }
-        rules_by_id: Dict[str, Dict[str, Any]] = {}
-        results: List[Dict[str, Any]] = []
+        rules_by_id: dict[str, dict[str, Any]] = {}
+        results: list[dict[str, Any]] = []
         for c in self.clusters:
             res = c.to_sarif_result()
             rid = res["ruleId"]
@@ -416,7 +416,7 @@ def _norm_cwe_family(cwe: str, title: str = "") -> str:
     return clean or "GENERIC"
 
 
-def _classify_age_hours(age_hours: Optional[float], freshness_hours: int = 72) -> str:
+def _classify_age_hours(age_hours: float | None, freshness_hours: int = 72) -> str:
     if age_hours is None:
         return "UNKNOWN_FRESHNESS"
     if age_hours <= float(freshness_hours):
@@ -427,9 +427,9 @@ def _classify_age_hours(age_hours: Optional[float], freshness_hours: int = 72) -
 
 
 def inspect_repo_freshness(
-    repo_path: Union[str, Path],
+    repo_path: str | Path,
     freshness_hours: int = 72,
-    now_epoch: Optional[float] = None,
+    now_epoch: float | None = None,
 ) -> RepoFreshnessSnapshot:
     """
     Stage 0: Inspects local git history (read-only, `shell=False`) to classify HEAD age
@@ -475,7 +475,7 @@ def inspect_repo_freshness(
     )
     head_commit = ""
     head_iso = ""
-    head_age_hours: Optional[float] = None
+    head_age_hours: float | None = None
     now_ts = float(now_epoch if now_epoch is not None else time.time())
     if head_proc.returncode == 0 and "|" in head_proc.stdout.strip():
         parts = head_proc.stdout.strip().split("|", 2)
@@ -487,7 +487,7 @@ def inspect_repo_freshness(
         except ValueError:
             head_age_hours = None
 
-    def _files_since(hours: int) -> List[str]:
+    def _files_since(hours: int) -> list[str]:
         since_epoch = int(max(0.0, now_ts - hours * 3600.0))
         proc = silent_subprocess_run(
             [
@@ -507,8 +507,8 @@ def inspect_repo_freshness(
         )
         if proc.returncode != 0:
             return []
-        seen: Set[str] = set()
-        out: List[str] = []
+        seen: set[str] = set()
+        out: list[str] = []
         for line in proc.stdout.splitlines():
             norm = _norm_path(line)
             if norm and norm not in seen:
@@ -550,8 +550,8 @@ def evaluate_vendor_threat_model(
     """
     prog = (program or "generic").strip().lower()
     blob = f"{title} {summary} {file_path}".lower()
-    matched_rules: List[str] = []
-    reasons: List[str] = []
+    matched_rules: list[str] = []
+    reasons: list[str] = []
 
     # Universal OS-runtime fidelity check (e.g. macOS APFS/Seatbelt #4235906, Android WebView)
     req_os = (target_os_required or "").strip().lower()
@@ -688,12 +688,11 @@ def evaluate_vendor_threat_model(
             matched_rules.append("AMAZONVRP_HYGIENE_NON_BOUNDARY")
             reasons.append("Amazon VRP excludes hygiene-only findings without a concrete security impact.")
 
-    elif prog == "temu":
-        if any(k in blob for k in ("hygiene_only", "self-xss", "self xss", "scanner noise only")):
-            matched_rules.append("TEMU_OUT_OF_SCOPE")
-            reasons.append(
-                "Temu BBP excludes hygiene-only findings, self-XSS, and unverified scanner noise."
-            )
+    elif prog == "temu" and any(k in blob for k in ("hygiene_only", "self-xss", "self xss", "scanner noise only")):
+        matched_rules.append("TEMU_OUT_OF_SCOPE")
+        reasons.append(
+            "Temu BBP excludes hygiene-only findings, self-XSS, and unverified scanner noise."
+        )
 
     passed = len(reasons) == 0
     return ThreatModelVerdict(
@@ -706,7 +705,7 @@ def evaluate_vendor_threat_model(
 
 def _compute_ensemble_confidence(findings: Sequence[EngineFinding]) -> float:
     """Computes independent-engine calibrated probability `1 - prod(1 - w_i)`."""
-    by_engine: Dict[str, float] = {}
+    by_engine: dict[str, float] = {}
     for f in findings:
         if not f.confirmed:
             continue
@@ -737,12 +736,12 @@ def _strongest_severity(findings: Sequence[EngineFinding]) -> str:
     return best
 
 
-def _correlate_gha_attack_chains(clusters: List[EnsembleCluster]) -> None:
+def _correlate_gha_attack_chains(clusters: list[EnsembleCluster]) -> None:
     """
     Post-clustering GHA multi-step attack-chain correlator: links distinct GHA classes
     within the same workflow (or cross-workflow artifact poisoning) into shared attack chains.
     """
-    by_file: Dict[str, List[EnsembleCluster]] = {}
+    by_file: dict[str, list[EnsembleCluster]] = {}
     for c in clusters:
         if c.gha_class:
             by_file.setdefault(_norm_path(c.file_path), []).append(c)
@@ -760,7 +759,7 @@ def _correlate_gha_attack_chains(clusters: List[EnsembleCluster]) -> None:
             continue
         ordered = sorted(file_clusters, key=lambda c: (c.line, c.gha_class))
         steps = [f"{c.gha_class} (line {max(1, c.line)})" for c in ordered]
-        chain_id = "CHAIN-" + hashlib.sha256(f"{norm_file}|{'|'.join(steps)}".encode("utf-8")).hexdigest()[:10].upper()
+        chain_id = "CHAIN-" + hashlib.sha256(f"{norm_file}|{'|'.join(steps)}".encode()).hexdigest()[:10].upper()
         all_ids = [c.cluster_id for c in ordered]
         for c in ordered:
             c.attack_chain_id = chain_id
@@ -803,9 +802,9 @@ class EnsembleConsensusVoter:
         self,
         findings: Sequence[EngineFinding],
         *,
-        freshness: Optional[RepoFreshnessSnapshot] = None,
-        poc_transcripts: Optional[Dict[str, VerifiableTranscript]] = None,
-    ) -> List[EnsembleCluster]:
+        freshness: RepoFreshnessSnapshot | None = None,
+        poc_transcripts: dict[str, VerifiableTranscript] | None = None,
+    ) -> list[EnsembleCluster]:
         """
         Fuses findings into ranked `EnsembleCluster` objects using proximity-based line
         clustering within `(normalized_path, family)` (using canonical `gha_class` when
@@ -814,15 +813,15 @@ class EnsembleConsensusVoter:
         `poc_transcripts` maps either cluster `fingerprint`, `file_path`, or `"*"` to a
         `VerifiableTranscript` produced by `LinuxPocRunner` (or target-OS runner).
         """
-        by_file_fam: Dict[Tuple[str, str], List[EngineFinding]] = {}
+        by_file_fam: dict[tuple[str, str], list[EngineFinding]] = {}
         for f in findings:
             key = (_norm_path(f.file_path), self._cluster_family(f))
             by_file_fam.setdefault(key, []).append(f)
 
-        grouped: Dict[str, List[EngineFinding]] = {}
+        grouped: dict[str, list[EngineFinding]] = {}
         for (norm_p, fam), items in by_file_fam.items():
             items_sorted = sorted(items, key=lambda x: int(x.line or 0))
-            subclusters: List[Tuple[int, List[EngineFinding]]] = []
+            subclusters: list[tuple[int, list[EngineFinding]]] = []
             for item in items_sorted:
                 ln = int(item.line or 0)
                 if subclusters and abs(ln - subclusters[-1][0]) <= self.line_bucket_size:
@@ -838,7 +837,7 @@ class EnsembleConsensusVoter:
         default_freshness = freshness.freshness_status if freshness else "UNKNOWN_FRESHNESS"
         transcripts = poc_transcripts or {}
 
-        clusters: List[EnsembleCluster] = []
+        clusters: list[EnsembleCluster] = []
         for fp, members in grouped.items():
             # Determine deterministic / Lean 4 witness presence and LLM dissent
             has_deterministic_confirmed = any(
@@ -854,14 +853,11 @@ class EnsembleConsensusVoter:
 
             confirmed_engines = sorted({m.engine.lower() for m in members if m.confirmed})
             all_engines = sorted({m.engine.lower() for m in members})
-            primary = sorted(
-                members,
-                key=lambda m: (
+            primary = min(members, key=lambda m: (
                     0 if (m.deterministic and m.confirmed) else (1 if m.confirmed else 2),
                     SEVERITY_RANK.get((m.severity or "MEDIUM").upper(), 2),
                     -float(m.confidence),
-                ),
-            )[0]
+                ))
 
             norm_file = _norm_path(primary.file_path)
             changed_in_fresh = bool(norm_file and norm_file in fresh_set)
@@ -906,16 +902,18 @@ class EnsembleConsensusVoter:
 
             # Production noise check (preserves Lean 4 deterministic confirmations and poc_verified=True)
             try:
-                from engine.parity_invariant_auditor import is_non_production_noise as _is_noise_fn
-            except Exception:
+                from engine.parity_invariant_auditor import (
+                    is_non_production_noise as _is_noise_fn,
+                )
+            except ImportError:
                 _is_noise_fn = None
 
-            def _is_member_noise(m: EngineFinding) -> bool:
+            def _is_member_noise(m: EngineFinding, _noise_fn: Any = _is_noise_fn) -> bool:
                 meta = m.metadata if isinstance(m.metadata, dict) else {}
                 if bool(getattr(m, "non_production_noise", False)) or bool(meta.get("non_production_noise", False)):
                     return True
-                if _is_noise_fn is not None:
-                    return bool(_is_noise_fn(m.file_path, meta, rule_id=m.rule_id, summary=m.summary))
+                if _noise_fn is not None:
+                    return bool(_noise_fn(m.file_path, meta, rule_id=m.rule_id, summary=m.summary))
                 return False
 
             all_members_noise = bool(members) and all(_is_member_noise(m) for m in members)
@@ -946,7 +944,7 @@ class EnsembleConsensusVoter:
                 ),
                 "",
             )
-            chain_steps: List[str] = []
+            chain_steps: list[str] = []
             for m in members:
                 if isinstance(m.metadata, dict) and isinstance(m.metadata.get("attack_chain_steps"), list):
                     for s in m.metadata["attack_chain_steps"]:
@@ -1000,7 +998,7 @@ class EnsembleConsensusVoter:
         return clusters
 
 
-def _embedded_toolchain_status() -> Dict[str, Dict[str, Any]]:
+def _embedded_toolchain_status() -> dict[str, dict[str, Any]]:
     """Zero-subprocess toolchain availability map used in `embedded=True` offline mode."""
     backends = (
         "docker",
@@ -1033,7 +1031,7 @@ def _classify_finding_domain(f: EngineFinding) -> str:
     meta = f.metadata if isinstance(f.metadata, dict) else {}
     cwe_l = (f.cwe or "").lower()
     rule_u = (f.rule_id or "").upper()
-    blob = " ".join((f.rule_id, f.cwe, f.title, f.summary, f.file_path)).lower()
+    blob = f"{f.rule_id} {f.cwe} {f.title} {f.summary} {f.file_path}".lower()
 
     if (
         "cwe-444" in cwe_l
@@ -1074,17 +1072,17 @@ def _classify_finding_domain(f: EngineFinding) -> str:
 
 
 def _dedup_lean_diagnostics(
-    diags: Sequence[Dict[str, Any]],
+    diags: Sequence[dict[str, Any]],
     *,
     include_branch_summary: bool = True,
-) -> List[Dict[str, Any]]:
-    seen: Set[Tuple[Any, ...]] = set()
-    out: List[Dict[str, Any]] = []
+) -> list[dict[str, Any]]:
+    seen: set[tuple[Any, ...]] = set()
+    out: list[dict[str, Any]] = []
     for d in diags:
         if not isinstance(d, dict):
             continue
         if include_branch_summary:
-            key: Tuple[Any, ...] = (
+            key: tuple[Any, ...] = (
                 d.get("module"),
                 d.get("theorem"),
                 d.get("line"),
@@ -1104,9 +1102,9 @@ def _dedup_lean_diagnostics(
     return out
 
 
-def _dedup_lean_counterexamples(ces: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen: Set[Tuple[Any, ...]] = set()
-    out: List[Dict[str, Any]] = []
+def _dedup_lean_counterexamples(ces: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[Any, ...]] = set()
+    out: list[dict[str, Any]] = []
     for c in ces:
         if not isinstance(c, dict):
             continue
@@ -1122,7 +1120,7 @@ def _dedup_lean_counterexamples(ces: Sequence[Dict[str, Any]]) -> List[Dict[str,
     return out
 
 
-def _normalize_command_tokens(raw_cmd: Optional[Union[str, Sequence[str]]]) -> Optional[List[str]]:
+def _normalize_command_tokens(raw_cmd: str | Sequence[str] | None) -> list[str] | None:
     if raw_cmd is None:
         return None
     if isinstance(raw_cmd, str):
@@ -1138,7 +1136,7 @@ def _normalize_command_tokens(raw_cmd: Optional[Union[str, Sequence[str]]]) -> O
 
 
 def _append_unique_lean_finding(
-    findings: List[EngineFinding],
+    findings: list[EngineFinding],
     candidate: EngineFinding,
 ) -> None:
     """
@@ -1154,40 +1152,44 @@ def _append_unique_lean_finding(
             continue
         ex_path = _norm_path(existing.file_path)
         ex_fam = EnsembleConsensusVoter._cluster_family(existing)
-        if ex_path == cand_path and ex_fam == cand_fam and abs(int(existing.line or 0) - int(candidate.line or 0)) <= 15:
-            if not cand_rule or (existing.rule_id or "") == cand_rule or cand_rule.startswith("LEAN-"):
-                ex_meta = existing.metadata if isinstance(existing.metadata, dict) else {}
-                c_meta = candidate.metadata if isinstance(candidate.metadata, dict) else {}
-                if c_meta.get("lean_counterexamples"):
-                    merged_ce = list(ex_meta.get("lean_counterexamples") or [])
-                    merged_ce.extend(c_meta["lean_counterexamples"])
-                    ex_meta["lean_counterexamples"] = _dedup_lean_counterexamples(merged_ce)
-                if c_meta.get("lean_diagnostic") or c_meta.get("lean_diagnostics"):
-                    merged_diag: List[Dict[str, Any]] = []
-                    if isinstance(ex_meta.get("lean_diagnostics"), list):
-                        merged_diag.extend(ex_meta["lean_diagnostics"])
-                    elif isinstance(ex_meta.get("lean_diagnostic"), dict):
-                        merged_diag.append(ex_meta["lean_diagnostic"])
-                    if isinstance(c_meta.get("lean_diagnostics"), list):
-                        merged_diag.extend(c_meta["lean_diagnostics"])
-                    if isinstance(c_meta.get("lean_diagnostic"), dict):
-                        merged_diag.append(c_meta["lean_diagnostic"])
-                    ex_meta["lean_diagnostics"] = _dedup_lean_diagnostics(
-                        merged_diag, include_branch_summary=True
-                    )
-                existing.metadata = ex_meta
-                existing.deterministic = True
-                existing.confirmed = True
-                return
+        if (
+            ex_path == cand_path
+            and ex_fam == cand_fam
+            and abs(int(existing.line or 0) - int(candidate.line or 0)) <= 15
+            and (not cand_rule or (existing.rule_id or "") == cand_rule or cand_rule.startswith("LEAN-"))
+        ):
+            ex_meta = existing.metadata if isinstance(existing.metadata, dict) else {}
+            c_meta = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+            if c_meta.get("lean_counterexamples"):
+                merged_ce = list(ex_meta.get("lean_counterexamples") or [])
+                merged_ce.extend(c_meta["lean_counterexamples"])
+                ex_meta["lean_counterexamples"] = _dedup_lean_counterexamples(merged_ce)
+            if c_meta.get("lean_diagnostic") or c_meta.get("lean_diagnostics"):
+                merged_diag: list[dict[str, Any]] = []
+                if isinstance(ex_meta.get("lean_diagnostics"), list):
+                    merged_diag.extend(ex_meta["lean_diagnostics"])
+                elif isinstance(ex_meta.get("lean_diagnostic"), dict):
+                    merged_diag.append(ex_meta["lean_diagnostic"])
+                if isinstance(c_meta.get("lean_diagnostics"), list):
+                    merged_diag.extend(c_meta["lean_diagnostics"])
+                if isinstance(c_meta.get("lean_diagnostic"), dict):
+                    merged_diag.append(c_meta["lean_diagnostic"])
+                ex_meta["lean_diagnostics"] = _dedup_lean_diagnostics(
+                    merged_diag, include_branch_summary=True
+                )
+            existing.metadata = ex_meta
+            existing.deterministic = True
+            existing.confirmed = True
+            return
     findings.append(candidate)
 
 
 def _evaluate_lean_domains_embedded(
     findings: Sequence[EngineFinding],
     *,
-    repo_path: Optional[Path],
+    repo_path: Path | None,
     lean_dir: Path,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Zero-subprocess Lean 4 domain evaluation for `embedded=True` mode using pure-Python
     `audit_lean_file` and isomorphic Python mirrors (`oracle=None`).
@@ -1222,7 +1224,7 @@ def _evaluate_lean_domains_embedded(
         "diagnostics": [],
     }
 
-    checks: List[LeanCounterexample] = []
+    checks: list[LeanCounterexample] = []
     # Force pure-Python mirror resolution even if a compiled oracle binary exists under `lean_dir`.
     mirror_lean_dir = Path("__embedded_python_mirror__")
     # Evaluate baseline self-checks via pure Python mirror (oracle=None, zero subprocesses)
@@ -1256,7 +1258,7 @@ def _evaluate_lean_domains_embedded(
         )
     )
 
-    extra_diags: List[LeanProofDiagnostic] = []
+    extra_diags: list[LeanProofDiagnostic] = []
     for f in findings:
         dom = _classify_finding_domain(f)
         meta = f.metadata if isinstance(f.metadata, dict) else {}
@@ -1298,7 +1300,9 @@ def _evaluate_lean_domains_embedded(
                     )
                 )
         elif dom == "policy_guard":
-            from engine.lean_formal_verifier import _coerce_strict_bool as _lean_strict_bool
+            from engine.lean_formal_verifier import (
+                _coerce_strict_bool as _lean_strict_bool,
+            )
 
             pg = meta.get("policy_guard") if isinstance(meta.get("policy_guard"), dict) else {}
             try:
@@ -1319,7 +1323,7 @@ def _evaluate_lean_domains_embedded(
                         )
                     )
                 else:
-                    blob_l = " ".join((f.rule_id, f.cwe, f.title, f.summary, f.file_path)).lower()
+                    blob_l = f"{f.rule_id} {f.cwe} {f.title} {f.summary} {f.file_path}".lower()
                     is_active = _lean_strict_bool(f.confirmed, field_name="confirmed")
                     if any(kw in blob_l for kw in ("llm_dissent", "override_immunity", "deterministic_confirmation")):
                         obs_rec = (
@@ -1418,7 +1422,7 @@ def _evaluate_lean_domains_embedded(
                 )
 
     domains_order = ["http_framing", "policy_guard", "dotnet_pe"]
-    domain_checks: Dict[str, Dict[str, Any]] = {}
+    domain_checks: dict[str, dict[str, Any]] = {}
     for dom in domains_order:
         dom_items = [c for c in checks if c.domain == dom]
         dom_v = sum(1 for c in dom_items if c.violated)
@@ -1460,15 +1464,15 @@ class EnsembleOrchestrator:
         quorum: int = 2,
         exhaustive_default: bool = True,
         embedded: bool = False,
-        model: Optional[str] = None,
-        enable_llm_verify: Optional[bool] = None,
+        model: str | None = None,
+        enable_llm_verify: bool | None = None,
         gha_only: bool = False,
         no_external_scanners: bool = False,
-        proxy: Optional[str] = None,
+        proxy: str | None = None,
         max_whiteboard_rounds: int = 2,
         enable_whiteboard: bool = True,
-        db: Optional[Any] = None,
-        lean_dir: Optional[Union[str, Path]] = None,
+        db: Any | None = None,
+        lean_dir: str | Path | None = None,
         max_workers: int = 4,
     ) -> None:
         self.program = (program or "generic").strip().lower()
@@ -1494,21 +1498,21 @@ class EnsembleOrchestrator:
             else (Path(__file__).resolve().parent.parent / "formal" / "lean4")
         )
         self.max_workers = max(1, int(max_workers))
-        self.last_telemetry: Dict[str, Any] = {}
+        self.last_telemetry: dict[str, Any] = {}
 
     @staticmethod
     def run_exhaustive_local_engines(
-        repo_path: Union[str, Path],
+        repo_path: str | Path,
         *,
         refresh_stix: bool = True,
         embedded: bool = False,
-        model: Optional[str] = None,
-        enable_llm_verify: Optional[bool] = None,
+        model: str | None = None,
+        enable_llm_verify: bool | None = None,
         gha_only: bool = False,
         no_external_scanners: bool = False,
-        lean_dir: Optional[Union[str, Path]] = None,
+        lean_dir: str | Path | None = None,
         program: str = "generic",
-    ) -> Tuple[List[EngineFinding], Dict[str, Any]]:
+    ) -> tuple[list[EngineFinding], dict[str, Any]]:
         """
         Default exhaustive multi-engine local fan-out (bounded ThreadPoolExecutor).
         Runs all available RFCHunt local static & formal engines concurrently:
@@ -1531,15 +1535,15 @@ class EnsembleOrchestrator:
             if lean_dir is not None
             else (Path(__file__).resolve().parent.parent / "formal" / "lean4")
         )
-        collected: List[EngineFinding] = []
-        telemetry: Dict[str, Any] = {
+        collected: list[EngineFinding] = []
+        telemetry: dict[str, Any] = {
             "embedded": bool(embedded),
             "gha_only": bool(gha_only),
             "no_external_scanners": bool(no_external_scanners),
             "engines_executed": [],
         }
 
-        def _run_zizmor() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+        def _run_zizmor() -> tuple[str, list[EngineFinding], dict[str, Any]]:
             from engine.gha_workflow_scanners import run_zizmor_scan
 
             res = run_zizmor_scan(root, embedded=skip_external_bins)
@@ -1556,7 +1560,7 @@ class EnsembleOrchestrator:
                 },
             )
 
-        def _run_actionlint() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+        def _run_actionlint() -> tuple[str, list[EngineFinding], dict[str, Any]]:
             from engine.gha_workflow_scanners import run_actionlint_scan
 
             res = run_actionlint_scan(root, embedded=skip_external_bins)
@@ -1573,7 +1577,7 @@ class EnsembleOrchestrator:
                 },
             )
 
-        def _run_web_llm_atlas() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+        def _run_web_llm_atlas() -> tuple[str, list[EngineFinding], dict[str, Any]]:
             if not root.is_dir():
                 return ("web_llm+atlas_stix", [], {"status": "skipped_non_dir"})
             from engine.web_llm_auditor import (
@@ -1583,7 +1587,7 @@ class EnsembleOrchestrator:
 
             rep = audit_web_llm_repository(root)
             enr = enrich_web_llm_report_with_atlas(rep, refresh_stix=eff_refresh_stix)
-            out: List[EngineFinding] = []
+            out: list[EngineFinding] = []
             for item in enr.get("enriched_findings", []):
                 out.append(
                     EngineFinding(
@@ -1611,7 +1615,7 @@ class EnsembleOrchestrator:
                 },
             )
 
-        def _run_lean4() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+        def _run_lean4() -> tuple[str, list[EngineFinding], dict[str, Any]]:
             if embedded:
                 return ("lean4", [], {"status": "skipped_embedded"})
             if not eff_lean_dir.is_dir():
@@ -1628,7 +1632,7 @@ class EnsembleOrchestrator:
             )
             ws = dom_rep.workspace_report or {}
             ws_status = str(ws.get("status") or "unknown")
-            emitted: List[EngineFinding] = []
+            emitted: list[EngineFinding] = []
 
             if ws_status in ("proof_integrity_violation", "kernel_failed"):
                 for diag in dom_rep.diagnostics:
@@ -1703,7 +1707,7 @@ class EnsembleOrchestrator:
                 },
             )
 
-        def _run_semgrep_raptor() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+        def _run_semgrep_raptor() -> tuple[str, list[EngineFinding], dict[str, Any]]:
             if embedded:
                 return ("raptor_semgrep", [], {"status": "skipped_embedded"})
             if no_external_scanners:
@@ -1726,7 +1730,7 @@ class EnsembleOrchestrator:
                 errors="replace",
                 timeout=180.0,
             )
-            out: List[EngineFinding] = []
+            out: list[EngineFinding] = []
             try:
                 data = json.loads(proc.stdout or "{}")
                 for r in data.get("results") or []:
@@ -1749,11 +1753,11 @@ class EnsembleOrchestrator:
                             rule_id=str(r.get("check_id") or ""),
                         )
                     )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 return ("raptor_semgrep", [], {"status": f"parse_error:{exc}"})
             return ("raptor_semgrep", out, {"status": "completed", "findings": len(out)})
 
-        def _run_gha_agent_auditor() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+        def _run_gha_agent_auditor() -> tuple[str, list[EngineFinding], dict[str, Any]]:
             from engine.gha_agent_auditor import audit_gha_workflows
 
             gfindings = audit_gha_workflows(root)
@@ -1781,14 +1785,14 @@ class EnsembleOrchestrator:
             ]
             return ("gha_agent", out, {"findings": len(out)})
 
-        def _run_rea() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+        def _run_rea() -> tuple[str, list[EngineFinding], dict[str, Any]]:
             # `run_rea_hook` runs pure-Python static JS/Electron surface inspection
             # (`use_rea_cli=False`, zero subprocesses / external binaries), safe in `embedded=True`.
             if not root.exists():
                 return ("rea", [], {"status": "target_not_found", "findings": 0, "zero_subprocess": True})
             try:
                 hook_res = run_rea_hook(root)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 return (
                     "rea",
                     [],
@@ -1814,7 +1818,7 @@ class EnsembleOrchestrator:
                         "zero_subprocess": True,
                     },
                 )
-            out: List[EngineFinding] = []
+            out: list[EngineFinding] = []
             for rf in hook_res.get("findings") or []:
                 if not isinstance(rf, dict):
                     continue
@@ -1857,7 +1861,7 @@ class EnsembleOrchestrator:
                 },
             )
 
-        def _run_trufflehog() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+        def _run_trufflehog() -> tuple[str, list[EngineFinding], dict[str, Any]]:
             if not root.is_dir():
                 return ("trufflehog", [], {"status": "skipped_non_dir"})
             from engine.trufflehog_scanner import scan_secrets_with_trufflehog
@@ -1870,7 +1874,7 @@ class EnsembleOrchestrator:
             out = [_finding_from_dict(item, default_engine="trufflehog") for item in (raw or ())]
             return ("trufflehog", out, {"status": "completed", "findings": len(out)})
 
-        def _run_mobile_mobsf() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+        def _run_mobile_mobsf() -> tuple[str, list[EngineFinding], dict[str, Any]]:
             if not root.is_dir():
                 return ("mobile_mobsf", [], {"status": "skipped_non_dir"})
             from engine.mobile_app_auditor import audit_mobile_app
@@ -1883,7 +1887,7 @@ class EnsembleOrchestrator:
             out = [_finding_from_dict(item, default_engine="mobile_mobsf") for item in (raw or ())]
             return ("mobile_mobsf", out, {"status": "completed", "findings": len(out)})
 
-        def _run_api_jwt_sdjwt() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+        def _run_api_jwt_sdjwt() -> tuple[str, list[EngineFinding], dict[str, Any]]:
             if not root.is_dir():
                 return ("api_jwt_sdjwt", [], {"status": "skipped_non_dir"})
             from engine.api_jwt_sdjwt_auditor import audit_api_and_jwt
@@ -1898,7 +1902,7 @@ class EnsembleOrchestrator:
             out = [_finding_from_dict(item, default_engine="api_jwt_sdjwt") for item in (raw or ())]
             return ("api_jwt_sdjwt", out, {"status": "completed", "findings": len(out)})
 
-        def _run_ai_infra_guard() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+        def _run_ai_infra_guard() -> tuple[str, list[EngineFinding], dict[str, Any]]:
             if not root.is_dir():
                 return ("ai_infra_guard", [], {"status": "skipped_non_dir"})
             from engine.ai_infra_guard_auditor import audit_ai_infra
@@ -1907,7 +1911,7 @@ class EnsembleOrchestrator:
             out = [_finding_from_dict(item, default_engine="ai_infra_guard") for item in (raw or ())]
             return ("ai_infra_guard", out, {"status": "completed", "findings": len(out)})
 
-        def _run_parity_auditor() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+        def _run_parity_auditor() -> tuple[str, list[EngineFinding], dict[str, Any]]:
             if not root.is_dir():
                 return ("parity_auditor", [], {"status": "skipped_non_dir"})
             from engine.parity_invariant_auditor import audit_parity_and_invariants
@@ -1916,10 +1920,10 @@ class EnsembleOrchestrator:
             out = [_finding_from_dict(item, default_engine="parity_auditor") for item in (raw or ())]
             return ("parity_auditor", out, {"status": "completed", "findings": len(out)})
 
-        def _run_z3_formal() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+        def _run_z3_formal() -> tuple[str, list[EngineFinding], dict[str, Any]]:
             if not root.is_dir():
                 return ("z3_formal", [], {"status": "skipped_non_dir"})
-            discovered: Dict[str, List[Path]] = {"openapi": [], "iam": [], "state_machine": []}
+            discovered: dict[str, list[Path]] = {"openapi": [], "iam": [], "state_machine": []}
             scanned = 0
             for cur_root, dirnames, filenames in os.walk(root):
                 dirnames[:] = [
@@ -1995,7 +1999,7 @@ class EnsembleOrchestrator:
                     telemetry["engines_executed"].append(eng_name)
                     telemetry[eng_name] = info
                     collected.extend(eng_findings)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     telemetry.setdefault("errors", []).append(str(exc))
 
         if eff_llm_verify:
@@ -2025,16 +2029,16 @@ class EnsembleOrchestrator:
         self,
         hyp: WhiteboardHypothesis,
         *,
-        finding: Optional[EngineFinding],
+        finding: EngineFinding | None,
         target_p: Path,
         target_str: str,
-        eff_poc_lang: Optional[str],
-        eff_poc_cmd: Optional[Union[str, Sequence[str]]],
-        oracle: Optional[Any],
+        eff_poc_lang: str | None,
+        eff_poc_cmd: str | Sequence[str] | None,
+        oracle: Any | None,
         whiteboard: EnsembleWhiteboard,
         round_idx: int,
         worker_idx: int,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Executes a single non-destructive verification worker task."""
         worker_id = f"worker-{round_idx}-{worker_idx}"
         whiteboard.update_status(
@@ -2058,7 +2062,7 @@ class EnsembleOrchestrator:
                     command=list(norm_poc_cmd),
                     image="",
                     repo_path=target_str,
-                    started_at_utc=datetime.now(timezone.utc).isoformat(),
+                    started_at_utc=datetime.now(UTC).isoformat(),
                     elapsed_ms=0.0,
                     remediation_hint=msg_p if not ok_p else (msg_c if not ok_c else "Skipped in embedded=True mode."),
                 )
@@ -2077,7 +2081,7 @@ class EnsembleOrchestrator:
                     command=list(norm_poc_cmd),
                     image="",
                     repo_path=target_str,
-                    started_at_utc=datetime.now(timezone.utc).isoformat(),
+                    started_at_utc=datetime.now(UTC).isoformat(),
                     elapsed_ms=0.0,
                     remediation_hint=f"Target directory does not exist: {target_str}",
                 )
@@ -2125,7 +2129,7 @@ class EnsembleOrchestrator:
 
             counterexamples = []
             witness_evaluated = False
-            invalid_error: Optional[str] = None
+            invalid_error: str | None = None
             try:
                 if hyp.domain == "http_framing":
                     hf_meta = meta.get("http_framing") if isinstance(meta.get("http_framing"), dict) else {}
@@ -2168,7 +2172,9 @@ class EnsembleOrchestrator:
                         witness_evaluated = True
 
                 elif hyp.domain == "policy_guard":
-                    from engine.lean_formal_verifier import _coerce_strict_bool as _lean_strict_bool
+                    from engine.lean_formal_verifier import (
+                        _coerce_strict_bool as _lean_strict_bool,
+                    )
 
                     pg_meta = meta.get("policy_guard") if isinstance(meta.get("policy_guard"), dict) else {}
                     if pg_meta:
@@ -2254,7 +2260,9 @@ class EnsembleOrchestrator:
                     pe_rep = meta.get("pe_report") if isinstance(meta.get("pe_report"), dict) else None
                     if pe_rep is None and meta.get("repo_pe_candidate") and target_p.is_dir():
                         try:
-                            from engine.pe_magika_classifier import audit_pe_dotnet_target
+                            from engine.pe_magika_classifier import (
+                                audit_pe_dotnet_target,
+                            )
 
                             pe_audit = audit_pe_dotnet_target(
                                 target_p,
@@ -2272,7 +2280,7 @@ class EnsembleOrchestrator:
                                         )
                                     )
                             witness_evaluated = bool(counterexamples)
-                        except Exception:
+                        except Exception:  # noqa: BLE001
                             witness_evaluated = False
                     elif pe_rep is not None:
                         counterexamples = verify_dotnet_pe_invariant(
@@ -2301,7 +2309,7 @@ class EnsembleOrchestrator:
                 counterexamples = []
                 witness_evaluated = False
 
-            symbolic_trace: Optional[Dict[str, Any]] = None
+            symbolic_trace: dict[str, Any] | None = None
             if hyp.domain == "dotnet_pe" and not self.embedded and target_p.is_dir() and hyp.file_path:
                 cand_path = target_p / hyp.file_path
                 if cand_path.is_file():
@@ -2362,17 +2370,17 @@ class EnsembleOrchestrator:
 
     def run(
         self,
-        target: Union[str, Path],
-        findings: Optional[Sequence[EngineFinding]] = None,
+        target: str | Path,
+        findings: Sequence[EngineFinding] | None = None,
         *,
-        poc_transcripts: Optional[Dict[str, VerifiableTranscript]] = None,
-        poc_lang: Optional[str] = None,
-        poc_cmd: Optional[Union[str, Sequence[str]]] = None,
-        poc_language: Optional[str] = None,
-        poc_command: Optional[Union[str, Sequence[str]]] = None,
-        all_scan_summary: Optional[Dict[str, Any]] = None,
-        out_dir: Optional[Union[str, Path]] = None,
-        package_client_name: Optional[str] = None,
+        poc_transcripts: dict[str, VerifiableTranscript] | None = None,
+        poc_lang: str | None = None,
+        poc_cmd: str | Sequence[str] | None = None,
+        poc_language: str | None = None,
+        poc_command: str | Sequence[str] | None = None,
+        all_scan_summary: dict[str, Any] | None = None,
+        out_dir: str | Path | None = None,
+        package_client_name: str | None = None,
         refresh_stix: bool = True,
     ) -> EnsembleReport:
         if all_scan_summary is not None and not isinstance(all_scan_summary, Mapping):
@@ -2396,7 +2404,7 @@ class EnsembleOrchestrator:
         else:
             freshness = inspect_repo_freshness(target_str, freshness_hours=self.freshness_hours)
 
-        active_findings: List[EngineFinding] = list(findings) if findings is not None else []
+        active_findings: list[EngineFinding] = list(findings) if findings is not None else []
         is_workflow_file = target_p.is_file() and target_p.suffix.lower() in (".yml", ".yaml")
         if findings is None and self.exhaustive_default and (target_p.is_dir() or is_workflow_file):
             auto_findings, tele = self.run_exhaustive_local_engines(
@@ -2442,7 +2450,7 @@ class EnsembleOrchestrator:
             )
 
         # Planner: seed WhiteboardHypothesis objects from active findings (+ optional PoC/PE tasks)
-        finding_by_hid: Dict[str, EngineFinding] = {}
+        finding_by_hid: dict[str, EngineFinding] = {}
         for idx, f in enumerate(active_findings, start=1):
             hid = f"HYP-{idx:03d}"
             dom = _classify_finding_domain(f)
@@ -2512,16 +2520,16 @@ class EnsembleOrchestrator:
                 )
             )
 
-        transcripts: Dict[str, VerifiableTranscript] = dict(poc_transcripts or {})
+        transcripts: dict[str, VerifiableTranscript] = dict(poc_transcripts or {})
 
         # Resolve Lean compiled oracle at most once per run when not embedded
-        resolved_oracle: Optional[Any] = None
+        resolved_oracle: Any | None = None
         if not self.embedded and toolchain_status.get("rfchunt_lean_oracle", {}).get("available"):
             try:
                 from engine.lean_formal_verifier import _resolve_oracle
 
                 resolved_oracle, _ = _resolve_oracle(self.lean_dir, None)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 resolved_oracle = None
 
         # Planner-Worker-Verifier Loop
@@ -2533,7 +2541,7 @@ class EnsembleOrchestrator:
                 for h in open_hyps:
                     whiteboard.update_status(h.hypothesis_id, "DISPATCHED", round_idx=round_idx)
 
-                results: List[Dict[str, Any]] = []
+                results: list[dict[str, Any]] = []
                 with ThreadPoolExecutor(max_workers=min(self.max_workers, len(open_hyps))) as pool:
                     futs = [
                         pool.submit(
@@ -2565,9 +2573,7 @@ class EnsembleOrchestrator:
 
                     if kind == "runtime_poc":
                         tr: VerifiableTranscript = res["transcript"]
-                        if "*" not in transcripts and tr.verified:
-                            transcripts["*"] = tr
-                        elif "*" not in transcripts:
+                        if "*" not in transcripts and tr.verified or "*" not in transcripts:
                             transcripts["*"] = tr
                         if tr.verified:
                             whiteboard.update_status(
@@ -2607,7 +2613,7 @@ class EnsembleOrchestrator:
                         violated_dicts = [c.to_dict() for c in violated]
                         sym_trace = res.get("symbolic_trace")
                         if violated_dicts:
-                            ev_payload: Dict[str, Any] = {
+                            ev_payload: dict[str, Any] = {
                                 "domain": hyp_obj.domain,
                                 "violations_count": len(violated_dicts),
                                 "theorems": [v["theorem"] for v in violated_dicts],
@@ -2633,7 +2639,7 @@ class EnsembleOrchestrator:
                             )
                             orig_finding = finding_by_hid.get(hid)
                             lean_cwe = hyp_obj.cwe or cwe_fallback
-                            lean_meta: Dict[str, Any] = {"lean_counterexamples": violated_dicts}
+                            lean_meta: dict[str, Any] = {"lean_counterexamples": violated_dicts}
                             if orig_finding is not None:
                                 orig_meta = orig_finding.metadata if isinstance(orig_finding.metadata, dict) else {}
                                 gha_cls = str(orig_meta.get("gha_class") or "").strip()
@@ -2668,7 +2674,7 @@ class EnsembleOrchestrator:
                                 ),
                             )
                         elif res.get("witness_evaluated"):
-                            ev_pass: Dict[str, Any] = {
+                            ev_pass: dict[str, Any] = {
                                 "domain": hyp_obj.domain,
                                 "reason": "Lean 4 invariant checks passed with zero violations.",
                             }
@@ -2770,7 +2776,10 @@ class EnsembleOrchestrator:
                 lean_dir=self.lean_dir,
             )
         else:
-            from engine.lean_formal_verifier import LeanDomainReport, evaluate_lean_domains
+            from engine.lean_formal_verifier import (
+                LeanDomainReport,
+                evaluate_lean_domains,
+            )
 
             try:
                 dom_rep = evaluate_lean_domains(
@@ -2800,7 +2809,7 @@ class EnsembleOrchestrator:
                             ),
                         )
             except (RuntimeError, OSError, subprocess.SubprocessError, ValueError) as exc:
-                fallback_exc_obj: Optional[Exception] = None
+                fallback_exc_obj: Exception | None = None
                 try:
                     lean_dict = _evaluate_lean_domains_embedded(
                         active_findings,
@@ -2863,13 +2872,13 @@ class EnsembleOrchestrator:
         violated_ces = list(lean_dict.get("violations") or [])
         all_diags = list(lean_dict.get("diagnostics") or [])
         wb_hyps = whiteboard.list_hypotheses()
-        clusters_by_file: Dict[str, List[EnsembleCluster]] = {}
+        clusters_by_file: dict[str, list[EnsembleCluster]] = {}
         for cl in clusters:
             clusters_by_file.setdefault(_norm_path(cl.file_path), []).append(cl)
 
         for c in clusters:
-            c_diags: List[Dict[str, Any]] = []
-            c_ces: List[Dict[str, Any]] = []
+            c_diags: list[dict[str, Any]] = []
+            c_ces: list[dict[str, Any]] = []
             for mf in c.member_findings:
                 meta = mf.get("metadata") if isinstance(mf, dict) else None
                 if isinstance(meta, dict):
@@ -2903,7 +2912,7 @@ class EnsembleOrchestrator:
                     if _norm_path(h.file_path) == c_norm
                 ]
             else:
-                matched_hids: List[str] = []
+                matched_hids: list[str] = []
                 for h in wb_hyps:
                     if _norm_path(h.file_path) != c_norm:
                         continue
@@ -2916,7 +2925,7 @@ class EnsembleOrchestrator:
                             h_fam = "CWE-347"
                         elif h.domain == "policy_guard":
                             h_fam = "CWE-862"
-                    fam_match: Optional[bool]
+                    fam_match: bool | None
                     if c.gha_class and h_gha:
                         fam_match = (c.gha_class == h_gha)
                     elif c.cwe_family != "GENERIC" and h_fam != "GENERIC":
@@ -2926,9 +2935,7 @@ class EnsembleOrchestrator:
                     if fam_match is False:
                         continue
                     line_dist = abs(int(h.line or 0) - int(c.line or 0))
-                    if line_dist <= 15:
-                        matched_hids.append(h.hypothesis_id)
-                    elif fam_match is True and not any(
+                    if line_dist <= 15 or fam_match is True and not any(
                         abs(int(h.line or 0) - int(other.line or 0)) <= 15
                         for other in same_file_clusters
                         if other is not c
@@ -2936,7 +2943,7 @@ class EnsembleOrchestrator:
                         matched_hids.append(h.hypothesis_id)
                 c.whiteboard_hypothesis_ids = matched_hids
 
-        counts: Dict[str, int] = {}
+        counts: dict[str, int] = {}
         for c in clusters:
             counts[c.disposition] = counts.get(c.disposition, 0) + 1
 
@@ -2973,9 +2980,9 @@ class EnsembleOrchestrator:
         self,
         report: EnsembleReport,
         *,
-        out_dir: Union[str, Path],
-        package_client_name: Optional[str] = None,
-    ) -> Dict[str, str]:
+        out_dir: str | Path,
+        package_client_name: str | None = None,
+    ) -> dict[str, str]:
         from engine.advisory_exporter import _redact_inline_tokens
 
         def _redact_payload(obj: Any) -> Any:
@@ -3044,18 +3051,18 @@ class EnsembleOrchestrator:
 
     def run_fast_parallel_ooda(
         self,
-        repo_path: Union[Path, str],
+        repo_path: Path | str,
         *,
         program: str = "",
-        blackboard_db: Union[Path, str] = "reports/ensemble_hunt/blackboard.sqlite3",
-        max_cpu_workers: Optional[int] = None,
+        blackboard_db: Path | str = "reports/ensemble_hunt/blackboard.sqlite3",
+        max_cpu_workers: int | None = None,
         resume: bool = False,
         signal_score: float = 0.0,
-        eligibility_db: Optional[Any] = None,
-        poc_runner: Optional[LinuxPocRunner] = None,
-        out_dir: Optional[Union[Path, str]] = None,
+        eligibility_db: Any | None = None,
+        poc_runner: LinuxPocRunner | None = None,
+        out_dir: Path | str | None = None,
         trigger_browser: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Loop 3 Strict 3-Stage Parallel OODA Funnel:
           - Stage 1 (`ProcessPoolExecutor`, 0 LLM): deterministic CPU checks & noise drop
@@ -3063,7 +3070,10 @@ class EnsembleOrchestrator:
           - Stage 3 (single-slot `OllamaConcurrencyGuard`): LLM verification on top 3-5 only
         """
         from engine.acdso_bridge import rank_stage2_candidates
-        from engine.async_blackboard_runtime import default_cpu_workers, run_local_rfchunt_async
+        from engine.async_blackboard_runtime import (
+            default_cpu_workers,
+            run_local_rfchunt_async,
+        )
         from engine.ollama_concurrency_guard import get_shared_ollama_guard
 
         t0 = time.monotonic()
@@ -3075,16 +3085,18 @@ class EnsembleOrchestrator:
         if bb_str != ":memory:":
             Path(bb_str).parent.mkdir(parents=True, exist_ok=True)
 
-        seed_intents: Optional[List[Dict[str, Any]]] = None
+        seed_intents: list[dict[str, Any]] | None = None
         if not resume:
             run_nonce = f"{time.time_ns()}"
-            discovered_specs: Dict[str, List[Path]] = {"openapi": [], "iam": [], "state_machine": []}
+            discovered_specs: dict[str, list[Path]] = {"openapi": [], "iam": [], "state_machine": []}
             if repo_p.is_dir():
                 try:
-                    from engine.async_blackboard_runtime import _discover_formal_spec_files
+                    from engine.async_blackboard_runtime import (
+                        _discover_formal_spec_files,
+                    )
 
                     discovered_specs = _discover_formal_spec_files(repo_p, max_files=2)
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
             seed_intents = [
                 {
@@ -3109,7 +3121,7 @@ class EnsembleOrchestrator:
                     or discovered_specs.get("iam")
                     or discovered_specs.get("state_machine")
                 )
-                formal_payload: Dict[str, Any] = {
+                formal_payload: dict[str, Any] = {
                     "repo_path": str(repo_p),
                     "target_name": eff_program or repo_p.name,
                     "cpu_work_iters": 0 if has_specs else 6_000,
@@ -3133,7 +3145,7 @@ class EnsembleOrchestrator:
 
         elig_db_path = getattr(eligibility_db, "db_path", None) if eligibility_db is not None else None
 
-        def _run_async() -> Dict[str, Any]:
+        def _run_async() -> dict[str, Any]:
             coro = run_local_rfchunt_async(
                 seed_intents,
                 repo_path=repo_p,
@@ -3155,12 +3167,14 @@ class EnsembleOrchestrator:
         all_facts = list(async_res.get("facts") or [])
 
         try:
-            from engine.parity_invariant_auditor import is_non_production_noise as _is_noise_fn
-        except Exception:
+            from engine.parity_invariant_auditor import (
+                is_non_production_noise as _is_noise_fn,
+            )
+        except Exception:  # noqa: BLE001
             _is_noise_fn = None
 
-        deduped_prod: List[Dict[str, Any]] = []
-        seen_prod_keys: Set[Tuple[str, str, str, int]] = set()
+        deduped_prod: list[dict[str, Any]] = []
+        seen_prod_keys: set[tuple[str, str, str, int]] = set()
         extra_noise = 0
         for fact in all_facts:
             if not isinstance(fact, dict):
@@ -3217,9 +3231,9 @@ class EnsembleOrchestrator:
             stage2_res = rank_stage2_candidates(deduped_prod, top_k=5)
         stage2_selected = list(stage2_res.get("selected") or [])
 
-        stage3_findings: List[EngineFinding] = []
-        stage3_results: List[Dict[str, Any]] = []
-        stage3_telemetry: Dict[str, Any] = {
+        stage3_findings: list[EngineFinding] = []
+        stage3_results: list[dict[str, Any]] = []
+        stage3_telemetry: dict[str, Any] = {
             "status": "skipped",
             "candidates_evaluated": 0,
             "findings_emitted": 0,
@@ -3293,7 +3307,7 @@ class EnsembleOrchestrator:
 
         stage1_efs = [_finding_from_dict(d) for d in deduped_prod]
         all_efs = stage1_efs + stage3_findings
-        poc_transcripts_map: Dict[str, VerifiableTranscript] = {}
+        poc_transcripts_map: dict[str, VerifiableTranscript] = {}
         if poc_runner is not None:
             for cand in stage2_selected[:5]:
                 cand_meta = cand.get("metadata") if isinstance(cand.get("metadata"), dict) else {}
@@ -3323,7 +3337,7 @@ class EnsembleOrchestrator:
                         command=["GET", sandbox_url],
                         image="sandbox_http",
                         repo_path=str(repo_p),
-                        started_at_utc=datetime.now(timezone.utc).isoformat(),
+                        started_at_utc=datetime.now(UTC).isoformat(),
                         elapsed_ms=float(probe_res.get("elapsed_ms") or 0.0),
                         stdout=json.dumps(probe_res, sort_keys=True),
                         stderr="" if probe_ok else str(probe_res.get("reason") or "; ".join(probe_res.get("reasons") or [])),
@@ -3356,7 +3370,7 @@ class EnsembleOrchestrator:
             freshness=freshness,
             poc_transcripts=poc_transcripts_map or None,
         )
-        counts_by_disp: Dict[str, int] = {}
+        counts_by_disp: dict[str, int] = {}
         for c in clusters:
             counts_by_disp[c.disposition] = counts_by_disp.get(c.disposition, 0) + 1
 
@@ -3364,7 +3378,7 @@ class EnsembleOrchestrator:
         s1_prod_count = len(deduped_prod)
         elapsed_ms = round((time.monotonic() - t0) * 1000.0, 3)
 
-        out: Dict[str, Any] = {
+        out: dict[str, Any] = {
             "status": "completed",
             "program": eff_program,
             "repo_path": str(repo_p),
@@ -3422,7 +3436,7 @@ class EnsembleOrchestrator:
 
 
 _STAGE3_ENDPOINT_LOCK = threading.Lock()
-_LAST_STAGE3_OLLAMA_ENDPOINT: Optional[str] = None
+_LAST_STAGE3_OLLAMA_ENDPOINT: str | None = None
 
 
 def _reset_guard_on_endpoint_change(guard: Any) -> None:
@@ -3430,9 +3444,12 @@ def _reset_guard_on_endpoint_change(guard: Any) -> None:
     global _LAST_STAGE3_OLLAMA_ENDPOINT
     cur_ep = os.environ.get("OLLAMA_HOST", "").strip()
     with _STAGE3_ENDPOINT_LOCK:
-        if _LAST_STAGE3_OLLAMA_ENDPOINT is not None and cur_ep != _LAST_STAGE3_OLLAMA_ENDPOINT:
-            if hasattr(guard, "reset"):
-                guard.reset()
+        if (
+            _LAST_STAGE3_OLLAMA_ENDPOINT is not None
+            and cur_ep != _LAST_STAGE3_OLLAMA_ENDPOINT
+            and hasattr(guard, "reset")
+        ):
+            guard.reset()
         _LAST_STAGE3_OLLAMA_ENDPOINT = cur_ep
 
 
@@ -3446,20 +3463,20 @@ def evaluate_and_stage_submission(
     severity: str = "HIGH",
     poc_verified: Any = False,
     poc_transcript: str = "",
-    eligibility_db: Optional[Any] = None,
-    eligibility_db_path: Optional[Union[str, Path]] = None,
-    output_dir: Optional[Union[str, Path]] = None,
+    eligibility_db: Any | None = None,
+    eligibility_db_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
     trigger_browser: bool = True,
-    poc_runner: Optional[LinuxPocRunner] = None,
-    sandbox_url: Optional[str] = None,
+    poc_runner: LinuxPocRunner | None = None,
+    sandbox_url: str | None = None,
     researcher_handle: str = "oyesanyf",
-    poc_lang: Optional[str] = None,
-    poc_cmd: Optional[Sequence[str]] = None,
-    poc_target_os: Optional[str] = None,
-    target_os_required: Optional[str] = None,
-    report_id: Optional[str] = None,
+    poc_lang: str | None = None,
+    poc_cmd: Sequence[str] | None = None,
+    poc_target_os: str | None = None,
+    target_os_required: str | None = None,
+    report_id: str | None = None,
     finding_id: str = "",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Loop 4 Fail-Closed Submission Gate:
       1. `ProgramEligibilityDB.is_eligible(program)` must be True (UNLOCKED)
@@ -3567,14 +3584,14 @@ def evaluate_and_stage_submission(
         eff_report_id = str(report_id).strip()
     else:
         digest = hashlib.sha256(
-            f"{eff_program}|{clean_asset}|{clean_title}|{finding_id}".encode("utf-8")
+            f"{eff_program}|{clean_asset}|{clean_title}|{finding_id}".encode()
         ).hexdigest()
         eff_report_id = str(int(digest[:10], 16) % 9_000_000 + 1_000_000)
 
     report_url = f"{HACKERONE_BASE_URL}/reports/{eff_report_id}"
     program_new_url = f"{HACKERONE_BASE_URL}/{eff_program}/reports/new"
 
-    browser_handoff_spec: Optional[Dict[str, Any]] = None
+    browser_handoff_spec: dict[str, Any] | None = None
     if trigger_browser:
         browser_handoff_spec = {
             "action": "stage_draft",
@@ -3601,7 +3618,7 @@ def evaluate_and_stage_submission(
     dest_dir.mkdir(parents=True, exist_ok=True)
     ready_path = dest_dir / "READY_TO_SUBMIT.json"
 
-    staged_payload: Dict[str, Any] = {
+    staged_payload: dict[str, Any] = {
         "eligible": True,
         "status": "ready_to_submit",
         "program": eff_program,
@@ -3619,7 +3636,7 @@ def evaluate_and_stage_submission(
         "program_new_url": program_new_url,
         "threat_model": tm_verdict.to_dict(),
         "browser_handoff_spec": browser_handoff_spec,
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "generated_at_utc": datetime.now(UTC).isoformat(),
     }
     ready_path.write_text(json.dumps(staged_payload, indent=2), encoding="utf-8")
     return {

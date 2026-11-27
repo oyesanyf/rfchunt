@@ -8,18 +8,18 @@ Contains ZERO `unittest.mock`, `MagicMock`, or `monkeypatch`.
 
 from __future__ import annotations
 
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 import multiprocessing as mp
 import os
-from pathlib import Path
 import struct
 import sys
 import threading
 import time
-from typing import Any, Dict, List
 import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -222,10 +222,10 @@ def test_mobile_app_auditor_android_ios_and_xxe_fail_closed(tmp_path: Path) -> N
 
 def test_mobile_app_auditor_mobsf_api_and_failsafe_scan_list(tmp_path: Path) -> None:
     mode = {"with_report": True}
-    requests_seen: List[str] = []
+    requests_seen: list[str] = []
 
     class _MobSFHandler(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
+        def do_GET(self):
             requests_seen.append(f"GET {self.path}")
             if self.headers.get("Authorization") != "test-mobsf-key":
                 self.send_response(401)
@@ -238,7 +238,7 @@ def test_mobile_app_auditor_mobsf_api_and_failsafe_scan_list(tmp_path: Path) -> 
             self.end_headers()
             self.wfile.write(payload)
 
-        def do_POST(self):  # noqa: N802
+        def do_POST(self):
             requests_seen.append(f"POST {self.path}")
             length = int(self.headers.get("Content-Length") or "0")
             _ = self.rfile.read(length)
@@ -303,7 +303,7 @@ def test_mobile_app_auditor_mobsf_api_and_failsafe_scan_list(tmp_path: Path) -> 
             self.end_headers()
             self.wfile.write(rep)
 
-        def log_message(self, format, *args):  # noqa: A002
+        def log_message(self, format, *args):
             return
 
     empty_repo = tmp_path / "empty_repo"
@@ -395,7 +395,7 @@ def test_mobile_app_auditor_plist_padding_utf16_zip_spoof_and_exported_false(tmp
     padded_xxe = (
         f'<?xml version="1.0" encoding="UTF-8"?>{pad_comment}'
         '<!DOCTYPE plist [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><plist><dict/></plist>'
-    ).encode("utf-8")
+    ).encode()
     with pytest.raises(ValueError):
         _safe_parse_plist(padded_xxe)
 
@@ -532,15 +532,15 @@ paths:
     assert all(f["engine"] == "api_jwt_sdjwt" and f["deterministic"] is True for f in findings)
 
     # Verify fail-closed live gate against a real local HTTP server
-    hits: List[str] = []
+    hits: list[str] = []
 
     class _HitHandler(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
+        def do_GET(self):
             hits.append(self.path)
             self.send_response(200)
             self.end_headers()
 
-        def log_message(self, format, *args):  # noqa: A002
+        def log_message(self, format, *args):
             return
 
     db = ProgramEligibilityDB(tmp_path / "elig.sqlite3")
@@ -679,10 +679,10 @@ paths: {}
     assert _parse_subfinder_jsonl(sub_jsonl, base_host="localhost", allow_private=True) == ["api.localhost"]
 
     # 3. Full live pipeline with real CLI shims + ThreadingHTTPServer (blocked vs eligible)
-    recorded_requests: List[Dict[str, Any]] = []
+    recorded_requests: list[dict[str, Any]] = []
 
     class _LiveApiHandler(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
+        def do_GET(self):
             recorded_requests.append(
                 {
                     "method": "GET",
@@ -722,7 +722,7 @@ paths: {}
             self.send_response(404)
             self.end_headers()
 
-        def do_POST(self):  # noqa: N802
+        def do_POST(self):
             length = int(self.headers.get("Content-Length") or "0")
             _ = self.rfile.read(length)
             recorded_requests.append(
@@ -744,7 +744,7 @@ paths: {}
             self.send_response(404)
             self.end_headers()
 
-        def log_message(self, format, *args):  # noqa: A002
+        def log_message(self, format, *args):
             return
 
     shim_dir = tmp_path / "shims"
@@ -1067,9 +1067,8 @@ def safe_match(user_input, mode):
     taint_hits = [f for f in findings if f["rule_id"] == "AI-INFRA-TAINT-005"]
     if_hits = [f for f in taint_hits if f["file_path"] == "src/if_branch_taint.py"]
     assert [f["line"] for f in if_hits] == [9, 24]
-    if sys.version_info >= (3, 10):
-        match_hits = [f for f in taint_hits if f["file_path"] == "src/match_branch_taint.py"]
-        assert [f["line"] for f in match_hits] == [10]
+    match_hits = [f for f in taint_hits if f["file_path"] == "src/match_branch_taint.py"]
+    assert [f["line"] for f in match_hits] == [10]
 
 
 def test_ai_infra_guard_loop_fixed_point_and_try_pre_tainted_join(tmp_path: Path) -> None:
@@ -1387,12 +1386,12 @@ def test_gha_llm_verifier_oom_downshift_and_circuit_breaker(tmp_path: Path) -> N
     assert guard_probe.is_oom_500(500, "invalid json") is False
     assert guard_probe.is_oom_500(400, "CUDA out of memory") is False
 
-    chat_models_called: List[str] = []
-    tags_calls: List[int] = []
+    chat_models_called: list[str] = []
+    tags_calls: list[int] = []
     server_mode = {"fail_all": False}
 
     class _LocalOllamaHandler(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
+        def do_GET(self):
             if self.path == "/api/tags":
                 tags_calls.append(1)
                 payload = json.dumps(
@@ -1412,7 +1411,7 @@ def test_gha_llm_verifier_oom_downshift_and_circuit_breaker(tmp_path: Path) -> N
                 self.end_headers()
                 self.wfile.write(payload)
 
-        def do_POST(self):  # noqa: N802
+        def do_POST(self):
             length = int(self.headers.get("Content-Length") or "0")
             body = json.loads(self.rfile.read(length).decode("utf-8"))
             model = str(body.get("model") or "")
@@ -1454,7 +1453,7 @@ def test_gha_llm_verifier_oom_downshift_and_circuit_breaker(tmp_path: Path) -> N
             self.end_headers()
             self.wfile.write(ok_body)
 
-        def log_message(self, format, *args):  # noqa: A002
+        def log_message(self, format, *args):
             return
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), _LocalOllamaHandler)

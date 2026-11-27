@@ -11,22 +11,24 @@ from pathlib import Path
 
 import pytest
 
+import hunt as root_hunt
 from engine.hackerone_porter import (
     HackerOneCampaign,
     HackerOneComputerUsePorter,
     HackerOneReportDraft,
 )
 from engine.program_eligibility_db import ProgramEligibilityDB
-import hunt as root_hunt
 from scripts.autonomous_hunt import (
     build_parser,
     check_program_eligibility,
     execute_hunt_cycle,
     extract_verified_findings_from_cycle,
-    main as hunt_main,
     open_urls_in_chrome,
     scan_draft_safety_violations,
     validate_repo_slug,
+)
+from scripts.autonomous_hunt import (
+    main as hunt_main,
 )
 
 

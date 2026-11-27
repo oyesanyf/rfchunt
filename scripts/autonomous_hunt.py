@@ -35,36 +35,38 @@ Full Pipeline (Single Run or Scheduled Continuous Loop):
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import re
 import signal
 import subprocess
 import sys
 import time
 import urllib.request
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from collections.abc import Sequence
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 RFCHUNT_ROOT = Path(__file__).resolve().parent.parent
 if str(RFCHUNT_ROOT) not in sys.path:
     sys.path.insert(0, str(RFCHUNT_ROOT))
 
-from engine.hackerone_porter import (  # noqa: E402
+import shutil
+import webbrowser
+
+from engine.hackerone_porter import (
     HackerOneComputerUsePorter,
     HackerOnePorter,
     validate_hackerone_url,
 )
-from engine.program_eligibility_db import ProgramEligibilityDB  # noqa: E402
-import shutil  # noqa: E402
-import webbrowser  # noqa: E402
+from engine.program_eligibility_db import ProgramEligibilityDB
 
 _REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _HANDLE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 
 # Safety & Hygiene Violation Patterns checked on every generated draft/artifact
-_SECRET_LEAK_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
+_SECRET_LEAK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("github_pat", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{24,}\b")),
     ("private_key_block", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")),
@@ -76,7 +78,7 @@ _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffd]")
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def probe_http_fast(url: str, timeout_sec: float = 0.4) -> bool:
@@ -86,11 +88,11 @@ def probe_http_fast(url: str, timeout_sec: float = 0.4) -> bool:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=eff) as resp:
             return 200 <= int(resp.status) < 500
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
-def discover_ollama_models(ollama_endpoint: str, timeout_sec: float = 0.4) -> List[str]:
+def discover_ollama_models(ollama_endpoint: str, timeout_sec: float = 0.4) -> list[str]:
     eff = min(max(float(timeout_sec), 0.05), 0.4)
     url = f"{ollama_endpoint.rstrip('/')}/api/tags"
     try:
@@ -102,7 +104,7 @@ def discover_ollama_models(ollama_endpoint: str, timeout_sec: float = 0.4) -> Li
                     for m in (data.get("models") or [])
                     if isinstance(m, dict) and m.get("name")
                 ]
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return []
 
@@ -121,14 +123,14 @@ def validate_program_handle(handle: str) -> str:
     return cleaned
 
 
-def scan_draft_safety_violations(markdown_text: str) -> List[Dict[str, str]]:
+def scan_draft_safety_violations(markdown_text: str) -> list[dict[str, str]]:
     """
     Audits a generated Markdown draft for hard safety & formatting violations:
       - Unredacted credentials / private keys
       - Corrupted HTML entities (`&lt;`, `&gt;`)
       - Illegal ASCII control characters / `U+FFFD` replacement glyphs
     """
-    violations: List[Dict[str, str]] = []
+    violations: list[dict[str, str]] = []
     text = markdown_text or ""
 
     for name, pat in _SECRET_LEAK_PATTERNS:
@@ -167,9 +169,9 @@ def build_process_env(
     modelfusion_endpoint: str,
     ollama_endpoint: str,
     use_modelfusion: bool,
-    model_override: Optional[str] = None,
+    model_override: str | None = None,
     offline: bool = False,
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """Process-scoped environment only — never touches Windows Registry or user/system PATH."""
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -191,10 +193,10 @@ def run_step(
     cmd: Sequence[str],
     *,
     cwd: Path,
-    env: Dict[str, str],
+    env: dict[str, str],
     timeout_sec: float = 600.0,
     dry_run: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Executes one CLI stage with `shell=False`, deterministic timeout, and structured telemetry."""
     started = time.monotonic()
     if dry_run:
@@ -254,9 +256,9 @@ def sync_watchlist_repo(
     repo_slug: str,
     repos_cache_dir: Path,
     *,
-    env: Dict[str, str],
+    env: dict[str, str],
     dry_run: bool = False,
-) -> Tuple[Optional[Path], Dict[str, Any]]:
+) -> tuple[Path | None, dict[str, Any]]:
     """Shallow-clones or fast-forward-pulls an in-scope GitHub repo using `shell=False`."""
     clean_slug = validate_repo_slug(repo_slug)
     safe_dir = repos_cache_dir / clean_slug.replace("/", "__")
@@ -290,14 +292,14 @@ def sync_watchlist_repo(
     return (safe_dir if safe_dir.is_dir() else None), res
 
 
-def load_watchlist_targets(watchlist_path: Path) -> List[Dict[str, str]]:
+def load_watchlist_targets(watchlist_path: Path) -> list[dict[str, str]]:
     if not watchlist_path.is_file():
         return []
     try:
         data = json.loads(watchlist_path.read_text(encoding="utf-8"))
-    except Exception:
+    except (json.JSONDecodeError, TypeError, ValueError):
         return []
-    out: List[Dict[str, str]] = []
+    out: list[dict[str, str]] = []
     for item in data.get("targets") or []:
         if not isinstance(item, dict):
             continue
@@ -311,9 +313,9 @@ def load_watchlist_targets(watchlist_path: Path) -> List[Dict[str, str]]:
 def check_program_eligibility(
     program_handle: str,
     *,
-    eligibility_db_path: Optional[str] = None,
+    eligibility_db_path: str | None = None,
     allow_blocked: bool = False,
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """
     Fail-safe Program Eligibility & Signal Gate:
       - If a program is recorded as `BLOCKED_SIGNAL`, `PAUSED`, or `NOT_FOUND`,
@@ -332,20 +334,20 @@ def check_program_eligibility(
         if status == "UNLOCKED":
             return True, "unlocked"
         return False, f"blocked_by_eligibility_db:{status}"
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return True, f"eligibility_db_unavailable:{exc}"
 
 
-def extract_verified_findings_from_cycle(target_out_dir: Path) -> List[Dict[str, Any]]:
+def extract_verified_findings_from_cycle(target_out_dir: Path) -> list[dict[str, Any]]:
     """
     Collects verified, PoC-backed or corroborated findings from `fast_ooda_report.json`,
     `READY_TO_SUBMIT.json`, and `ensemble_audit` JSON outputs inside `target_out_dir`.
     Strictly drops speculative/unverified items so only high-signal findings reach draft staging.
     """
-    collected: List[Dict[str, Any]] = []
+    collected: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
 
-    def _add_candidate(item: Dict[str, Any]) -> None:
+    def _add_candidate(item: dict[str, Any]) -> None:
         if not isinstance(item, dict):
             return
         disp = str(item.get("disposition") or "").upper()
@@ -384,7 +386,7 @@ def extract_verified_findings_from_cycle(target_out_dir: Path) -> List[Dict[str,
             continue
         try:
             data = json.loads(json_path.read_text(encoding="utf-8", errors="ignore"))
-        except Exception:
+        except Exception:  # noqa: BLE001, S112
             continue
         if isinstance(data, list):
             for entry in data:
@@ -402,9 +404,9 @@ def extract_verified_findings_from_cycle(target_out_dir: Path) -> List[Dict[str,
     return collected
 
 
-def find_chrome_executable() -> Optional[str]:
+def find_chrome_executable() -> str | None:
     """Locates Google Chrome (`chrome.exe`) across standard Windows/Linux/macOS install paths."""
-    candidates: List[str] = []
+    candidates: list[str] = []
     if os.name == "nt":
         for base in (
             os.environ.get("PROGRAMFILES", r"C:\Program Files"),
@@ -432,12 +434,12 @@ def find_chrome_executable() -> Optional[str]:
     return None
 
 
-def open_urls_in_chrome(urls: Sequence[str], *, dry_run: bool = False) -> Dict[str, Any]:
+def open_urls_in_chrome(urls: Sequence[str], *, dry_run: bool = False) -> dict[str, Any]:
     """
     Validates every URL strictly against `https://hackerone.com/...` and opens them
     in Google Chrome (`shell=False`) so the user can review and manually click Submit.
     """
-    validated: List[str] = []
+    validated: list[str] = []
     seen: set[str] = set()
     for raw in urls:
         clean = validate_hackerone_url(str(raw or "").strip())
@@ -473,7 +475,7 @@ def maybe_start_modelfusion_server(
     port: int,
     *,
     dry_run: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Optionally starts ModelFusion's local HTTP server (`--server --port 5000`) detached."""
     endpoint = f"http://127.0.0.1:{port}"
     if probe_http_fast(f"{endpoint}/health") or probe_http_fast(f"{endpoint}/api/health"):
@@ -507,11 +509,11 @@ def maybe_start_modelfusion_server(
     return {"started": True, "reachable": False, "endpoint": endpoint, "note": "spawned_warming_up"}
 
 
-def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, Any]:
+def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, Any]:
     """Executes one complete end-to-end defensive hunting + violation + QA cycle."""
     cycle_started = utc_now_iso()
     out_root = Path(args.out).resolve()
-    cycle_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    cycle_id = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     cycle_dir = out_root / f"cycle_{cycle_id}_n{cycle_num}"
     if not args.dry_run:
         cycle_dir.mkdir(parents=True, exist_ok=True)
@@ -519,7 +521,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
     # Stage 0: Fast <=400ms Pre-Flight Probes
     mf_endpoint = args.modelfusion_endpoint.rstrip("/")
     ollama_endpoint = args.ollama_endpoint.rstrip("/")
-    mf_start_info: Dict[str, Any] = {"started": False, "reachable": False, "endpoint": mf_endpoint}
+    mf_start_info: dict[str, Any] = {"started": False, "reachable": False, "endpoint": mf_endpoint}
     if args.start_modelfusion and not args.embedded:
         mf_start_info = maybe_start_modelfusion_server(
             Path(args.modelfusion_cli),
@@ -551,8 +553,8 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
         offline=args.embedded,
     )
 
-    steps: List[Dict[str, Any]] = []
-    targets_to_audit: List[Tuple[str, Path]] = []
+    steps: list[dict[str, Any]] = []
+    targets_to_audit: list[tuple[str, Path]] = []
 
     # Stage 0.2: Optional Public HackerOne Program Directory Sync (newest launches, >=min_efficiency%)
     if getattr(args, "sync_public_directory", False) and not args.embedded:
@@ -581,7 +583,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
         )
 
     # Stage 0.5: ACDSO-Adapted ML Public HackerOne Program Selection & Two-Lane Portfolio
-    ml_program_selection: Dict[str, Any] = {"status": "skipped"}
+    ml_program_selection: dict[str, Any] = {"status": "skipped"}
     if not getattr(args, "skip_ml_ranking", False):
         if args.dry_run:
             rank_cmd = [
@@ -616,7 +618,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
                     min_efficiency_pct=float(getattr(args, "min_efficiency", 80.0)),
                     capacity=max(1, int(getattr(args, "portfolio_capacity", 6))),
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 ml_program_selection = {"status": "error", "error": str(exc)}
 
     # Collect explicit local targets (`--target PATH[:PROGRAM]`)
@@ -713,7 +715,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
                 targets_to_audit.append((item["program"], repo_dir))
 
     # Stage 2 & Stage 3: Fast 3-Stage OODA + Exhaustive Multi-Engine Ensemble Audit per eligible target
-    per_target_results: List[Dict[str, Any]] = []
+    per_target_results: list[dict[str, Any]] = []
     blackboard_db = str(Path(args.blackboard_db).resolve()) if args.blackboard_db else str(out_root / "blackboard.sqlite3")
 
     for idx, (prog, target_dir) in enumerate(targets_to_audit, start=1):
@@ -776,7 +778,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
         steps.append(ooda_res)
 
         # Stage 3: Exhaustive Multi-Engine Violation & Security Audit (`--all --ensemble` + SARIF)
-        ens_res: Optional[Dict[str, Any]] = None
+        ens_res: dict[str, Any] | None = None
         if not args.skip_ensemble:
             sarif_path = t_out / "ensemble_audit" / "results.sarif"
             ens_cmd = [
@@ -866,9 +868,9 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
         )
 
     # Stage 5: Hard Safety Violation Check + Strict QA Audit (`qa-drafts --strict`) + Optional Draft-Only Staging
-    draft_violations: List[Dict[str, Any]] = []
-    ready_to_click_submit: List[Dict[str, Any]] = []
-    staged_browser_drafts: List[Dict[str, Any]] = []
+    draft_violations: list[dict[str, Any]] = []
+    ready_to_click_submit: list[dict[str, Any]] = []
+    staged_browser_drafts: list[dict[str, Any]] = []
 
     draft_dirs = [cycle_dir, RFCHUNT_ROOT / "reports" / "hackerone"]
     non_draft_md_names = {
@@ -884,7 +886,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
         "readme.md",
     }
     seen_md: set[Path] = set()
-    qa_status_by_path: Dict[str, str] = {}
+    qa_status_by_path: dict[str, str] = {}
     for d_root in draft_dirs:
         if not d_root.is_dir():
             continue
@@ -1024,12 +1026,12 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
         )
 
     # Stage 5D: Open every verified ready-to-submit HackerOne URL in Google Chrome for manual Submit click
-    urls_to_submit: List[str] = [
+    urls_to_submit: list[str] = [
         str(item["draft_url"])
         for item in ready_to_click_submit
         if str(item.get("draft_url") or "").startswith("https://hackerone.com/")
     ]
-    chrome_launch: Dict[str, Any] = {"status": "disabled", "opened_urls": []}
+    chrome_launch: dict[str, Any] = {"status": "disabled", "opened_urls": []}
     if args.open_chrome and urls_to_submit:
         chrome_launch = open_urls_in_chrome(urls_to_submit, dry_run=args.dry_run)
 
@@ -1038,7 +1040,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
     ]
     failed_steps = [s["label"] for s in steps if s.get("status") not in ("ok", "dry_run_planned", "skipped_ineligible")]
 
-    summary: Dict[str, Any] = {
+    summary: dict[str, Any] = {
         "schema": "rfchunt.autonomous_hunt_cycle.v1",
         "cycle_number": cycle_num,
         "started_utc": cycle_started,
@@ -1220,7 +1222,7 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -1235,7 +1237,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if sig_val is not None:
             try:
                 signal.signal(sig_val, _handle_sig)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
 
     cycle_num = 0

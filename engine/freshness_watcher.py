@@ -16,13 +16,9 @@ Design Invariants:
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
 import inspect
 import json
 import os
-from pathlib import Path
 import re
 import sqlite3
 import threading
@@ -30,8 +26,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
-
+from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import TracebackType
+from typing import Any, Self
 
 DEFAULT_API_BASE = "https://api.github.com"
 DEFAULT_FRESHNESS_HOURS = 72
@@ -39,7 +40,7 @@ DEFAULT_TIMEOUT_SEC = 12.0
 MAX_WORKERS = 8
 
 
-SURFACE_RULES: Tuple[Tuple[str, int, Tuple[str, ...]], ...] = (
+SURFACE_RULES: tuple[tuple[str, int, tuple[str, ...]], ...] = (
     (
         "wasm_sandbox_ffi",
         35,
@@ -172,7 +173,7 @@ class WatchTarget:
     enabled: bool = True
 
     @classmethod
-    def from_dict(cls, raw: Dict[str, Any]) -> "WatchTarget":
+    def from_dict(cls, raw: dict[str, Any]) -> WatchTarget:
         repo = _validate_repo_slug(raw.get("repo", ""))
         return cls(
             program=str(raw.get("program", "unknown")).strip(),
@@ -198,12 +199,12 @@ class FreshCandidate:
     landed_at: str  # ISO-8601 UTC
     age_hours: float
     surface_score: int
-    matched_surfaces: List[str] = field(default_factory=list)
-    changed_files: List[str] = field(default_factory=list)
+    matched_surfaces: list[str] = field(default_factory=list)
+    changed_files: list[str] = field(default_factory=list)
     bounty_tier: str = "Medium-High"
     scope_asset: str = ""
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "program": self.program,
             "repo": self.repo,
@@ -230,10 +231,10 @@ class FreshnessRunReport:
     freshness_hours: int
     targets_checked: int
     etag_cache_hits: int
-    candidates: List[FreshCandidate] = field(default_factory=list)
-    errors: List[str] = field(default_factory=list)
+    candidates: list[FreshCandidate] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "generated_at": self.generated_at,
             "freshness_hours": self.freshness_hours,
@@ -245,7 +246,7 @@ class FreshnessRunReport:
         }
 
 
-def _parse_iso_utc(raw: Optional[str]) -> Optional[datetime]:
+def _parse_iso_utc(raw: str | None) -> datetime | None:
     if not raw:
         return None
     s = str(raw).strip()
@@ -254,13 +255,13 @@ def _parse_iso_utc(raw: Optional[str]) -> Optional[datetime]:
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
     except ValueError:
         return None
 
 
-def load_github_token(workspace_root: Optional[Path] = None) -> Optional[str]:
+def load_github_token(workspace_root: Path | None = None) -> str | None:
     """Reads GITHUB_TOKEN from process env or local .env.local without mutating system env."""
     for key in ("GITHUB_TOKEN", "GH_TOKEN"):
         val = os.environ.get(key, "").strip()
@@ -289,7 +290,7 @@ def score_diff_surface(
     title: str = "",
     body: str = "",
     event_type: str = "commit",
-) -> Tuple[int, List[str]]:
+) -> tuple[int, list[str]]:
     """
     Scores a newly landed release/PR/commit from 0 to 100 based on high-bounty attack surface.
     """
@@ -303,7 +304,7 @@ def score_diff_surface(
     haystack = " ".join(haystack_parts).lower()
 
     score = 0
-    matched: List[str] = []
+    matched: list[str] = []
     for surface_name, weight, keywords in SURFACE_RULES:
         if any(kw in haystack for kw in keywords):
             score += weight
@@ -318,13 +319,12 @@ def score_diff_surface(
         score += min(15, code_files * 3)
 
     # Penalize pure docs/lockfile-only changes
-    if changed_files and code_files == 0:
-        if all(
-            f.lower().endswith((".md", ".txt", ".rst", ".lock", ".png", ".svg"))
-            or f.lower().startswith("docs/")
-            for f in changed_files
-        ):
-            score = max(0, score - 25)
+    if changed_files and code_files == 0 and all(
+        f.lower().endswith((".md", ".txt", ".rst", ".lock", ".png", ".svg"))
+        or f.lower().startswith("docs/")
+        for f in changed_files
+    ):
+        score = max(0, score - 25)
 
     return min(100, score), matched
 
@@ -332,7 +332,7 @@ def score_diff_surface(
 class FreshnessStateStore:
     """Thread-safe SQLite WAL store for GitHub ETag caching and already-triaged SHAs."""
 
-    def __init__(self, db_path: Union[str, Path]):
+    def __init__(self, db_path: str | Path):
         self.raw_db_path = str(db_path)
         self.is_memory = self.raw_db_path == ":memory:"
         if not self.is_memory:
@@ -357,7 +357,7 @@ class FreshnessStateStore:
                 self._conn.execute("PRAGMA journal_mode=WAL;")
 
     def _run_with_retry(self, fn: Callable[[], Any]) -> Any:
-        last_exc: Optional[Exception] = None
+        last_exc: Exception | None = None
         for attempt in range(6):
             try:
                 with self._lock:
@@ -396,8 +396,8 @@ class FreshnessStateStore:
 
         self._run_with_retry(_create)
 
-    def get_etag(self, url: str) -> Optional[str]:
-        def _get() -> Optional[str]:
+    def get_etag(self, url: str) -> str | None:
+        def _get() -> str | None:
             row = self._conn.execute(
                 "SELECT etag FROM etag_cache WHERE url = ?", (url,)
             ).fetchone()
@@ -406,7 +406,7 @@ class FreshnessStateStore:
         return self._run_with_retry(_get)
 
     def set_etag(self, url: str, etag: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
 
         def _set() -> None:
             self._conn.execute(
@@ -427,7 +427,7 @@ class FreshnessStateStore:
         return bool(self._run_with_retry(_seen))
 
     def mark_seen(self, repo: str, sha: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
 
         def _mark() -> None:
             self._conn.execute(
@@ -438,10 +438,15 @@ class FreshnessStateStore:
 
         self._run_with_retry(_mark)
 
-    def __enter__(self) -> "FreshnessStateStore":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def close(self) -> None:
@@ -451,17 +456,17 @@ class FreshnessStateStore:
                 if not self.is_memory:
                     try:
                         self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                    except Exception:
+                    except Exception:  # noqa: BLE001, S110
                         pass
                 try:
                     self._conn.close()
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
 
     def __del__(self) -> None:
         try:
             self.close()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
 
@@ -471,9 +476,7 @@ def _is_sha_seen(store: FreshnessStateStore, repo: str, sha: str) -> bool:
         return False
     if store.is_seen(repo, s):
         return True
-    if len(s) > 12 and store.is_seen(repo, s[:12]):
-        return True
-    return False
+    return bool(len(s) > 12 and store.is_seen(repo, s[:12]))
 
 
 def _mark_sha_seen(store: FreshnessStateStore, repo: str, sha: str, full_sha: str = "") -> None:
@@ -496,10 +499,10 @@ class FreshnessWatcher:
     def __init__(
         self,
         api_base: str = DEFAULT_API_BASE,
-        token: Optional[str] = None,
-        state_db: Optional[Union[str, Path]] = None,
+        token: str | None = None,
+        state_db: str | Path | None = None,
         timeout_sec: float = DEFAULT_TIMEOUT_SEC,
-        now_utc: Optional[datetime] = None,
+        now_utc: datetime | None = None,
     ):
         self.api_base = api_base.rstrip("/")
         self.token = token if token is not None else load_github_token()
@@ -507,12 +510,12 @@ class FreshnessWatcher:
         self._now_override = now_utc
         self.store = FreshnessStateStore(state_db or Path("out/freshness_state.db"))
         self._sha_lock = threading.Lock()
-        self._full_shas: Dict[Tuple[str, str], str] = {}
+        self._full_shas: dict[tuple[str, str], str] = {}
 
     def _now(self) -> datetime:
-        return self._now_override or datetime.now(timezone.utc)
+        return self._now_override or datetime.now(UTC)
 
-    def _get_json(self, path: str) -> Tuple[Optional[Any], bool, Optional[str]]:
+    def _get_json(self, path: str) -> tuple[Any | None, bool, str | None]:
         """
         Fetches JSON from `api_base + path` with ETag caching.
         Returns `(payload, was_304_cache_hit, error_message)`.
@@ -540,7 +543,7 @@ class FreshnessWatcher:
             if exc.code == 304:
                 return None, True, None
             return None, False, f"HTTP {exc.code} on {path}"
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return None, False, f"Request failed on {path}: {exc}"
 
     def _scan_target(
@@ -549,13 +552,13 @@ class FreshnessWatcher:
         freshness_hours: int,
         min_score: int,
         skip_seen: bool,
-    ) -> Tuple[List[FreshCandidate], int, List[str]]:
+    ) -> tuple[list[FreshCandidate], int, list[str]]:
         repo_slug = _validate_repo_slug(target.repo)
         now = self._now()
         cutoff = now - timedelta(hours=freshness_hours)
-        candidates: List[FreshCandidate] = []
+        candidates: list[FreshCandidate] = []
         cache_hits = 0
-        errors: List[str] = []
+        errors: list[str] = []
         seen_local_shas: set[str] = set()
 
         # 1. Fresh Releases
@@ -576,7 +579,7 @@ class FreshnessWatcher:
                 seen_local_shas.add(sha)
                 if len(sha) > 12:
                     seen_local_shas.add(sha[:12])
-                rel_changed: List[str] = [
+                rel_changed: list[str] = [
                     str(f.get("filename", f) if isinstance(f, dict) else f)
                     for f in (rel.get("changed_files") or rel.get("files") or [])
                     if f
@@ -642,7 +645,7 @@ class FreshnessWatcher:
                 if len(sha) > 12:
                     seen_local_shas.add(sha[:12])
                 pr_num = pr.get("number")
-                changed_files: List[str] = []
+                changed_files: list[str] = []
                 if pr_num is not None:
                     files_json, fhit, _ = self._get_json(
                         f"/repos/{repo_slug}/pulls/{pr_num}/files?per_page=30"
@@ -704,8 +707,8 @@ class FreshnessWatcher:
                 if not ts or ts < cutoff:
                     continue
                 msg = str(commit_obj.get("message") or "").splitlines()[0].strip()
-                changed_files: List[str] = []
-                diff_chunks: List[str] = []
+                changed_files: list[str] = []
+                diff_chunks: list[str] = []
                 for f in (c.get("files") or []):
                     if isinstance(f, dict) and f.get("filename"):
                         changed_files.append(str(f["filename"]))
@@ -761,15 +764,15 @@ class FreshnessWatcher:
         eligibility_db: Any = None,
         ml_rank: bool = False,
     ) -> FreshnessRunReport:
-        active: List[WatchTarget] = []
+        active: list[WatchTarget] = []
         for t in targets:
             if not t.enabled:
                 continue
             if eligibility_db is not None and not eligibility_db.is_eligible(t.program):
                 continue
             active.append(t)
-        all_candidates: List[FreshCandidate] = []
-        all_errors: List[str] = []
+        all_candidates: list[FreshCandidate] = []
+        all_errors: list[str] = []
         total_cache_hits = 0
 
         worker_count = min(MAX_WORKERS, max(1, len(active)))
@@ -784,7 +787,7 @@ class FreshnessWatcher:
                     all_candidates.extend(cands)
                     total_cache_hits += hits
                     all_errors.extend(errs)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     t = futures[fut]
                     all_errors.append(f"{t.repo}: unhandled error: {exc}")
 
@@ -799,7 +802,7 @@ class FreshnessWatcher:
                     scored_pairs.append((float(s_res.get("ml_priority_score", 0.0)), cand))
                 scored_pairs.sort(key=lambda pair: (-pair[0], -pair[1].surface_score, pair[1].age_hours))
                 all_candidates = [pair[1] for pair in scored_pairs]
-            except Exception:
+            except Exception:  # noqa: BLE001
                 all_candidates.sort(key=lambda c: (-c.surface_score, c.age_hours))
         else:
             all_candidates.sort(key=lambda c: (-c.surface_score, c.age_hours))
@@ -819,10 +822,15 @@ class FreshnessWatcher:
             errors=all_errors,
         )
 
-    def __enter__(self) -> "FreshnessWatcher":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def close(self) -> None:
@@ -831,11 +839,11 @@ class FreshnessWatcher:
     def __del__(self) -> None:
         try:
             self.close()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
 
-def load_watchlist(path: Union[str, Path]) -> List[WatchTarget]:
+def load_watchlist(path: str | Path) -> list[WatchTarget]:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     raw_targets = data.get("targets", data) if isinstance(data, dict) else data
     return [WatchTarget.from_dict(item) for item in raw_targets]
@@ -881,7 +889,7 @@ def render_fresh_hunt_queue_markdown(report: FreshnessRunReport) -> str:
 # ---------------------------------------------------------------------------
 
 
-_MONOREPO_CONTAINERS: Tuple[str, ...] = (
+_MONOREPO_CONTAINERS: tuple[str, ...] = (
     "packages",
     "apps",
     "crates",
@@ -896,8 +904,8 @@ _MONOREPO_CONTAINERS: Tuple[str, ...] = (
 def _sanitize_safe_rel_path(
     raw_path: Any,
     *,
-    repo_root: Optional[Path] = None,
-) -> Optional[str]:
+    repo_root: Path | None = None,
+) -> str | None:
     """
     Validate and normalize a repository-relative path, rejecting traversal (`..`),
     absolute paths, drive letters (`:`), UNC paths (`\\\\`), null bytes, and
@@ -944,9 +952,9 @@ def _sanitize_safe_rel_path(
 def resolve_changed_sibling_paths(
     changed_files: Sequence[str],
     *,
-    repo_path: Optional[Union[str, Path]] = None,
+    repo_path: str | Path | None = None,
     max_siblings: int = 32,
-) -> List[str]:
+) -> list[str]:
     """
     Resolve sibling package/handler paths related to `changed_files`.
 
@@ -956,7 +964,7 @@ def resolve_changed_sibling_paths(
     sibling directory prefixes for downstream scanning.
     """
     root_for_check = Path(repo_path) if repo_path is not None else None
-    norm_changed: List[str] = []
+    norm_changed: list[str] = []
     for f in changed_files:
         clean = _sanitize_safe_rel_path(f, repo_root=root_for_check)
         if clean is not None:
@@ -965,7 +973,7 @@ def resolve_changed_sibling_paths(
         return []
 
     changed_set = set(norm_changed)
-    siblings: List[str] = []
+    siblings: list[str] = []
     seen: set[str] = set()
 
     def _add(item: str) -> None:
@@ -985,7 +993,7 @@ def resolve_changed_sibling_paths(
                     clean_s = _sanitize_safe_rel_path(s, repo_root=root)
                     if clean_s is not None:
                         _add(clean_s)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
 
             # Monorepo sibling package discovery
@@ -1068,14 +1076,17 @@ class AsyncFreshnessPoller:
         self,
         *,
         api_base: str = DEFAULT_API_BASE,
-        token: Optional[str] = None,
-        state_db: Union[str, Path] = Path("out/freshness_state.db"),
+        token: str | None = None,
+        state_db: str | Path = Path("out/freshness_state.db"),
         timeout_sec: float = DEFAULT_TIMEOUT_SEC,
         max_concurrency: int = MAX_WORKERS,
         allow_loopback: bool = True,
-        now_utc: Optional[datetime] = None,
+        now_utc: datetime | None = None,
     ) -> None:
-        from engine.safe_network_validator import is_explicit_loopback_host, validate_target_host
+        from engine.safe_network_validator import (
+            is_explicit_loopback_host,
+            validate_target_host,
+        )
 
         self.api_base = str(api_base or DEFAULT_API_BASE).rstrip("/")
         parsed = urllib.parse.urlparse(self.api_base)
@@ -1096,12 +1107,17 @@ class AsyncFreshnessPoller:
         self.store = FreshnessStateStore(state_db)
 
     def _now(self) -> datetime:
-        return self._now_override or datetime.now(timezone.utc)
+        return self._now_override or datetime.now(UTC)
 
-    def __enter__(self) -> "AsyncFreshnessPoller":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def close(self) -> None:
@@ -1110,7 +1126,7 @@ class AsyncFreshnessPoller:
     def __del__(self) -> None:
         try:
             self.close()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
     async def _get_json_async(
@@ -1118,8 +1134,8 @@ class AsyncFreshnessPoller:
         path: str,
         *,
         client: Any = None,
-        http_get: Optional[Callable[..., Any]] = None,
-    ) -> Tuple[Optional[Any], bool, Optional[str]]:
+        http_get: Callable[..., Any] | None = None,
+    ) -> tuple[Any | None, bool, str | None]:
         url = f"{self.api_base}{path}"
         headers = {
             "Accept": "application/vnd.github+json",
@@ -1166,7 +1182,7 @@ class AsyncFreshnessPoller:
             if etag:
                 await asyncio.to_thread(self.store.set_etag, url, etag)
             return resp.json(), False, None
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return None, False, f"Request failed on {path}: {exc}"
 
     async def _scan_target_async(
@@ -1174,18 +1190,18 @@ class AsyncFreshnessPoller:
         target: WatchTarget,
         *,
         client: Any,
-        http_get: Optional[Callable[..., Any]],
+        http_get: Callable[..., Any] | None,
         freshness_hours: int,
         min_score: int,
         skip_seen: bool,
-        repo_path: Optional[Union[str, Path]] = None,
-    ) -> Tuple[List[Dict[str, Any]], int, List[str]]:
+        repo_path: str | Path | None = None,
+    ) -> tuple[list[dict[str, Any]], int, list[str]]:
         repo_slug = _validate_repo_slug(target.repo)
         now = self._now()
         cutoff = now - timedelta(hours=freshness_hours)
-        records: List[Dict[str, Any]] = []
+        records: list[dict[str, Any]] = []
         cache_hits = 0
-        errors: List[str] = []
+        errors: list[str] = []
         seen_local_shas: set[str] = set()
 
         # 1. Fresh Releases (with tag compare/commit diff file extraction)
@@ -1211,7 +1227,7 @@ class AsyncFreshnessPoller:
                 if len(sha) > 12:
                     seen_local_shas.add(sha[:12])
 
-                rel_files: List[str] = [
+                rel_files: list[str] = [
                     str(f.get("filename", f) if isinstance(f, dict) else f)
                     for f in (rel.get("changed_files") or rel.get("files") or [])
                     if f
@@ -1304,8 +1320,8 @@ class AsyncFreshnessPoller:
                 if len(sha) > 12:
                     seen_local_shas.add(sha[:12])
                 pr_num = pr.get("number")
-                changed_files: List[str] = []
-                diff_chunks: List[str] = []
+                changed_files: list[str] = []
+                diff_chunks: list[str] = []
                 if pr_num is not None:
                     files_json, fhit, _ = await self._get_json_async(
                         f"/repos/{repo_slug}/pulls/{pr_num}/files?per_page=30",
@@ -1379,8 +1395,8 @@ class AsyncFreshnessPoller:
                 if not ts or ts < cutoff:
                     continue
                 msg = str(commit_obj.get("message") or "").splitlines()[0].strip()
-                changed_files: List[str] = []
-                diff_chunks: List[str] = []
+                changed_files: list[str] = []
+                diff_chunks: list[str] = []
                 for f in (c.get("files") or []):
                     if isinstance(f, dict) and f.get("filename"):
                         changed_files.append(str(f["filename"]))
@@ -1443,20 +1459,20 @@ class AsyncFreshnessPoller:
         *,
         eligibility_db: Any = None,
         blackboard: Any = None,
-        http_get: Optional[Callable[..., Any]] = None,
+        http_get: Callable[..., Any] | None = None,
         freshness_hours: int = DEFAULT_FRESHNESS_HOURS,
         min_score: int = 20,
         skip_seen: bool = True,
         mark_returned_seen: bool = True,
-        repo_paths: Optional[Dict[str, Union[str, Path]]] = None,
+        repo_paths: dict[str, str | Path] | None = None,
         lane: int = 2,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Execute one async ETag-cached poll cycle across `UNLOCKED` targets.
         Returns `304 Not Modified` immediately with zero re-scans/intents.
         """
-        eligible_targets: List[WatchTarget] = []
-        skipped_ineligible: List[str] = []
+        eligible_targets: list[WatchTarget] = []
+        skipped_ineligible: list[str] = []
         for t in targets:
             if not t.enabled:
                 continue
@@ -1466,12 +1482,12 @@ class AsyncFreshnessPoller:
             eligible_targets.append(t)
 
         sem = asyncio.Semaphore(self.max_concurrency)
-        all_records: List[Dict[str, Any]] = []
+        all_records: list[dict[str, Any]] = []
         total_cache_hits = 0
-        all_errors: List[str] = []
+        all_errors: list[str] = []
         paths_map = repo_paths or {}
 
-        async def _run_target(target: WatchTarget, client: Any) -> Tuple[List[Dict[str, Any]], int, List[str]]:
+        async def _run_target(target: WatchTarget, client: Any) -> tuple[list[dict[str, Any]], int, list[str]]:
             async with sem:
                 rpath = paths_map.get(target.repo) or paths_map.get(target.program)
                 return await self._scan_target_async(
@@ -1505,11 +1521,11 @@ class AsyncFreshnessPoller:
             key=lambda r: (-r["candidate"].surface_score, r["candidate"].age_hours)
         )
 
-        enqueued_intent_ids: List[str] = []
-        candidates_out: List[FreshCandidate] = []
+        enqueued_intent_ids: list[str] = []
+        candidates_out: list[FreshCandidate] = []
         for rec in all_records:
             cand: FreshCandidate = rec["candidate"]
-            sibling_files: List[str] = list(rec["sibling_files"])
+            sibling_files: list[str] = list(rec["sibling_files"])
             body_text = str(rec.get("body") or "")
             rpath_str = str(rec.get("repo_path") or "")
             candidates_out.append(cand)
@@ -1531,7 +1547,7 @@ class AsyncFreshnessPoller:
                     )
 
                     sec_signals = detect_security_fix_signal(cand.title, body_text)
-                except Exception:
+                except Exception:  # noqa: BLE001
                     sec_signals = []
                     emit_sibling_parity_intents = None  # type: ignore[assignment]
 
@@ -1606,12 +1622,12 @@ class AsyncFreshnessPoller:
         targets: Sequence[WatchTarget],
         *,
         interval_sec: float = 60.0,
-        max_cycles: Optional[int] = None,
-        stop_event: Optional[asyncio.Event] = None,
+        max_cycles: int | None = None,
+        stop_event: asyncio.Event | None = None,
         **poll_kwargs: Any,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Run periodic 60-second async ETag poll cycles until stopped or `max_cycles` reached."""
-        reports: List[Dict[str, Any]] = []
+        reports: list[dict[str, Any]] = []
         cycles = 0
         eff_interval = max(0.01, float(interval_sec))
         while True:
@@ -1625,7 +1641,7 @@ class AsyncFreshnessPoller:
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=eff_interval)
                     break
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     continue
             else:
                 await asyncio.sleep(eff_interval)

@@ -16,9 +16,10 @@ import hashlib
 import io
 import json
 import re
-from datetime import datetime, timezone
+from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any
 
 from engine.secret_store import SecretBox
 
@@ -56,14 +57,14 @@ def neutralize_csv_cell(value: Any) -> str:
     return text
 
 
-def redact_sensitive_headers(headers: Optional[Dict[str, Any]]) -> Dict[str, str]:
+def redact_sensitive_headers(headers: dict[str, Any] | None) -> dict[str, str]:
     """
     Redacts credentials, bearer tokens, cookies, and API keys from HTTP headers
     while preserving auth scheme names (e.g., `Bearer <REDACTED>`) for triage.
     """
     if not headers or not isinstance(headers, dict):
         return {}
-    redacted: Dict[str, str] = {}
+    redacted: dict[str, str] = {}
     for k, v in headers.items():
         key_str = str(k)
         val_str = str(v)
@@ -114,19 +115,19 @@ def _redact_inline_tokens(text: str) -> str:
     return out
 
 
-def _fence_for(content: str, lang: str = "") -> Tuple[str, str]:
+def _fence_for(content: str, lang: str = "") -> tuple[str, str]:
     max_ticks = max((len(m.group(0)) for m in re.finditer(r"`+", content or "")), default=2)
     fence = "`" * max(3, max_ticks + 1)
     return f"{fence}{lang}", fence
 
 
-def _decode_body_preview(body_b64: Optional[str], max_chars: int = 2000) -> str:
+def _decode_body_preview(body_b64: str | None, max_chars: int = 2000) -> str:
     if not body_b64:
         return ""
     try:
         raw = base64.b64decode(body_b64)
         text = raw.decode("utf-8", errors="replace")
-    except Exception:
+    except Exception:  # noqa: BLE001
         text = str(body_b64)
     text = _redact_inline_tokens(text)
     if len(text) > max_chars:
@@ -145,15 +146,15 @@ class AdvisoryExporter:
     encrypted task archives from RFCHunt / ARTEX state.
     """
 
-    def __init__(self, reports_dir: Optional[Union[str, Path]] = None):
+    def __init__(self, reports_dir: str | Path | None = None):
         self.reports_dir = Path(reports_dir) if reports_dir else Path("reports")
 
     def export_ghsa_markdown(
         self,
-        chain: Dict[str, Any],
-        traffic_record: Optional[Dict[str, Any]] = None,
-        retests: Optional[List[Dict[str, Any]]] = None,
-        output_path: Optional[Union[str, Path]] = None,
+        chain: dict[str, Any],
+        traffic_record: dict[str, Any] | None = None,
+        retests: list[dict[str, Any]] | None = None,
+        output_path: str | Path | None = None,
     ) -> str:
         """
         Renders a GHSA-ready GitHub Security Advisory Markdown report for a
@@ -204,17 +205,17 @@ class AdvisoryExporter:
         if isinstance(source_scanners, str):
             try:
                 source_scanners = json.loads(source_scanners)
-            except Exception:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 source_scanners = [source_scanners]
         chain_steps = chain.get("chain_steps") or chain.get("steps") or []
         if isinstance(chain_steps, str):
             try:
                 chain_steps = json.loads(chain_steps)
-            except Exception:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 chain_steps = []
 
-        generated_at = datetime.now(timezone.utc).isoformat()
-        lines: List[str] = [
+        generated_at = datetime.now(UTC).isoformat()
+        lines: list[str] = [
             f"# Security Advisory: {title}",
             "",
             "| Field | Value |",
@@ -350,9 +351,9 @@ class AdvisoryExporter:
 
     def export_findings_csv(
         self,
-        findings: Sequence[Dict[str, Any]],
-        chains: Optional[Sequence[Dict[str, Any]]] = None,
-        output_path: Optional[Union[str, Path]] = None,
+        findings: Sequence[dict[str, Any]],
+        chains: Sequence[dict[str, Any]] | None = None,
+        output_path: str | Path | None = None,
     ) -> str:
         """
         Exports findings and attack chains to RFC 4180 CSV with mandatory
@@ -433,11 +434,11 @@ class AdvisoryExporter:
     def export_task_archive(
         self,
         db: Any,
-        output_path: Union[str, Path],
+        output_path: str | Path,
         *,
-        task_id: Optional[str] = None,
-        secret_box: Optional[SecretBox] = None,
-    ) -> Dict[str, Any]:
+        task_id: str | None = None,
+        secret_box: SecretBox | None = None,
+    ) -> dict[str, Any]:
         """
         Exports all persisted ARTEX task state from `db` into an AES-256-GCM
         encrypted archive (`*.rfca`) protected with a canonical SHA-256 digest.
@@ -487,7 +488,7 @@ class AdvisoryExporter:
         envelope = {
             "schema": "rfchunt-task-archive/v1",
             "task_id": task_id or "ALL",
-            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "exported_at": datetime.now(UTC).isoformat(),
             "sha256": sha256_hex,
             "payload": payload,
         }
@@ -517,10 +518,10 @@ class AdvisoryExporter:
 
     @staticmethod
     def import_task_archive(
-        archive_path: Union[str, Path],
+        archive_path: str | Path,
         *,
-        secret_box: Optional[SecretBox] = None,
-    ) -> Dict[str, Any]:
+        secret_box: SecretBox | None = None,
+    ) -> dict[str, Any]:
         """
         Decrypts an AES-256-GCM `.rfca` archive and verifies its SHA-256 digest
         fail-closed before returning the unpacked dictionary.
@@ -532,12 +533,12 @@ class AdvisoryExporter:
         plaintext = box.decrypt_bytes(raw)
         envelope = json.loads(plaintext.decode("utf-8"))
         if not isinstance(envelope, dict):
-            raise ValueError("Task archive envelope malformed (expected JSON object).")
+            raise ValueError("Task archive envelope malformed (expected JSON object).")  # noqa: TRY004
         if envelope.get("schema") != "rfchunt-task-archive/v1":
             raise ValueError(f"Unsupported task archive schema: {envelope.get('schema')}")
         payload = envelope.get("payload")
         if not isinstance(payload, dict):
-            raise ValueError("Task archive payload missing or malformed.")
+            raise ValueError("Task archive payload missing or malformed.")  # noqa: TRY004
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         actual_sha = hashlib.sha256(canonical).hexdigest()
         expected_sha = str(envelope.get("sha256") or "")

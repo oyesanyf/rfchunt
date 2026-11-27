@@ -13,12 +13,12 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
 
 from engine.ml_program_selector import signed_hash_features, signed_log1p
 from engine.program_eligibility_db import ProgramEligibilityDB
-from pathlib import Path
-
 
 # ---------------------------------------------------------------------------
 # 1. O(1)-Memory Welford Online Scaler & Commit Velocity Burst Detector
@@ -34,8 +34,8 @@ class WelfordOnlineScaler:
     def __init__(self, n_features: int) -> None:
         self.n_features = max(1, int(n_features))
         self.count: int = 0
-        self.mean: List[float] = [0.0] * self.n_features
-        self.m2: List[float] = [0.0] * self.n_features
+        self.mean: list[float] = [0.0] * self.n_features
+        self.m2: list[float] = [0.0] * self.n_features
 
     def partial_fit_one(self, row: Sequence[float]) -> None:
         self.count += 1
@@ -47,12 +47,12 @@ class WelfordOnlineScaler:
             delta2 = x - self.mean[j]
             self.m2[j] += delta * delta2
 
-    def partial_fit(self, rows: Sequence[Sequence[float]]) -> "WelfordOnlineScaler":
+    def partial_fit(self, rows: Sequence[Sequence[float]]) -> WelfordOnlineScaler:
         for r in rows:
             self.partial_fit_one(r)
         return self
 
-    def stds(self, *, floor: float = 1e-6) -> List[float]:
+    def stds(self, *, floor: float = 1e-6) -> list[float]:
         if self.count <= 1:
             return [max(1.0, floor)] * self.n_features
         return [
@@ -60,9 +60,9 @@ class WelfordOnlineScaler:
             for j in range(self.n_features)
         ]
 
-    def transform_one(self, row: Sequence[float], *, clip: float = 8.0) -> List[float]:
+    def transform_one(self, row: Sequence[float], *, clip: float = 8.0) -> list[float]:
         st = self.stds()
-        out: List[float] = []
+        out: list[float] = []
         for j in range(self.n_features):
             x = float(row[j]) if j < len(row) and math.isfinite(float(row[j])) else 0.0
             z = (x - self.mean[j]) / st[j]
@@ -79,9 +79,9 @@ class CommitVelocityBurstDetector:
 
     def __init__(self, *, z_threshold: float = 2.0) -> None:
         self.z_threshold = max(0.5, float(z_threshold))
-        self._scalers: Dict[str, WelfordOnlineScaler] = {}
+        self._scalers: dict[str, WelfordOnlineScaler] = {}
 
-    def observe_and_score(self, repo_slug: str, current_daily_commits: float) -> Tuple[float, bool]:
+    def observe_and_score(self, repo_slug: str, current_daily_commits: float) -> tuple[float, bool]:
         key = str(repo_slug or "").strip().lower()
         val = max(0.0, float(current_daily_commits or 0.0))
         scaler = self._scalers.get(key)
@@ -101,7 +101,7 @@ class CommitVelocityBurstDetector:
 # 2. Multi-Label Surface-to-Scanner Router (adapted from ACDSO multilabel.py)
 # ---------------------------------------------------------------------------
 
-ALL_SURFACES: Tuple[str, ...] = (
+ALL_SURFACES: tuple[str, ...] = (
     "wildcard_web",
     "rest_graphql_api",
     "mobile_android_ios",
@@ -113,7 +113,7 @@ ALL_SURFACES: Tuple[str, ...] = (
     "gha_ci",
 )
 
-_SURFACE_TO_SCANNERS: Dict[str, Tuple[str, ...]] = {
+_SURFACE_TO_SCANNERS: dict[str, tuple[str, ...]] = {
     "wildcard_web": ("parity_auditor", "trufflehog", "rea"),
     "rest_graphql_api": ("api_jwt_sdjwt", "parity_auditor", "trufflehog"),
     "mobile_android_ios": ("mobile_mobsf", "trufflehog", "parity_auditor"),
@@ -125,7 +125,7 @@ _SURFACE_TO_SCANNERS: Dict[str, Tuple[str, ...]] = {
     "gha_ci": ("gha_workflow_scanners", "trufflehog", "parity_auditor"),
 }
 
-_SURFACE_PATH_HINTS: Dict[str, Tuple[str, ...]] = {
+_SURFACE_PATH_HINTS: dict[str, tuple[str, ...]] = {
     "gha_ci": (".github/workflows/", "action.yml", "action.yaml", ".gitlab-ci"),
     "mobile_android_ios": ("androidmanifest.xml", "info.plist", "network_security_config.xml", ".kt", ".java", ".swift", ".m", ".mm", ".apk", ".ipa", "gradle"),
     "ai_llm_mcp": ("prompt", "mcp", "agent", "llm", "ollama", "vllm", "ray", "gradio", "langchain", "openai", "anthropic", "tool_call", "dockerfile", "pickle", "torch"),
@@ -149,11 +149,11 @@ class SurfaceToScannerRouter:
         *,
         changed_files: Sequence[str] = (),
         text_context: str = "",
-        scope_asset_types: Optional[Dict[str, int]] = None,
-    ) -> Dict[str, float]:
+        scope_asset_types: dict[str, int] | None = None,
+    ) -> dict[str, float]:
         blob_files = " ".join(str(f or "").replace("\\", "/").lower() for f in changed_files)
         blob_all = f"{blob_files} {(text_context or '').lower()}"
-        probs: Dict[str, float] = {s: 0.0 for s in ALL_SURFACES}
+        probs: dict[str, float] = {s: 0.0 for s in ALL_SURFACES}
 
         for surface, hints in _SURFACE_PATH_HINTS.items():
             hits = sum(1 for h in hints if h in blob_all)
@@ -182,17 +182,17 @@ class SurfaceToScannerRouter:
         *,
         changed_files: Sequence[str] = (),
         text_context: str = "",
-        scope_asset_types: Optional[Dict[str, int]] = None,
+        scope_asset_types: dict[str, int] | None = None,
         threshold: float = 0.40,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         probs = self.predict_surfaces(
             changed_files=changed_files,
             text_context=text_context,
             scope_asset_types=scope_asset_types,
         )
         active_surfaces = [s for s, p in probs.items() if p >= threshold]
-        scanners: List[str] = []
-        seen: Set[str] = set()
+        scanners: list[str] = []
+        seen: set[str] = set()
         for surf in sorted(active_surfaces, key=lambda s: -probs[s]):
             for sc in _SURFACE_TO_SCANNERS.get(surf, ()):
                 if sc not in seen:
@@ -211,7 +211,7 @@ class SurfaceToScannerRouter:
 # 3. ML Commit / PR Diff Prioritizer & Dynamic Unlocked Watchlist Sync
 # ---------------------------------------------------------------------------
 
-_HIGH_RISK_DIFF_TOKENS: Tuple[Tuple[str, float], ...] = (
+_HIGH_RISK_DIFF_TOKENS: tuple[tuple[str, float], ...] = (
     ("sanitize", 1.8),
     ("o_nofollow", 2.2),
     ("symlink", 2.0),
@@ -262,20 +262,20 @@ class CommitDiffRanker:
     def __init__(
         self,
         *,
-        burst_detector: Optional[CommitVelocityBurstDetector] = None,
-        router: Optional[SurfaceToScannerRouter] = None,
+        burst_detector: CommitVelocityBurstDetector | None = None,
+        router: SurfaceToScannerRouter | None = None,
     ) -> None:
         self.burst_detector = burst_detector or CommitVelocityBurstDetector()
         self.router = router or SurfaceToScannerRouter()
 
     def score_candidate(
         self,
-        candidate: Dict[str, Any],
+        candidate: dict[str, Any],
         *,
         program_ml_score: float = 0.55,
         repo_stars: int = 0,
-        daily_commit_rate: Optional[float] = None,
-    ) -> Dict[str, Any]:
+        daily_commit_rate: float | None = None,
+    ) -> dict[str, Any]:
         age_hours = max(0.0, float(candidate.get("age_hours", 24.0) or 0.0))
         recency_urgency = math.exp(-age_hours / 24.0)
 
@@ -290,7 +290,7 @@ class CommitDiffRanker:
         low_text = full_text.lower()
 
         # Token & security-fix signal density
-        matched_signals: List[str] = []
+        matched_signals: list[str] = []
         token_weight_sum = 0.0
         for tok, w in _HIGH_RISK_DIFF_TOKENS:
             if tok in low_text:
@@ -359,14 +359,14 @@ class CommitDiffRanker:
 
     def rank_candidates(
         self,
-        candidates: Sequence[Dict[str, Any]],
+        candidates: Sequence[dict[str, Any]],
         *,
-        program_scores: Optional[Dict[str, float]] = None,
-        repo_stars_map: Optional[Dict[str, int]] = None,
-    ) -> List[Dict[str, Any]]:
+        program_scores: dict[str, float] | None = None,
+        repo_stars_map: dict[str, int] | None = None,
+    ) -> list[dict[str, Any]]:
         prog_map = {k.lower(): float(v) for k, v in (program_scores or {}).items()}
         stars_map = {k.lower(): int(v) for k, v in (repo_stars_map or {}).items()}
-        scored: List[Dict[str, Any]] = []
+        scored: list[dict[str, Any]] = []
         for c in candidates:
             prog = str(c.get("program") or "").lower()
             repo = str(c.get("repo") or "").lower()
@@ -391,10 +391,10 @@ class CommitDiffRanker:
 
 def build_unlocked_watchlist_from_db(
     *,
-    eligibility_db: Optional[ProgramEligibilityDB] = None,
-    db_path: Optional[str] = None,
+    eligibility_db: ProgramEligibilityDB | None = None,
+    db_path: str | None = None,
     min_efficiency_pct: float = 80.0,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """
     Dynamically synthesizes a WatchTarget list strictly from UNLOCKED programs'
     `in_scope_repos` in `ProgramEligibilityDB`, eliminating blocked-program deadweight.
@@ -405,8 +405,8 @@ def build_unlocked_watchlist_from_db(
         db.seed_observed_hackerone_baseline()
         unlocked = db.list_unlocked()
 
-    targets: List[Dict[str, Any]] = []
-    seen_repos: Set[str] = set()
+    targets: list[dict[str, Any]] = []
+    seen_repos: set[str] = set()
     for rec in unlocked:
         if rec.response_efficiency_pct is not None and rec.response_efficiency_pct < min_efficiency_pct:
             continue
@@ -447,7 +447,7 @@ def build_unlocked_watchlist_from_db(
 #    (adapted from ACDSO clustering.py, anomaly.py, scale.py)
 # ---------------------------------------------------------------------------
 
-_HIGH_VALUE_RECON_TOKENS: Tuple[str, ...] = (
+_HIGH_VALUE_RECON_TOKENS: tuple[str, ...] = (
     "graphql",
     "swagger",
     "openapi",
@@ -476,7 +476,7 @@ _HIGH_VALUE_RECON_TOKENS: Tuple[str, ...] = (
 )
 
 
-def _extract_recon_feature_vector(asset: Dict[str, Any]) -> Tuple[List[float], List[str]]:
+def _extract_recon_feature_vector(asset: dict[str, Any]) -> tuple[list[float], list[str]]:
     """Extracts a compact numeric + hashed-metadata feature vector for an HTTP endpoint / JS bundle."""
     url = str(asset.get("url") or asset.get("endpoint") or asset.get("host") or "")
     status_code = int(asset.get("status_code") or asset.get("status") or 200)
@@ -485,7 +485,7 @@ def _extract_recon_feature_vector(asset: Dict[str, Any]) -> Tuple[List[float], L
     title = str(asset.get("title") or "")
     tech = " ".join(str(t) for t in (asset.get("tech") or asset.get("technologies") or []))
     headers_blob = " ".join(
-        sorted(str(k).lower() for k in (asset.get("headers") or {}).keys())
+        sorted(str(k).lower() for k in (asset.get("headers") or {}))
         if isinstance(asset.get("headers"), dict)
         else [str(h).lower() for h in (asset.get("headers") or [])]
     )
@@ -529,7 +529,7 @@ class StreamingReconAnomalyScorer:
     def __init__(self, n_features: int = 14) -> None:
         self.scaler = WelfordOnlineScaler(n_features)
 
-    def score_batch(self, vectors: Sequence[Sequence[float]]) -> List[float]:
+    def score_batch(self, vectors: Sequence[Sequence[float]]) -> list[float]:
         if not vectors:
             return []
         self.scaler.partial_fit(vectors)
@@ -540,7 +540,7 @@ class StreamingReconAnomalyScorer:
         s_norms = sorted(norms)
         med = s_norms[len(s_norms) // 2]
         mad = sorted(abs(x - med) for x in norms)[len(norms) // 2] or 0.25
-        out: List[float] = []
+        out: list[float] = []
         for nm in norms:
             rob_z = max(0.0, (nm - med) / (1.4826 * mad))
             score = 1.0 - math.exp(-rob_z / 2.2)
@@ -566,15 +566,15 @@ class ReconAssetClusterer:
 
     def cluster_and_prioritize(
         self,
-        assets: Sequence[Dict[str, Any]],
+        assets: Sequence[dict[str, Any]],
         *,
-        compliance_ctx: Optional[Any] = None,
-    ) -> Dict[str, Any]:
+        compliance_ctx: Any | None = None,
+    ) -> dict[str, Any]:
         """
         Clusters recon assets and returns prioritized anomalies.
         If `compliance_ctx` is provided, filters out any out-of-scope host fail-closed.
         """
-        filtered_assets: List[Dict[str, Any]] = []
+        filtered_assets: list[dict[str, Any]] = []
         skipped_oos: int = 0
         for a in assets:
             if not isinstance(a, dict):
@@ -601,8 +601,8 @@ class ReconAssetClusterer:
                 "cluster_summaries": [],
             }
 
-        vectors: List[List[float]] = []
-        token_hits: List[List[str]] = []
+        vectors: list[list[float]] = []
+        token_hits: list[list[str]] = []
         for a in filtered_assets:
             vec, toks = _extract_recon_feature_vector(a)
             vectors.append(vec)
@@ -616,7 +616,7 @@ class ReconAssetClusterer:
 
         # Deterministic farthest-first K-Means++ initialization
         k = 1 if n <= 2 else min(self.max_clusters, max(2, int(math.sqrt(n / 2.0))))
-        centroids: List[List[float]] = [list(X[0])]
+        centroids: list[list[float]] = [list(X[0])]
         for _ in range(1, k):
             best_i = max(
                 range(n),
@@ -644,24 +644,24 @@ class ReconAssetClusterer:
                     ]
 
         # Compute per-cluster distances, sizes, and inductive p95 noise thresholds
-        cluster_members: Dict[int, List[int]] = {}
+        cluster_members: dict[int, list[int]] = {}
         dists = [math.sqrt(_euclid_sq(X[i], centroids[labels[i]])) for i in range(n)]
         for i, lbl in enumerate(labels):
             cluster_members.setdefault(lbl, []).append(i)
 
-        p95_thresh: Dict[int, float] = {}
+        p95_thresh: dict[int, float] = {}
         for lbl, idxs in cluster_members.items():
             s_d = sorted(dists[i] for i in idxs)
-            p_idx = min(len(s_d) - 1, int(math.floor(0.95 * (len(s_d) - 1))))
+            p_idx = min(len(s_d) - 1, math.floor(0.95 * (len(s_d) - 1)))
             # Require nonzero threshold margin so identical points aren't falsely flagged
             p95_thresh[lbl] = max(s_d[p_idx], 0.35)
 
-        final_labels: List[int] = []
-        is_outlier: List[bool] = []
+        final_labels: list[int] = []
+        is_outlier: list[bool] = []
         suppressed_homogeneous = 0
-        prioritized: List[Dict[str, Any]] = []
+        prioritized: list[dict[str, Any]] = []
 
-        small_cluster_cap = max(1, int(math.floor(0.15 * n))) if n >= 6 else 1
+        small_cluster_cap = max(1, math.floor(0.15 * n)) if n >= 6 else 1
         for i, a in enumerate(filtered_assets):
             orig_lbl = labels[i]
             c_size = len(cluster_members[orig_lbl])
@@ -742,7 +742,7 @@ _JS_ENDPOINT_RX = re.compile(
 )
 _JS_ABS_URL_RX = re.compile(r"""https?://[A-Za-z0-9._-]+(?::\d{1,5})?(?:/[A-Za-z0-9_./:?=&%-]{0,120})?""")
 _JS_SOURCEMAP_RX = re.compile(r"""sourceMappingURL\s*=\s*([^\s'"]+)""", re.IGNORECASE)
-_JS_SINK_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
+_JS_SINK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("postMessage", re.compile(r"\.postMessage\s*\(", re.IGNORECASE)),
     ("message_listener", re.compile(r"""addEventListener\s*\(\s*["']message["']""", re.IGNORECASE)),
     ("innerHTML", re.compile(r"\.(?:innerHTML|outerHTML)\s*=", re.IGNORECASE)),
@@ -751,14 +751,14 @@ _JS_SINK_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
     ("document_write", re.compile(r"document\.write(?:ln)?\s*\(", re.IGNORECASE)),
     ("location_sink", re.compile(r"(?:window\.)?location(?:\.href)?\s*=", re.IGNORECASE)),
 )
-_JS_SECRET_HINT_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
+_JS_SECRET_HINT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("aws_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("github_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
     ("jwt_literal", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),
     ("bearer_literal", re.compile(r"""Bearer\s+[A-Za-z0-9_.-]{20,}""")),
     ("client_secret_assign", re.compile(r"""(?:client_secret|api_secret|private_key)\s*[:=]\s*["'][^"']{8,}["']""", re.IGNORECASE)),
 )
-_STACKTRACE_MARKERS: Tuple[str, ...] = (
+_STACKTRACE_MARKERS: tuple[str, ...] = (
     "traceback (most recent call last)",
     "sqlstate[",
     "syntax error at or near",
@@ -771,7 +771,7 @@ _STACKTRACE_MARKERS: Tuple[str, ...] = (
     "fatal error:",
     "x-debug-token",
 )
-_LEAK_BODY_MARKERS: Tuple[str, ...] = (
+_LEAK_BODY_MARKERS: tuple[str, ...] = (
     "sourcemappingurl",
     "__schema",
     "\"openapi\"",
@@ -796,13 +796,13 @@ class JavaScriptBundleAnalyzer:
         source_label: str,
         text: str,
         *,
-        compliance_ctx: Optional[Any] = None,
-    ) -> Dict[str, Any]:
+        compliance_ctx: Any | None = None,
+    ) -> dict[str, Any]:
         raw = str(text or "")
         rel_endpoints = sorted({m.group(1) for m in _JS_ENDPOINT_RX.finditer(raw)})[:80]
         raw_abs_urls = sorted({m.group(0) for m in _JS_ABS_URL_RX.finditer(raw)})[:80]
 
-        in_scope_urls: List[str] = []
+        in_scope_urls: list[str] = []
         skipped_oos_urls: int = 0
         for u in raw_abs_urls:
             if compliance_ctx is not None:
@@ -860,13 +860,13 @@ class JavaScriptBundleAnalyzer:
 
     def analyze_bundles(
         self,
-        bundles: Sequence[Dict[str, Any]],
+        bundles: Sequence[dict[str, Any]],
         *,
-        compliance_ctx: Optional[Any] = None,
+        compliance_ctx: Any | None = None,
         cluster: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Analyzes a batch of `{url|path, content}` dicts or on-disk `.js`/`.mjs`/`.js.map` files."""
-        results: List[Dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
         skipped_oos_bundles = 0
 
         for item in bundles:
@@ -926,12 +926,12 @@ class HTTPResponseAnomalyClassifier:
 
     def classify_responses(
         self,
-        responses: Sequence[Dict[str, Any]],
+        responses: Sequence[dict[str, Any]],
         *,
-        baseline: Optional[Dict[str, Any]] = None,
-        compliance_ctx: Optional[Any] = None,
-    ) -> List[Dict[str, Any]]:
-        filtered: List[Dict[str, Any]] = []
+        baseline: dict[str, Any] | None = None,
+        compliance_ctx: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        filtered: list[dict[str, Any]] = []
         for r in responses:
             if not isinstance(r, dict):
                 continue
@@ -947,8 +947,8 @@ class HTTPResponseAnomalyClassifier:
         if not filtered:
             return []
 
-        vecs: List[List[float]] = []
-        tok_lists: List[List[str]] = []
+        vecs: list[list[float]] = []
+        tok_lists: list[list[str]] = []
         for r in filtered:
             v, toks = _extract_recon_feature_vector(r)
             vecs.append(v)
@@ -958,7 +958,7 @@ class HTTPResponseAnomalyClassifier:
         base_status = int(baseline.get("status_code") or baseline.get("status") or 0) if isinstance(baseline, dict) else 0
         base_len = int(baseline.get("content_length") or baseline.get("length") or 0) if isinstance(baseline, dict) else 0
 
-        out: List[Dict[str, Any]] = []
+        out: list[dict[str, Any]] = []
         for idx, r in enumerate(filtered):
             status = int(r.get("status_code") or r.get("status") or 200)
             clen = max(0, int(r.get("content_length") or r.get("length") or 0))
@@ -966,14 +966,14 @@ class HTTPResponseAnomalyClassifier:
                 [
                     str(r.get("title") or ""),
                     str(r.get("body_preview") or r.get("snippet") or r.get("body") or ""),
-                    " ".join(str(k) for k in (r.get("headers") or {}).keys())
+                    " ".join(str(k) for k in (r.get("headers") or {}))
                     if isinstance(r.get("headers"), dict)
                     else "",
                 ]
             ).lower()
             score = anom_scores[idx]
             toks = tok_lists[idx]
-            reasons: List[str] = []
+            reasons: list[str] = []
 
             has_stack = status >= 500 or any(m in body_blob for m in _STACKTRACE_MARKERS)
             has_leak = any(m in body_blob for m in _LEAK_BODY_MARKERS)
@@ -1024,14 +1024,14 @@ class HTTPResponseAnomalyClassifier:
 
 
 __all__ = [
-    "WelfordOnlineScaler",
-    "CommitVelocityBurstDetector",
     "ALL_SURFACES",
-    "SurfaceToScannerRouter",
     "CommitDiffRanker",
-    "build_unlocked_watchlist_from_db",
-    "StreamingReconAnomalyScorer",
-    "ReconAssetClusterer",
-    "JavaScriptBundleAnalyzer",
+    "CommitVelocityBurstDetector",
     "HTTPResponseAnomalyClassifier",
+    "JavaScriptBundleAnalyzer",
+    "ReconAssetClusterer",
+    "StreamingReconAnomalyScorer",
+    "SurfaceToScannerRouter",
+    "WelfordOnlineScaler",
+    "build_unlocked_watchlist_from_db",
 ]
