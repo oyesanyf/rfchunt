@@ -273,26 +273,61 @@ _SENSITIVE_QUERY_KEYS = frozenset(
         "refresh_token",
         "id_token",
         "auth",
+        "authorization",
+        "proxy_authorization",
         "auth_token",
+        "csrf_token",
+        "xsrf_token",
         "api_key",
+        "x_api_key",
         "apikey",
         "key",
+        "private_key",
+        "access_key",
+        "secret_key",
         "secret",
         "client_secret",
         "password",
         "passwd",
         "pwd",
+        "passphrase",
         "jwt",
         "session",
         "session_id",
+        "sessionid",
+        "jsessionid",
+        "phpsessid",
+        "cookie",
+        "set_cookie",
         "sig",
         "signature",
         "credential",
+        "credentials",
         "bearer",
         "pat",
         "code",
     }
 )
+
+
+def _coerce_command_display(cmd: Any) -> List[str]:
+    """Safely coerces arbitrary command inputs into `List[str]` for rejection/audit transcripts."""
+    if cmd is None:
+        return []
+    if isinstance(cmd, str):
+        return [cmd]
+    if isinstance(cmd, (bytes, bytearray)):
+        return [bytes(cmd).decode("utf-8", errors="replace")]
+    if isinstance(cmd, dict):
+        return [repr(cmd)]
+    if isinstance(cmd, Sequence):
+        return [
+            bytes(tok).decode("utf-8", errors="replace")
+            if isinstance(tok, (bytes, bytearray))
+            else str(tok)
+            for tok in cmd
+        ]
+    return [repr(cmd)]
 
 
 def _sanitize_probe_url(raw_url: str, redact_fn: Callable[[str], str]) -> str:
@@ -316,12 +351,32 @@ def _sanitize_probe_url(raw_url: str, redact_fn: Callable[[str], str]) -> str:
         redacted_pairs: List[Tuple[str, str]] = []
         for k, v in parse_qsl(query, keep_blank_values=True):
             k_low = k.strip().lower()
+            k_norm = k_low.replace("-", "_")
             is_sensitive_key = (
-                k_low in _SENSITIVE_QUERY_KEYS
+                k_norm in _SENSITIVE_QUERY_KEYS
                 or any(
-                    tok in k_low
-                    for tok in ("token", "secret", "password", "passwd", "apikey", "api_key", "credential", "bearer")
+                    tok in k_norm
+                    for tok in (
+                        "token",
+                        "secret",
+                        "password",
+                        "passwd",
+                        "passphrase",
+                        "apikey",
+                        "api_key",
+                        "private_key",
+                        "access_key",
+                        "secret_key",
+                        "authorization",
+                        "session",
+                        "sessid",
+                        "cookie",
+                        "credential",
+                        "bearer",
+                    )
                 )
+                or k_norm.endswith(("_key", "_auth", "_pwd", "_jwt"))
+                or k_norm.startswith(("auth_", "api_key_"))
             )
             redacted_v = redact_fn(v)
             if is_sensitive_key or redacted_v != v:
@@ -383,6 +438,7 @@ class LinuxPocRunner:
         started_iso = datetime.now(timezone.utc).isoformat()
         t0 = time.monotonic()
 
+        cmd_display = _coerce_command_display(cmd)
         ok_mount, mount_info = validate_mount_path(repo_path)
         if not ok_mount:
             return VerifiableTranscript(
@@ -390,7 +446,7 @@ class LinuxPocRunner:
                 backend="unavailable",
                 status="rejected_unsafe",
                 exit_code=None,
-                command=list(cmd),
+                command=cmd_display,
                 image=image,
                 repo_path=str(repo_path),
                 started_at_utc=started_iso,
@@ -405,7 +461,7 @@ class LinuxPocRunner:
                 backend="unavailable",
                 status="rejected_unsafe",
                 exit_code=None,
-                command=list(cmd),
+                command=cmd_display,
                 image=image,
                 repo_path=mount_info,
                 started_at_utc=started_iso,
@@ -425,7 +481,7 @@ class LinuxPocRunner:
                 backend="unavailable",
                 status="unavailable",
                 exit_code=None,
-                command=list(cmd),
+                command=cmd_display,
                 image=image,
                 repo_path=mount_info,
                 started_at_utc=started_iso,
@@ -464,7 +520,7 @@ class LinuxPocRunner:
                 backend=backend,
                 status=status,
                 exit_code=proc.returncode,
-                command=list(cmd),
+                command=cmd_display,
                 image=image if backend == "docker" else "wsl2-linux",
                 repo_path=mount_info,
                 started_at_utc=started_iso,
@@ -480,7 +536,7 @@ class LinuxPocRunner:
                 backend=backend,
                 status="timeout",
                 exit_code=None,
-                command=list(cmd),
+                command=cmd_display,
                 image=image if backend == "docker" else "wsl2-linux",
                 repo_path=mount_info,
                 started_at_utc=started_iso,
@@ -497,7 +553,7 @@ class LinuxPocRunner:
                 backend=backend,
                 status="failed",
                 exit_code=None,
-                command=list(cmd),
+                command=cmd_display,
                 image=image if backend == "docker" else "wsl2-linux",
                 repo_path=mount_info,
                 started_at_utc=started_iso,

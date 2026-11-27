@@ -160,6 +160,24 @@ def _coerce_strict_bool(val: Any) -> bool:
     return False
 
 
+def _redact_payload(obj: Any) -> Any:
+    """Recursively redact inline credentials/tokens from serialized report structures."""
+    from engine.advisory_exporter import _redact_inline_tokens
+
+    def _walk(val: Any) -> Any:
+        if isinstance(val, str):
+            return _redact_inline_tokens(val)
+        if isinstance(val, dict):
+            return {k: _walk(v) for k, v in val.items()}
+        if isinstance(val, list):
+            return [_walk(v) for v in val]
+        if isinstance(val, tuple):
+            return tuple(_walk(v) for v in val)
+        return val
+
+    return _walk(obj)
+
+
 def _finding_from_dict(d: Any, default_engine: str = "") -> EngineFinding:
     """Safely converts an M1/M2 scanner dict or `EngineFinding` into an `EngineFinding`."""
     if isinstance(d, EngineFinding):
@@ -168,7 +186,9 @@ def _finding_from_dict(d: Any, default_engine: str = "") -> EngineFinding:
         return EngineFinding(engine=default_engine or "unknown", title=str(d or ""))
     raw_meta = d.get("metadata")
     meta: dict[str, Any] = dict(raw_meta) if isinstance(raw_meta, dict) else {}
-    eff_noise = bool(d.get("non_production_noise", False)) or bool(meta.get("non_production_noise", False))
+    eff_noise = _coerce_strict_bool(d.get("non_production_noise", False)) or _coerce_strict_bool(
+        meta.get("non_production_noise", False)
+    )
     if eff_noise and "non_production_noise" not in meta:
         meta["non_production_noise"] = True
     sev = str(d.get("severity") or "MEDIUM").upper()
@@ -193,8 +213,8 @@ def _finding_from_dict(d: Any, default_engine: str = "") -> EngineFinding:
         summary=str(d.get("summary") or d.get("description") or ""),
         rule_id=str(d.get("rule_id") or ""),
         atlas_technique=str(d.get("atlas_technique") or ""),
-        deterministic=bool(d.get("deterministic", False)),
-        confirmed=bool(d.get("confirmed", True)),
+        deterministic=_coerce_strict_bool(d.get("deterministic", False)),
+        confirmed=_coerce_strict_bool(d.get("confirmed", True)),
         target_os_required=str(d.get("target_os_required") or ""),
         non_production_noise=eff_noise,
         poc_verified=_coerce_strict_bool(d.get("poc_verified", False)),
@@ -333,22 +353,30 @@ class EnsembleReport:
         default_factory=lambda: datetime.now(UTC).isoformat()
     )
 
+    def __post_init__(self) -> None:
+        if self.proxy is not None:
+            from engine.advisory_exporter import _redact_inline_tokens
+
+            self.proxy = _redact_inline_tokens(str(self.proxy))
+
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "target": self.target,
-            "program": self.program,
-            "quorum": self.quorum,
-            "proxy": self.proxy,
-            "generated_at_utc": self.generated_at_utc,
-            "freshness": self.freshness.to_dict(),
-            "counts_by_disposition": dict(self.counts_by_disposition),
-            "total_clusters": len(self.clusters),
-            "clusters": [c.to_dict() for c in self.clusters],
-            "whiteboard": dict(self.whiteboard),
-            "lean_verification": dict(self.lean_verification),
-            "toolchain_status": dict(self.toolchain_status),
-            "all_scan_summary": self.all_scan_summary,
-        }
+        return _redact_payload(
+            {
+                "target": self.target,
+                "program": self.program,
+                "quorum": self.quorum,
+                "proxy": self.proxy,
+                "generated_at_utc": self.generated_at_utc,
+                "freshness": self.freshness.to_dict(),
+                "counts_by_disposition": dict(self.counts_by_disposition),
+                "total_clusters": len(self.clusters),
+                "clusters": [c.to_dict() for c in self.clusters],
+                "whiteboard": dict(self.whiteboard),
+                "lean_verification": dict(self.lean_verification),
+                "toolchain_status": dict(self.toolchain_status),
+                "all_scan_summary": self.all_scan_summary,
+            }
+        )
 
     def to_sarif(self) -> dict[str, Any]:
         level_map = {
@@ -379,30 +407,32 @@ class EnsembleReport:
                 }
             results.append(res)
 
-        return {
-            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-            "version": "2.1.0",
-            "runs": [
-                {
-                    "tool": {
-                        "driver": {
-                            "name": "RFCHunt-Ensemble-Orchestrator",
-                            "version": "1.0.0",
-                            "informationUri": "https://github.com/oyesanyf/rfchunt",
-                            "rules": list(rules_by_id.values()),
-                        }
-                    },
-                    "results": results,
-                    "properties": {
-                        "program": self.program,
-                        "proxy": self.proxy,
-                        "lean_status": self.lean_verification.get("status"),
-                        "lean_violations_count": self.lean_verification.get("violations_count", 0),
-                        "toolchain_status": self.toolchain_status,
-                    },
-                }
-            ],
-        }
+        return _redact_payload(
+            {
+                "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                "version": "2.1.0",
+                "runs": [
+                    {
+                        "tool": {
+                            "driver": {
+                                "name": "RFCHunt-Ensemble-Orchestrator",
+                                "version": "1.0.0",
+                                "informationUri": "https://github.com/oyesanyf/rfchunt",
+                                "rules": list(rules_by_id.values()),
+                            }
+                        },
+                        "results": results,
+                        "properties": {
+                            "program": self.program,
+                            "proxy": self.proxy,
+                            "lean_status": self.lean_verification.get("status"),
+                            "lean_violations_count": self.lean_verification.get("violations_count", 0),
+                            "toolchain_status": self.toolchain_status,
+                        },
+                    }
+                ],
+            }
+        )
 
 
 def _norm_path(path_str: str) -> str:
@@ -1047,7 +1077,7 @@ def _classify_finding_domain(f: EngineFinding) -> str:
         rule_u.startswith("PE-DOTNET-")
         or "cve-2026-108398" in blob
         or isinstance(meta.get("pe_report"), dict)
-        or bool(meta.get("has_forshaw_cve_2026_108398_anomaly"))
+        or _coerce_strict_bool(meta.get("has_forshaw_cve_2026_108398_anomaly"))
     ):
         return "dotnet_pe"
     if (
@@ -1188,6 +1218,46 @@ def _append_unique_lean_finding(
     findings.append(candidate)
 
 
+def _heuristic_active_policy_failure_for_finding(
+    finding: EngineFinding | None,
+    meta: Mapping[str, Any],
+    *,
+    default_severity: str = "",
+    default_confirmed: Any = True,
+) -> bool:
+    """
+    Mirrors `evaluate_lean_domains._heuristic_active_policy_failure` while
+    enforcing strict boolean validation on `confirmed` and honoring both
+    `severity` and `metadata["status"]` so informational/passed findings never
+    fabricate PolicyGuard counterexamples.
+    """
+    from engine.lean_formal_verifier import _coerce_strict_bool as _lean_strict_bool
+
+    raw_conf = finding.confirmed if finding is not None else meta.get("confirmed", default_confirmed)
+    conf_b: bool | None = (
+        _lean_strict_bool(raw_conf, field_name="confirmed")
+        if raw_conf is not None
+        else None
+    )
+    if conf_b is False:
+        return False
+    sev = str((finding.severity if finding is not None else default_severity) or "").strip().lower()
+    if sev in ("info", "informational", "none", "clean", "passed"):
+        return False
+    st = str(
+        meta.get("status")
+        or (getattr(finding, "status", "") if finding is not None else "")
+        or ""
+    ).strip().lower()
+    if st in ("info", "passed", "clean", "ok", "denied", "blocked", "mitigated", "refuted"):
+        return False
+    return bool(
+        conf_b is True
+        or sev in ("critical", "high", "medium", "low", "error", "warning")
+        or st in ("failed", "violated", "open", "confirmed", "vulnerable", "active")
+    )
+
+
 def _evaluate_lean_domains_embedded(
     findings: Sequence[EngineFinding],
     *,
@@ -1275,18 +1345,26 @@ def _evaluate_lean_domains_embedded(
                     checks.extend(
                         verify_http_framing_invariant(
                             content_lengths=hf.get("content_lengths", []),
-                            has_transfer_encoding_chunked=bool(hf.get("has_transfer_encoding_chunked", False)),
-                            has_bare_lf=bool(hf.get("has_bare_lf", False)),
+                            has_transfer_encoding_chunked=hf.get("has_transfer_encoding_chunked", False),
+                            has_bare_lf=hf.get("has_bare_lf", False),
                             proxy_verdict=pv_t,  # type: ignore[arg-type]
                             lean_dir=mirror_lean_dir,
                             oracle=None,
                         )
                     )
                 else:
+                    blob_hf = f"{f.rule_id} {f.cwe} {f.title} {f.summary} {f.file_path}".lower()
+                    if "dual content-length" in blob_hf:
+                        cls_val, te_val, lf_val = [10, 20], False, False
+                    elif "bare lf" in blob_hf:
+                        cls_val, te_val, lf_val = [], False, True
+                    else:
+                        cls_val, te_val, lf_val = [42], True, False
                     checks.extend(
                         verify_http_framing_invariant(
-                            content_lengths=[42],
-                            has_transfer_encoding_chunked=True,
+                            content_lengths=cls_val,
+                            has_transfer_encoding_chunked=te_val,
+                            has_bare_lf=lf_val,
                             lean_dir=mirror_lean_dir,
                             oracle=None,
                         )
@@ -1328,7 +1406,7 @@ def _evaluate_lean_domains_embedded(
                     )
                 else:
                     blob_l = f"{f.rule_id} {f.cwe} {f.title} {f.summary} {f.file_path}".lower()
-                    is_active = _lean_strict_bool(f.confirmed, field_name="confirmed")
+                    is_active = _heuristic_active_policy_failure_for_finding(f, meta)
                     if any(kw in blob_l for kw in ("llm_dissent", "override_immunity", "deterministic_confirmation")):
                         obs_rec = (
                             _lean_strict_bool(meta["observed_reconciled"], field_name="observed_reconciled")
@@ -1344,44 +1422,50 @@ def _evaluate_lean_domains_embedded(
                                 oracle=None,
                             )
                         )
-                    elif "shellexec" in blob_l or "shell_exec" in blob_l:
-                        checks.extend(
-                            verify_policy_guard_invariant(
-                                action="shellExec",
-                                observed_allowed=meta.get("observed_allowed", is_active),
-                                lean_dir=mirror_lean_dir,
-                                oracle=None,
-                            )
-                        )
-                    elif "out_of_scope" in blob_l or "out-of-scope" in blob_l:
-                        checks.extend(
-                            verify_policy_guard_invariant(
-                                action="networkProbe",
-                                scope="outOfScope",
-                                observed_allowed=meta.get("observed_allowed", is_active),
-                                lean_dir=mirror_lean_dir,
-                                oracle=None,
-                            )
-                        )
-                    elif "outside_workspace" in blob_l:
-                        checks.extend(
-                            verify_policy_guard_invariant(
-                                action="readWorkspaceFile",
-                                in_workspace_root=False,
-                                observed_allowed=meta.get("observed_allowed", is_active),
-                                lean_dir=mirror_lean_dir,
-                                oracle=None,
-                            )
-                        )
                     else:
-                        checks.extend(
-                            verify_policy_guard_invariant(
-                                rules=[("permit", True), ("forbid", True)],
-                                observed_allowed=meta.get("observed_allowed", is_active),
-                                lean_dir=mirror_lean_dir,
-                                oracle=None,
-                            )
+                        obs_allowed = (
+                            _lean_strict_bool(meta["observed_allowed"], field_name="observed_allowed")
+                            if "observed_allowed" in meta
+                            else is_active
                         )
+                        if "shellexec" in blob_l or "shell_exec" in blob_l:
+                            checks.extend(
+                                verify_policy_guard_invariant(
+                                    action="shellExec",
+                                    observed_allowed=obs_allowed,
+                                    lean_dir=mirror_lean_dir,
+                                    oracle=None,
+                                )
+                            )
+                        elif "out_of_scope" in blob_l or "out-of-scope" in blob_l:
+                            checks.extend(
+                                verify_policy_guard_invariant(
+                                    action="networkProbe",
+                                    scope="outOfScope",
+                                    observed_allowed=obs_allowed,
+                                    lean_dir=mirror_lean_dir,
+                                    oracle=None,
+                                )
+                            )
+                        elif "outside_workspace" in blob_l:
+                            checks.extend(
+                                verify_policy_guard_invariant(
+                                    action="readWorkspaceFile",
+                                    in_workspace_root=False,
+                                    observed_allowed=obs_allowed,
+                                    lean_dir=mirror_lean_dir,
+                                    oracle=None,
+                                )
+                            )
+                        else:
+                            checks.extend(
+                                verify_policy_guard_invariant(
+                                    rules=[("permit", True), ("forbid", True)],
+                                    observed_allowed=obs_allowed,
+                                    lean_dir=mirror_lean_dir,
+                                    oracle=None,
+                                )
+                            )
             except (ValueError, TypeError) as exc:
                 extra_diags.append(
                     LeanProofDiagnostic(
@@ -1396,11 +1480,25 @@ def _evaluate_lean_domains_embedded(
                 )
         elif dom == "dotnet_pe":
             try:
-                pe_rep = meta.get("pe_report") if isinstance(meta.get("pe_report"), dict) else None
+                from engine.lean_formal_verifier import (
+                    _coerce_strict_bool as _lean_strict_bool,
+                )
+
+                if "pe_report" in meta and meta["pe_report"] is not None and not isinstance(meta["pe_report"], Mapping):
+                    raise TypeError(
+                        f"pe_report must be a mapping or None, got {type(meta['pe_report']).__name__}"
+                    )
+                pe_rep = meta.get("pe_report") if isinstance(meta.get("pe_report"), Mapping) else None
                 if pe_rep is not None:
                     checks.extend(verify_dotnet_pe_invariant(pe_report=pe_rep, lean_dir=mirror_lean_dir, oracle=None))
                 else:
-                    has_anom = "cve-2026-108398" in f.title.lower() or bool(meta.get("has_forshaw_cve_2026_108398_anomaly"))
+                    blob_l = f"{f.rule_id} {f.cwe} {f.title} {f.summary} {f.file_path}".lower()
+                    raw_anom = meta.get("has_forshaw_cve_2026_108398_anomaly")
+                    has_anom = "cve-2026-108398" in blob_l or (
+                        _lean_strict_bool(raw_anom, field_name="has_forshaw_cve_2026_108398_anomaly")
+                        if raw_anom is not None
+                        else False
+                    )
                     checks.extend(
                         verify_dotnet_pe_invariant(
                             is_valid_pe=True,
@@ -1492,7 +1590,12 @@ class EnsembleOrchestrator:
         )
         self.gha_only = bool(gha_only)
         self.no_external_scanners = bool(no_external_scanners)
-        self.proxy = proxy
+        if proxy is not None:
+            from engine.advisory_exporter import _redact_inline_tokens
+
+            self.proxy: str | None = _redact_inline_tokens(str(proxy))
+        else:
+            self.proxy = None
         self.max_whiteboard_rounds = max(0, int(max_whiteboard_rounds))
         self.enable_whiteboard = bool(enable_whiteboard)
         self.db = db
@@ -2270,8 +2373,8 @@ class EnsembleOrchestrator:
                         pv_val = tuple(pv_raw) if isinstance(pv_raw, (list, tuple)) and len(pv_raw) == 2 else None
                         counterexamples = verify_http_framing_invariant(
                             content_lengths=hf_meta.get("content_lengths", []),
-                            has_transfer_encoding_chunked=bool(hf_meta.get("has_transfer_encoding_chunked", False)),
-                            has_bare_lf=bool(hf_meta.get("has_bare_lf", False)),
+                            has_transfer_encoding_chunked=hf_meta.get("has_transfer_encoding_chunked", False),
+                            has_bare_lf=hf_meta.get("has_bare_lf", False),
                             proxy_verdict=pv_val,  # type: ignore[arg-type]
                             lean_dir=worker_lean_dir,
                             oracle=use_oracle,
@@ -2338,10 +2441,10 @@ class EnsembleOrchestrator:
                             "policy_guard",
                         )
                     ):
-                        is_active = (
-                            _lean_strict_bool(finding.confirmed, field_name="confirmed")
-                            if finding is not None
-                            else True
+                        is_active = _heuristic_active_policy_failure_for_finding(
+                            finding,
+                            meta,
+                            default_severity=hyp.severity,
                         )
                         if any(kw in blob for kw in ("llm_dissent", "override_immunity", "deterministic_confirmation")):
                             obs_rec = (
@@ -2356,40 +2459,50 @@ class EnsembleOrchestrator:
                                 lean_dir=worker_lean_dir,
                                 oracle=use_oracle,
                             )
-                        elif "shellexec" in blob or "shell_exec" in blob:
-                            counterexamples = verify_policy_guard_invariant(
-                                action="shellExec",
-                                observed_allowed=meta.get("observed_allowed", is_active),
-                                lean_dir=worker_lean_dir,
-                                oracle=use_oracle,
-                            )
-                        elif "out_of_scope" in blob or "out-of-scope" in blob:
-                            counterexamples = verify_policy_guard_invariant(
-                                action="networkProbe",
-                                scope="outOfScope",
-                                observed_allowed=meta.get("observed_allowed", is_active),
-                                lean_dir=worker_lean_dir,
-                                oracle=use_oracle,
-                            )
-                        elif "outside_workspace" in blob:
-                            counterexamples = verify_policy_guard_invariant(
-                                action="readWorkspaceFile",
-                                in_workspace_root=False,
-                                observed_allowed=meta.get("observed_allowed", is_active),
-                                lean_dir=worker_lean_dir,
-                                oracle=use_oracle,
-                            )
                         else:
-                            counterexamples = verify_policy_guard_invariant(
-                                rules=[("permit", True), ("forbid", True)],
-                                observed_allowed=meta.get("observed_allowed", is_active),
-                                lean_dir=worker_lean_dir,
-                                oracle=use_oracle,
+                            obs_allowed = (
+                                _lean_strict_bool(meta["observed_allowed"], field_name="observed_allowed")
+                                if "observed_allowed" in meta
+                                else is_active
                             )
+                            if "shellexec" in blob or "shell_exec" in blob:
+                                counterexamples = verify_policy_guard_invariant(
+                                    action="shellExec",
+                                    observed_allowed=obs_allowed,
+                                    lean_dir=worker_lean_dir,
+                                    oracle=use_oracle,
+                                )
+                            elif "out_of_scope" in blob or "out-of-scope" in blob:
+                                counterexamples = verify_policy_guard_invariant(
+                                    action="networkProbe",
+                                    scope="outOfScope",
+                                    observed_allowed=obs_allowed,
+                                    lean_dir=worker_lean_dir,
+                                    oracle=use_oracle,
+                                )
+                            elif "outside_workspace" in blob:
+                                counterexamples = verify_policy_guard_invariant(
+                                    action="readWorkspaceFile",
+                                    in_workspace_root=False,
+                                    observed_allowed=obs_allowed,
+                                    lean_dir=worker_lean_dir,
+                                    oracle=use_oracle,
+                                )
+                            else:
+                                counterexamples = verify_policy_guard_invariant(
+                                    rules=[("permit", True), ("forbid", True)],
+                                    observed_allowed=obs_allowed,
+                                    lean_dir=worker_lean_dir,
+                                    oracle=use_oracle,
+                                )
                         witness_evaluated = True
 
                 elif hyp.domain == "dotnet_pe":
-                    pe_rep = meta.get("pe_report") if isinstance(meta.get("pe_report"), dict) else None
+                    if "pe_report" in meta and meta["pe_report"] is not None and not isinstance(meta["pe_report"], Mapping):
+                        raise TypeError(
+                            f"pe_report must be a mapping or None, got {type(meta['pe_report']).__name__}"
+                        )
+                    pe_rep = meta.get("pe_report") if isinstance(meta.get("pe_report"), Mapping) else None
                     if pe_rep is None and meta.get("repo_pe_candidate") and target_p.is_dir():
                         try:
                             from engine.pe_magika_classifier import (
@@ -2422,9 +2535,15 @@ class EnsembleOrchestrator:
                         )
                         witness_evaluated = True
                     else:
-                        has_anom = (
-                            "cve-2026-108398" in blob
-                            or bool(meta.get("has_forshaw_cve_2026_108398_anomaly"))
+                        from engine.lean_formal_verifier import (
+                            _coerce_strict_bool as _lean_strict_bool,
+                        )
+
+                        raw_anom = meta.get("has_forshaw_cve_2026_108398_anomaly")
+                        has_anom = "cve-2026-108398" in blob or (
+                            _lean_strict_bool(raw_anom, field_name="has_forshaw_cve_2026_108398_anomaly")
+                            if raw_anom is not None
+                            else False
                         )
                         counterexamples = verify_dotnet_pe_invariant(
                             is_valid_pe=True,
@@ -2914,8 +3033,26 @@ class EnsembleOrchestrator:
             )
 
             try:
+                lean_findings_payload = [
+                    {
+                        "rule_id": f.rule_id,
+                        "cwe": f.cwe,
+                        "title": f.title,
+                        "summary": f.summary,
+                        "file_path": f.file_path,
+                        "severity": f.severity,
+                        "status": str(
+                            (f.metadata.get("status") if isinstance(f.metadata, Mapping) else None)
+                            or getattr(f, "status", "")
+                            or ""
+                        ),
+                        "confirmed": f.confirmed,
+                        "metadata": f.metadata,
+                    }
+                    for f in active_findings
+                ]
                 dom_rep = evaluate_lean_domains(
-                    findings=active_findings,
+                    findings=lean_findings_payload,
                     repo_path=target_p if target_p.is_dir() else None,
                     lean_dir=self.lean_dir,
                 )
@@ -3113,8 +3250,9 @@ class EnsembleOrchestrator:
             pass
 
         wb_snapshot = whiteboard.to_dict()
-        self.last_telemetry.update(
+        self.last_telemetry = _redact_payload(
             {
+                **self.last_telemetry,
                 "embedded": self.embedded,
                 "proxy": self.proxy,
                 "whiteboard": wb_snapshot,
@@ -3150,17 +3288,6 @@ class EnsembleOrchestrator:
         package_client_name: str | None = None,
     ) -> dict[str, str]:
         from engine.advisory_exporter import _redact_inline_tokens
-
-        def _redact_payload(obj: Any) -> Any:
-            if isinstance(obj, str):
-                return _redact_inline_tokens(obj)
-            if isinstance(obj, dict):
-                return {k: _redact_payload(v) for k, v in obj.items()}
-            if isinstance(obj, list):
-                return [_redact_payload(v) for v in obj]
-            if isinstance(obj, tuple):
-                return tuple(_redact_payload(v) for v in obj)
-            return obj
 
         dest = Path(out_dir)
         dest.mkdir(parents=True, exist_ok=True)
@@ -3812,6 +3939,8 @@ def evaluate_and_stage_submission(
 
 
 def render_ensemble_markdown(report: EnsembleReport) -> str:
+    from engine.advisory_exporter import _redact_inline_tokens
+
     lines = [
         f"# RFCHunt Ensemble Security Audit Summary ({report.program})",
         "",
@@ -3821,7 +3950,7 @@ def render_ensemble_markdown(report: EnsembleReport) -> str:
         f"- **Dispositions:** `{json.dumps(report.counts_by_disposition)}`",
     ]
     if report.proxy:
-        lines.append(f"- **Proxy:** `{report.proxy}`")
+        lines.append(f"- **Proxy:** `{_redact_inline_tokens(str(report.proxy))}`")
     lines.extend(
         [
             "",
@@ -3872,4 +4001,4 @@ def render_ensemble_markdown(report: EnsembleReport) -> str:
             ]
         )
 
-    return "\n".join(lines) + "\n"
+    return _redact_inline_tokens("\n".join(lines) + "\n")

@@ -112,6 +112,11 @@ def _redact_inline_tokens(text: str) -> str:
     out = re.sub(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "<REDACTED_AWS_KEY>", out)
     out = re.sub(r"\b[sr]k_live_[A-Za-z0-9]{16,}\b", "<REDACTED_STRIPE_KEY>", out)
     out = re.sub(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", "<REDACTED_SLACK_TOKEN>", out)
+    out = re.sub(
+        r"([a-zA-Z][a-zA-Z0-9+.-]*://[^/@?#\s:\"'`<>]+:)[^/@?#\s\"'`<>]+(@)",
+        r"\1<REDACTED>\2",
+        out,
+    )
     return out
 
 

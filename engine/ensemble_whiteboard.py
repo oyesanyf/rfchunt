@@ -121,7 +121,7 @@ class EnsembleWhiteboard:
         self._db = db
         self._enable_db_sync = bool(enable_db_sync and db is not None)
         self.enabled = bool(enabled)
-        self.proxy = proxy
+        self.proxy = _redact_inline_tokens(str(proxy)) if proxy is not None else None
         self._hypotheses: Dict[str, WhiteboardHypothesis] = {}
         self._order: List[str] = []
         self._facts: List[Dict[str, Any]] = []
@@ -292,7 +292,7 @@ class EnsembleWhiteboard:
                     add_fact_fn = getattr(self._db, "add_fact", None)
                     if callable(add_fact_fn):
                         add_fact_fn(
-                            f"[{fact_type}] {summary}",
+                            f"[{fact_type}] {entry['summary']}",
                             task_id=self.task_id,
                             domain=domain or fact_type,
                             source_agent=source,
@@ -320,7 +320,7 @@ class EnsembleWhiteboard:
                 "round_idx": int(round_idx),
                 "dispatched": int(dispatched),
                 "updated": int(updated),
-                "notes": str(notes),
+                "notes": _redact_inline_tokens(str(notes)),
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             }
             self._rounds.append(rec)

@@ -17,6 +17,7 @@ Two-Layer Integrity Model:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
@@ -1447,6 +1448,30 @@ def verify_policy_guard_invariant(
     return results
 
 
+def _coerce_clr_rva_nonzero(val: Any, *, field_name: str = "clr_header_rva") -> bool:
+    """Strictly evaluate whether an integer CLR header RVA is non-zero."""
+    if val is None:
+        return False
+    if isinstance(val, bool):
+        raise TypeError(f"Invalid integer RVA for {field_name}: {val!r}")
+    if isinstance(val, int):
+        if val < 0:
+            raise ValueError(f"Negative RVA for {field_name}: {val!r}")
+        return val != 0
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            raise ValueError(f"Empty RVA string for {field_name}: {val!r}")
+        try:
+            parsed = int(s, 0)
+        except ValueError as exc:
+            raise ValueError(f"Invalid RVA string for {field_name}: {val!r}") from exc
+        if parsed < 0:
+            raise ValueError(f"Negative RVA for {field_name}: {val!r}")
+        return parsed != 0
+    raise TypeError(f"Invalid RVA value for {field_name}: {val!r}")
+
+
 def verify_dotnet_pe_invariant(
     *,
     is_valid_pe: bool = True,
@@ -1459,62 +1484,125 @@ def verify_dotnet_pe_invariant(
     oracle: Optional[LeanCompiledOracle] = None,
 ) -> List[LeanCounterexample]:
     """Evaluates .NET Framework 4 UMCI loader integrity against `RFCHunt.DotNetPeIntegrity`."""
+    is_valid_pe_b = _coerce_strict_bool(is_valid_pe, field_name="is_valid_pe")
+    has_clr_descriptor_b = _coerce_strict_bool(
+        has_clr_descriptor, field_name="has_clr_descriptor"
+    )
+    has_executable_image_bit_b = _coerce_strict_bool(
+        has_executable_image_bit, field_name="has_executable_image_bit"
+    )
+    is_umci_enforced_b = _coerce_strict_bool(
+        is_umci_enforced, field_name="is_umci_enforced"
+    )
+    is_signed_by_trusted_publisher_b = _coerce_strict_bool(
+        is_signed_by_trusted_publisher,
+        field_name="is_signed_by_trusted_publisher",
+    )
+
     if pe_report is not None:
-        if "is_pe" in pe_report:
-            is_valid_pe = bool(pe_report["is_pe"])
-        elif "is_valid_pe" in pe_report:
-            is_valid_pe = bool(pe_report["is_valid_pe"])
+        if not isinstance(pe_report, Mapping):
+            raise TypeError(
+                f"pe_report must be a mapping or None, got {type(pe_report).__name__}"
+            )
+        if "is_pe" in pe_report and pe_report["is_pe"] is not None:
+            is_valid_pe_b = _coerce_strict_bool(
+                pe_report["is_pe"], field_name="pe_report.is_pe"
+            )
+        elif "is_valid_pe" in pe_report and pe_report["is_valid_pe"] is not None:
+            is_valid_pe_b = _coerce_strict_bool(
+                pe_report["is_valid_pe"], field_name="pe_report.is_valid_pe"
+            )
 
         dot_net = pe_report.get("dot_net")
-        if isinstance(dot_net, dict) and dot_net:
-            if "is_dot_net" in dot_net:
-                has_clr_descriptor = bool(dot_net["is_dot_net"])
-            elif "has_clr_descriptor" in dot_net:
-                has_clr_descriptor = bool(dot_net["has_clr_descriptor"])
+        if dot_net is not None and not isinstance(dot_net, Mapping):
+            raise TypeError(
+                f"pe_report.dot_net must be a mapping or None, got {type(dot_net).__name__}"
+            )
+        if isinstance(dot_net, Mapping) and dot_net:
+            if "is_dot_net" in dot_net and dot_net["is_dot_net"] is not None:
+                has_clr_descriptor_b = _coerce_strict_bool(
+                    dot_net["is_dot_net"], field_name="pe_report.dot_net.is_dot_net"
+                )
+            elif "has_clr_descriptor" in dot_net and dot_net["has_clr_descriptor"] is not None:
+                has_clr_descriptor_b = _coerce_strict_bool(
+                    dot_net["has_clr_descriptor"],
+                    field_name="pe_report.dot_net.has_clr_descriptor",
+                )
+            elif "clr_header_rva" in dot_net:
+                has_clr_descriptor_b = _coerce_clr_rva_nonzero(
+                    dot_net["clr_header_rva"],
+                    field_name="pe_report.dot_net.clr_header_rva",
+                )
             else:
-                has_clr_descriptor = bool(dot_net.get("clr_header_rva", 0))
-        elif "is_dot_net" in pe_report:
-            has_clr_descriptor = bool(pe_report["is_dot_net"])
-        elif "has_clr_descriptor" in pe_report:
-            has_clr_descriptor = bool(pe_report["has_clr_descriptor"])
+                has_clr_descriptor_b = False
+        elif "is_dot_net" in pe_report and pe_report["is_dot_net"] is not None:
+            has_clr_descriptor_b = _coerce_strict_bool(
+                pe_report["is_dot_net"], field_name="pe_report.is_dot_net"
+            )
+        elif "has_clr_descriptor" in pe_report and pe_report["has_clr_descriptor"] is not None:
+            has_clr_descriptor_b = _coerce_strict_bool(
+                pe_report["has_clr_descriptor"],
+                field_name="pe_report.has_clr_descriptor",
+            )
         elif "clr_header_rva" in pe_report:
-            has_clr_descriptor = bool(pe_report["clr_header_rva"])
+            has_clr_descriptor_b = _coerce_clr_rva_nonzero(
+                pe_report["clr_header_rva"],
+                field_name="pe_report.clr_header_rva",
+            )
         else:
-            has_clr_descriptor = False
+            has_clr_descriptor_b = False
 
-        if "is_executable_image" in pe_report:
-            has_executable_image_bit = bool(pe_report["is_executable_image"])
-        elif "has_executable_image_bit" in pe_report:
-            has_executable_image_bit = bool(pe_report["has_executable_image_bit"])
+        if "is_executable_image" in pe_report and pe_report["is_executable_image"] is not None:
+            has_executable_image_bit_b = _coerce_strict_bool(
+                pe_report["is_executable_image"],
+                field_name="pe_report.is_executable_image",
+            )
+        elif (
+            "has_executable_image_bit" in pe_report
+            and pe_report["has_executable_image_bit"] is not None
+        ):
+            has_executable_image_bit_b = _coerce_strict_bool(
+                pe_report["has_executable_image_bit"],
+                field_name="pe_report.has_executable_image_bit",
+            )
 
-        if pe_report.get("has_forshaw_cve_2026_108398_anomaly") and has_executable_image_bit:
-            has_executable_image_bit = False
+        raw_anom = pe_report.get("has_forshaw_cve_2026_108398_anomaly")
+        has_anom = (
+            _coerce_strict_bool(
+                raw_anom,
+                field_name="pe_report.has_forshaw_cve_2026_108398_anomaly",
+            )
+            if raw_anom is not None
+            else False
+        )
+        if has_anom and has_executable_image_bit_b:
+            has_executable_image_bit_b = False
 
     active_oracle, backend = _resolve_oracle(lean_dir, oracle)
     anom, unpatched, patched = (
         active_oracle.evaluate_dotnet_pe(
-            is_valid_pe=bool(is_valid_pe),
-            has_clr_descriptor=bool(has_clr_descriptor),
-            has_executable_image_bit=bool(has_executable_image_bit),
-            is_umci_enforced=bool(is_umci_enforced),
-            is_signed_by_trusted_publisher=bool(is_signed_by_trusted_publisher),
+            is_valid_pe=is_valid_pe_b,
+            has_clr_descriptor=has_clr_descriptor_b,
+            has_executable_image_bit=has_executable_image_bit_b,
+            is_umci_enforced=is_umci_enforced_b,
+            is_signed_by_trusted_publisher=is_signed_by_trusted_publisher_b,
         )
         if active_oracle is not None
         else dotnet_pe_integrity_mirror(
-            is_valid_pe=bool(is_valid_pe),
-            has_clr_descriptor=bool(has_clr_descriptor),
-            has_executable_image_bit=bool(has_executable_image_bit),
-            is_umci_enforced=bool(is_umci_enforced),
-            is_signed_by_trusted_publisher=bool(is_signed_by_trusted_publisher),
+            is_valid_pe=is_valid_pe_b,
+            has_clr_descriptor=has_clr_descriptor_b,
+            has_executable_image_bit=has_executable_image_bit_b,
+            is_umci_enforced=is_umci_enforced_b,
+            is_signed_by_trusted_publisher=is_signed_by_trusted_publisher_b,
         )
     )
 
     witness = {
-        "is_valid_pe": bool(is_valid_pe),
-        "has_clr_descriptor": bool(has_clr_descriptor),
-        "has_executable_image_bit": bool(has_executable_image_bit),
-        "is_umci_enforced": bool(is_umci_enforced),
-        "is_signed_by_trusted_publisher": bool(is_signed_by_trusted_publisher),
+        "is_valid_pe": is_valid_pe_b,
+        "has_clr_descriptor": has_clr_descriptor_b,
+        "has_executable_image_bit": has_executable_image_bit_b,
+        "is_umci_enforced": is_umci_enforced_b,
+        "is_signed_by_trusted_publisher": is_signed_by_trusted_publisher_b,
     }
 
     results: List[LeanCounterexample] = [
@@ -1535,7 +1623,7 @@ def verify_dotnet_pe_invariant(
         )
     ]
 
-    if is_umci_enforced and not is_signed_by_trusted_publisher:
+    if is_umci_enforced_b and not is_signed_by_trusted_publisher_b:
         umci_violated = patched != "rejectedInvalidOrUnsigned"
         results.append(
             LeanCounterexample(
@@ -1932,15 +2020,32 @@ def evaluate_lean_domains(
             except (ValueError, TypeError) as exc:
                 _record_invalid_witness("RFCHunt.PolicyGuard", f, exc)
 
+        raw_anom = meta.get("has_forshaw_cve_2026_108398_anomaly")
+        has_anom_meta = False
+        anom_invalid_exc: Optional[Exception] = None
+        if raw_anom is not None:
+            try:
+                has_anom_meta = _coerce_strict_bool(
+                    raw_anom,
+                    field_name="has_forshaw_cve_2026_108398_anomaly",
+                )
+            except (ValueError, TypeError) as exc:
+                anom_invalid_exc = exc
+
         if (
             f["rule_id"].upper().startswith("PE-DOTNET-")
             or "cve-2026-108398" in blob
             or isinstance(meta.get("pe_report"), dict)
-            or bool(meta.get("has_forshaw_cve_2026_108398_anomaly"))
+            or has_anom_meta
+            or anom_invalid_exc is not None
         ):
             saw_pe_finding = True
             try:
-                pe_rep = meta.get("pe_report") if isinstance(meta.get("pe_report"), dict) else None
+                if "pe_report" in meta and meta["pe_report"] is not None and not isinstance(meta["pe_report"], Mapping):
+                    raise TypeError(
+                        f"pe_report must be a mapping or None, got {type(meta['pe_report']).__name__}"
+                    )
+                pe_rep = meta.get("pe_report") if isinstance(meta.get("pe_report"), Mapping) else None
                 if pe_rep is not None:
                     checks.extend(
                         verify_dotnet_pe_invariant(
@@ -1949,11 +2054,10 @@ def evaluate_lean_domains(
                             oracle=oracle,
                         )
                     )
+                elif anom_invalid_exc is not None:
+                    raise anom_invalid_exc
                 else:
-                    has_anom_flag = (
-                        "cve-2026-108398" in blob
-                        or bool(meta.get("has_forshaw_cve_2026_108398_anomaly"))
-                    )
+                    has_anom_flag = "cve-2026-108398" in blob or has_anom_meta
                     checks.extend(
                         verify_dotnet_pe_invariant(
                             is_valid_pe=True,

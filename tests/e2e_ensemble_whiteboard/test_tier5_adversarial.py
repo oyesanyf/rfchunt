@@ -464,3 +464,671 @@ class TestTier5ConfirmedBugRegressions:
         )
         assert isinstance(res, dict)
         assert res.get("ok") is False or res.get("status") == "error"
+
+
+# =============================================================================
+# PART C: Tier 5 Re-Challenge Gap Regressions (GAP-01 .. GAP-05)
+# =============================================================================
+
+
+class TestTier5RechallengeGapRegressions:
+    def test_gap01_orchestrator_and_lean_strict_bool_no_false_positive_fabrication(self, tmp_path: Path) -> None:
+        from engine.ensemble_orchestrator import (
+            EngineFinding,
+            EnsembleOrchestrator,
+            _finding_from_dict,
+        )
+        from engine.lean_formal_verifier import evaluate_lean_domains
+
+        repo = tmp_path / "gap01_repo"
+        repo.mkdir()
+        (repo / "proxy.py").write_text("x = 1\n", encoding="utf-8")
+
+        f_http = EngineFinding(
+            engine="smuggling",
+            rule_id="HTTP-TEST",
+            title="Clean framing check",
+            file_path="proxy.py",
+            line=1,
+            cwe="CWE-444",
+            severity="INFO",
+            confidence=0.6,
+            metadata={
+                "http_framing": {
+                    "content_lengths": [42],
+                    "has_transfer_encoding_chunked": "false",
+                    "has_bare_lf": "false",
+                }
+            },
+        )
+        dom_direct = evaluate_lean_domains([f_http])
+        assert dom_direct.violations_count == 0
+
+        rep_emb = EnsembleOrchestrator(embedded=True).run(
+            str(repo),
+            findings=[f_http],
+            out_dir=str(tmp_path / "gap01_emb_out"),
+        )
+        assert rep_emb.lean_verification.get("violations_count") == 0
+        assert all("lean4" not in c.engines for c in rep_emb.clusters)
+
+        rep_std = EnsembleOrchestrator(embedded=False).run(
+            str(repo),
+            findings=[f_http],
+            out_dir=str(tmp_path / "gap01_std_out"),
+        )
+        assert rep_std.lean_verification.get("violations_count") == 0
+        assert all("lean4" not in c.engines for c in rep_std.clusters)
+
+        ef = _finding_from_dict(
+            {
+                "engine": "web_llm",
+                "title": "JSON finding",
+                "confirmed": "false",
+                "deterministic": "false",
+                "poc_verified": "false",
+            }
+        )
+        assert ef.confirmed is False
+        assert ef.deterministic is False
+        assert ef.poc_verified is False
+
+        f_pe = EngineFinding(
+            engine="pe_magika",
+            rule_id="PE-DOTNET-01",
+            title="Clean PE check",
+            file_path="bin/sample.dll",
+            line=1,
+            cwe="CWE-345",
+            severity="INFO",
+            confidence=0.6,
+            metadata={"has_forshaw_cve_2026_108398_anomaly": "false"},
+        )
+        dom_pe = evaluate_lean_domains([f_pe])
+        assert dom_pe.violations_count == 0
+        rep_pe = EnsembleOrchestrator(embedded=True).run(
+            str(repo),
+            findings=[f_pe],
+            out_dir=str(tmp_path / "gap01_pe_out"),
+        )
+        assert rep_pe.lean_verification.get("violations_count") == 0
+
+    def test_gap02_direct_report_to_dict_to_sarif_and_cli_sarif_json_redact_secrets(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import revenue_cli as rc
+        from engine.ensemble_orchestrator import EngineFinding, EnsembleOrchestrator
+
+        repo = tmp_path / "gap02_repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+
+        sec1 = "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"
+        sec2 = "ghp_1234567890abcdef1234567890abcdef1234"
+        sec3 = "AKIAIOSFODNN7EXAMPLE"
+
+        finding = EngineFinding(
+            engine="semgrep",
+            rule_id="TEST-SEC-GAP02",
+            title=f"Leak {sec1}",
+            severity="high",
+            confidence=0.9,
+            file_path="app.py",
+            line=1,
+            cwe="CWE-798",
+            summary=f"Token {sec2}",
+            metadata={"raw": sec3},
+        )
+        rep = EnsembleOrchestrator(embedded=True).run(
+            str(repo),
+            findings=[finding],
+            out_dir=str(tmp_path / "gap02_out"),
+        )
+        direct_dict_s = json.dumps(rep.to_dict(), default=str)
+        direct_sarif_s = json.dumps(rep.to_sarif(), default=str)
+        for sec in (sec1, sec2, sec3):
+            assert sec not in direct_dict_s
+            assert sec not in direct_sarif_s
+
+        findings_file = tmp_path / "gap02_findings.json"
+        findings_file.write_text(
+            json.dumps(
+                [
+                    {
+                        "engine": "semgrep",
+                        "rule_id": "TEST-SEC-GAP02",
+                        "title": f"Leak {sec1}",
+                        "severity": "high",
+                        "confidence": 0.9,
+                        "file_path": "app.py",
+                        "line": 1,
+                        "cwe": "CWE-798",
+                        "summary": f"Token {sec2}",
+                        "metadata": {"raw": sec3},
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        custom_sarif = tmp_path / "gap02_custom.sarif"
+        cli_rc = rc.run_revenue_cli(
+            [
+                "ensemble-audit",
+                "--repo",
+                str(repo),
+                "--findings-json",
+                str(findings_file),
+                "--out",
+                str(tmp_path / "gap02_cli_out"),
+                "--sarif-out",
+                str(custom_sarif),
+                "--json",
+                "--embedded",
+            ]
+        )
+        assert cli_rc == 0
+        stdout_txt = capsys.readouterr().out
+        custom_sarif_txt = custom_sarif.read_text(encoding="utf-8")
+        for sec in (sec1, sec2, sec3):
+            assert sec not in custom_sarif_txt
+            assert sec not in stdout_txt
+
+    def test_gap03_verify_sandbox_http_probe_redacts_normalized_sensitive_query_keys(self) -> None:
+        from engine.linux_poc_runner import LinuxPocRunner
+
+        runner = LinuxPocRunner()
+        u = (
+            "http://127.0.0.1:1/"
+            "?authorization=RawAuthSecret999"
+            "&x-api-key=RawXApiKey999"
+            "&sessionid=RawSessionId999"
+            "&private_key=RawPrivKey999"
+            "&token=RawTok999"
+            "&safe=1"
+            "&author=alice"
+        )
+        res = runner.verify_sandbox_http_probe(url=u, program="tier5-probe", timeout_sec=0.2)
+        serialized = json.dumps(res, default=str)
+        for secret_val in (
+            "RawAuthSecret999",
+            "RawXApiKey999",
+            "RawSessionId999",
+            "RawPrivKey999",
+            "RawTok999",
+        ):
+            assert secret_val not in serialized
+        assert "safe=1" in str(res.get("url", ""))
+        assert "author=alice" in str(res.get("url", ""))
+
+    def test_gap04_linux_poc_runner_safe_command_coercion_on_non_iterable_and_bytes(self, tmp_path: Path) -> None:
+        from engine.linux_poc_runner import LinuxPocRunner
+
+        valid_dir = tmp_path / "gap04_valid"
+        valid_dir.mkdir()
+        runner = LinuxPocRunner()
+
+        tr_int = runner.run_poc(language="python", repo_path=valid_dir, cmd=123)  # type: ignore[arg-type]
+        assert tr_int.status == "rejected_unsafe"
+        assert isinstance(tr_int.command, list)
+        assert all(isinstance(tok, str) for tok in tr_int.command)
+        assert "rejected_unsafe" in tr_int.to_markdown()
+
+        tr_bytes = runner.run_poc(language="python", repo_path=valid_dir, cmd=b"python3 -V")  # type: ignore[arg-type]
+        assert tr_bytes.status == "rejected_unsafe"
+        assert tr_bytes.command == ["python3 -V"]
+        assert "python3 -V" in tr_bytes.to_markdown()
+
+    def test_gap05_mcp_dispatch_strict_bool_and_raw_numeric_validation(self, tmp_path: Path) -> None:
+        import bugbounty_mcp_server as bms
+
+        repo = tmp_path / "gap05_repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+        srv = bms.BugBountyMCPServer()
+
+        resp_dry = srv.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "bb_run_all_scan",
+                    "arguments": {
+                        "target": str(repo),
+                        "dry_run": "true",
+                        "ensemble": "false",
+                        "embedded": "false",
+                        "include_lean_verify": "false",
+                    },
+                },
+            }
+        )
+        assert resp_dry["result"]["isError"] is False
+        parsed_dry = json.loads(resp_dry["result"]["content"][0]["text"])
+        assert parsed_dry["status"] == "dry_run_ready"
+        assert parsed_dry["mode"] == "--all"
+        assert parsed_dry["embedded"] is False
+
+        resp_bool_quorum = srv.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "bb_run_all_scan",
+                    "arguments": {
+                        "target": str(repo),
+                        "dry_run": "false",
+                        "ensemble": "false",
+                        "embedded": "false",
+                        "include_lean_verify": "false",
+                        "ensemble_quorum": True,
+                    },
+                },
+            }
+        )
+        parsed_bool_quorum = json.loads(resp_bool_quorum["result"]["content"][0]["text"])
+        assert parsed_bool_quorum.get("ok") is False
+        assert parsed_bool_quorum.get("status") == "error"
+
+        resp_bad_bool = srv.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "bb_run_all_scan",
+                    "arguments": {
+                        "target": str(repo),
+                        "dry_run": "maybe",
+                    },
+                },
+            }
+        )
+        assert resp_bad_bool["result"]["isError"] is True
+
+
+class TestTier5Gap06Gap07Regressions:
+    def test_gap06_dotnet_pe_strict_bool_coercion_and_invalid_witness_handling(self, tmp_path: Path) -> None:
+        from engine.ensemble_orchestrator import EngineFinding, EnsembleOrchestrator
+        from engine.lean_formal_verifier import (
+            evaluate_lean_domains,
+            verify_dotnet_pe_invariant,
+        )
+
+        # 1. String "false" in pe_report must NOT coerce to True and fabricate CVE-2026-108398
+        rep_clean = verify_dotnet_pe_invariant(
+            pe_report={
+                "is_pe": True,
+                "is_dot_net": True,
+                "is_executable_image": True,
+                "has_forshaw_cve_2026_108398_anomaly": "false",
+            },
+            is_signed_by_trusted_publisher=True,
+        )
+        assert sum(1 for c in rep_clean if c.violated) == 0
+        assert rep_clean[0].input_witness["has_executable_image_bit"] is True
+
+        # 2. String "false" direct parameters must all coerce strictly to False
+        str_false_res = verify_dotnet_pe_invariant(
+            is_valid_pe="false",  # type: ignore[arg-type]
+            has_clr_descriptor="false",  # type: ignore[arg-type]
+            has_executable_image_bit="false",  # type: ignore[arg-type]
+            is_umci_enforced="false",  # type: ignore[arg-type]
+            is_signed_by_trusted_publisher="false",  # type: ignore[arg-type]
+        )
+        assert sum(1 for c in str_false_res if c.violated) == 0
+        assert all(v is False for v in str_false_res[0].input_witness.values())
+
+        # 3. Invalid boolean strings raise ValueError; clr_header_rva preserves integer checks
+        with pytest.raises(ValueError):
+            verify_dotnet_pe_invariant(is_valid_pe="maybe")  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            verify_dotnet_pe_invariant(
+                pe_report={
+                    "is_pe": True,
+                    "is_dot_net": True,
+                    "is_executable_image": True,
+                    "has_forshaw_cve_2026_108398_anomaly": "maybe",
+                }
+            )
+        with pytest.raises(TypeError):
+            verify_dotnet_pe_invariant(
+                pe_report={
+                    "is_pe": True,
+                    "dot_net": {"clr_header_rva": True},
+                    "is_executable_image": False,
+                }
+            )
+        rva_vuln = verify_dotnet_pe_invariant(
+            pe_report={"is_pe": True, "dot_net": {"clr_header_rva": 0x2008}, "is_executable_image": False}
+        )
+        assert any(c.violated for c in rva_vuln)
+        rva_zero = verify_dotnet_pe_invariant(
+            pe_report={"is_pe": True, "dot_net": {"clr_header_rva": 0}, "is_executable_image": False}
+        )
+        assert sum(1 for c in rva_zero if c.violated) == 0
+
+        # 4. End-to-end evaluate_lean_domains and EnsembleOrchestrator(embedded=True/False)
+        f_pe_false = EngineFinding(
+            engine="pe_magika",
+            rule_id="PE-DOTNET-02",
+            title="Clean PE report with string false anomaly",
+            file_path="bin/clean.dll",
+            line=1,
+            cwe="CWE-345",
+            severity="INFO",
+            confidence=0.6,
+            metadata={
+                "pe_report": {
+                    "is_pe": True,
+                    "is_dot_net": True,
+                    "is_executable_image": True,
+                    "has_forshaw_cve_2026_108398_anomaly": "false",
+                }
+            },
+        )
+        dom_rep = evaluate_lean_domains([f_pe_false])
+        assert dom_rep.violations_count == 0
+
+        repo = tmp_path / "gap06_repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+
+        rep_emb = EnsembleOrchestrator(embedded=True).run(
+            str(repo),
+            findings=[f_pe_false],
+            out_dir=str(tmp_path / "gap06_emb_out"),
+        )
+        assert rep_emb.lean_verification.get("violations_count") == 0
+        assert rep_emb.whiteboard.get("counts_by_status", {}).get("COUNTEREXAMPLE_FOUND", 0) == 0
+
+        rep_std = EnsembleOrchestrator(embedded=False).run(
+            str(repo),
+            findings=[f_pe_false],
+            out_dir=str(tmp_path / "gap06_std_out"),
+        )
+        assert rep_std.lean_verification.get("violations_count") == 0
+        assert rep_std.whiteboard.get("counts_by_status", {}).get("COUNTEREXAMPLE_FOUND", 0) == 0
+
+        # Invalid pe_report boolean in finding metadata records invalid_witness cleanly without crashing
+        f_pe_bad = EngineFinding(
+            engine="pe_magika",
+            rule_id="PE-DOTNET-BAD",
+            title="Malformed PE report",
+            file_path="bin/bad.dll",
+            line=1,
+            cwe="CWE-345",
+            severity="INFO",
+            confidence=0.5,
+            metadata={
+                "pe_report": {
+                    "is_pe": True,
+                    "is_dot_net": True,
+                    "is_executable_image": True,
+                    "has_forshaw_cve_2026_108398_anomaly": "maybe",
+                }
+            },
+        )
+        dom_bad = evaluate_lean_domains([f_pe_bad])
+        assert dom_bad.violations_count == 0
+        assert any(
+            d.kind == "invalid_witness" and d.module == "RFCHunt.DotNetPeIntegrity"
+            for d in dom_bad.diagnostics
+        )
+        rep_bad_emb = EnsembleOrchestrator(embedded=True).run(
+            str(repo),
+            findings=[f_pe_bad],
+            out_dir=str(tmp_path / "gap06_bad_emb_out"),
+        )
+        assert rep_bad_emb.lean_verification.get("violations_count") == 0
+        assert rep_bad_emb.whiteboard.get("counts_by_status", {}).get("COUNTEREXAMPLE_FOUND", 0) == 0
+
+    def test_gap07_embedded_lean_domains_detects_cve_2026_108398_in_summary_matching_whiteboard(
+        self, tmp_path: Path
+    ) -> None:
+        from engine.ensemble_orchestrator import EngineFinding, EnsembleOrchestrator
+
+        repo = tmp_path / "gap07_repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+
+        finding = EngineFinding(
+            engine="pe_magika",
+            rule_id="PE-DOTNET-03",
+            title="PE summary test",
+            file_path="bin/sample.dll",
+            line=1,
+            cwe="CWE-347",
+            severity="HIGH",
+            confidence=0.85,
+            summary="Detected CVE-2026-108398 anomaly in CLR header",
+            metadata={},
+        )
+        rep = EnsembleOrchestrator(embedded=True).run(
+            str(repo),
+            findings=[finding],
+            out_dir=str(tmp_path / "gap07_emb_out"),
+        )
+        assert rep.whiteboard.get("counts_by_status", {}).get("COUNTEREXAMPLE_FOUND", 0) == 1
+        assert any(c.lean_verified for c in rep.clusters)
+        assert int(rep.lean_verification.get("violations_count") or 0) >= 1
+        dotnet_check = rep.lean_verification.get("domain_checks", {}).get("dotnet_pe", {})
+        assert dotnet_check.get("status") != "passed"
+        assert dotnet_check.get("status") == "counterexample_found"
+        assert int(dotnet_check.get("violations") or 0) >= 1
+
+
+class TestTier5Gap08Gap09Regressions:
+    def test_gap08_policy_guard_info_and_passed_status_do_not_fabricate_counterexamples(
+        self, tmp_path: Path
+    ) -> None:
+        from engine.ensemble_orchestrator import EngineFinding, EnsembleOrchestrator
+        from engine.lean_formal_verifier import evaluate_lean_domains
+
+        repo = tmp_path / "gap08_repo"
+        repo.mkdir()
+        (repo / "policy.yaml").write_text("shellExec: deny\n", encoding="utf-8")
+
+        f_pol_info = EngineFinding(
+            engine="policy_checker",
+            rule_id="POL-INFO-01",
+            title="PolicyGuard shellExec check passed",
+            file_path="policy.yaml",
+            line=1,
+            cwe="CWE-862",
+            severity="INFO",
+            confidence=0.5,
+            summary="Verified shellExec is blocked by policy",
+            confirmed=True,
+            metadata={"status": "passed"},
+        )
+
+        # 1. evaluate_lean_domains and all 4 EnsembleOrchestrator combinations yield 0 violations
+        dom_rep = evaluate_lean_domains([f_pol_info])
+        assert dom_rep.violations_count == 0
+
+        for idx, (emb, en_wb) in enumerate(
+            ((False, False), (True, False), (False, True), (True, True)),
+            start=1,
+        ):
+            rep = EnsembleOrchestrator(embedded=emb, enable_whiteboard=en_wb).run(
+                str(repo),
+                findings=[f_pol_info],
+                out_dir=str(tmp_path / f"gap08_out_{idx}"),
+            )
+            assert rep.lean_verification.get("violations_count") == 0
+            assert rep.whiteboard.get("counts_by_status", {}).get("COUNTEREXAMPLE_FOUND", 0) == 0
+            assert all("lean4" not in c.engines for c in rep.clusters)
+            if en_wb:
+                assert rep.whiteboard.get("counts_by_status", {}).get("REFUTED", 0) == 1
+
+        # 2. metadata={"status": "passed"} also prevents fabrication even with MEDIUM/HIGH severity
+        f_pol_status_passed = EngineFinding(
+            engine="policy_checker",
+            rule_id="POL-PASS-02",
+            title="PolicyGuard out_of_scope denied",
+            file_path="policy.yaml",
+            line=2,
+            cwe="CWE-862",
+            severity="MEDIUM",
+            confidence=0.5,
+            summary="Blocked out_of_scope probe",
+            confirmed=True,
+            metadata={"status": "passed"},
+        )
+        for emb in (True, False):
+            rep_pass = EnsembleOrchestrator(embedded=emb, enable_whiteboard=True).run(
+                str(repo),
+                findings=[f_pol_status_passed],
+                out_dir=str(tmp_path / f"gap08_pass_{emb}"),
+            )
+            assert rep_pass.lean_verification.get("violations_count") == 0
+            assert rep_pass.whiteboard.get("counts_by_status", {}).get("COUNTEREXAMPLE_FOUND", 0) == 0
+
+        # 3. Invalid/non-bool confirmed triggers invalid-witness handling cleanly without crashing
+        f_pol_bad_conf = EngineFinding(
+            engine="policy_checker",
+            rule_id="POL-BAD-03",
+            title="Malformed PolicyGuard shellExec witness",
+            file_path="policy.yaml",
+            line=3,
+            cwe="CWE-862",
+            severity="HIGH",
+            confidence=0.6,
+            summary="shellExec policy witness",
+            confirmed="maybe",  # type: ignore[arg-type]
+            metadata={},
+        )
+        rep_bad = EnsembleOrchestrator(embedded=True, enable_whiteboard=True).run(
+            str(repo),
+            findings=[f_pol_bad_conf],
+            out_dir=str(tmp_path / "gap08_bad_conf"),
+        )
+        assert rep_bad.lean_verification.get("violations_count") == 0
+        assert rep_bad.whiteboard.get("counts_by_status", {}).get("COUNTEREXAMPLE_FOUND", 0) == 0
+        assert rep_bad.whiteboard.get("counts_by_status", {}).get("UNVERIFIED_UNAVAILABLE", 0) == 1
+        assert any(
+            d.get("kind") == "invalid_witness" and d.get("module") == "RFCHunt.PolicyGuard"
+            for d in (rep_bad.lean_verification.get("diagnostics") or [])
+        )
+
+        # 4. Genuine active HIGH policy violation still triggers COUNTEREXAMPLE_FOUND == 1 & violations_count >= 1
+        f_pol_vuln = EngineFinding(
+            engine="policy_checker",
+            rule_id="POL-HIGH-04",
+            title="PolicyGuard shellExec bypass",
+            file_path="policy.yaml",
+            line=4,
+            cwe="CWE-862",
+            severity="HIGH",
+            confidence=0.9,
+            summary="Active shellExec violation",
+            confirmed=True,
+            metadata={},
+        )
+        dom_vuln = evaluate_lean_domains([f_pol_vuln])
+        assert dom_vuln.violations_count >= 1
+        for emb in (True, False):
+            rep_vuln = EnsembleOrchestrator(embedded=emb, enable_whiteboard=True).run(
+                str(repo),
+                findings=[f_pol_vuln],
+                out_dir=str(tmp_path / f"gap08_vuln_{emb}"),
+            )
+            assert rep_vuln.whiteboard.get("counts_by_status", {}).get("COUNTEREXAMPLE_FOUND", 0) == 1
+            assert int(rep_vuln.lean_verification.get("violations_count") or 0) >= 1
+            assert any("lean4" in c.engines and c.lean_verified for c in rep_vuln.clusters)
+
+    def test_gap09_proxy_userinfo_credentials_redacted_across_all_outputs_preserving_non_secret_urls(
+        self, tmp_path: Path
+    ) -> None:
+        from engine.advisory_exporter import _redact_inline_tokens
+        from engine.ensemble_orchestrator import (
+            EnsembleOrchestrator,
+            EnsembleReport,
+            RepoFreshnessSnapshot,
+            render_ensemble_markdown,
+        )
+        from engine.ensemble_whiteboard import EnsembleWhiteboard
+
+        secret_pw = "ProxyUserInfoPass98765"
+        secret_proxy = f"http://alice:{secret_pw}@127.0.0.1:8080"
+        socks_pw = "SocksSecret54321"
+        socks_proxy = f"socks5h://svc:{socks_pw}@127.0.0.1:1080"
+
+        # 1. Direct _redact_inline_tokens checks (positive redaction + negative non-corruption)
+        red_http = _redact_inline_tokens(secret_proxy)
+        assert secret_pw not in red_http
+        assert "<REDACTED>" in red_http
+        assert red_http == "http://alice:<REDACTED>@127.0.0.1:8080"
+
+        red_socks = _redact_inline_tokens(socks_proxy)
+        assert socks_pw not in red_socks
+        assert red_socks == "socks5h://svc:<REDACTED>@127.0.0.1:1080"
+
+        for intact in (
+            "http://127.0.0.1:8080",
+            "https://example.com/user@corp",
+            "https://example.com:8443/user@corp",
+            "https://example.com:8443?email=alice@corp.com",
+            '{"url":"https://example.com:8443","email":"alice@corp.com"}',
+        ):
+            assert _redact_inline_tokens(intact) == intact
+
+        # 2. EnsembleWhiteboard.to_dict() redacts proxy and facts
+        wb = EnsembleWhiteboard(proxy=secret_proxy)
+        wb.add_fact("proxy_note", f"Using {socks_proxy}", payload={"proxy": secret_proxy})
+        wb_json = json.dumps(wb.to_dict(), default=str)
+        assert secret_pw not in wb_json
+        assert socks_pw not in wb_json
+        assert "<REDACTED>" in wb_json
+
+        # 3. Full EnsembleOrchestrator run + exported artifacts + direct render_ensemble_markdown
+        repo = tmp_path / "gap09_repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+        out_dir = tmp_path / "gap09_out"
+
+        orch = EnsembleOrchestrator(embedded=True, proxy=secret_proxy)
+        rep = orch.run(str(repo), findings=[], out_dir=str(out_dir))
+
+        rep_dict_s = json.dumps(rep.to_dict(), default=str)
+        rep_sarif_s = json.dumps(rep.to_sarif(), default=str)
+        telemetry_s = json.dumps(orch.last_telemetry, default=str)
+        direct_md = render_ensemble_markdown(rep)
+        json_file_s = (out_dir / "ensemble_report.json").read_text(encoding="utf-8")
+        sarif_file_s = (out_dir / "ensemble_findings.sarif").read_text(encoding="utf-8")
+        md_file_s = (out_dir / "ensemble_summary.md").read_text(encoding="utf-8")
+
+        for label, blob in (
+            ("rep.to_dict", rep_dict_s),
+            ("rep.to_sarif", rep_sarif_s),
+            ("last_telemetry", telemetry_s),
+            ("direct_render_md", direct_md),
+            ("ensemble_report.json", json_file_s),
+            ("ensemble_findings.sarif", sarif_file_s),
+            ("ensemble_summary.md", md_file_s),
+        ):
+            assert secret_pw not in blob, f"proxy password leaked in {label}"
+            assert "<REDACTED>" in blob, f"missing redaction marker in {label}"
+
+        # Also verify manually constructed EnsembleReport passed directly to render_ensemble_markdown
+        manual_rep = EnsembleReport(
+            target=str(repo),
+            program="generic",
+            quorum=2,
+            freshness=RepoFreshnessSnapshot(repo_path=str(repo), is_git_repo=False),
+            proxy=secret_proxy,
+        )
+        manual_md = render_ensemble_markdown(manual_rep)
+        assert secret_pw not in manual_md
+        assert "<REDACTED>" in manual_md
+
+        # Non-userinfo proxy stays intact
+        rep_plain = EnsembleOrchestrator(embedded=True, proxy="http://127.0.0.1:8080").run(
+            str(repo), findings=[], out_dir=str(tmp_path / "gap09_plain_out")
+        )
+        assert rep_plain.to_dict()["proxy"] == "http://127.0.0.1:8080"
+        assert "http://127.0.0.1:8080" in render_ensemble_markdown(rep_plain)
+
+
