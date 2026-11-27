@@ -672,28 +672,55 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
             )
         )
 
-    # Optionally shallow-clone unlocked watchlist repos into local cache for full white-box auditing
-    if args.clone_unlocked and not args.embedded:
+    # Shallow-clone explicit `--repo owner/repo` slugs and (when `--clone-unlocked`) unlocked watchlist repos
+    explicit_repo_items = [
+        {"program": validate_program_handle(args.program), "repo": validate_repo_slug(r)}
+        for r in (args.repos or [])
+    ]
+    if (args.clone_unlocked or explicit_repo_items) and not args.embedded:
         repos_cache = out_root / "repos_cache"
-        if getattr(args, "from_eligibility_db", False) and (
-            not args.dry_run
-            or args.eligibility_db is None
-            or Path(args.eligibility_db).exists()
-        ):
-            from engine.ml_diff_and_recon_ranker import build_unlocked_watchlist_from_db
-
-            wl_items = [
-                {"program": t["program"], "repo": t["repo"]}
-                for t in build_unlocked_watchlist_from_db(
-                    db_path=args.eligibility_db,
-                    min_efficiency_pct=float(getattr(args, "min_efficiency", 80.0)),
+        wl_items: list[dict[str, str]] = []
+        if args.clone_unlocked:
+            if getattr(args, "from_eligibility_db", False) and (
+                not args.dry_run
+                or args.eligibility_db is None
+                or Path(args.eligibility_db).exists()
+            ):
+                from engine.ml_diff_and_recon_ranker import (
+                    build_unlocked_watchlist_from_db,
                 )
-            ]
-        else:
-            wl_items = load_watchlist_targets(watchlist_path)
-        for r in args.repos or []:
-            wl_items.append({"program": validate_program_handle(args.program), "repo": validate_repo_slug(r)})
-        for item in wl_items[: max(1, int(args.max_repos))]:
+
+                wl_items = [
+                    {"program": t["program"], "repo": t["repo"]}
+                    for t in build_unlocked_watchlist_from_db(
+                        db_path=args.eligibility_db,
+                        min_efficiency_pct=float(getattr(args, "min_efficiency", 80.0)),
+                    )
+                ]
+            else:
+                wl_items = load_watchlist_targets(watchlist_path)
+
+        # Prioritize explicit `--repo owner/repo` slugs first so they are never truncated by max_repos
+        seen_slugs: set[str] = set()
+        combined_clone_items: list[dict[str, str]] = []
+        for item in explicit_repo_items:
+            slug_low = item["repo"].lower()
+            if slug_low not in seen_slugs:
+                seen_slugs.add(slug_low)
+                combined_clone_items.append(item)
+        wl_budget = max(1, int(args.max_repos))
+        wl_added = 0
+        for item in wl_items:
+            if wl_added >= wl_budget:
+                break
+            slug_low = item["repo"].lower()
+            if slug_low not in seen_slugs:
+                seen_slugs.add(slug_low)
+                combined_clone_items.append(item)
+                wl_added += 1
+
+        seen_target_paths = {t_path.resolve() for _, t_path in targets_to_audit}
+        for item in combined_clone_items:
             eligible, reason = check_program_eligibility(
                 item["program"],
                 eligibility_db_path=args.eligibility_db,
@@ -711,7 +738,8 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
                 continue
             repo_dir, sync_res = sync_watchlist_repo(item["repo"], repos_cache, env=env, dry_run=args.dry_run)
             steps.append(sync_res)
-            if repo_dir is not None:
+            if repo_dir is not None and repo_dir.resolve() not in seen_target_paths:
+                seen_target_paths.add(repo_dir.resolve())
                 targets_to_audit.append((item["program"], repo_dir))
 
     # Stage 2 & Stage 3: Fast 3-Stage OODA + Exhaustive Multi-Engine Ensemble Audit per eligible target

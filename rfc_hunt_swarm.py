@@ -5410,22 +5410,16 @@ def build_autonomous_hunt_argv(args, raw_argv: Optional[List[str]] = None) -> Li
         i = 0
         while i < len(tokens):
             tok = tokens[i]
-            if tok in ("--target", "--hunt-target") and i + 1 < len(tokens):
+            if tok in ("--target", "--hunt-target", "--folder", "--dir", "--raptor-target", "--path") and i + 1 < len(tokens):
                 _add_target(tokens[i + 1])
                 i += 2
-            elif tok.startswith("--target="):
-                _add_target(tok.split("=", 1)[1])
-                i += 1
-            elif tok.startswith("--hunt-target="):
+            elif tok.startswith(("--target=", "--hunt-target=", "--folder=", "--dir=", "--raptor-target=", "--path=")):
                 _add_target(tok.split("=", 1)[1])
                 i += 1
             elif tok in ("--repo", "--hunt-repo") and i + 1 < len(tokens):
                 _add_repo_or_target(tokens[i + 1])
                 i += 2
-            elif tok.startswith("--repo="):
-                _add_repo_or_target(tok.split("=", 1)[1])
-                i += 1
-            elif tok.startswith("--hunt-repo="):
+            elif tok.startswith(("--repo=", "--hunt-repo=")):
                 _add_repo_or_target(tok.split("=", 1)[1])
                 i += 1
             else:
@@ -5439,15 +5433,29 @@ def build_autonomous_hunt_argv(args, raw_argv: Optional[List[str]] = None) -> Li
             _add_repo_or_target(r)
         if getattr(args, "repo", None):
             _add_repo_or_target(str(args.repo))
+        if getattr(args, "raptor_target", None):
+            _add_target(str(args.raptor_target))
 
-    if not targets and getattr(args, "path", None) and os.path.isdir(str(args.path)):
+    for t in getattr(args, "hunt_targets", None) or []:
+        _add_target(t)
+    for r in getattr(args, "hunt_repos", None) or []:
+        _add_repo_or_target(r)
+    if getattr(args, "path", None) and os.path.isdir(str(args.path)):
         _add_target(str(args.path))
+    if getattr(args, "target_arg", None):
+        _t_pos = str(args.target_arg).strip()
+        if _t_pos and _t_pos not in ALL_MODES:
+            _add_repo_or_target(_t_pos)
 
     hunt_argv: List[str] = []
     for t in targets:
         hunt_argv.extend(["--target", t])
     for r in repos:
         hunt_argv.extend(["--repo", r])
+    if getattr(args, "clone_unlocked", False):
+        hunt_argv.append("--clone-unlocked")
+    if getattr(args, "no_clone_unlocked", False):
+        hunt_argv.append("--no-clone-unlocked")
 
     prog_val = str(getattr(args, "program", "") or "").strip()
     h1_prog_val = str(getattr(args, "hackerone_program", "") or "").strip()
@@ -6224,6 +6232,60 @@ def cmd_all(args):
                 except Exception as _ooda_exc:
                     res.setdefault("engines", {})["fast_ooda"] = {"status": "error", "error": str(_ooda_exc)}
 
+        # Audit any additional distinct local folder(s) passed alongside --repo (e.g., --all --repo ./r --folder ./f)
+        _extra_local_dirs: List[str] = []
+        _primary_resolved: Optional[Path] = None
+        if repo and os.path.isdir(str(repo)):
+            _primary_resolved = Path(str(repo)).resolve(strict=False)
+        elif path and os.path.isdir(str(path)):
+            _primary_resolved = Path(str(path)).resolve(strict=False)
+        for _cand_dir in (
+            [getattr(args, "raptor_target", None), getattr(args, "path", None)]
+            + list(getattr(args, "hunt_targets", None) or [])
+        ):
+            if not _cand_dir or not os.path.isdir(str(_cand_dir)):
+                continue
+            _cand_res = Path(str(_cand_dir)).resolve(strict=False)
+            if _primary_resolved is not None and _cand_res == _primary_resolved:
+                continue
+            _cand_s = str(_cand_res)
+            if _cand_s not in _extra_local_dirs:
+                _extra_local_dirs.append(_cand_s)
+        if _extra_local_dirs:
+            from engine.ensemble_orchestrator import EnsembleOrchestrator
+
+            _extra_target_summaries: List[Dict[str, Any]] = []
+            _extra_offline = (
+                os.environ.get("RFCHUNT_OFFLINE") == "1"
+                or bool(os.environ.get("CI"))
+                or bool(getattr(args, "embedded", False))
+            )
+            for _ed in _extra_local_dirs:
+                try:
+                    _ef_list, _ef_tele = EnsembleOrchestrator.run_exhaustive_local_engines(
+                        Path(_ed),
+                        refresh_stix=False,
+                        embedded=bool(getattr(args, "embedded", False)),
+                        model=None,
+                        enable_llm_verify=False,
+                        no_external_scanners=bool(getattr(args, "no_external_scanners", False)) or _extra_offline,
+                        program=str(getattr(args, "program", "generic") or "generic"),
+                    )
+                    _extra_target_summaries.append(
+                        {
+                            "target_path": _ed,
+                            "status": "completed",
+                            "engines_executed": list(_ef_tele.get("engines_executed") or []),
+                            "total_findings": len(_ef_list),
+                            "findings": [ef.to_dict() for ef in _ef_list],
+                        }
+                    )
+                except Exception as _ed_exc:
+                    _extra_target_summaries.append(
+                        {"target_path": _ed, "status": "error", "error": str(_ed_exc)}
+                    )
+            res["additional_local_targets"] = _extra_target_summaries
+
         if hasattr(db, "add_fact"):
             try:
                 total_agg = int(res.get("total_aggregated_findings", 0) or 0)
@@ -6267,6 +6329,19 @@ def cmd_all(args):
                 pass
 
         if getattr(args, "as_json", False):
+            if getattr(args, "enable_autonomous_hunt", False):
+                import io as _all_hunt_io
+                import json as _all_hunt_json
+
+                _h_buf = _all_hunt_io.StringIO()
+                with contextlib.redirect_stdout(_h_buf):
+                    _h_rc = cmd_autonomous_hunt(args, raw_argv=getattr(args, "_raw_cli_argv", None))
+                _h_raw = _h_buf.getvalue().strip()
+                try:
+                    _h_doc = _all_hunt_json.loads(_h_raw) if _h_raw else {}
+                except ValueError:
+                    _h_doc = {"raw_output": _h_raw[:2000]}
+                res["autonomous_hunt"] = {**_h_doc, "returncode": int(_h_rc)}
             from engine.cli_render import render_json
             render_json(res)
             return
@@ -6427,6 +6502,11 @@ def cmd_all(args):
                 pass
     finally:
         db.close()
+
+    if getattr(args, "enable_autonomous_hunt", False):
+        _post_all_hunt_rc = cmd_autonomous_hunt(args, raw_argv=getattr(args, "_raw_cli_argv", None))
+        if _post_all_hunt_rc != 0:
+            sys.exit(_post_all_hunt_rc)
 
 
 def cmd_harness2(args):
@@ -8698,8 +8778,10 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
 
     # Turnkey Autonomous Bug Bounty Hunter (--hunt) — unified into rfc_hunt_swarm.py (regular pentests run unchanged without --hunt)
     parser.add_argument("--hunt", dest="enable_autonomous_hunt", action="store_true", default=False, help="Run the turnkey autonomous RFCHunt + ModelFusion bug bounty pipeline (syncs directory, ranks unlocked programs via ACDSO ML, runs freshness-watch, fast-ooda, ensemble-audit, Lean 4, QA-drafts & HITL Chrome handoff; omit for regular pentesting)")
-    parser.add_argument("--hunt-target", dest="hunt_targets", action="append", default=[], help="Local repository directory to audit during --hunt (repeatable; --target / --repo also supported)")
-    parser.add_argument("--hunt-repo", dest="hunt_repos", action="append", default=[], help="Extra 'owner/repo' GitHub slug to include during --hunt (repeatable)")
+    parser.add_argument("--hunt-target", dest="hunt_targets", action="append", default=[], help="Local repository or folder directory to audit during --hunt (repeatable; --target / --repo / --folder / --dir / --path also supported)")
+    parser.add_argument("--hunt-repo", dest="hunt_repos", action="append", default=[], help="Extra 'owner/repo' GitHub slug or local repo to include during --hunt (repeatable)")
+    parser.add_argument("--clone-unlocked", dest="clone_unlocked", action="store_true", default=False, help="Also shallow-clone and hunt UNLOCKED watchlist/EligibilityDB repos alongside local --repo / --folder / --target scans during --hunt")
+    parser.add_argument("--no-clone-unlocked", dest="no_clone_unlocked", action="store_true", default=False, help="Audit only explicitly passed local --repo / --folder / --target paths during --hunt without cloning additional unlocked watchlist repos")
     parser.add_argument("--sync-public-directory", dest="sync_public_directory", action="store_true", default=False, help="Refresh public HackerOne Program Directory sorted by newest launch date before ML ranking during --hunt")
     parser.add_argument("--eligibility-db", dest="eligibility_db", type=str, default=None, help="Optional ProgramEligibilityDB SQLite path for --hunt / --all")
     parser.add_argument("--min-efficiency", dest="min_efficiency", type=float, default=80.0, help="Minimum HackerOne response efficiency %% during --hunt (default: 80.0)")
@@ -8724,6 +8806,8 @@ _CURATED_FLAG_EXAMPLES: Dict[str, str] = {
     "--hunt": "python rfc_hunt_swarm.py --hunt --sync-public-directory --dry-run",
     "--hunt-target": "python rfc_hunt_swarm.py --hunt --hunt-target ./target_repo --program common_codes --once --dry-run",
     "--hunt-repo": "python rfc_hunt_swarm.py --hunt --hunt-repo Shopify/shopify-app-js --once --dry-run",
+    "--clone-unlocked": "python rfc_hunt_swarm.py --hunt --repo ./my_repo --folder ./my_folder --clone-unlocked --dry-run",
+    "--no-clone-unlocked": "python rfc_hunt_swarm.py --hunt --repo ./my_repo --folder ./my_folder --no-clone-unlocked --once --dry-run",
     "--sync-public-directory": "python rfc_hunt_swarm.py --hunt --sync-public-directory --min-efficiency 80 --dry-run",
     "--eligibility-db": "python rfc_hunt_swarm.py --hunt --eligibility-db reports/program_eligibility.sqlite3 --dry-run",
     "--min-efficiency": "python rfc_hunt_swarm.py --hunt --min-efficiency 85 --dry-run",
@@ -9265,7 +9349,7 @@ def _normalize_all_positional_target(
             break
         if tok.startswith("-"):
             opt_key = tok.split("=", 1)[0]
-            if opt_key in ("--all", "--run-all", "--all-scans"):
+            if opt_key in ("--all", "--run-all", "--all-scans", "--hunt", "--fast-ooda", "--ensemble", "--essemble", "--essample"):
                 has_all_flag = True
             elif opt_key == "--mode":
                 if "=" in tok:
@@ -9273,7 +9357,7 @@ def _normalize_all_positional_target(
                         has_all_flag = True
                 elif i + 1 < len(argv_list) and argv_list[i + 1] in ("all", "all_scans"):
                     has_all_flag = True
-            if opt_key in ("--repo", "--raptor-target", "--folder", "--dir", "--path", "--host", "--target"):
+            if opt_key in ("--repo", "--raptor-target", "--folder", "--dir", "--path", "--host", "--target", "--hunt-target"):
                 has_explicit_target_opt = True
             i += 1 + _consume_option_count(tok, i, argv_list)
         else:
@@ -9284,6 +9368,7 @@ def _normalize_all_positional_target(
     if not has_all_flag:
         return list(argv_list), None
 
+    has_hunt_mode = any(t == "--hunt" for t in argv_list)
     out: List[str] = []
     promoted_target: Optional[str] = None
     pos_idx = 0
@@ -9298,17 +9383,27 @@ def _normalize_all_positional_target(
             out.extend(argv_list[i : i + 1 + consume])
             i += 1 + consume
             continue
-        if pos_idx == 0 and tok not in ALL_MODES:
-            promoted_target = tok
-            if not has_explicit_target_opt:
-                if tok.lower().startswith(("http://", "https://")):
-                    out.extend(["--host", tok])
+        if tok not in ALL_MODES:
+            if promoted_target is None:
+                promoted_target = tok
+            if has_hunt_mode:
+                if os.path.isdir(tok) or tok in (".", "..") or tok.startswith(("./", "../", ".\\", "..\\")):
+                    out.extend(["--hunt-target", tok])
                 else:
-                    out.extend(["--repo", tok])
-                has_explicit_target_opt = True
-            pos_idx += 1
-            i += 1
-            continue
+                    out.extend(["--hunt-repo", tok])
+                pos_idx += 1
+                i += 1
+                continue
+            if pos_idx == 0:
+                if not has_explicit_target_opt:
+                    if tok.lower().startswith(("http://", "https://")):
+                        out.extend(["--host", tok])
+                    else:
+                        out.extend(["--repo", tok])
+                    has_explicit_target_opt = True
+                pos_idx += 1
+                i += 1
+                continue
         pos_idx += 1
         out.append(tok)
         i += 1
@@ -9379,6 +9474,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         sys.exit(1)
 
     raw_argv = sys.argv[1:] if argv is None else list(argv)
+    args._raw_cli_argv = list(raw_argv)
     explicit_dests = getattr(args, "_explicit_cli_dests", set())
     explicit_mode_given = bool(args.command) or any(
         arg == "--mode" or arg.startswith("--mode=") for arg in _normalize_harness2_argv(raw_argv)
@@ -9473,9 +9569,11 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         )
         sys.exit(1)
 
-    # Turnkey Autonomous Bug Bounty Hunter (--hunt) dispatches BEFORE generic --dry-run so `--hunt --dry-run`
-    # prints the full 5-stage autonomous hunt plan with zero side effects while regular pentests remain untouched.
-    if getattr(args, "enable_autonomous_hunt", False):
+    # Turnkey Autonomous Bug Bounty Hunter (--hunt):
+    # - Standalone `--hunt` (without `--all`) dispatches directly BEFORE generic `--dry-run`.
+    # - Combined `--all --hunt` (e.g., `--all --repo ./repo --folder ./folder --hunt`) executes
+    #   BOTH the full `--all` audit on local repo/folder targets AND the `--hunt` pipeline!
+    if getattr(args, "enable_autonomous_hunt", False) and not getattr(args, "run_all_scans", False):
         _hunt_rc = cmd_autonomous_hunt(args, raw_argv=raw_argv)
         if _hunt_rc != 0:
             sys.exit(_hunt_rc)
@@ -9483,6 +9581,45 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
 
     # Universal --dry-run guard: works across EVERY flag and subcommand with zero side effects
     if getattr(args, "dry_run", False):
+        if getattr(args, "enable_autonomous_hunt", False) and getattr(args, "run_all_scans", False):
+            # Combined `--all --hunt --dry-run`: preview BOTH --all and --hunt with zero side effects
+            if getattr(args, "as_json", False):
+                import io as _combo_io
+                import json as _combo_json
+
+                _all_buf = _combo_io.StringIO()
+                with contextlib.redirect_stdout(_all_buf):
+                    cmd_dry_run_plan(args, active_mode=active_mode, raw_argv=raw_argv)
+                _hunt_buf = _combo_io.StringIO()
+                with contextlib.redirect_stdout(_hunt_buf):
+                    _hunt_dry_rc = cmd_autonomous_hunt(args, raw_argv=raw_argv)
+                _all_doc = _combo_json.loads(_all_buf.getvalue()) if _all_buf.getvalue().strip() else {}
+                _hunt_doc = _combo_json.loads(_hunt_buf.getvalue()) if _hunt_buf.getvalue().strip() else {}
+                print(
+                    _combo_json.dumps(
+                        {
+                            "status": "dry_run_combined_all_and_hunt_planned",
+                            "dry_run": True,
+                            "all_scan_plan": _all_doc,
+                            "autonomous_hunt_plan": _hunt_doc,
+                            "side_effects": {
+                                "network_packets_sent": 0,
+                                "filesystem_mutations": 0,
+                                "external_submissions": 0,
+                                "browser_launched": False,
+                            },
+                        },
+                        indent=2,
+                    )
+                )
+                if _hunt_dry_rc != 0:
+                    sys.exit(_hunt_dry_rc)
+                return
+            cmd_dry_run_plan(args, active_mode=active_mode, raw_argv=raw_argv)
+            _hunt_dry_rc = cmd_autonomous_hunt(args, raw_argv=raw_argv)
+            if _hunt_dry_rc != 0:
+                sys.exit(_hunt_dry_rc)
+            return
         if (getattr(args, "enable_hackerone", False) or getattr(args, "hackerone_auto", False) or active_mode == "hackerone") and not getattr(args, "run_all_scans", False):
             args.enable_hackerone = True
             cmd_hackerone(args)

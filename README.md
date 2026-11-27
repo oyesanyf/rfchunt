@@ -856,7 +856,9 @@ RFCHunt integrates pure-Python stdlib ML pipelines (adapted from ACDSO with zero
 # 0. SINGLE MASTER CLI (`rfc_hunt_swarm.py`) — Autonomous Hunt Mode (--hunt) & Regular Pentest Mode (without --hunt):
 python rfc_hunt_swarm.py --hunt --sync-public-directory --dry-run
 python rfc_hunt_swarm.py --hunt --sync-public-directory --once
-python rfc_hunt_swarm.py --hunt --target D:\path\to\repo --program common_codes --once --headless-only
+python rfc_hunt_swarm.py --hunt --repo D:\path\to\repo --folder D:\path\to\folder --clone-unlocked --dry-run
+python rfc_hunt_swarm.py --all --repo D:\path\to\repo --folder D:\path\to\folder --hunt --clone-unlocked --dry-run
+python rfc_hunt_swarm.py --hunt --repo anthropics/claude-code --folder D:\path\to\folder --program anthropic --once --headless-only
 
 # Regular Pentest (without --hunt) — --all, --ensemble & --fast-ooda run ALL tools + ModelFusion + ACDSO + Lean 4/Z3:
 python rfc_hunt_swarm.py --all --repo D:\path\to\repo --dry-run

@@ -676,3 +676,160 @@ def test_help_and_docs_include_examples_for_all_flags() -> None:
     assert missing_doc_flags == [], f"Flags missing from docs/CLI_REFERENCE.md: {missing_doc_flags[:15]}"
     assert "Example:" in help_text
     assert "--hunt" in help_text and "--fast-ooda" in help_text and "--start-modelfusion" in help_text
+
+
+def test_scan_repo_and_folder_and_hunt_together(tmp_path: Path) -> None:
+    repo_dir = tmp_path / "local_repo"
+    folder_dir = tmp_path / "extra_folder"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    folder_dir.mkdir(parents=True, exist_ok=True)
+    (repo_dir / "service.py").write_text("def ok():\n    return 1\n", encoding="utf-8")
+    (folder_dir / "widget.js").write_text(
+        'const ep = "/api/admin/audit"; document.body.innerHTML = ep;\n',
+        encoding="utf-8",
+    )
+    swarm_script = Path(__file__).resolve().parents[1] / "rfc_hunt_swarm.py"
+
+    # 1. --hunt with BOTH local --repo AND local --folder AND --clone-unlocked (dry-run)
+    p1 = subprocess.run(
+        [
+            sys.executable,
+            str(swarm_script),
+            "--hunt",
+            "--repo",
+            str(repo_dir),
+            "--folder",
+            str(folder_dir),
+            "--clone-unlocked",
+            "--dry-run",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=90,
+        check=False,
+    )
+    assert p1.returncode == 0, f"stderr={p1.stderr}\nstdout={p1.stdout}"
+    d1 = json.loads(p1.stdout)
+    audited_paths_1 = [str(t.get("target") or "") for t in (d1.get("targets_audited") or [])]
+    assert any(Path(p).resolve() == repo_dir.resolve() for p in audited_paths_1)
+    assert any(Path(p).resolve() == folder_dir.resolve() for p in audited_paths_1)
+    assert len(audited_paths_1) >= 3  # Both local dirs + unlocked watchlist repos planned!
+
+    # 2. --hunt with remote GitHub --repo slug AND local --folder together (dry-run)
+    p2 = subprocess.run(
+        [
+            sys.executable,
+            str(swarm_script),
+            "--hunt",
+            "--repo",
+            "anthropics/claude-code",
+            "--folder",
+            str(folder_dir),
+            "--program",
+            "anthropic",
+            "--dry-run",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=90,
+        check=False,
+    )
+    assert p2.returncode == 0, f"stderr={p2.stderr}\nstdout={p2.stdout}"
+    d2 = json.loads(p2.stdout)
+    audited_paths_2 = [str(t.get("target") or "") for t in (d2.get("targets_audited") or [])]
+    assert any(Path(p).resolve() == folder_dir.resolve() for p in audited_paths_2)
+    assert any("anthropics__claude-code" in p for p in audited_paths_2)
+
+    # 3. Positional repo + folder directly on --hunt (real embedded cycle, 0 mocks)
+    emb_out = tmp_path / "pos_hunt_out"
+    p3 = subprocess.run(
+        [
+            sys.executable,
+            str(swarm_script),
+            "--hunt",
+            str(repo_dir),
+            str(folder_dir),
+            "--once",
+            "--headless-only",
+            "--embedded",
+            "--no-llm",
+            "--out",
+            str(emb_out),
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+        check=False,
+    )
+    assert p3.returncode == 0, f"stderr={p3.stderr}\nstdout={p3.stdout}"
+    d3 = json.loads(p3.stdout)
+    assert len(d3.get("targets_audited") or []) == 2
+
+    # 4. Combined --all + --repo + --folder + --hunt --clone-unlocked --dry-run
+    p4 = subprocess.run(
+        [
+            sys.executable,
+            str(swarm_script),
+            "--all",
+            "--repo",
+            str(repo_dir),
+            "--folder",
+            str(folder_dir),
+            "--hunt",
+            "--clone-unlocked",
+            "--dry-run",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=90,
+        check=False,
+    )
+    assert p4.returncode == 0, f"stderr={p4.stderr}\nstdout={p4.stdout}"
+    d4 = json.loads(p4.stdout)
+    assert d4["status"] == "dry_run_combined_all_and_hunt_planned"
+    assert d4["all_scan_plan"]["dry_run"] is True
+    assert d4["autonomous_hunt_plan"]["dry_run"] is True
+    assert len(d4["autonomous_hunt_plan"]["targets_audited"]) >= 3
+
+    # 5. Regular --all with BOTH --repo AND --folder (no --hunt) audits both local directories
+    all_out = tmp_path / "all_two_dirs"
+    env_off = os.environ.copy()
+    env_off["RFCHUNT_OFFLINE"] = "1"
+    p5 = subprocess.run(
+        [
+            sys.executable,
+            str(swarm_script),
+            "--all",
+            "--repo",
+            str(repo_dir),
+            "--folder",
+            str(folder_dir),
+            "--output-dir",
+            str(all_out),
+            "--no-preflight-live",
+            "--no-include-models",
+            "--no-auto-install",
+            "--no-external-scanners",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env_off,
+        timeout=180,
+        check=False,
+    )
+    assert p5.returncode == 0, f"stderr={p5.stderr}\nstdout={p5.stdout}"
+    d5 = json.loads(p5.stdout)
+    extra = d5.get("additional_local_targets") or []
+    assert len(extra) == 1
+    assert Path(extra[0]["target_path"]).resolve() == folder_dir.resolve()
+    assert extra[0]["status"] == "completed"

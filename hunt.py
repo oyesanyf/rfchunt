@@ -57,17 +57,53 @@ def build_hunt_argv(ns: argparse.Namespace) -> list[str]:
     if getattr(ns, "portfolio_capacity", None) is not None:
         argv.extend(["--portfolio-capacity", str(max(1, int(ns.portfolio_capacity)))])
 
-    if ns.targets:
-        for t in ns.targets:
-            argv.extend(["--target", str(t)])
+    local_targets: list[str] = []
+    remote_repos: list[str] = []
+
+    def _add_local(val: str) -> None:
+        v = str(val or "").strip()
+        if v and v not in local_targets:
+            local_targets.append(v)
+
+    def _add_repo_or_local(val: str) -> None:
+        v = str(val or "").strip()
+        if not v:
+            return
+        if os.path.isdir(v) or v in (".", "..") or v.startswith(("./", "../", ".\\", "..\\")):
+            _add_local(v)
+        elif v not in remote_repos:
+            remote_repos.append(v)
+
+    for t in getattr(ns, "targets", None) or []:
+        _add_local(str(t))
+    for f in getattr(ns, "folders", None) or []:
+        _add_local(str(f))
+    for r in getattr(ns, "repos", None) or []:
+        _add_repo_or_local(str(r))
+
+    for t in local_targets:
+        argv.extend(["--target", t])
+    if local_targets or remote_repos:
         argv.extend(["--program", str(ns.program)])
-    else:
+
+    for r in remote_repos:
+        argv.extend(["--repo", r])
+
+    explicit_clone = bool(getattr(ns, "clone_unlocked", False))
+    explicit_no_clone = bool(getattr(ns, "no_clone_unlocked", False))
+    want_unlocked_hunt = (
+        not explicit_no_clone
+        and (
+            not local_targets
+            or explicit_clone
+            or bool(getattr(ns, "sync_public_directory", False))
+            or bool(ns.watchlist)
+        )
+    )
+    if want_unlocked_hunt:
         argv.extend(["--clone-unlocked", "--max-repos", str(max(1, int(ns.max_repos)))])
         if not ns.watchlist:
             argv.append("--from-eligibility-db")
-
-    for r in ns.repos or []:
-        argv.extend(["--repo", str(r)])
 
     if ns.watchlist:
         argv.extend(["--watchlist", str(ns.watchlist)])
@@ -177,9 +213,12 @@ def build_parser() -> argparse.ArgumentParser:
         prog="hunt.py",
         description="Turnkey pure-Python RFCHunt + ModelFusion autonomous hunter (lists ready URLs & opens Chrome for manual Submit).",
     )
-    p.add_argument("--target", dest="targets", action="append", default=[], help="Local repo directory to audit (repeatable).")
+    p.add_argument("--target", dest="targets", action="append", default=[], help="Local repo or folder directory to audit (repeatable).")
+    p.add_argument("--folder", "--dir", "--path", dest="folders", action="append", default=[], help="Additional local folder/path to audit alongside --repo or unlocked hunt (repeatable).")
     p.add_argument("--program", default="generic", help="HackerOne program handle (default: generic).")
-    p.add_argument("--repo", dest="repos", action="append", default=[], help="Extra 'owner/repo' slug to include.")
+    p.add_argument("--repo", dest="repos", action="append", default=[], help="Local repo directory or GitHub 'owner/repo' slug to include (repeatable).")
+    p.add_argument("--clone-unlocked", action="store_true", default=False, help="Also clone and hunt UNLOCKED watchlist/EligibilityDB repos alongside local --target/--folder/--repo targets.")
+    p.add_argument("--no-clone-unlocked", action="store_true", default=False, help="Disable cloning unlocked watchlist/EligibilityDB repos (audit only explicitly passed local targets/repos).")
     p.add_argument("--watchlist", default=None, help="Optional custom watchlist JSON path (omitting uses UNLOCKED ProgramEligibilityDB repos).")
     p.add_argument("--eligibility-db", default=None, help="Optional ProgramEligibilityDB SQLite path.")
     p.add_argument("--sync-public-directory", action="store_true", default=False, help="Refresh public HackerOne Program Directory sorted by newest launch date before ML ranking.")
