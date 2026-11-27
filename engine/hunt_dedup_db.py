@@ -33,6 +33,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -277,9 +278,19 @@ class HuntDedupDB:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA busy_timeout=15000;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        for attempt in range(6):
+            try:
+                row = conn.execute("PRAGMA journal_mode;").fetchone()
+                if row is None or str(row[0]).lower() != "wal":
+                    conn.execute("PRAGMA journal_mode=WAL;")
+                break
+            except sqlite3.OperationalError as exc:
+                if ("locked" in str(exc).lower() or "busy" in str(exc).lower()) and attempt < 5:
+                    time.sleep(0.02 * (2 ** attempt))
+                    continue
+                raise
         return conn
 
     def _init_schema(self) -> None:

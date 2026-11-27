@@ -284,11 +284,17 @@ class SqliteBlackboard:
 
     def _configure_pragmas(self) -> None:
         with self._lock:
-            self._conn.execute("PRAGMA busy_timeout=10000;")
+            self._conn.execute("PRAGMA busy_timeout=15000;")
             self._conn.execute("PRAGMA synchronous=NORMAL;")
             self._conn.execute("PRAGMA foreign_keys=ON;")
-            if not self.is_memory:
+        if not self.is_memory:
+            def _enable_wal() -> None:
+                row = self._conn.execute("PRAGMA journal_mode;").fetchone()
+                if row is not None and str(row[0]).lower() == "wal":
+                    return
                 self._conn.execute("PRAGMA journal_mode=WAL;")
+
+            self._run_with_retry(_enable_wal)
 
     def _run_with_retry(self, fn: Callable[[], Any]) -> Any:
         last_exc: Exception | None = None

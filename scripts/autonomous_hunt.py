@@ -1148,6 +1148,14 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
         return local_steps, t_res
 
     if swarm_enabled and len(targets_to_audit) > 1 and not args.dry_run:
+        # Pre-initialize shared SQLite WAL blackboard once before concurrent worker fan-out
+        try:
+            from engine.async_blackboard_runtime import SqliteBlackboard
+
+            _pre_bb = SqliteBlackboard(blackboard_db)
+            _pre_bb.close()
+        except Exception:  # noqa: BLE001, S110
+            pass
         indexed_out: dict[int, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
         max_w = min(eff_swarm_workers, len(targets_to_audit))
         with ThreadPoolExecutor(max_workers=max_w) as pool:
