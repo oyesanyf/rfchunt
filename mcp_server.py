@@ -1684,6 +1684,190 @@ class TerminatorMCPServer:
                     },
                 },
             },
+            {
+                "name": "run_autonomous_hunt",
+                "description": (
+                    "[Unified Master CLI --hunt Agent Tool] Runs RFCHunt's turnkey autonomous hunt "
+                    "pipeline (`rfc_hunt_swarm.py --hunt --once --headless-only`) for zero-side-effect "
+                    "dry-run planning or a single bounded headless cycle (auto-submit & CAPTCHA bypass forbidden)."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "targets": {"type": "array", "items": {"type": "string"}},
+                        "repos": {"type": "array", "items": {"type": "string"}},
+                        "program": {"type": "string", "default": "generic"},
+                        "sync_public_directory": {"type": "boolean", "default": False},
+                        "eligibility_db": {"type": "string"},
+                        "watchlist": {"type": "string"},
+                        "min_efficiency": {"type": "number", "default": 80.0},
+                        "portfolio_capacity": {"type": "integer", "default": 6},
+                        "max_repos": {"type": "integer", "default": 4},
+                        "out_dir": {"type": "string", "default": "out/autonomous_hunt"},
+                        "embedded": {"type": "boolean", "default": False},
+                        "no_llm": {"type": "boolean", "default": False},
+                        "allow_blocked": {"type": "boolean", "default": False},
+                        "dry_run": {"type": "boolean", "default": True},
+                        "model": {"type": "string"},
+                        "workspace_root": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "run_fast_ooda",
+                "description": (
+                    "[3-Stage Parallel OODA Triage Funnel] Runs Stage 1 parallel deterministic CPU checks, "
+                    "Stage 2 ACDSO Pareto/Anomaly top-5 ranking, and Stage 3 bounded LLM verification."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["target"],
+                    "properties": {
+                        "target": {"type": "string"},
+                        "program": {"type": "string", "default": "generic"},
+                        "cpu_workers": {"type": "integer"},
+                        "blackboard_db": {"type": "string"},
+                        "out_dir": {"type": "string"},
+                        "embedded": {"type": "boolean", "default": False},
+                        "resume": {"type": "boolean", "default": False},
+                        "signal_score": {"type": "number", "default": 0.0},
+                        "eligibility_db_path": {"type": "string"},
+                        "model": {"type": "string"},
+                        "workspace_root": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "rank_bounty_programs",
+                "description": (
+                    "[ACDSO ML Program Selector] Ranks UNLOCKED public HackerOne programs using "
+                    "survival anti-saturation, GroupKFold LTR, 6-objective Pareto knee, bandit & Two-Phase knapsack."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "eligibility_db_path": {"type": "string"},
+                        "min_efficiency_pct": {"type": "number", "default": 80.0},
+                        "preset": {"type": "string", "enum": ["signal_fast", "balanced", "max_ev"]},
+                        "capacity": {"type": "integer", "default": 6},
+                        "budget_minutes": {"type": "number", "default": 120.0},
+                        "include_deferred": {"type": "boolean", "default": False},
+                        "use_boost_tie_break": {"type": "boolean", "default": False},
+                    },
+                },
+            },
+            {
+                "name": "sync_hackerone_directory",
+                "description": (
+                    "[HackerOne Public Directory Sync] Syncs public HackerOne programs (newest launch first, "
+                    ">=80% efficiency) or offline JSON snapshots into ProgramEligibilityDB v2."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "eligibility_db_path": {"type": "string"},
+                        "snapshot_json": {"type": "string"},
+                        "programs": {"type": "array", "items": {"type": "object"}},
+                        "public_directory": {"type": "boolean", "default": False},
+                        "public_endpoint": {"type": "string"},
+                        "query": {"type": "string", "default": ""},
+                        "limit": {"type": "integer", "default": 25},
+                        "min_efficiency_pct": {"type": "number", "default": 80.0},
+                        "bounties_only": {"type": "boolean", "default": False},
+                        "vdp_only": {"type": "boolean", "default": False},
+                    },
+                },
+            },
+            {
+                "name": "score_fresh_commits",
+                "description": "[ACDSO CommitDiffRanker] Scores and prioritizes <72h commits/PRs/releases with velocity burst detection and diff-scoped scanner routing.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["candidates"],
+                    "properties": {
+                        "candidates": {"type": "array", "items": {"type": "object"}},
+                        "program_scores": {"type": "object"},
+                        "repo_stars_map": {"type": "object"},
+                    },
+                },
+            },
+            {
+                "name": "cluster_recon_assets",
+                "description": "[ReconAssetClusterer] Clusters HTTP recon endpoints via K-Means++ + p95 noise threshold and classifies anomalous HTTP responses.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["assets"],
+                    "properties": {
+                        "assets": {"type": "array", "items": {"type": "object"}},
+                        "program_handle": {"type": "string"},
+                        "eligibility_db_path": {"type": "string"},
+                        "max_clusters": {"type": "integer", "default": 8},
+                    },
+                },
+            },
+            {
+                "name": "analyze_js_bundles",
+                "description": "[JavaScriptBundleAnalyzer] Extracts hidden API/GraphQL/OIDC endpoints, DOM/postMessage sinks, source map leaks, and scoped recon clusters from JS bundles.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["bundles"],
+                    "properties": {
+                        "bundles": {"type": "array", "items": {"type": "object"}},
+                        "program_handle": {"type": "string"},
+                        "eligibility_db_path": {"type": "string"},
+                        "cluster": {"type": "boolean", "default": True},
+                    },
+                },
+            },
+            {
+                "name": "classify_http_responses",
+                "description": "[HTTPResponseAnomalyClassifier] Classifies anomalous HTTP responses via Welford streaming outlier scoring and baseline differential checks.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["responses"],
+                    "properties": {
+                        "responses": {"type": "array", "items": {"type": "object"}},
+                        "baseline": {"type": "object"},
+                        "program_handle": {"type": "string"},
+                        "eligibility_db_path": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "qa_bounty_drafts",
+                "description": "[HackerOne Draft QA Phase] Runs 14 automated QA checks & lossless auto-repairs on Markdown drafts or exported draft JSON snapshots.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "markdown_body": {"type": "string"},
+                        "markdown_file": {"type": "string"},
+                        "snapshots": {"type": "array", "items": {"type": "object"}},
+                        "title": {"type": "string", "default": ""},
+                        "report_id": {"type": "integer", "default": 1},
+                        "program": {"type": "string", "default": ""},
+                        "verify_sources": {"type": "boolean", "default": False},
+                        "qa_db_path": {"type": "string"},
+                        "include_repaired_body": {"type": "boolean", "default": True},
+                    },
+                },
+            },
+            {
+                "name": "check_bounty_drafts",
+                "description": "[HackerOne Cooldown Monitor] Strictly read-only inspection of tracked HackerOne drafts and cooldown readiness (never clicks Submit or Delete).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "db_path": {"type": "string"},
+                        "qa_db_path": {"type": "string"},
+                        "probe_id": {"type": "integer", "default": 4243972},
+                        "probe_only": {"type": "boolean", "default": True},
+                        "seed_only": {"type": "boolean", "default": True},
+                        "snapshots": {"type": "array", "items": {"type": "object"}},
+                        "max_per_day": {"type": "integer", "default": 2},
+                        "mark_submitted": {"type": "integer"},
+                    },
+                },
+            },
         ]
 
     @staticmethod
@@ -3523,6 +3707,67 @@ class TerminatorMCPServer:
                 include_yara=include_yara,
                 workspace_root=explicit_ws_root,
             )
+
+        elif name in (
+            "run_autonomous_hunt",
+            "run_fast_ooda",
+            "rank_bounty_programs",
+            "sync_hackerone_directory",
+            "score_fresh_commits",
+            "cluster_recon_assets",
+            "analyze_js_bundles",
+            "classify_http_responses",
+            "qa_bounty_drafts",
+            "check_bounty_drafts",
+        ):
+            self._reject_shell_execution(args)
+            from bugbounty_mcp_server import BugBountyMCPServer
+
+            bridge_map = {
+                "run_autonomous_hunt": "bb_run_autonomous_hunt",
+                "run_fast_ooda": "bb_run_fast_ooda",
+                "rank_bounty_programs": "bb_rank_programs",
+                "sync_hackerone_directory": "bb_sync_public_directory",
+                "score_fresh_commits": "bb_score_fresh_commits",
+                "cluster_recon_assets": "bb_cluster_recon_assets",
+                "analyze_js_bundles": "bb_analyze_js_bundles",
+                "classify_http_responses": "bb_classify_http_responses",
+                "qa_bounty_drafts": "bb_qa_drafts",
+                "check_bounty_drafts": "bb_check_drafts",
+            }
+            forwarded_args = dict(args)
+            explicit_ws_root = self._resolve_mcp_workspace_root(args)
+            if name == "run_autonomous_hunt" and forwarded_args.get("targets"):
+                validated_targets: List[str] = []
+                for raw_t in forwarded_args["targets"]:
+                    validated_targets.append(
+                        self._validate_mcp_scan_path(
+                            str(raw_t),
+                            workspace_root=explicit_ws_root,
+                            allow_directory=True,
+                        )
+                    )
+                forwarded_args["targets"] = validated_targets
+            elif name == "run_fast_ooda":
+                raw_t = self._parse_strict_str(args, "target", ".", allow_empty=False) or "."
+                forwarded_args["target"] = self._validate_mcp_scan_path(
+                    raw_t,
+                    workspace_root=explicit_ws_root,
+                    allow_directory=True,
+                )
+            elif name == "qa_bounty_drafts" and forwarded_args.get("markdown_file"):
+                forwarded_args["markdown_file"] = self._validate_mcp_scan_path(
+                    str(forwarded_args["markdown_file"]),
+                    workspace_root=explicit_ws_root,
+                    allow_directory=False,
+                )
+            elif name == "sync_hackerone_directory" and forwarded_args.get("snapshot_json"):
+                forwarded_args["snapshot_json"] = self._validate_mcp_scan_path(
+                    str(forwarded_args["snapshot_json"]),
+                    workspace_root=explicit_ws_root,
+                    allow_directory=False,
+                )
+            return BugBountyMCPServer()._dispatch_tool(bridge_map[name], forwarded_args)
 
         raise ValueError(f"Unknown tool: {name}")
 

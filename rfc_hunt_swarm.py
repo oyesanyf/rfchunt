@@ -5380,6 +5380,151 @@ def _validate_export_sarif_path(
     )
 
 
+def build_autonomous_hunt_argv(args, raw_argv: Optional[List[str]] = None) -> List[str]:
+    """
+    Translates unified `rfc_hunt_swarm.py --hunt ...` arguments into `hunt.py` argv,
+    bridging repeatable `--target`/`--hunt-target` and `--repo`/`--hunt-repo` flags
+    and forwarding `--model` / `--out` only when explicitly passed by the caller.
+    """
+    tokens = list(raw_argv) if raw_argv is not None else []
+    explicit_dests = getattr(args, "_explicit_cli_dests", set())
+
+    targets: List[str] = []
+    repos: List[str] = []
+
+    def _add_target(val: str) -> None:
+        v = str(val or "").strip()
+        if v and v not in targets:
+            targets.append(v)
+
+    def _add_repo_or_target(val: str) -> None:
+        v = str(val or "").strip()
+        if not v:
+            return
+        if os.path.isdir(v) or v in (".", "..") or v.startswith(("./", "../", ".\\", "..\\")):
+            _add_target(v)
+        elif v not in repos:
+            repos.append(v)
+
+    if tokens:
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok in ("--target", "--hunt-target") and i + 1 < len(tokens):
+                _add_target(tokens[i + 1])
+                i += 2
+            elif tok.startswith("--target="):
+                _add_target(tok.split("=", 1)[1])
+                i += 1
+            elif tok.startswith("--hunt-target="):
+                _add_target(tok.split("=", 1)[1])
+                i += 1
+            elif tok in ("--repo", "--hunt-repo") and i + 1 < len(tokens):
+                _add_repo_or_target(tokens[i + 1])
+                i += 2
+            elif tok.startswith("--repo="):
+                _add_repo_or_target(tok.split("=", 1)[1])
+                i += 1
+            elif tok.startswith("--hunt-repo="):
+                _add_repo_or_target(tok.split("=", 1)[1])
+                i += 1
+            else:
+                i += 1
+    else:
+        for t in getattr(args, "hunt_targets", None) or []:
+            _add_target(t)
+        if "host" in explicit_dests and getattr(args, "host", None):
+            _add_target(str(args.host))
+        for r in getattr(args, "hunt_repos", None) or []:
+            _add_repo_or_target(r)
+        if getattr(args, "repo", None):
+            _add_repo_or_target(str(args.repo))
+
+    if not targets and getattr(args, "path", None) and os.path.isdir(str(args.path)):
+        _add_target(str(args.path))
+
+    hunt_argv: List[str] = []
+    for t in targets:
+        hunt_argv.extend(["--target", t])
+    for r in repos:
+        hunt_argv.extend(["--repo", r])
+
+    prog_val = str(getattr(args, "program", "") or "").strip()
+    h1_prog_val = str(getattr(args, "hackerone_program", "") or "").strip()
+    if prog_val and prog_val != "generic":
+        eff_prog = prog_val
+    elif h1_prog_val:
+        eff_prog = h1_prog_val
+    else:
+        eff_prog = prog_val or "generic"
+    hunt_argv.extend(["--program", eff_prog])
+
+    if getattr(args, "watchlist", None):
+        hunt_argv.extend(["--watchlist", str(args.watchlist)])
+    if getattr(args, "eligibility_db", None):
+        hunt_argv.extend(["--eligibility-db", str(args.eligibility_db)])
+    if getattr(args, "sync_public_directory", False):
+        hunt_argv.append("--sync-public-directory")
+    if getattr(args, "min_efficiency", None) is not None:
+        hunt_argv.extend(["--min-efficiency", str(float(args.min_efficiency))])
+    if getattr(args, "portfolio_capacity", None) is not None:
+        hunt_argv.extend(["--portfolio-capacity", str(max(1, int(args.portfolio_capacity)))])
+    if getattr(args, "max_repos", None) is not None:
+        hunt_argv.extend(["--max-repos", str(max(1, int(args.max_repos)))])
+    if getattr(args, "interval_minutes", None) is not None:
+        hunt_argv.extend(["--interval-minutes", str(float(args.interval_minutes))])
+    if getattr(args, "max_cycles", None) and int(args.max_cycles) > 0:
+        hunt_argv.extend(["--max-cycles", str(int(args.max_cycles))])
+    if getattr(args, "hunt_once", False):
+        hunt_argv.append("--once")
+    if getattr(args, "headless_only", False):
+        hunt_argv.append("--headless-only")
+    if getattr(args, "embedded", False):
+        hunt_argv.append("--embedded")
+    if getattr(args, "no_llm", False):
+        hunt_argv.append("--no-llm")
+    if getattr(args, "allow_blocked", False):
+        hunt_argv.append("--allow-blocked")
+    if getattr(args, "dry_run", False):
+        hunt_argv.append("--dry-run")
+    if getattr(args, "as_json", False):
+        hunt_argv.append("--json")
+    if getattr(args, "install_schedule", False):
+        hunt_argv.append("--install-schedule")
+    if getattr(args, "uninstall_schedule", False):
+        hunt_argv.append("--uninstall-schedule")
+    if getattr(args, "run_now", False):
+        hunt_argv.append("--run-now")
+    if getattr(args, "task_name", None):
+        hunt_argv.extend(["--task-name", str(args.task_name)])
+
+    # Forward --model only when explicitly provided so hunt.py's dynamic RAM-gated abliterated selector runs by default
+    model_explicit = any(t == "--model" or t.startswith("--model=") for t in tokens)
+    raw_model = getattr(args, "model", None)
+    if (model_explicit or (not tokens and raw_model and raw_model != "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M")) and raw_model:
+        hunt_argv.extend(["--model", str(raw_model)])
+
+    # Forward --out / --output-dir only when explicitly provided so hunt.py preserves default out/autonomous_hunt
+    out_explicit = any(t == "--out" or t.startswith("--out=") for t in tokens)
+    outdir_explicit = any(t == "--output-dir" or t.startswith("--output-dir=") for t in tokens)
+    if out_explicit and getattr(args, "out", None):
+        hunt_argv.extend(["--out", str(args.out)])
+    elif outdir_explicit and getattr(args, "output_dir", None):
+        hunt_argv.extend(["--out", str(args.output_dir)])
+    elif not tokens and getattr(args, "out", None) and str(args.out) != "reports":
+        hunt_argv.extend(["--out", str(args.out)])
+
+    return hunt_argv
+
+
+def cmd_autonomous_hunt(args, raw_argv: Optional[List[str]] = None) -> int:
+    """Master CLI handler for `rfc_hunt_swarm.py --hunt` delegating to the turnkey autonomous hunter (`hunt.py`)."""
+    import hunt as _turnkey_hunt
+
+    hunt_argv = build_autonomous_hunt_argv(args, raw_argv=raw_argv)
+    return int(_turnkey_hunt.main(hunt_argv))
+
+
 def cmd_all(args):
     """
     Unified --all orchestrator running Google Mantis, haasonsaas/aiscan, BaaRai/ARTEX Dual-Graph,
@@ -5866,6 +6011,7 @@ def cmd_all(args):
                         gha_only=bool(getattr(args, "gha_only", False)) or (ens_target_p.is_file() and ens_target_p.suffix.lower() in (".yml", ".yaml")),
                         no_external_scanners=bool(getattr(args, "no_external_scanners", False)),
                         lean_dir=orch.lean_dir,
+                        program=str(getattr(args, "program", "generic") or "generic"),
                     )
                     orch.last_telemetry = local_tele
                     merged_findings.extend(local_findings)
@@ -5897,6 +6043,68 @@ def cmd_all(args):
             rf["ensemble_sarif"] = str(ens_out_dir / "ensemble_findings.sarif")
             if combined_json_str and Path(combined_json_str).parent.exists():
                 Path(combined_json_str).write_text(_ens_json.dumps(res, indent=2), encoding="utf-8")
+        else:
+            # Even when --ensemble and --hunt are NOT passed, --all runs all local defensive tools
+            # (TruffleHog, Mobile/MobSF, API/JWT/SD-JWT, AI Infra Guard, Parity/Invariants,
+            # Zizmor/Actionlint/GHA Agent, Z3 Formal, JS Bundle Analyzer, Lean 4, and ACDSO Stage-2 ranking).
+            _local_target_str = str(repo or path or "").strip()
+            _local_target_p = Path(_local_target_str) if _local_target_str else None
+            if _local_target_p is not None and (
+                _local_target_p.is_dir()
+                or (_local_target_p.is_file() and _local_target_p.suffix.lower() in (".yml", ".yaml"))
+            ):
+                try:
+                    import json as _all_tools_json
+                    from engine.acdso_bridge import rank_stage2_candidates
+                    from engine.ensemble_orchestrator import EnsembleOrchestrator
+
+                    _all_offline = (
+                        os.environ.get("RFCHUNT_OFFLINE") == "1"
+                        or bool(os.environ.get("CI"))
+                        or bool(getattr(args, "embedded", False))
+                        or (not bool(getattr(args, "preflight_live", True)))
+                    )
+                    _all_embedded = bool(getattr(args, "embedded", False))
+                    _all_tools_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+                    with _all_tools_ctx:
+                        _extra_local_findings, _extra_local_tele = EnsembleOrchestrator.run_exhaustive_local_engines(
+                            _local_target_p,
+                            refresh_stix=False,
+                            embedded=_all_embedded,
+                            model=None,
+                            enable_llm_verify=False,
+                            gha_only=bool(getattr(args, "gha_only", False))
+                            or (_local_target_p.is_file() and _local_target_p.suffix.lower() in (".yml", ".yaml")),
+                            no_external_scanners=bool(getattr(args, "no_external_scanners", False)) or _all_offline,
+                            program=str(getattr(args, "program", "generic") or "generic"),
+                        )
+                    _prod_cands = [
+                        ef.to_dict()
+                        for ef in _extra_local_findings
+                        if not getattr(ef, "non_production_noise", False)
+                    ]
+                    _acdso_s2 = (
+                        rank_stage2_candidates(_prod_cands, top_k=5)
+                        if _prod_cands
+                        else {"selected": [], "pareto_count": 0, "total_candidates": 0}
+                    )
+                    res["exhaustive_local_findings"] = [ef.to_dict() for ef in _extra_local_findings]
+                    res.setdefault("engines", {})["exhaustive_local_tools"] = {
+                        "status": "completed",
+                        "engines_executed": list(_extra_local_tele.get("engines_executed") or []),
+                        "total_findings": len(_extra_local_findings),
+                        "production_findings": len(_prod_cands),
+                        "telemetry": _extra_local_tele,
+                        "acdso_stage2": _acdso_s2,
+                    }
+                    _combined_json_p = str((res.get("report_files") or {}).get("combined_json") or "").strip()
+                    if _combined_json_p and Path(_combined_json_p).parent.exists():
+                        Path(_combined_json_p).write_text(_all_tools_json.dumps(res, indent=2, default=str), encoding="utf-8")
+                except Exception as _ext_tools_exc:
+                    res.setdefault("engines", {})["exhaustive_local_tools"] = {
+                        "status": "degraded_error",
+                        "error": str(_ext_tools_exc),
+                    }
 
         if hasattr(db, "add_fact"):
             try:
@@ -6048,6 +6256,14 @@ def cmd_all(args):
                 f"    Ensemble Whiteboard : {ens_info.get('total_clusters', 0)} clusters "
                 f"(hyps={wb_info.get('total_hypotheses', len(wb_info.get('hypotheses') or []))}, "
                 f"lean={res.get('lean_verification', {}).get('status', 'unknown')})"
+            )
+        elif "exhaustive_local_tools" in eng:
+            elt = eng.get("exhaustive_local_tools") or {}
+            elt_exec = elt.get("engines_executed") or []
+            print(
+                f"    Exhaustive Tools    : {elt.get('status', 'completed')} "
+                f"(engines={len(elt_exec)} [{','.join(elt_exec[:8])}], "
+                f"findings={elt.get('total_findings', 0)}, prod={elt.get('production_findings', 0)})"
             )
         print(f"    Combined SARIF      : {res['report_files'].get('combined_sarif')}")
         if res["report_files"].get("exported_sarif"):
@@ -8340,6 +8556,26 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--gha-only", dest="gha_only", action="store_true", default=False, help="Restrict --ensemble local engine fan-out to GitHub Actions workflow scanners")
     parser.add_argument("--package-client", dest="package_client", type=str, default=None, help="Optional client organization name to emit 5-file ClientAuditPackager bundle in --ensemble")
 
+    # Turnkey Autonomous Bug Bounty Hunter (--hunt) — unified into rfc_hunt_swarm.py (regular pentests run unchanged without --hunt)
+    parser.add_argument("--hunt", dest="enable_autonomous_hunt", action="store_true", default=False, help="Run the turnkey autonomous RFCHunt + ModelFusion bug bounty pipeline (syncs directory, ranks unlocked programs via ACDSO ML, runs freshness-watch, fast-ooda, ensemble-audit, Lean 4, QA-drafts & HITL Chrome handoff; omit for regular pentesting)")
+    parser.add_argument("--hunt-target", dest="hunt_targets", action="append", default=[], help="Local repository directory to audit during --hunt (repeatable; --target / --repo also supported)")
+    parser.add_argument("--hunt-repo", dest="hunt_repos", action="append", default=[], help="Extra 'owner/repo' GitHub slug to include during --hunt (repeatable)")
+    parser.add_argument("--sync-public-directory", dest="sync_public_directory", action="store_true", default=False, help="Refresh public HackerOne Program Directory sorted by newest launch date before ML ranking during --hunt")
+    parser.add_argument("--eligibility-db", dest="eligibility_db", type=str, default=None, help="Optional ProgramEligibilityDB SQLite path for --hunt / --all")
+    parser.add_argument("--min-efficiency", dest="min_efficiency", type=float, default=80.0, help="Minimum HackerOne response efficiency %% during --hunt (default: 80.0)")
+    parser.add_argument("--portfolio-capacity", dest="portfolio_capacity", type=int, default=6, help="Daily Two-Phase Knapsack portfolio capacity during --hunt (default: 6)")
+    parser.add_argument("--max-repos", dest="max_repos", type=int, default=4, help="Maximum unlocked watchlist repos to audit per --hunt cycle (default: 4)")
+    parser.add_argument("--watchlist", dest="watchlist", type=str, default=None, help="Optional custom JSON watchlist path for --hunt (omitting uses UNLOCKED ProgramEligibilityDB repos)")
+    parser.add_argument("--interval-minutes", dest="interval_minutes", type=float, default=60.0, help="Minutes between continuous --hunt cycles (default: 60.0)")
+    parser.add_argument("--max-cycles", dest="max_cycles", type=int, default=0, help="Stop --hunt after N cycles (0 = run continuously unless --once or --dry-run)")
+    parser.add_argument("--once", dest="hunt_once", action="store_true", default=False, help="Run a single complete --hunt cycle and exit")
+    parser.add_argument("--headless-only", dest="headless_only", action="store_true", default=False, help="During --hunt, write READY_TO_CLICK_SUBMIT.md only without staging drafts or opening Chrome")
+    parser.add_argument("--allow-blocked", dest="allow_blocked", action="store_true", default=False, help="Allow Signal-blocked programs for local offline research during --hunt")
+    parser.add_argument("--install-schedule", dest="install_schedule", action="store_true", default=False, help="Install recurring native OS schedule for `rfc_hunt_swarm.py --hunt --once` (zero Registry/PATH mutation)")
+    parser.add_argument("--uninstall-schedule", dest="uninstall_schedule", action="store_true", default=False, help="Remove the recurring native OS schedule for --hunt")
+    parser.add_argument("--run-now", dest="run_now", action="store_true", default=False, help="Trigger an immediate scheduled task run right after --hunt --install-schedule")
+    parser.add_argument("--task-name", dest="task_name", type=str, default="RFCHunt-Autonomous-Defensive-Hunt", help="OS Scheduled Task name for --hunt --install-schedule")
+
     return parser
 
 
@@ -8740,7 +8976,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "harness2_report", "mantis_report", "aiscan_report", "install_tools", "tool_status",
             "deep_audit", "proxy_target", "live_proxy_fuzz", "trust_boundary_review",
             "coverage_fuzz", "enable_poc", "enable_phi", "enable_hackerone", "hackerone_auto",
-            "serve_ui", "network_lifecycle", "dry_run", "enable_pe_audit",
+            "serve_ui", "network_lifecycle", "dry_run", "enable_pe_audit", "enable_autonomous_hunt",
         )
     ) and getattr(args, "hint", None) is None and not getattr(args, "dispatch", None):
         build_swarm_parser().print_help()
@@ -8819,6 +9055,14 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             file=(sys.stderr if _as_json_cli else sys.stdout),
         )
         sys.exit(1)
+
+    # Turnkey Autonomous Bug Bounty Hunter (--hunt) dispatches BEFORE generic --dry-run so `--hunt --dry-run`
+    # prints the full 5-stage autonomous hunt plan with zero side effects while regular pentests remain untouched.
+    if getattr(args, "enable_autonomous_hunt", False):
+        _hunt_rc = cmd_autonomous_hunt(args, raw_argv=raw_argv)
+        if _hunt_rc != 0:
+            sys.exit(_hunt_rc)
+        return
 
     # Universal --dry-run guard: works across EVERY flag and subcommand with zero side effects
     if getattr(args, "dry_run", False):
@@ -8974,7 +9218,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "enable_rea_only", "install_tools", "tool_status",
             "raptor_status", "raptor_findings", "raptor_setup",
             "harness2_report", "mantis_report", "aiscan_report",
-            "preflight_only", "enable_pe_audit",
+            "preflight_only", "enable_pe_audit", "enable_autonomous_hunt",
         )
     )
     if active_mode == "hint" or (
@@ -9907,6 +10151,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
 
 if __name__ == "__main__":
     _cli_argv = sys.argv[1:]
+    _has_hunt_flag = any(t == "--hunt" for t in _cli_argv)
     _has_embedded = any(t in ("--embedded", "--embeded") for t in _cli_argv)
     _has_all_flag = (
         any(t in ("--all", "--run-all", "--all-scans", "all", "all_scans") for t in _cli_argv)
@@ -9918,12 +10163,13 @@ if __name__ == "__main__":
             for idx in range(len(_cli_argv))
         )
     )
-    from revenue_cli import REVENUE_SUBCOMMANDS, maybe_dispatch_revenue_cli
+    if not _has_hunt_flag:
+        from revenue_cli import REVENUE_SUBCOMMANDS, maybe_dispatch_revenue_cli
 
-    _is_rev_subcmd = bool(_cli_argv) and (_cli_argv[0] in REVENUE_SUBCOMMANDS)
-    if _is_rev_subcmd or _has_embedded or not _has_all_flag:
-        _rev_rc = maybe_dispatch_revenue_cli(_cli_argv)
-        if _rev_rc is not None:
-            raise SystemExit(_rev_rc)
+        _is_rev_subcmd = bool(_cli_argv) and (_cli_argv[0] in REVENUE_SUBCOMMANDS)
+        if _is_rev_subcmd or _has_embedded or not _has_all_flag:
+            _rev_rc = maybe_dispatch_revenue_cli(_cli_argv)
+            if _rev_rc is not None:
+                raise SystemExit(_rev_rc)
     main_swarm()
 

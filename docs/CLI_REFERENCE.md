@@ -521,32 +521,43 @@ powershell -ExecutionPolicy Bypass -File scripts/clear_conpty_deadlocks.ps1 -Dry
 powershell -ExecutionPolicy Bypass -File scripts/install_global_deadlock_watchdog.ps1
 ```
 
-### 13. One-Command Turnkey Runner (`hunt.py`) & ACDSO ML Program Selection, JS Analysis, Recon Clustering & ATLAS AI Gate
+### 13. Unified Master CLI (`rfc_hunt_swarm.py --hunt`), Regular Pentest (`--all` / `--ensemble`) & Agent MCP Tools
+`rfc_hunt_swarm.py` is the single master CLI entrypoint calling every scanner, formal verifier, ML ranker, QA checker, and autonomous hunt workflow in RFCHunt:
+- **With `--hunt`:** runs the full turnkey autonomous bug bounty pipeline (`--sync-public-directory`, `--eligibility-db`, `--min-efficiency`, `--portfolio-capacity`, `--max-repos`, `--watchlist`, `--interval-minutes`, `--max-cycles`, `--once`, `--headless-only`, `--allow-blocked`, `--embedded`, `--no-llm`, `--dry-run`, `--json`, `--install-schedule`, `--uninstall-schedule`, `--run-now`, `--task-name`, `--target`/`--hunt-target`, `--repo`/`--hunt-repo`, `--program`, `--model`, `--out`). `python hunt.py` remains available as a thin shortcut.
+- **Without `--hunt` (Regular Pentest Mode):** `--all` and `--all --ensemble` automatically execute ALL local defensive tools (Mantis, aiscan, ARTEX, RAPTOR, REA, PE/.NET, TruffleHog, Mobile/MobSF, API/JWT/SD-JWT, AI Infra Guard, Parity/Invariants, Zizmor/Actionlint/GHA Agent, Z3 Formal, JS Bundle Analyzer + Recon Clustering, Lean 4 Formal Verifier, and ACDSO Stage-2 Pareto ranking).
+- **MCP Agent Tools:** Both `mcp_server.py` (`run_autonomous_hunt`, `run_fast_ooda`, `rank_bounty_programs`, `sync_hackerone_directory`, `score_fresh_commits`, `cluster_recon_assets`, `analyze_js_bundles`, `classify_http_responses`, `qa_bounty_drafts`, `check_bounty_drafts`) and `bugbounty_mcp_server.py` (`bb_run_autonomous_hunt`, `bb_sync_public_directory`, `bb_qa_drafts`, `bb_check_drafts`, etc.) expose all capabilities directly as MCP tools.
+
 ```powershell
-# 0. ONE-COMMAND TURNKEY PYTHON RUNNER (runs ML ranking, unlocked freshness watch, OODA, ensemble audit, Lean 4, QA & Chrome handoff)
-python hunt.py --dry-run
-python hunt.py --sync-public-directory --once
-python hunt.py
+# 0. UNIFIED MASTER CLI — Autonomous Hunt Mode (--hunt) with zero-side-effect --dry-run:
+python rfc_hunt_swarm.py --hunt --sync-public-directory --dry-run
+python rfc_hunt_swarm.py --hunt --sync-public-directory --once
+python rfc_hunt_swarm.py --hunt --target D:\path\to\repo --program common_codes --once --headless-only
+python rfc_hunt_swarm.py --hunt --install-schedule --interval-minutes 60
+
+# Regular Pentest (without --hunt) — --all and --all --ensemble run ALL tools automatically:
+python rfc_hunt_swarm.py --all --repo D:\path\to\repo --dry-run
+python rfc_hunt_swarm.py --all --repo D:\path\to\repo
+python rfc_hunt_swarm.py --all --ensemble --repo D:\path\to\repo --program generic
 
 # 1. Rank UNLOCKED HackerOne programs (newest launches, >=80% efficiency, wide scope, Lane 1/2 portfolio knapsack)
-python revenue_cli.py rank-programs --min-efficiency 80 --capacity 6 --budget-minutes 120 --json
-python revenue_cli.py rank-programs --preset signal_fast --use-boost --json
+python rfc_hunt_swarm.py rank-programs --min-efficiency 80 --capacity 6 --budget-minutes 120 --json
+python rfc_hunt_swarm.py rank-programs --preset signal_fast --use-boost --json
 
 # 2. Sync HackerOne public directory & structured scopes into ProgramEligibilityDB v2 (public newest-first, API, or offline snapshot)
-python revenue_cli.py sync-directory --public-directory --min-efficiency 80 --limit 25 --json
-python revenue_cli.py sync-directory --snapshot-json h1_directory.json --json
-python revenue_cli.py sync-directory --query "api" --limit 25 --json
+python rfc_hunt_swarm.py sync-directory --public-directory --min-efficiency 80 --limit 25 --json
+python rfc_hunt_swarm.py sync-directory --snapshot-json h1_directory.json --json
+python rfc_hunt_swarm.py sync-directory --query "api" --limit 25 --json
 
 # 3. Poll fresh <72h diffs strictly from UNLOCKED DB repos with invariant ETag caching + CommitDiffRanker ML scoring
-python revenue_cli.py freshness-watch --from-eligibility-db --ml-rank --hours 72 --min-score 20
+python rfc_hunt_swarm.py freshness-watch --from-eligibility-db --ml-rank --hours 72 --min-score 20
 
 # 4. Analyze JavaScript bundles & cluster/classify anomalous HTTP responses (enforces strict DNS-boundary scope allowlist)
-python revenue_cli.py analyze-js --input ./js_bundles --program common_codes --json
-python revenue_cli.py cluster-recon --input recon_endpoints.json --program common_codes --json
+python rfc_hunt_swarm.py analyze-js --input ./js_bundles --program common_codes --json
+python rfc_hunt_swarm.py cluster-recon --input recon_endpoints.json --program common_codes --json
 
 # 5. Adversarial LLM prompt injection / indirect data exfiltration / guardrail bypass (fails closed unless AI is in scope)
-python revenue_cli.py atlas-llm-eval --llm-target https://ai.example.com --program anthropic --suites low_resource,canary,indirect_exfil,ssrf_tool
+python rfc_hunt_swarm.py atlas-llm-eval --llm-target https://ai.example.com --program anthropic --suites low_resource,canary,indirect_exfil,ssrf_tool
 
 # 6. Log real HackerOne report triage outcomes to continuously update Cox survival, GroupKFold LTR & LinUCB/Thompson models
-python revenue_cli.py record-outcome --handle henkel_vdp --outcome TRIAGED --lane 1 --signal-delta 7.0 --bounty-usd 0 --triage-hours 16
+python rfc_hunt_swarm.py record-outcome --handle henkel_vdp --outcome TRIAGED --lane 1 --signal-delta 7.0 --bounty-usd 0 --triage-hours 16
 ```

@@ -114,7 +114,7 @@ def manage_os_schedule(ns: argparse.Namespace) -> int:
             return 0 if proc.returncode == 0 else 1
 
         interval = max(5, round(float(ns.interval_minutes)))
-        run_flags = ["--once"]
+        run_flags = ["--hunt", "--once"]
         if ns.targets:
             for t in ns.targets:
                 run_flags.extend(["--target", f'"{t}"'])
@@ -123,7 +123,7 @@ def manage_os_schedule(ns: argparse.Namespace) -> int:
             run_flags.append("--headless-only")
         if ns.embedded:
             run_flags.append("--embedded")
-        task_cmd = f'"{sys.executable}" "{RFCHUNT_ROOT / "hunt.py"}" ' + " ".join(run_flags)
+        task_cmd = f'"{sys.executable}" "{RFCHUNT_ROOT / "rfc_hunt_swarm.py"}" ' + " ".join(run_flags)
 
         create_cmd = [
             "schtasks",
@@ -161,7 +161,10 @@ def manage_os_schedule(ns: argparse.Namespace) -> int:
 
     # POSIX / Linux / macOS crontab line
     interval = max(5, round(float(ns.interval_minutes)))
-    cron_line = f"*/{interval} * * * * cd {RFCHUNT_ROOT} && {sys.executable} {RFCHUNT_ROOT / 'hunt.py'} --once"
+    cron_line = (
+        f"*/{interval} * * * * cd {RFCHUNT_ROOT} && "
+        f"{sys.executable} {RFCHUNT_ROOT / 'rfc_hunt_swarm.py'} --hunt --once"
+    )
     if ns.uninstall_schedule:
         print(f"[INFO] Remove this line from `crontab -e`:\n  {cron_line}")
     else:

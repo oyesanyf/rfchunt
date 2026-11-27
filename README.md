@@ -842,32 +842,42 @@ RFCHunt integrates pure-Python stdlib ML pipelines (adapted from ACDSO with zero
   - **`HackerOnePublicDirectoryClient`:** Syncs public HackerOne programs sorted by newest launch date (`launched_at DESC`), actively accepting submissions (`open`), and `>= 80%` response efficiency without requiring API tokens.
   - **Fail-Closed AI/LLM & Differential Protocol RoE:** `AtlasLLMEvaluator` (including prompt injection, `indirect_exfil`, canary, and guardrail bypass suites) fails closed unless `ProgramComplianceContext.ai_testing_allowed` is `True`; `MultiImplementationDifferentialOracle` enforces scope allowlists, fractional sub-1 RPS throttling, and custom policy headers/`User-Agent`.
 - **Hybrid `/boost` Decision Adapter (`engine/boost_decision_adapter.py`)**: Strict `<= 400ms` health probes against local ModelFusion (`:5000`) / Ollama (`:11434`) with deterministic local fallback for Pareto near-ties (`<= 0.02`) and top-3 Stage 3 anti-slop stress testing (never overriding `poc_verified`, Lean 4, Z3, or differential oracle proofs).
-- **Bug Bounty MCP Server Tools (`bugbounty_mcp_server.py`)**: Exposes `bb_rank_programs`, `bb_score_fresh_commits`, `bb_cluster_recon_assets`, `bb_analyze_js_bundles`, `bb_classify_http_responses`, `bb_record_hunt_outcome`, and `bb_atlas_llm_eval` alongside `bb_freshness_watch`, `bb_run_fast_ooda`, and `bb_stage_hackerone_draft`.
+- **Unified Master CLI (`rfc_hunt_swarm.py`) & Agent MCP Tools (`mcp_server.py`, `bugbounty_mcp_server.py`)**:
+  - **Single Master Entrypoint (`rfc_hunt_swarm.py`)**: Calls everything in RFCHunt from one command:
+    - Pass `--hunt` (+ `--dry-run`, `--sync-public-directory`, `--once`, `--headless-only`, `--embedded`, `--no-llm`, `--target`, `--repo`, `--program`, `--install-schedule`) to run the turnkey autonomous bug bounty pipeline (`python hunt.py` remains available as a thin alias).
+    - Omit `--hunt` to run regular pentests (`--all`, `--all --ensemble`, `--host`, `--deep-audit`, `--proxy`, `--poc`, `--raptor`, `--mantis`, `--phi`, `--crlf-desync`, `--web-llm`, `--pe-audit`) — and BOTH `--all` and `--ensemble` automatically run ALL local defensive tools (TruffleHog, Mobile/MobSF, API/JWT/SD-JWT, AI Infra Guard, Parity/Invariants, Zizmor/Actionlint/GHA Agent, Z3 Formal, JS Bundle Analyzer + Recon Clustering, Lean 4 Formal Verifier, and ACDSO Stage-2 Pareto ranking) even without `--hunt`.
+  - **First-Class MCP Agent Tools**: Both `bugbounty_mcp_server.py` (`bb_run_autonomous_hunt`, `bb_sync_public_directory`, `bb_qa_drafts`, `bb_check_drafts`, `bb_rank_programs`, `bb_score_fresh_commits`, `bb_cluster_recon_assets`, `bb_analyze_js_bundles`, `bb_classify_http_responses`, `bb_record_hunt_outcome`, `bb_atlas_llm_eval`, `bb_freshness_watch`, `bb_run_fast_ooda`, `bb_stage_hackerone_draft`) and `mcp_server.py` (`run_autonomous_hunt`, `run_fast_ooda`, `rank_bounty_programs`, `sync_hackerone_directory`, `score_fresh_commits`, `cluster_recon_assets`, `analyze_js_bundles`, `classify_http_responses`, `qa_bounty_drafts`, `check_bounty_drafts`) expose every capability to autonomous IDE/LLM agents.
 
 ```powershell
-# 0. ONE-COMMAND TURNKEY PYTHON RUNNER (does everything end-to-end; add --dry-run to preview safely):
-python hunt.py --dry-run
-python hunt.py --sync-public-directory --once
+# 0. SINGLE MASTER CLI (`rfc_hunt_swarm.py`) — Autonomous Hunt Mode (--hunt) & Regular Pentest Mode (without --hunt):
+python rfc_hunt_swarm.py --hunt --sync-public-directory --dry-run
+python rfc_hunt_swarm.py --hunt --sync-public-directory --once
+python rfc_hunt_swarm.py --hunt --target D:\path\to\repo --program common_codes --once --headless-only
+
+# Regular Pentest (without --hunt) — --all and --all --ensemble automatically invoke ALL local tools + JS Bundle + ACDSO:
+python rfc_hunt_swarm.py --all --repo D:\path\to\repo --dry-run
+python rfc_hunt_swarm.py --all --repo D:\path\to\repo
+python rfc_hunt_swarm.py --all --ensemble --repo D:\path\to\repo --program generic
 
 # 1. Rank unlocked public HackerOne programs and compute the daily Lane 1/Lane 2 hunt portfolio:
-python revenue_cli.py rank-programs --min-efficiency 80 --capacity 6 --budget-minutes 120 --json
+python rfc_hunt_swarm.py rank-programs --min-efficiency 80 --capacity 6 --budget-minutes 120 --json
 
 # 2. Sync public HackerOne directory (newest launches, >=80% eff, zero API token) or offline JSON snapshot:
-python revenue_cli.py sync-directory --public-directory --min-efficiency 80 --limit 25 --json
-python revenue_cli.py sync-directory --snapshot-json directory_snapshot.json --json
+python rfc_hunt_swarm.py sync-directory --public-directory --min-efficiency 80 --limit 25 --json
+python rfc_hunt_swarm.py sync-directory --snapshot-json directory_snapshot.json --json
 
 # 3. Poll <72h commits/PRs/releases directly from UNLOCKED DB repos with ML commit ranking & invariant ETag 304 caching:
-python revenue_cli.py freshness-watch --from-eligibility-db --ml-rank --hours 72
+python rfc_hunt_swarm.py freshness-watch --from-eligibility-db --ml-rank --hours 72
 
 # 4. Analyze JavaScript bundles & cluster/classify anomalous HTTP recon responses (strictly scope-filtered):
-python revenue_cli.py analyze-js --input ./js_bundles --program common_codes --json
-python revenue_cli.py cluster-recon --input recon_assets.json --program common_codes --json
+python rfc_hunt_swarm.py analyze-js --input ./js_bundles --program common_codes --json
+python rfc_hunt_swarm.py cluster-recon --input recon_assets.json --program common_codes --json
 
 # 5. Run adversarial LLM prompt-injection / indirect-exfil / guardrail testing ONLY on programs with AI explicitly in scope:
-python revenue_cli.py atlas-llm-eval --llm-target https://ai.example.com --program anthropic --suites low_resource,canary,indirect_exfil,ssrf_tool
+python rfc_hunt_swarm.py atlas-llm-eval --llm-target https://ai.example.com --program anthropic --suites low_resource,canary,indirect_exfil,ssrf_tool
 
 # 6. Log real HackerOne report triage outcomes to feed the Cox survival, LTR & bandit models:
-python revenue_cli.py record-outcome --handle henkel_vdp --outcome TRIAGED --lane 1 --signal-delta 7.0 --triage-hours 18.5
+python rfc_hunt_swarm.py record-outcome --handle henkel_vdp --outcome TRIAGED --lane 1 --signal-delta 7.0 --triage-hours 18.5
 ```
 
 ---

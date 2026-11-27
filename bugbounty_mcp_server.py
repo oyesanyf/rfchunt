@@ -13,7 +13,9 @@ and consulting workflows:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import sys
@@ -878,6 +880,87 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "bb_run_autonomous_hunt",
+        "description": "Invoke RFCHunt's unified master autonomous hunt pipeline (`rfc_hunt_swarm.py --hunt --once --headless-only`) for dry-run planning or a single bounded headless hunt cycle (auto-submit and CAPTCHA bypass strictly forbidden).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "targets": {"type": "array", "items": {"type": "string"}, "description": "Optional local repository directories to audit"},
+                "repos": {"type": "array", "items": {"type": "string"}, "description": "Optional extra 'owner/repo' slugs"},
+                "program": {"type": "string", "default": "generic"},
+                "sync_public_directory": {"type": "boolean", "default": False},
+                "eligibility_db": {"type": "string"},
+                "watchlist": {"type": "string"},
+                "min_efficiency": {"type": "number", "default": 80.0},
+                "portfolio_capacity": {"type": "integer", "default": 6},
+                "max_repos": {"type": "integer", "default": 4},
+                "out_dir": {"type": "string", "default": "out/autonomous_hunt"},
+                "embedded": {"type": "boolean", "default": False},
+                "no_llm": {"type": "boolean", "default": False},
+                "allow_blocked": {"type": "boolean", "default": False},
+                "dry_run": {"type": "boolean", "default": True},
+                "model": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "bb_sync_public_directory",
+        "description": "Sync HackerOne programs (offline JSON snapshot or Public Directory newest-first >=80% efficiency) into ProgramEligibilityDB v2.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "eligibility_db_path": {"type": "string"},
+                "snapshot_json": {"type": "string", "description": "Optional offline JSON snapshot file path"},
+                "programs": {"type": "array", "items": {"type": "object"}, "description": "Optional inline list of program dicts to upsert offline"},
+                "public_directory": {"type": "boolean", "default": False},
+                "public_endpoint": {"type": "string"},
+                "query": {"type": "string", "default": ""},
+                "limit": {"type": "integer", "default": 25},
+                "min_efficiency_pct": {"type": "number", "default": 80.0},
+                "bounties_only": {"type": "boolean", "default": False},
+                "vdp_only": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "bb_qa_drafts",
+        "description": "Run RFCHunt's 14-check HackerOne Draft QA Phase checker & deterministic auto-fixer (HTML entities, control chars, code fences, citations, Netlink checks) on a Markdown draft or exported draft snapshots.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "markdown_body": {"type": "string", "description": "Inline Markdown draft body to QA-check and auto-repair"},
+                "markdown_file": {"type": "string", "description": "Path to a local Markdown draft file"},
+                "snapshots": {"type": "array", "items": {"type": "object"}, "description": "List of HackerOne draft snapshot objects"},
+                "title": {"type": "string", "default": ""},
+                "report_id": {"type": "integer", "default": 1},
+                "program": {"type": "string", "default": ""},
+                "verify_sources": {"type": "boolean", "default": False},
+                "qa_db_path": {"type": "string"},
+                "out_md": {"type": "string"},
+                "out_edit_queue": {"type": "string"},
+                "include_repaired_body": {"type": "boolean", "default": True},
+            },
+        },
+    },
+    {
+        "name": "bb_check_drafts",
+        "description": "Inspect HackerOne saved drafts and cooldown readiness (`can_submit_draft?`) strictly read-only via seeded queue, offline JSON snapshots, or single-anchor probe (never clicks Submit or Delete).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "default": "reports/ensemble_hunt/draft_submit_tracker.sqlite3"},
+                "qa_db_path": {"type": "string"},
+                "probe_id": {"type": "integer", "default": 4243972},
+                "probe_only": {"type": "boolean", "default": True},
+                "seed_only": {"type": "boolean", "default": True},
+                "snapshots": {"type": "array", "items": {"type": "object"}},
+                "max_per_day": {"type": "integer", "default": 2},
+                "mark_submitted": {"type": "integer"},
+                "out_md": {"type": "string"},
+            },
+        },
+    },
 ]
 
 
@@ -1242,6 +1325,250 @@ class BugBountyMCPServer:
                     signal_score=float(args["update_signal_score"]),
                 ).to_dict()
             return {"status": "recorded", "outcome": rec.to_dict(), "account_state": acct}
+
+        if name == "bb_run_autonomous_hunt":
+            import rfc_hunt_swarm
+
+            swarm_argv: list[str] = ["--hunt", "--once", "--headless-only", "--json"]
+            for t in args.get("targets") or []:
+                t_s = str(t).strip()
+                if t_s:
+                    if t_s.startswith("-"):
+                        raise ValueError(f"Invalid target {t_s!r}: must not start with '-'.")
+                    swarm_argv.extend(["--hunt-target", t_s])
+            for r in args.get("repos") or []:
+                r_s = str(r).strip()
+                if r_s:
+                    if r_s.startswith("-"):
+                        raise ValueError(f"Invalid repo slug {r_s!r}: must not start with '-'.")
+                    swarm_argv.extend(["--hunt-repo", r_s])
+            if args.get("program"):
+                swarm_argv.extend(["--program", str(args["program"]).strip()])
+            if _coerce_strict_bool(args.get("sync_public_directory", False)):
+                swarm_argv.append("--sync-public-directory")
+            if args.get("eligibility_db"):
+                swarm_argv.extend(["--eligibility-db", str(args["eligibility_db"])])
+            if args.get("watchlist"):
+                swarm_argv.extend(["--watchlist", str(args["watchlist"])])
+            if args.get("min_efficiency") is not None:
+                swarm_argv.extend(["--min-efficiency", str(float(args["min_efficiency"]))])
+            if args.get("portfolio_capacity") is not None:
+                swarm_argv.extend(["--portfolio-capacity", str(max(1, int(args["portfolio_capacity"])))])
+            if args.get("max_repos") is not None:
+                swarm_argv.extend(["--max-repos", str(max(1, int(args["max_repos"])))])
+            if args.get("out_dir"):
+                swarm_argv.extend(["--out", str(args["out_dir"])])
+            if _coerce_strict_bool(args.get("embedded", False)):
+                swarm_argv.append("--embedded")
+            if _coerce_strict_bool(args.get("no_llm", False)):
+                swarm_argv.append("--no-llm")
+            if _coerce_strict_bool(args.get("allow_blocked", False)):
+                swarm_argv.append("--allow-blocked")
+            if _coerce_strict_bool(args.get("dry_run", True)):
+                swarm_argv.append("--dry-run")
+            if args.get("model"):
+                swarm_argv.extend(["--model", str(args["model"]).strip()])
+
+            parsed_ns = rfc_hunt_swarm.parse_swarm_arguments(swarm_argv)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = rfc_hunt_swarm.cmd_autonomous_hunt(parsed_ns, raw_argv=swarm_argv)
+            raw_out = buf.getvalue().strip()
+            parsed_payload: dict[str, Any] = {}
+            if raw_out:
+                try:
+                    loaded = json.loads(raw_out)
+                    if isinstance(loaded, dict):
+                        parsed_payload = loaded
+                except ValueError:
+                    start_idx = raw_out.find("{")
+                    end_idx = raw_out.rfind("}")
+                    if start_idx != -1 and end_idx > start_idx:
+                        try:
+                            loaded = json.loads(raw_out[start_idx : end_idx + 1])
+                            if isinstance(loaded, dict):
+                                parsed_payload = loaded
+                        except ValueError:
+                            parsed_payload = {"raw_output": raw_out[:2000]}
+                    else:
+                        parsed_payload = {"raw_output": raw_out[:2000]}
+            return {
+                **parsed_payload,
+                "status": parsed_payload.get("status") or ("completed" if rc == 0 else "error"),
+                "returncode": int(rc),
+                "invoked_via": "rfc_hunt_swarm.py --hunt",
+                "swarm_argv": swarm_argv,
+                "auto_submit_forbidden": True,
+                "captcha_bypass_forbidden": True,
+            }
+
+        if name == "bb_sync_public_directory":
+            from engine.program_eligibility_db import ProgramEligibilityDB
+
+            db = ProgramEligibilityDB(db_path=args.get("eligibility_db_path"))
+            upserted: list[str] = []
+            items: list[dict[str, Any]] = []
+            if args.get("snapshot_json"):
+                raw_data = json.loads(Path(str(args["snapshot_json"])).read_text(encoding="utf-8"))
+                raw_items = raw_data.get("programs", raw_data) if isinstance(raw_data, dict) else raw_data
+                if isinstance(raw_items, list):
+                    items.extend(x for x in raw_items if isinstance(x, dict))
+            if isinstance(args.get("programs"), list):
+                items.extend(x for x in args["programs"] if isinstance(x, dict))
+
+            for item in items:
+                handle = str(item.get("handle") or "").strip().lower()
+                if not handle:
+                    continue
+                status = str(item.get("status") or "UNLOCKED").strip().upper()
+                db.upsert(
+                    handle,
+                    status,
+                    signal_required=item.get("signal_required"),
+                    bounty_min_usd=item.get("bounty_min_usd"),
+                    bounty_max_usd=item.get("bounty_max_usd"),
+                    submit_url=str(item.get("submit_url") or ""),
+                    scope_summary=str(item.get("scope_summary") or ""),
+                    notes=str(item.get("notes") or ""),
+                    launched_at_utc=str(item.get("launched_at_utc") or ""),
+                    response_efficiency_pct=item.get("response_efficiency_pct"),
+                    first_response_hours=item.get("first_response_hours"),
+                    triage_hours=item.get("triage_hours"),
+                    bounty_hours=item.get("bounty_hours"),
+                    resolved_count=int(item.get("resolved_count") or 0),
+                    offers_bounties=item.get("offers_bounties"),
+                    is_vdp=item.get("is_vdp"),
+                    gold_standard=bool(item.get("gold_standard", False)),
+                    fast_payments=bool(item.get("fast_payments", False)),
+                    submission_state=str(item.get("submission_state") or "open"),
+                    in_scope_assets=item.get("in_scope_assets") or (),
+                    in_scope_repos=item.get("in_scope_repos") or (),
+                    out_of_scope_assets=item.get("out_of_scope_assets") or (),
+                    roe_automated_prohibited=item.get("roe_automated_prohibited"),
+                    roe_max_rps=item.get("roe_max_rps"),
+                )
+                upserted.append(handle)
+
+            if _coerce_strict_bool(args.get("public_directory", False)):
+                from engine.hackerone_porter import HackerOnePublicDirectoryClient
+
+                pub_client = HackerOnePublicDirectoryClient(endpoint_url=args.get("public_endpoint"))
+                pub_res = pub_client.fetch_and_sync_directory(
+                    eligibility_db=db,
+                    query=str(args.get("query") or ""),
+                    limit=max(1, int(args.get("limit", 25))),
+                    min_efficiency_pct=float(args.get("min_efficiency_pct", 80.0)),
+                    bounties_only=_coerce_strict_bool(args.get("bounties_only", False)),
+                    vdp_only=_coerce_strict_bool(args.get("vdp_only", False)),
+                )
+                upserted.extend(pub_res.get("upserted") or [])
+
+            return {
+                "status": "completed",
+                "upserted_count": len(upserted),
+                "upserted": upserted,
+                "summary_counts": db.summary_counts(),
+                "db_path": str(db.db_path),
+            }
+
+        if name == "bb_qa_drafts":
+            from engine.draft_qa_checker import DraftQAChecker, DraftQATrackerDB
+
+            qa_db = DraftQATrackerDB(args.get("qa_db_path") or "reports/ensemble_hunt/draft_qa_tracker.sqlite3")
+            qa_checker = DraftQAChecker(db=qa_db)
+            snapshots: list[dict[str, Any]] = []
+            if isinstance(args.get("snapshots"), list) and args["snapshots"]:
+                snapshots = [s for s in args["snapshots"] if isinstance(s, dict)]
+            elif args.get("markdown_file"):
+                md_path = Path(str(args["markdown_file"]))
+                snapshots = [
+                    {
+                        "id": int(args.get("report_id", 1)),
+                        "title": str(args.get("title") or md_path.stem),
+                        "team_handle": str(args.get("program") or ""),
+                        "state": "Draft",
+                        "vulnerability_information": md_path.read_text(encoding="utf-8"),
+                    }
+                ]
+            elif args.get("markdown_body") is not None:
+                snapshots = [
+                    {
+                        "id": int(args.get("report_id", 1)),
+                        "title": str(args.get("title") or "Draft Audit"),
+                        "team_handle": str(args.get("program") or ""),
+                        "state": "Draft",
+                        "vulnerability_information": str(args["markdown_body"]),
+                    }
+                ]
+            else:
+                raise ValueError("Provide markdown_body, markdown_file, or snapshots for bb_qa_drafts.")
+
+            summary = qa_checker.audit_snapshots(
+                snapshots,
+                verify_sources=_coerce_strict_bool(args.get("verify_sources", False)),
+                out_md=args.get("out_md"),
+                out_edit_queue=args.get("out_edit_queue"),
+            )
+            return summary.to_dict(
+                include_bodies=_coerce_strict_bool(args.get("include_repaired_body", True))
+            )
+
+        if name == "bb_check_drafts":
+            from engine.draft_qa_checker import DraftQATrackerDB
+            from engine.draft_submit_checker import (
+                DraftSubmitChecker,
+                DraftSubmitTrackerDB,
+            )
+
+            db_path = str(args.get("db_path") or "reports/ensemble_hunt/draft_submit_tracker.sqlite3")
+            db = DraftSubmitTrackerDB(db_path)
+            db.seed_default_queue()
+            qa_db_arg = args.get("qa_db_path")
+            if qa_db_arg and Path(str(qa_db_arg)).exists():
+                qa_map = DraftQATrackerDB(str(qa_db_arg)).get_qa_status_map()
+                if qa_map:
+                    db.sync_qa_statuses(qa_map)
+
+            if args.get("mark_submitted") is not None:
+                rid = int(args["mark_submitted"])
+                db.mark_submitted(rid)
+                return {
+                    "status": "marked_submitted",
+                    "report_id": rid,
+                    "submitted_today": db.get_submitted_today(),
+                    "auto_submit_forbidden": True,
+                }
+
+            if isinstance(args.get("snapshots"), list) and args["snapshots"]:
+                checker = DraftSubmitChecker(db=db, session_cookie="")
+                summary = checker.ingest_snapshots(
+                    [s for s in args["snapshots"] if isinstance(s, dict)],
+                    probe_report_id=int(args.get("probe_id", 4243972)),
+                    max_per_day=int(args.get("max_per_day", 2)),
+                    out_md=args.get("out_md"),
+                )
+                return {**summary.to_dict(), "auto_submit_forbidden": True, "auto_delete_forbidden": True}
+
+            if _coerce_strict_bool(args.get("seed_only", True)):
+                drafts = db.list_drafts(only_drafts=True)
+                return {
+                    "status": "seeded_queue",
+                    "total_drafts": len(drafts),
+                    "drafts": [d.__dict__ for d in drafts],
+                    "auto_submit_forbidden": True,
+                    "auto_delete_forbidden": True,
+                }
+
+            cookie_val = os.environ.get("HACKERONE_SESSION_COOKIE", "").strip()
+            checker = DraftSubmitChecker(db=db, session_cookie=cookie_val)
+            summary = checker.check(
+                probe_report_id=int(args.get("probe_id", 4243972)),
+                probe_first=True,
+                probe_only=_coerce_strict_bool(args.get("probe_only", True)),
+                max_per_day=int(args.get("max_per_day", 2)),
+                out_md=args.get("out_md"),
+            )
+            return {**summary.to_dict(), "auto_submit_forbidden": True, "auto_delete_forbidden": True}
 
         raise ValueError(f"Unknown tool: {name}")
 

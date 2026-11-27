@@ -36,7 +36,10 @@ from pathlib import Path
 from typing import Any
 
 from engine.ensemble_whiteboard import (
+    HYPOTHESIS_STATUSES,  # noqa: F401
+    TERMINAL_STATUSES,  # noqa: F401
     EnsembleWhiteboard,
+    SharedWhiteboard,  # noqa: F401
     WhiteboardHypothesis,
 )
 from engine.host_containment import silent_subprocess_run
@@ -63,6 +66,7 @@ ENGINE_WEIGHTS: dict[str, float] = {
     "gha_agent": 0.80,
     "mobile_mobsf": 0.78,
     "ai_infra_guard": 0.76,
+    "js_bundle": 0.72,
     "raptor": 0.72,
     "mantis": 0.68,
     "aiscan": 0.65,
@@ -1974,6 +1978,133 @@ class EnsembleOrchestrator:
                 },
             )
 
+        def _run_js_bundle_analyzer() -> tuple[str, list[EngineFinding], dict[str, Any]]:
+            if not root.is_dir():
+                return ("js_bundle", [], {"status": "skipped_non_dir", "bundles": 0, "findings": 0})
+            from engine.ml_diff_and_recon_ranker import JavaScriptBundleAnalyzer
+            from engine.parity_invariant_auditor import is_non_production_noise
+
+            bundles_in: list[dict[str, Any]] = []
+            max_bundles = 120
+            skip_dirs = {
+                ".git",
+                "node_modules",
+                "__pycache__",
+                ".venv",
+                "venv",
+                "dist",
+                "build",
+                "out",
+                "reports",
+                ".pytest_cache",
+                "coverage",
+            }
+            for cur_root, dirnames, filenames in os.walk(root):
+                dirnames[:] = [d for d in sorted(dirnames) if d not in skip_dirs]
+                for fn in sorted(filenames):
+                    low = fn.lower()
+                    if not low.endswith((".js", ".mjs", ".cjs", ".js.map")):
+                        continue
+                    fpath = Path(cur_root) / fn
+                    try:
+                        rel_p = fpath.relative_to(root).as_posix()
+                    except ValueError:
+                        rel_p = str(fpath)
+                    bundles_in.append({"path": str(fpath), "url": rel_p})
+                    if len(bundles_in) >= max_bundles:
+                        break
+                if len(bundles_in) >= max_bundles:
+                    break
+
+            if not bundles_in:
+                return ("js_bundle", [], {"status": "skipped_no_js_bundles", "bundles": 0, "findings": 0})
+
+            rep = JavaScriptBundleAnalyzer().analyze_bundles(bundles_in, cluster=True)
+            out: list[EngineFinding] = []
+            for b in rep.get("bundles") or []:
+                src = str(b.get("source") or "")
+                noise = bool(is_non_production_noise(src))
+                secrets_hit = list(b.get("secret_indicators") or [])
+                sinks_hit = list(b.get("dom_sinks") or [])
+                maps_hit = list(b.get("sourcemap_urls") or [])
+                eps_hit = list(b.get("discovered_endpoints") or [])
+                risk = float(b.get("js_risk_score") or 0.0)
+                if secrets_hit:
+                    out.append(
+                        EngineFinding(
+                            engine="js_bundle",
+                            title=f"Hardcoded secret indicator in JS bundle ({', '.join(secrets_hit[:3])})",
+                            file_path=src,
+                            line=1,
+                            cwe="CWE-798",
+                            severity="HIGH",
+                            confidence=0.82,
+                            summary=f"JavaScriptBundleAnalyzer flagged secret indicators {secrets_hit} in {src}.",
+                            rule_id="JS-BUNDLE-SECRET-INDICATOR",
+                            deterministic=True,
+                            confirmed=True,
+                            non_production_noise=noise,
+                            metadata={"secret_indicators": secrets_hit, "js_risk_score": risk},
+                        )
+                    )
+                high_risk_sinks = [s for s in sinks_hit if s in ("dynamic_eval", "innerHTML", "dangerouslySetInnerHTML", "document_write", "postMessage")]
+                if high_risk_sinks and risk >= 0.20:
+                    out.append(
+                        EngineFinding(
+                            engine="js_bundle",
+                            title=f"JS bundle DOM/eval sink surface ({', '.join(high_risk_sinks[:4])})",
+                            file_path=src,
+                            line=1,
+                            cwe="CWE-79",
+                            severity="MEDIUM",
+                            confidence=min(0.85, max(0.55, risk)),
+                            summary=(
+                                f"JavaScriptBundleAnalyzer detected DOM sinks {high_risk_sinks} "
+                                f"and {len(eps_hit)} API endpoint(s) in {src}."
+                            ),
+                            rule_id="JS-BUNDLE-DOM-SINK",
+                            deterministic=True,
+                            confirmed=True,
+                            non_production_noise=noise,
+                            metadata={
+                                "dom_sinks": high_risk_sinks,
+                                "discovered_endpoints": eps_hit[:20],
+                                "sourcemap_urls": maps_hit[:5],
+                                "js_risk_score": risk,
+                            },
+                        )
+                    )
+                elif maps_hit:
+                    out.append(
+                        EngineFinding(
+                            engine="js_bundle",
+                            title=f"JavaScript sourceMappingURL reference exposed ({maps_hit[0]})",
+                            file_path=src,
+                            line=1,
+                            cwe="CWE-200",
+                            severity="LOW",
+                            confidence=0.70,
+                            summary=f"Source map reference(s) {maps_hit[:5]} detected in {src}.",
+                            rule_id="JS-BUNDLE-SOURCEMAP",
+                            deterministic=True,
+                            confirmed=True,
+                            non_production_noise=noise,
+                            metadata={"sourcemap_urls": maps_hit[:5], "js_risk_score": risk},
+                        )
+                    )
+            return (
+                "js_bundle",
+                out,
+                {
+                    "status": "completed",
+                    "bundles": int(rep.get("total_bundles") or len(bundles_in)),
+                    "endpoints_discovered": int(rep.get("total_endpoints_discovered") or 0),
+                    "dom_sinks": int(rep.get("total_dom_sinks") or 0),
+                    "sourcemap_leaks": int(rep.get("total_sourcemap_leaks") or 0),
+                    "findings": len(out),
+                },
+            )
+
         tasks = [_run_zizmor, _run_actionlint, _run_gha_agent_auditor]
         if not gha_only:
             tasks.extend(
@@ -1988,6 +2119,7 @@ class EnsembleOrchestrator:
                     _run_ai_infra_guard,
                     _run_parity_auditor,
                     _run_z3_formal,
+                    _run_js_bundle_analyzer,
                 ]
             )
 
@@ -2947,6 +3079,39 @@ class EnsembleOrchestrator:
         for c in clusters:
             counts[c.disposition] = counts.get(c.disposition, 0) + 1
 
+        acdso_stage2: dict[str, Any] = {"selected": [], "pareto_count": 0, "total_candidates": len(clusters)}
+        try:
+            from engine.acdso_bridge import rank_stage2_candidates
+
+            cluster_cands = [
+                {
+                    "id": c.cluster_id,
+                    "engine": c.engines[0] if c.engines else "ensemble",
+                    "rule_id": c.cwe_family,
+                    "title": c.title,
+                    "file_path": c.file_path,
+                    "line": c.line,
+                    "severity": c.severity,
+                    "confidence": c.ensemble_confidence,
+                    "poc_verified": c.poc_verified,
+                    "deterministic": c.deterministic_override_protected,
+                }
+                for c in clusters
+            ]
+            if cluster_cands:
+                acdso_stage2 = rank_stage2_candidates(cluster_cands, top_k=5)
+                whiteboard.add_fact(
+                    "acdso_stage2_ranking",
+                    f"ACDSO Pareto/Anomaly prioritized {len(acdso_stage2.get('selected') or [])} top cluster(s)",
+                    payload={
+                        "total_candidates": len(cluster_cands),
+                        "selected_ids": [str(s.get("id") or "") for s in (acdso_stage2.get("selected") or [])],
+                    },
+                    source="acdso_bridge",
+                )
+        except Exception:  # noqa: BLE001, S110
+            pass
+
         wb_snapshot = whiteboard.to_dict()
         self.last_telemetry.update(
             {
@@ -2955,6 +3120,7 @@ class EnsembleOrchestrator:
                 "whiteboard": wb_snapshot,
                 "lean_verification": lean_dict,
                 "toolchain_status": toolchain_status,
+                "acdso_stage2": acdso_stage2,
             }
         )
 
