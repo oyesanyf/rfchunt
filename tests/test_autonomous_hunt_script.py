@@ -654,3 +654,25 @@ def test_mcp_agent_tools_expose_hunt_and_bounty_engines_in_both_servers(tmp_path
         res_js = json.loads(res_js_rpc["result"]["content"][0]["text"])
         assert res_js["total_endpoints_discovered"] >= 1
         assert res_js["total_dom_sinks"] >= 1
+
+
+def test_help_and_docs_include_examples_for_all_flags() -> None:
+    parser = rfc_hunt_swarm.build_swarm_parser()
+    help_text = parser.format_help()
+    cli_doc = (Path(__file__).resolve().parents[1] / "docs" / "CLI_REFERENCE.md").read_text(encoding="utf-8")
+
+    missing_help_examples: list[str] = []
+    missing_doc_flags: list[str] = []
+    for act in parser._actions:
+        opts = [o for o in act.option_strings if o.startswith("--")]
+        if not opts or "--help" in opts:
+            continue
+        if "example:" not in (act.help or "").lower():
+            missing_help_examples.append(opts[0])
+        if not any(o in cli_doc for o in opts):
+            missing_doc_flags.append(opts[0])
+
+    assert missing_help_examples == [], f"Flags missing Example: in --help: {missing_help_examples[:15]}"
+    assert missing_doc_flags == [], f"Flags missing from docs/CLI_REFERENCE.md: {missing_doc_flags[:15]}"
+    assert "Example:" in help_text
+    assert "--hunt" in help_text and "--fast-ooda" in help_text and "--start-modelfusion" in help_text

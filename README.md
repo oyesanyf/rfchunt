@@ -359,6 +359,10 @@ python -u rfc_hunt_swarm.py raptor --repo D:\path\to\target --raptor-mode agenti
 ## Exhaustive CLI Flag & Parameter Reference
 
 > [!TIP]
+> **100% Flag-by-Flag Examples Everywhere:** Every single flag on `rfc_hunt_swarm.py` includes a concrete runnable `Example:` directly in `python rfc_hunt_swarm.py --help` and in the complete synchronized flag table in [docs/CLI_REFERENCE.md](docs/CLI_REFERENCE.md).
+
+
+> [!TIP]
 > **Complete 70-Flag Manual With Copy-Paste Examples**:
 > For the comprehensive flag-by-flag manual detailing all 70 flags across Swarm Orchestrator, Server/Lab, UI, RAPTOR, Google Research Harness², and Database Compaction with concrete CLI examples for every flag, see **[CLI Reference Manual](docs/CLI_REFERENCE.md)**, **[Harness² Integration Guide](docs/HARNESS2_INTEGRATION.md)**, and **[RAPTOR Integration Guide](docs/RAPTOR_INTEGRATION.md)**, or run `python -u rfc_hunt_swarm.py --help`.
 

@@ -8716,7 +8716,283 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--run-now", dest="run_now", action="store_true", default=False, help="Trigger an immediate scheduled task run right after --hunt --install-schedule")
     parser.add_argument("--task-name", dest="task_name", type=str, default="RFCHunt-Autonomous-Defensive-Hunt", help="OS Scheduled Task name for --hunt --install-schedule")
 
+    _ensure_help_examples_for_all_flags(parser)
     return parser
+
+
+_CURATED_FLAG_EXAMPLES: Dict[str, str] = {
+    "--hunt": "python rfc_hunt_swarm.py --hunt --sync-public-directory --dry-run",
+    "--hunt-target": "python rfc_hunt_swarm.py --hunt --hunt-target ./target_repo --program common_codes --once --dry-run",
+    "--hunt-repo": "python rfc_hunt_swarm.py --hunt --hunt-repo Shopify/shopify-app-js --once --dry-run",
+    "--sync-public-directory": "python rfc_hunt_swarm.py --hunt --sync-public-directory --min-efficiency 80 --dry-run",
+    "--eligibility-db": "python rfc_hunt_swarm.py --hunt --eligibility-db reports/program_eligibility.sqlite3 --dry-run",
+    "--min-efficiency": "python rfc_hunt_swarm.py --hunt --min-efficiency 85 --dry-run",
+    "--portfolio-capacity": "python rfc_hunt_swarm.py --hunt --portfolio-capacity 6 --dry-run",
+    "--max-repos": "python rfc_hunt_swarm.py --hunt --max-repos 4 --dry-run",
+    "--watchlist": "python rfc_hunt_swarm.py --hunt --watchlist config/freshness_watchlist.example.json --dry-run",
+    "--interval-minutes": "python rfc_hunt_swarm.py --hunt --interval-minutes 60 --max-cycles 2",
+    "--max-cycles": "python rfc_hunt_swarm.py --hunt --max-cycles 1 --headless-only",
+    "--once": "python rfc_hunt_swarm.py --hunt --once --headless-only",
+    "--headless-only": "python rfc_hunt_swarm.py --hunt --once --headless-only --embedded",
+    "--allow-blocked": "python rfc_hunt_swarm.py --hunt --target ./repo --program shopify --allow-blocked --once --dry-run",
+    "--install-schedule": "python rfc_hunt_swarm.py --hunt --install-schedule --interval-minutes 60 --dry-run",
+    "--uninstall-schedule": "python rfc_hunt_swarm.py --hunt --uninstall-schedule --task-name RFCHunt-Autonomous-Defensive-Hunt",
+    "--run-now": "python rfc_hunt_swarm.py --hunt --install-schedule --run-now --dry-run",
+    "--task-name": "python rfc_hunt_swarm.py --hunt --install-schedule --task-name RFCHunt-Nightly --dry-run",
+    "--all": "python rfc_hunt_swarm.py --all --repo . --dry-run",
+    "--ensemble": "python rfc_hunt_swarm.py --all --ensemble --repo . --program generic --quorum 2",
+    "--program": "python rfc_hunt_swarm.py --all --ensemble --repo . --program anthropic",
+    "--freshness-hours": "python rfc_hunt_swarm.py --all --ensemble --repo . --freshness-hours 72",
+    "--quorum": "python rfc_hunt_swarm.py --all --ensemble --repo . --quorum 2",
+    "--embedded": "python rfc_hunt_swarm.py --all --ensemble --repo . --embedded --no-llm",
+    "--no-llm": "python rfc_hunt_swarm.py --all --ensemble --repo . --no-llm",
+    "--gha-only": "python rfc_hunt_swarm.py --all --ensemble --repo . --gha-only",
+    "--package-client": 'python rfc_hunt_swarm.py --all --ensemble --repo . --package-client "Acme Corp"',
+    "--start-modelfusion": "python rfc_hunt_swarm.py --all --repo . --start-modelfusion --dry-run",
+    "--fast-ooda": "python rfc_hunt_swarm.py --fast-ooda --repo . --embedded --json",
+    "--cpu-workers": "python rfc_hunt_swarm.py --fast-ooda --repo . --cpu-workers 4 --embedded",
+    "--blackboard-db": "python rfc_hunt_swarm.py --fast-ooda --repo . --blackboard-db reports/blackboard.sqlite3",
+    "--resume": "python rfc_hunt_swarm.py --fast-ooda --repo . --resume --embedded",
+    "--signal-score": "python rfc_hunt_swarm.py --fast-ooda --repo . --signal-score 1.5 --embedded",
+    "--dry-run": "python rfc_hunt_swarm.py --all --repo . --dry-run --json",
+    "--host": "python rfc_hunt_swarm.py --all --host target.example.com --port 443 --tls --authorized --dry-run",
+    "--port": "python rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 3030",
+    "--tls": "python rfc_hunt_swarm.py --mode terminator --host target.example.com --port 443 --tls --authorized",
+    "--authorized": "python rfc_hunt_swarm.py --all --host target.example.com --port 443 --tls --authorized",
+    "--allow-destructive": "python rfc_hunt_swarm.py --all --host target.example.com --authorized --allow-destructive --dry-run",
+    "--repo": "python rfc_hunt_swarm.py --all --repo ./target_repo",
+    "--path": "python rfc_hunt_swarm.py --all --path engine/mantis_integrator.py",
+    "--output-dir": "python rfc_hunt_swarm.py --all --repo . --output-dir reports/audit_run",
+    "--out": "python rfc_hunt_swarm.py export-advisory --out reports/advisories",
+    "--json": "python rfc_hunt_swarm.py --all --repo . --dry-run --json",
+    "--plain": "python rfc_hunt_swarm.py --all --repo . --plain",
+    "--phi": "python rfc_hunt_swarm.py --phi --repo . --phi-redact",
+    "--phi-target": "python rfc_hunt_swarm.py --phi --phi-target ./records",
+    "--phi-redact": "python rfc_hunt_swarm.py --phi --repo . --phi-redact",
+    "--phi-model": "python rfc_hunt_swarm.py --phi --repo . --phi-model urchade/gliner_multi_pii-v1",
+    "--no-phi-ml": "python rfc_hunt_swarm.py --phi --repo . --no-phi-ml",
+    "--hackerone": "python rfc_hunt_swarm.py --hackerone --hackerone-program anthropic --dry-run",
+    "--hackerone-auto": "python rfc_hunt_swarm.py --hackerone-auto --hackerone-max-programs 2 --dry-run",
+    "--crlf-desync": "python rfc_hunt_swarm.py --crlf-desync --repo . --json",
+    "--web-llm": "python rfc_hunt_swarm.py --web-llm --repo . --json",
+    "--pe-audit": "python rfc_hunt_swarm.py --pe-audit --repo . --json",
+    "--no-pe-audit": "python rfc_hunt_swarm.py --all --repo . --no-pe-audit",
+    "--workspace-root": "python rfc_hunt_swarm.py --all --repo . --workspace-root .",
+    "--serve-ui": "python rfc_hunt_swarm.py --serve-ui --ui-host 127.0.0.1 --ui-port 8789",
+    "--network-lifecycle": "python rfc_hunt_swarm.py --network-lifecycle --host target.example.com --authorized --dry-run",
+    "--preflight": "python rfc_hunt_swarm.py --all --repo . --preflight",
+    "--no-preflight": "python rfc_hunt_swarm.py --all --repo . --no-preflight",
+    "--preflight-only": "python rfc_hunt_swarm.py --preflight-only --repo . --json",
+    "--deep-audit": "python rfc_hunt_swarm.py deep-audit --repo . --proxy --poc --plain",
+    "--proxy": "python rfc_hunt_swarm.py --repo . --proxy 127.0.0.1:8080 --plain",
+    "--poc": "python rfc_hunt_swarm.py --all --repo . --poc --output-dir reports",
+    "--header": 'python rfc_hunt_swarm.py --all --host target.example.com --authorized --header "X-Bug-Bounty: researcher"',
+    "--user-agent": 'python rfc_hunt_swarm.py --all --host target.example.com --authorized --user-agent "RFCHunt-Researcher/1.0"',
+    "--max-rps": "python rfc_hunt_swarm.py --all --host target.example.com --authorized --max-rps 2.0",
+    "--env-local": "python rfc_hunt_swarm.py --all --repo . --env-local .env.local",
+    "--force-ollama": "python rfc_hunt_swarm.py --all --repo . --force-ollama",
+}
+
+
+def _synthesize_flag_example(act: argparse.Action) -> str:
+    """Returns a curated or deterministically synthesized runnable CLI example for any parser flag."""
+    opts = [o for o in act.option_strings if o.startswith("--")]
+    if not opts:
+        return "python rfc_hunt_swarm.py --help"
+    primary = opts[0]
+    for o in opts:
+        if o in _CURATED_FLAG_EXAMPLES:
+            return _CURATED_FLAG_EXAMPLES[o]
+
+    # Pick realistic mode/context prefix from flag namespace
+    low = primary.lower()
+    if low.startswith("--hunt"):
+        prefix = "python rfc_hunt_swarm.py --hunt --dry-run"
+    elif low.startswith("--artex"):
+        prefix = "python rfc_hunt_swarm.py --all --repo ."
+    elif low.startswith("--aiscan"):
+        prefix = "python rfc_hunt_swarm.py aiscan"
+    elif low.startswith("--raptor"):
+        prefix = "python rfc_hunt_swarm.py raptor --repo ."
+    elif low.startswith("--mantis"):
+        prefix = "python rfc_hunt_swarm.py --mantis --repo ."
+    elif low.startswith("--harness2"):
+        prefix = "python rfc_hunt_swarm.py harness2 --rfc 9112"
+    elif low.startswith("--dream"):
+        prefix = "python rfc_hunt_swarm.py --mode dream"
+    elif low.startswith("--phi"):
+        prefix = "python rfc_hunt_swarm.py --phi --repo ."
+    elif low.startswith("--hackerone") or low.startswith("--hackone"):
+        prefix = "python rfc_hunt_swarm.py --hackerone --dry-run"
+    elif low.startswith("--preflight"):
+        prefix = "python rfc_hunt_swarm.py --preflight-only --repo ."
+    elif low.startswith("--pe-"):
+        prefix = "python rfc_hunt_swarm.py --pe-audit --repo ."
+    elif low.startswith("--fuzz"):
+        prefix = "python rfc_hunt_swarm.py fuzz-bridge --repo ."
+    elif low.startswith("--slice") or low.startswith("--escalation") or low.startswith("--frontier"):
+        prefix = "python rfc_hunt_swarm.py slice --repo ."
+    elif low.startswith("--poc"):
+        prefix = "python rfc_hunt_swarm.py --all --repo . --poc"
+    elif low.startswith("--proxy") or low.startswith("--live-proxy") or low.startswith("--trust-"):
+        prefix = "python rfc_hunt_swarm.py deep-audit --repo ."
+    elif low.startswith("--mcp"):
+        prefix = "python rfc_hunt_swarm.py mcp"
+    elif low.startswith("--hint"):
+        prefix = 'python rfc_hunt_swarm.py hint --hint "Focus auth boundaries"'
+    elif low.startswith("--caldera"):
+        prefix = "python rfc_hunt_swarm.py caldera"
+    elif low.startswith("--rea"):
+        prefix = "python rfc_hunt_swarm.py rea --path ."
+    elif low.startswith("--board") or low in ("--emoji", "--no-emoji", "--watch", "--interval"):
+        prefix = "python rfc_hunt_swarm.py swarm-board"
+    elif low.startswith("--ui") or low in ("--serve", "--random-port"):
+        prefix = "python rfc_hunt_swarm.py ui"
+    elif low.startswith("--novelty") or low.startswith("--refresh-novelty"):
+        prefix = "python rfc_hunt_swarm.py novelty"
+    elif low.startswith("--arxiv") or low.startswith("--last30days") or low.startswith("--research") or low.startswith("--reseach") or low.startswith("--skill"):
+        prefix = "python rfc_hunt_swarm.py --all --repo ."
+    elif low.startswith("--invariant") or low.startswith("--sandbox"):
+        prefix = "python rfc_hunt_swarm.py sandbox-invariants --repo ."
+    elif low.startswith("--poe") or low.startswith("--drop-unverified") or low.startswith("--findings-json"):
+        prefix = "python rfc_hunt_swarm.py poe-verify --repo ."
+    elif low.startswith("--docker") or low.startswith("--fix") or low.startswith("--include-all-wsl") or low.startswith("--reset-docker"):
+        prefix = "python rfc_hunt_swarm.py docker-doctor"
+    elif low in ("--chain-id", "--min-poe", "--verified-only"):
+        prefix = "python rfc_hunt_swarm.py chains"
+    elif low in ("--all-chains", "--live"):
+        prefix = "python rfc_hunt_swarm.py retest"
+    elif low in ("--worker-id", "--query"):
+        prefix = "python rfc_hunt_swarm.py traces"
+    elif low in ("--export-archive", "--import", "--key-file"):
+        prefix = "python rfc_hunt_swarm.py archive"
+    elif low in ("--ca-dir", "--noise-profile", "--rewrite-rule", "--duration"):
+        prefix = "python rfc_hunt_swarm.py proxy"
+    elif low in ("--sequence", "--name", "--max-size"):
+        prefix = "python rfc_hunt_swarm.py ruler --host 127.0.0.1 --port 3030"
+    elif low in ("--keep-rfcs-on-clean", "--keep-findings-on-clean"):
+        prefix = "python rfc_hunt_swarm.py --clean-db"
+    elif low in ("--include-docker", "--no-docker-tools", "--force-install", "--tools"):
+        prefix = "python rfc_hunt_swarm.py --setup"
+    else:
+        prefix = "python rfc_hunt_swarm.py --all --repo ."
+
+    # Boolean / count / flag-only actions take no argument
+    if act.nargs == 0:
+        return f"{prefix} {primary}"
+
+    # Determine concrete sample value
+    sample: str
+    if act.choices:
+        sample = str(list(act.choices)[0])
+    elif act.type is int:
+        dv = act.default if isinstance(act.default, int) and not isinstance(act.default, bool) and act.default > 0 else 5
+        sample = str(dv)
+    elif act.type is float:
+        dv = act.default if isinstance(act.default, (int, float)) and not isinstance(act.default, bool) and float(act.default) > 0 else 10.0
+        sample = str(dv)
+    elif "url" in low:
+        sample = "http://127.0.0.1:8787"
+    elif "host" in low:
+        sample = "127.0.0.1"
+    elif "model" in low:
+        sample = "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"
+    elif "profile" in low and "llm" in low:
+        sample = "profA,profB"
+    elif "har" in low:
+        sample = "traffic.har"
+    elif "openapi" in low:
+        sample = "openapi.yaml"
+    elif "sarif" in low:
+        sample = "reports/audit.sarif"
+    elif "archive" in low or low == "--import":
+        sample = "reports/task_backup.rfca"
+    elif "dir" in low or "folder" in low or "target" in low or "repo" in low:
+        sample = "./reports" if "dir" in low or "out" in low else "."
+    elif "file" in low or "rules" in low or "policy" in low or "cert" in low or "key" in low or "config" in low or "db" in low or "export" in low:
+        sample = str(act.default) if (isinstance(act.default, str) and act.default.strip()) else "config.yaml"
+    elif "rewrite" in low:
+        sample = '"add-hdr:X-Test=1"'
+    elif "sequence" in low:
+        sample = '"\\xc0\\x8a"'
+    elif "probe" in low:
+        sample = '"GET / HTTP/1.1\\r\\n\\r\\n"'
+    elif "query" in low or "topic" in low or "prompt" in low or "keywords" in low:
+        sample = '"auth bypass"'
+    elif "username" in low:
+        sample = "researcher"
+    elif "token" in low or "key" in low:
+        sample = "demo-token"
+    elif "tags" in low:
+        sample = "tech,misconfig,exposure"
+    elif "languages" in low:
+        sample = "python,rust"
+    elif "parsers" in low:
+        sample = "nginx,envoy,haproxy"
+    elif "tools" in low:
+        sample = "aiscan,raptor,httpx"
+    elif "image" in low:
+        sample = "python:3.12-slim"
+    elif "runtime" in low:
+        sample = "python"
+    elif isinstance(act.default, str) and act.default.strip():
+        dv_s = act.default.strip()
+        sample = f'"{dv_s}"' if " " in dv_s else dv_s
+    else:
+        sample = "example"
+
+    return f"{prefix} {primary} {sample}"
+
+
+def _ensure_help_examples_for_all_flags(parser: argparse.ArgumentParser) -> None:
+    """Guarantees every single CLI option in `--help` includes a concrete `Example:` line."""
+    for act in parser._actions:
+        opts = [o for o in act.option_strings if o.startswith("--")]
+        if not opts or "--help" in opts:
+            continue
+        cur_help = act.help or ""
+        if "example:" in cur_help.lower():
+            continue
+        ex = _synthesize_flag_example(act)
+        # Escape literal '%' for argparse %-formatting
+        ex_safe = ex.replace("%", "%%")
+        sep = " " if cur_help and not cur_help.endswith((".", ")")) else (" " if cur_help else "")
+        act.help = f"{cur_help}{sep}Example: `{ex_safe}`"
+
+
+def generate_complete_cli_flags_markdown() -> str:
+    """Generates a 100%-complete Markdown CLI flags + examples reference directly from `build_swarm_parser()`."""
+    parser = build_swarm_parser()
+    lines: List[str] = [
+        "| Flag(s) | Type | Default | Description | Example |",
+        "| :--- | :--- | :--- | :--- | :--- |",
+    ]
+    for act in parser._actions:
+        opts = [o for o in act.option_strings if o.startswith("--")]
+        if not opts or "--help" in opts:
+            continue
+        flag_cell = ", ".join(f"`{o}`" for o in opts)
+        if act.nargs == 0:
+            type_cell = "flag"
+        elif act.choices:
+            type_cell = "choice"
+        elif act.type is int:
+            type_cell = "int"
+        elif act.type is float:
+            type_cell = "float"
+        else:
+            type_cell = "string"
+        default_val = act.default
+        default_cell = f"`{default_val}`" if default_val is not None else "`None`"
+        raw_help = (act.help or "").replace("%%", "%")
+        if " Example: `" in raw_help:
+            desc_part = raw_help.split(" Example: `", 1)[0].strip()
+        else:
+            desc_part = raw_help.strip()
+        desc_cell = desc_part.replace("|", "\\|").replace("\n", " ")
+        ex_cmd = _synthesize_flag_example(act).replace("|", "\\|")
+        lines.append(f"| {flag_cell} | {type_cell} | {default_cell} | {desc_cell} | `{ex_cmd}` |")
+    return "\n".join(lines) + "\n"
 
 
 def print_raptor_help():
