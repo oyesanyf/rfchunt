@@ -320,7 +320,7 @@ def _audit_openapi_spec(rel_path: str, text: str) -> list[dict[str, Any]]:
             doc = json.loads(text)
         else:
             doc = yaml.safe_load(text)
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (json.JSONDecodeError, yaml.YAMLError, TypeError, ValueError):
         return findings
 
     if not isinstance(doc, dict):
@@ -952,7 +952,7 @@ def _is_openapi_spec_file(path: Path) -> bool:
             doc = json.loads(text)
         else:
             doc = yaml.safe_load(text)
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (json.JSONDecodeError, yaml.YAMLError, TypeError, ValueError):
         return False
     if not isinstance(doc, dict):
         return False
