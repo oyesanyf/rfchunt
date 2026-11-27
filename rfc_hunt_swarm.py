@@ -4398,6 +4398,8 @@ def cmd_dry_run_plan(
     except Exception:
         pass
 
+    _dry_fh_val = getattr(args, "freshness_hours", 72)
+    _dry_q_val = getattr(args, "quorum", 2)
     plan: Dict[str, Any] = {
         "status": "dry_run_plan_ready",
         "dry_run": True,
@@ -4419,8 +4421,8 @@ def cmd_dry_run_plan(
         "enabled_flags": enabled_flags,
         "ensemble": bool(getattr(args, "ensemble", False)),
         "program": str(getattr(args, "program", "generic") or "generic"),
-        "freshness_hours": int(getattr(args, "freshness_hours", 72) or 72),
-        "quorum": int(getattr(args, "quorum", 2) or 2),
+        "freshness_hours": int(_dry_fh_val) if _dry_fh_val is not None else 72,
+        "quorum": max(1, int(_dry_q_val)) if _dry_q_val is not None else 2,
         "sub_plans": sub_plans,
         "side_effects": {
             "network_packets_sent": 0,
@@ -5783,6 +5785,7 @@ def cmd_all(args):
                 res.setdefault("engines", {})["poc_verification"] = {"status": "error", "error": str(poc_exc)}
 
         if getattr(args, "ensemble", False):
+            import json as _ens_json
             from engine.ensemble_orchestrator import EnsembleOrchestrator
             from revenue_cli import unified_findings_to_engine_findings
 
@@ -5812,10 +5815,12 @@ def cmd_all(args):
             if ens_model == "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M":
                 ens_model = None
 
+            _fh_val = getattr(args, "freshness_hours", 72)
+            _q_val = getattr(args, "quorum", 2)
             orch = EnsembleOrchestrator(
                 program=str(getattr(args, "program", "generic") or "generic"),
-                freshness_hours=int(getattr(args, "freshness_hours", 72) or 72),
-                quorum=max(1, int(getattr(args, "quorum", 2) or 2)),
+                freshness_hours=int(_fh_val) if _fh_val is not None else 72,
+                quorum=max(1, int(_q_val)) if _q_val is not None else 2,
                 exhaustive_default=True,
                 embedded=ens_embedded,
                 model=ens_model,
@@ -5829,7 +5834,7 @@ def cmd_all(args):
             converted_findings = unified_findings_to_engine_findings(
                 res.get("findings") or [],
                 target_root=ensemble_target if (repo or path) else None,
-                exclude_speculative_and_preflight=False,
+                exclude_speculative_and_preflight=True,
             )
             merged_findings = list(converted_findings)
             ens_target_p = Path(ensemble_target)
@@ -5891,7 +5896,7 @@ def cmd_all(args):
             rf["ensemble_md"] = str(ens_out_dir / "ensemble_summary.md")
             rf["ensemble_sarif"] = str(ens_out_dir / "ensemble_findings.sarif")
             if combined_json_str and Path(combined_json_str).parent.exists():
-                Path(combined_json_str).write_text(json.dumps(res, indent=2), encoding="utf-8")
+                Path(combined_json_str).write_text(_ens_json.dumps(res, indent=2), encoding="utf-8")
 
         if hasattr(db, "add_fact"):
             try:
@@ -8325,8 +8330,8 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--pe-no-host-audit", dest="pe_include_host_audit", action="store_false", help="Disable host patch-level audit during --pe-audit")
     parser.add_argument("--pe-no-yara", dest="pe_include_yara", action="store_false", default=True, help="Disable defensive YARA rule evaluation during PE & .NET auditing")
 
-    # Planner-Worker-Verifier Whiteboard & Lean 4 Ensemble Orchestration (--ensemble / --essemble)
-    parser.add_argument("--ensemble", "--essemble", dest="ensemble", action="store_true", default=False, help="Enable Planner-Worker-Verifier shared-whiteboard + Lean 4 formal ensemble orchestration in --all")
+    # Planner-Worker-Verifier Whiteboard & Lean 4 Ensemble Orchestration (--ensemble / --essemble / --essample)
+    parser.add_argument("--ensemble", "--essemble", "--essample", dest="ensemble", action="store_true", default=False, help="Enable Planner-Worker-Verifier shared-whiteboard + Lean 4 formal ensemble orchestration in --all")
     parser.add_argument("--program", dest="program", type=str, default="generic", help="Vendor threat-model profile for --ensemble (generic, shopify, anthropic, arc-bbp, cloudflare, coinbase)")
     parser.add_argument("--freshness-hours", dest="freshness_hours", type=int, default=72, help="Git commit freshness lookback window in hours for --ensemble (default: 72)")
     parser.add_argument("--quorum", dest="quorum", type=int, default=2, help="Minimum independent engine quorum for static corroboration in --ensemble (default: 2)")

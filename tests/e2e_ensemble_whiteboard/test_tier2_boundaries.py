@@ -716,10 +716,12 @@ def test_t2_f6_03_probe_optional_backends_nonexistent_lean_dir_and_wsl_timeout(
 ) -> None:
     import engine.linux_poc_runner as lpr
 
+    monkeypatch.setattr(lpr, "find_docker_binary", lambda *_a, **_kw: None)
+    monkeypatch.setattr(lpr, "probe_docker_daemon", lambda *_a, **_kw: (False, None))
     monkeypatch.setattr(
         lpr,
         "diagnose_docker_wsl",
-        lambda: SimpleNamespace(daemon_running=False, docker_binary=None, server_version=""),
+        lambda *_a, **_kw: SimpleNamespace(daemon_running=False, docker_binary=None, server_version=""),
     )
     monkeypatch.setattr(lpr.shutil, "which", lambda name: "wsl.exe" if name == "wsl.exe" else None)
     monkeypatch.setattr(lpr, "_safe_find_spec", lambda _m: None)
@@ -732,7 +734,21 @@ def test_t2_f6_03_probe_optional_backends_nonexistent_lean_dir_and_wsl_timeout(
 
     monkeypatch.setattr(lpr, "silent_subprocess_run", _timeout)
     probes = lpr.probe_optional_backends(lean_dir=tmp_path / "missing_lean", timeout_sec=60.0)
-    assert len(probes) == 7
+    core_expected = {
+        "docker",
+        "wsl2",
+        "lean4",
+        "rfchunt_lean_oracle",
+        "angr",
+        "klee",
+        "semgrep",
+    }
+    assert core_expected.issubset(probes.keys())
+    for key, entry in probes.items():
+        assert {"available", "status", "reason", "path_or_module"}.issubset(entry.keys()), key
+        assert isinstance(entry["available"], bool), key
+        assert isinstance(entry["status"], str) and entry["status"], key
+        assert isinstance(entry["reason"], str) and entry["reason"], key
     assert recorded_timeouts and recorded_timeouts[0] <= 3.0
     assert probes["wsl2"]["status"] == "timeout"
     assert probes["rfchunt_lean_oracle"]["available"] is False

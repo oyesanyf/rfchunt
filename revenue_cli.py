@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 from typing import Any, Dict, List, Optional, Sequence
 
 from engine.client_audit_packager import ClientAuditPackager
@@ -358,24 +359,24 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
                 try:
                     from engine.mantis_integrator import run_unified_all_scans
 
-                    unified_reports_dir = str(Path(args.out) / "_unified_all")
                     ext_flag = (
                         False
                         if (bool(getattr(args, "no_external_scanners", False)) or offline_mode)
                         else None
                     )
-                    with (contextlib.redirect_stdout(sys.stderr) if args.json_out else contextlib.nullcontext()):
-                        all_res = run_unified_all_scans(
-                            repo=str(target_path),
-                            reports_dir=unified_reports_dir,
-                            quiet=True,
-                            enable_external_scanners=ext_flag,
-                            include_models=False,
-                            auto_install_tools=False,
-                            preflight_live=False,
-                            enable_h2_desync=False,
-                            confine_reports_to_workspace_root=False,
-                        )
+                    with tempfile.TemporaryDirectory(prefix="rfchunt_unified_") as unified_reports_dir:
+                        with (contextlib.redirect_stdout(sys.stderr) if args.json_out else contextlib.nullcontext()):
+                            all_res = run_unified_all_scans(
+                                repo=str(target_path),
+                                reports_dir=unified_reports_dir,
+                                quiet=True,
+                                enable_external_scanners=ext_flag,
+                                include_models=False,
+                                auto_install_tools=False,
+                                preflight_live=False,
+                                enable_h2_desync=False,
+                                confine_reports_to_workspace_root=False,
+                            )
                     all_scan_summary = {
                         "status": "completed",
                         "target_path": all_res.get("target_path"),

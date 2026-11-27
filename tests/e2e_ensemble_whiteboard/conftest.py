@@ -549,27 +549,20 @@ def degraded_toolchain_env(monkeypatch: pytest.MonkeyPatch) -> Callable[[], None
         monkeypatch.setattr(shutil, "which", lambda _name: None)
         monkeypatch.setattr(lpr.shutil, "which", lambda _name: None)
         monkeypatch.setattr(lfv.shutil, "which", lambda _name: None)
-        monkeypatch.setattr(
-            dwd,
-            "diagnose_docker_wsl",
-            lambda *a, **kw: SimpleNamespace(
-                daemon_running=False,
-                docker_binary=None,
-                server_version="",
-                wsl_binary=None,
-                wsl_available=False,
-                to_dict=lambda: {"daemon_running": False, "docker_binary": None},
-            ),
+        disabled_diag = dwd.DockerWSLDiagnosis(
+            platform="windows",
+            docker_binary=None,
+            docker_desktop_exe=None,
+            daemon_running=False,
+            server_version=None,
+            issues=["Docker disabled in degraded_toolchain_env"],
+            healthy=False,
         )
-        monkeypatch.setattr(
-            lpr,
-            "diagnose_docker_wsl",
-            lambda *a, **kw: SimpleNamespace(
-                daemon_running=False,
-                docker_binary=None,
-                server_version="",
-            ),
-        )
+        for mod in (lpr, dwd):
+            monkeypatch.setattr(mod, "find_docker_binary", lambda *_a, **_kw: None)
+            monkeypatch.setattr(mod, "probe_docker_daemon", lambda *_a, **_kw: (False, None))
+            monkeypatch.setattr(mod, "diagnose_docker_wsl", lambda *_a, **_kw: disabled_diag)
+        monkeypatch.setattr(dwd, "find_docker_desktop_exe", lambda *_a, **_kw: None)
         monkeypatch.setattr(lfv, "find_lean_oracle_binary", lambda *_a, **_kw: None)
         monkeypatch.setattr(lpr, "_safe_find_spec", lambda _mod: None)
 

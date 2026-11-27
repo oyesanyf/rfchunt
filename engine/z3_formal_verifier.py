@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -107,6 +108,8 @@ _PRIVILEGED_ROLE_TOKENS = frozenset(
     }
 )
 
+_PRIVILEGED_SEGMENT_TOKENS = frozenset(tok.lstrip("/") for tok in _PRIVILEGED_ROUTE_TOKENS)
+
 _LOW_PRIVILEGE_ROLES = ("anonymous", "guest", "user", "readonly")
 
 _TENANT_PARAM_NAMES = frozenset(
@@ -134,8 +137,86 @@ _TENANT_ROUTE_SEGMENT_RE = re.compile(
 )
 
 _WEAPONIZED_ARTIFACT_RE = re.compile(
-    r"(?i)(?:\b(?:curl|sqlmap|nmap|wget|hydra|msfconsole|powershell|bash\s+-c)\b|HTTP/1\.[01]\s*\r?\n|#!/bin/)",
+    r"(?i)(?:"
+    r"\b(?:curl|sqlmap|nmap|wget|hydra|msfconsole|powershell|pwsh|mkfifo)\b"
+    r"|\b(?:ba|da|z|k|a)?sh\s+-[a-z]*[ic][a-z]*\b"
+    r"|\bpython(?:\d+(?:\.\d+)*)?\s+-[a-z]*c[a-z]*\b"
+    r"|\b(?:perl|ruby|node)\s+-e\b"
+    r"|\bphp\s+-r\b"
+    r"|\bcmd(?:\.exe)?\s+/c\b"
+    r"|\b(?:nc|ncat|netcat)\s+-[el]\b"
+    r"|\brm\s+-rf\b"
+    r"|#!\s*/usr/bin/env\b"
+    r"|#!\s*/(?:usr/)?bin/(?:[^\s]*sh\b|python)"
+    r"|HTTP/1\.[01](?:\b|\s|$)"
+    r")",
 )
+
+
+def _is_privileged_role(role_name: str) -> bool:
+    low = (role_name or "").strip().lower()
+    if not low:
+        return False
+    if low in _PRIVILEGED_ROLE_TOKENS:
+        return True
+    tokens = [t for t in re.split(r"[:._/\-\s]+", low) if t]
+    return any(tok in _PRIVILEGED_ROLE_TOKENS for tok in tokens)
+
+
+def _parse_optional_bool(val: Any) -> Optional[bool]:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)) and val in (0, 1):
+        return bool(val)
+    if isinstance(val, str):
+        s = val.strip().lower()
+        if s in ("true", "1", "yes", "on", "y"):
+            return True
+        if s in ("false", "0", "no", "off", "n"):
+            return False
+    return None
+
+
+def _parse_bool(val: Any, default: bool = False) -> bool:
+    if val is None:
+        return default
+    parsed = _parse_optional_bool(val)
+    return parsed if parsed is not None else default
+
+
+def _resolve_local_ref(
+    root_doc: Dict[str, Any],
+    obj: Any,
+    *,
+    visited: Optional[Set[str]] = None,
+    depth: int = 0,
+) -> Any:
+    """Cycle-safe local JSON-pointer `#/...` resolver for OpenAPI components/parameters/pathItems."""
+    if not isinstance(obj, dict) or "$ref" not in obj or depth >= 16:
+        return obj
+    ref = str(obj.get("$ref") or "").strip()
+    if not ref.startswith("#/"):
+        return obj
+    seen = set(visited or ())
+    if ref in seen:
+        return {}
+    seen.add(ref)
+    cur: Any = root_doc
+    for raw_part in ref[2:].split("/"):
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return {}
+    if isinstance(cur, dict):
+        merged = {k: v for k, v in obj.items() if k != "$ref"}
+        resolved_target = _resolve_local_ref(root_doc, cur, visited=seen, depth=depth + 1)
+        if isinstance(resolved_target, dict):
+            out = dict(resolved_target)
+            out.update(merged)
+            return out
+        return resolved_target
+    return cur
 
 
 class ScopeGateDeniedError(PermissionError):
@@ -163,6 +244,8 @@ class OpenApiEndpointIR:
     tenant_ownership_enforced: bool = False
     parameters: List[Dict[str, Any]] = field(default_factory=list)
     line: int = 1
+    security_requirements: List[Dict[str, List[str]]] = field(default_factory=list)
+    unresolved_schemes: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -288,6 +371,15 @@ class FormalVerificationFinding:
     confidence: float = 0.94
     solver_time_ms: float = 0.0
 
+    def __post_init__(self) -> None:
+        self.title = _sanitize_defensive_text(self.title)
+        self.summary = _sanitize_defensive_text(self.summary)
+        self.proof_summary = _sanitize_defensive_text(self.proof_summary)
+        self.remediation = _sanitize_defensive_text(self.remediation)
+        self.counterexample = _sanitize_defensive_obj(self.counterexample)
+        self.trace = _sanitize_defensive_obj(self.trace)
+        self.proof_certificate = _sanitize_defensive_obj(self.proof_certificate)
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -295,13 +387,13 @@ class FormalVerificationFinding:
         rule_id = f"Z3-{self.domain.upper()}-{self.invariant_name.upper()}"
         return EngineFinding(
             engine="z3_formal",
-            title=self.title,
+            title=_sanitize_defensive_text(self.title),
             file_path=self.file_path or self.domain,
             line=max(1, int(self.line or 1)),
             cwe=self.cwe,
             severity=self.severity,
             confidence=float(self.confidence),
-            summary=self.summary,
+            summary=_sanitize_defensive_text(self.summary),
             rule_id=rule_id,
             deterministic=True,
             confirmed=(self.status == STATUS_SAT_VIOLATION),
@@ -310,11 +402,11 @@ class FormalVerificationFinding:
                 "z3_domain": self.domain,
                 "invariant_name": self.invariant_name,
                 "status": self.status,
-                "counterexample": dict(self.counterexample),
-                "trace": list(self.trace),
-                "proof_certificate": dict(self.proof_certificate),
-                "proof_summary": self.proof_summary,
-                "remediation": self.remediation,
+                "counterexample": _sanitize_defensive_obj(dict(self.counterexample)),
+                "trace": _sanitize_defensive_obj(list(self.trace)),
+                "proof_certificate": _sanitize_defensive_obj(dict(self.proof_certificate)),
+                "proof_summary": _sanitize_defensive_text(self.proof_summary),
+                "remediation": _sanitize_defensive_text(self.remediation),
                 "solver_time_ms": self.solver_time_ms,
             },
         )
@@ -382,12 +474,18 @@ class FormalVerificationReport:
                 level = level_map.get(f.severity.upper(), "warning")
             else:
                 level = "note"
+            safe_title = _sanitize_defensive_text(f.title)
+            safe_summary = _sanitize_defensive_text(f.summary)
+            safe_remediation = _sanitize_defensive_text(f.remediation)
+            safe_cex = _sanitize_defensive_obj(dict(f.counterexample))
+            safe_trace = _sanitize_defensive_obj(list(f.trace))
+            safe_cert = _sanitize_defensive_obj(dict(f.proof_certificate))
             if rule_id not in rules_by_id:
                 rules_by_id[rule_id] = {
                     "id": rule_id,
                     "name": rule_id,
-                    "shortDescription": {"text": f.title},
-                    "fullDescription": {"text": f.summary or f.title},
+                    "shortDescription": {"text": safe_title},
+                    "fullDescription": {"text": safe_summary or safe_title},
                     "defaultConfiguration": {"level": level},
                     "properties": {
                         "cwe": f.cwe,
@@ -402,7 +500,7 @@ class FormalVerificationReport:
                     "ruleId": rule_id,
                     "level": level,
                     "message": {
-                        "text": f"[{f.status}] {f.title}: {f.summary}"
+                        "text": _sanitize_defensive_text(f"[{f.status}] {safe_title}: {safe_summary}")
                     },
                     "locations": [
                         {
@@ -418,10 +516,10 @@ class FormalVerificationReport:
                         "domain": f.domain,
                         "invariant_name": f.invariant_name,
                         "cwe": f.cwe,
-                        "counterexample": dict(f.counterexample),
-                        "trace": list(f.trace),
-                        "proof_certificate": dict(f.proof_certificate),
-                        "remediation": f.remediation,
+                        "counterexample": safe_cex,
+                        "trace": safe_trace,
+                        "proof_certificate": safe_cert,
+                        "remediation": safe_remediation,
                     },
                 }
             )
@@ -509,13 +607,16 @@ def _load_structured_source(
         )
 
     parsed: Any = None
-    if is_yaml_hint:
-        parsed = yaml.safe_load(raw_text)
-    else:
-        try:
-            parsed = json.loads(raw_text)
-        except json.JSONDecodeError:
+    try:
+        if is_yaml_hint:
             parsed = yaml.safe_load(raw_text)
+        else:
+            try:
+                parsed = json.loads(raw_text)
+            except json.JSONDecodeError:
+                parsed = yaml.safe_load(raw_text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Invalid {kind_label} syntax: {exc}") from exc
 
     if not isinstance(parsed, dict):
         raise ValueError(f"Invalid {kind_label} document: expected JSON/YAML mapping.")
@@ -569,10 +670,43 @@ def _sanitize_defensive_text(text: str) -> str:
     return cleaned.strip()
 
 
+def _sanitize_defensive_obj(obj: Any) -> Any:
+    """Recursively sanitize all string keys/values inside counterexamples and traces."""
+    if isinstance(obj, str):
+        return _sanitize_defensive_text(obj)
+    if isinstance(obj, dict):
+        return {
+            (_sanitize_defensive_text(k) if isinstance(k, str) else k): _sanitize_defensive_obj(v)
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_sanitize_defensive_obj(item) for item in obj]
+    if isinstance(obj, tuple):
+        return [_sanitize_defensive_obj(item) for item in obj]
+    return obj
+
+
+def _contains_weaponized_artifact(obj: Any) -> bool:
+    """Recursively inspect unescaped strings across nested dicts/lists/tuples/sets."""
+    if isinstance(obj, str):
+        return bool(_WEAPONIZED_ARTIFACT_RE.search(obj))
+    if isinstance(obj, dict):
+        return any(
+            _contains_weaponized_artifact(k) or _contains_weaponized_artifact(v)
+            for k, v in obj.items()
+        )
+    if isinstance(obj, (list, tuple, set)):
+        return any(_contains_weaponized_artifact(item) for item in obj)
+    return False
+
+
 def _model_eval_int(model: z3.ModelRef, sym: z3.ArithRef, default: int = 0) -> int:
     val = model.eval(sym, model_completion=True)
     if z3.is_int_value(val):
-        return int(val.as_long())
+        try:
+            return int(val.as_long())
+        except Exception:
+            return int(val.as_string())
     return default
 
 
@@ -654,14 +788,30 @@ def parse_openapi_spec(source: Union[str, Path, Dict[str, Any]]) -> OpenApiModel
     if not isinstance(paths, dict):
         raise ValueError("Invalid OpenAPI/Swagger specification: 'paths' must be a mapping.")
 
+    def _roles_from_scope_list(scopes_seq: Sequence[str]) -> Set[str]:
+        inferred: Set[str] = set()
+        for sc in scopes_seq:
+            low_sc = sc.lower()
+            for role_tok in _PRIVILEGED_ROLE_TOKENS:
+                if role_tok in low_sc.replace(":", " ").replace("_", " ").split():
+                    inferred.add(role_tok)
+                    break
+                if low_sc.startswith(f"{role_tok}:") or low_sc.endswith(f":{role_tok}"):
+                    inferred.add(role_tok)
+                    break
+        return inferred
+
     endpoints: List[OpenApiEndpointIR] = []
-    for route_key, path_obj in paths.items():
-        if not isinstance(path_obj, dict):
+    for route_key, raw_path_obj in paths.items():
+        path_obj = _resolve_local_ref(spec, raw_path_obj)
+        if not isinstance(path_obj, dict) or not path_obj:
             continue
         full_route = f"{base_path}{route_key}" if base_path else str(route_key)
-        path_params = [
-            dict(p) for p in (path_obj.get("parameters") or []) if isinstance(p, dict)
-        ]
+        path_params: List[Dict[str, Any]] = []
+        for p in (path_obj.get("parameters") or []):
+            resolved_p = _resolve_local_ref(spec, p)
+            if isinstance(resolved_p, dict) and resolved_p:
+                path_params.append(dict(resolved_p))
         path_roles = _dedupe_preserve(
             _as_str_list(path_obj.get("x-required-role"))
             + _as_str_list(path_obj.get("x-required-roles"))
@@ -679,26 +829,40 @@ def parse_openapi_spec(source: Union[str, Path, Dict[str, Any]]) -> OpenApiModel
 
             scheme_names: List[str] = []
             required_scopes: List[str] = []
+            security_requirements: List[Dict[str, List[str]]] = []
+            unresolved_schemes: List[str] = []
             allows_anonymous = False
             auth_required = False
+            has_resolved_req = False
 
             if isinstance(effective_sec, list) and len(effective_sec) > 0:
-                has_non_empty_req = False
                 for req in effective_sec:
                     if not isinstance(req, dict):
                         continue
                     if len(req) == 0:
                         allows_anonymous = True
+                        security_requirements.append({})
                     else:
-                        has_non_empty_req = True
+                        req_clean: Dict[str, List[str]] = {}
+                        branch_resolved = True
                         for s_name, s_scopes in req.items():
-                            scheme_names.append(str(s_name))
-                            required_scopes.extend(_as_str_list(s_scopes))
-                auth_required = has_non_empty_req and not allows_anonymous
+                            s_key = str(s_name)
+                            sc_list = _as_str_list(s_scopes)
+                            scheme_names.append(s_key)
+                            req_clean[s_key] = sc_list
+                            if s_key not in security_schemes:
+                                unresolved_schemes.append(s_key)
+                                branch_resolved = False
+                            required_scopes.extend(sc_list)
+                        security_requirements.append(req_clean)
+                        if branch_resolved:
+                            has_resolved_req = True
+                auth_required = has_resolved_req and not allows_anonymous
             else:
                 allows_anonymous = True
                 auth_required = False
 
+            all_declared_scopes = list(required_scopes) + _as_str_list(op.get("x-scopes"))
             required_scopes.extend(_as_str_list(op.get("x-scopes")))
             explicit_roles = (
                 path_roles
@@ -709,33 +873,57 @@ def parse_openapi_spec(source: Union[str, Path, Dict[str, Any]]) -> OpenApiModel
                 + _as_str_list(op.get("x-auth-role"))
             )
             required_roles = list(explicit_roles)
-            # Infer privileged role constraint from scopes only when auth is NOT optional
-            if not allows_anonymous:
-                for sc in required_scopes:
-                    low_sc = sc.lower()
-                    for role_tok in _PRIVILEGED_ROLE_TOKENS:
-                        if role_tok in low_sc.replace(":", " ").replace("_", " ").split():
-                            required_roles.append(role_tok)
-                            break
-                        if low_sc.startswith(f"{role_tok}:") or low_sc.endswith(f":{role_tok}"):
-                            required_roles.append(role_tok)
-                            break
-            else:
+            # Infer privileged role constraint from scopes ONLY when auth is NOT optional
+            # and at least one security requirement resolves cleanly, using intersection
+            # across resolved non-empty branches so a non-privileged branch is not masked.
+            if not allows_anonymous and has_resolved_req:
+                branch_role_sets: List[Set[str]] = []
+                for req_item in security_requirements:
+                    if not req_item:
+                        continue
+                    if not all(s in security_schemes for s in req_item):
+                        continue
+                    b_scopes = [sc for sc_list in req_item.values() for sc in sc_list]
+                    branch_role_sets.append(_roles_from_scope_list(b_scopes))
+                if branch_role_sets:
+                    common_roles = set.intersection(*branch_role_sets)
+                    required_roles.extend(sorted(common_roles))
+                x_scopes = _as_str_list(op.get("x-scopes"))
+                if x_scopes:
+                    required_roles.extend(sorted(_roles_from_scope_list(x_scopes)))
+            elif allows_anonymous:
                 # Optional `{}` security branch does not enforce OAuth scopes on anonymous callers
                 required_scopes = _as_str_list(op.get("x-scopes"))
             required_roles = _dedupe_preserve([r.lower() for r in required_roles])
 
-            op_params = path_params + [
-                dict(p) for p in (op.get("parameters") or []) if isinstance(p, dict)
-            ]
+            op_resolved_params: List[Dict[str, Any]] = []
+            for p in (op.get("parameters") or []):
+                resolved_p = _resolve_local_ref(spec, p)
+                if isinstance(resolved_p, dict) and resolved_p:
+                    op_resolved_params.append(dict(resolved_p))
+            op_params = path_params + op_resolved_params
             tags_lower = " ".join(str(t).lower() for t in (op.get("tags") or []))
-            route_lower = full_route.lower()
-            is_public_auth = route_lower in _PUBLIC_AUTH_PATHS
 
+            rel_route = "/" + str(route_key).strip().lstrip("/")
+            rel_lower = rel_route.lower().rstrip("/") or "/"
+            rel_no_ver = re.sub(r"^/(?:api/)?v\d+(?=/)", "", rel_lower) or rel_lower
+            route_lower = full_route.lower().rstrip("/") or "/"
+            is_public_auth = (
+                route_lower in _PUBLIC_AUTH_PATHS
+                or rel_lower in _PUBLIC_AUTH_PATHS
+                or rel_no_ver in _PUBLIC_AUTH_PATHS
+            )
+
+            route_segments = [
+                seg
+                for seg in route_lower.split("/")
+                if seg and not (seg.startswith("{") and seg.endswith("}"))
+            ]
             is_privileged = (
-                any(tok in route_lower for tok in _PRIVILEGED_ROUTE_TOKENS)
+                any(seg in _PRIVILEGED_SEGMENT_TOKENS for seg in route_segments)
                 or any(tok in tags_lower for tok in ("admin", "internal", "iam", "system", "billing", "security"))
-                or any(r in _PRIVILEGED_ROLE_TOKENS for r in required_roles)
+                or any(_is_privileged_role(r) for r in required_roles)
+                or any(_is_privileged_scope(sc) for sc in all_declared_scopes)
             )
             is_state_changing = method in _STATE_CHANGING_METHODS and not is_public_auth
 
@@ -747,9 +935,9 @@ def parse_openapi_spec(source: Union[str, Path, Dict[str, Any]]) -> OpenApiModel
                 or _TENANT_ROUTE_SEGMENT_RE.search(full_route)
             )
             tenant_ownership_enforced = bool(
-                op.get("x-tenant-isolated")
-                or op.get("x-tenant-check")
-                or op.get("x-ownership-check")
+                _parse_bool(op.get("x-tenant-isolated"), default=False)
+                or _parse_bool(op.get("x-tenant-check"), default=False)
+                or _parse_bool(op.get("x-ownership-check"), default=False)
                 or str(op.get("x-tenant-policy") or "").strip().lower() in ("enforced", "strict", "isolated")
                 or any("tenant:own" in sc.lower() or "tenant:strict" in sc.lower() for sc in required_scopes)
             )
@@ -769,6 +957,8 @@ def parse_openapi_spec(source: Union[str, Path, Dict[str, Any]]) -> OpenApiModel
                     is_tenant_scoped=is_tenant_scoped,
                     tenant_ownership_enforced=tenant_ownership_enforced,
                     parameters=op_params,
+                    security_requirements=security_requirements,
+                    unresolved_schemes=_dedupe_preserve(unresolved_schemes),
                 )
             )
 
@@ -994,17 +1184,21 @@ def parse_state_machine(source: Union[str, Path, Dict[str, Any]]) -> StateMachin
         roles.extend(req_roles)
         guards_raw = tr.get("guards")
         guards = dict(guards_raw) if isinstance(guards_raw, dict) else {}
-        req_auth = bool(
+        raw_req_auth = (
             tr.get("required_auth")
             if "required_auth" in tr
             else tr.get("requires_auth", False)
         )
-        same_tenant_req = bool(
-            tr.get("same_tenant_required")
-            or guards.get("same_tenant")
-            or guards.get("tenant_match")
+        req_auth = _parse_bool(raw_req_auth, default=False)
+        same_tenant_req = any(
+            _parse_bool(v, default=False)
+            for v in (
+                tr.get("same_tenant_required"),
+                guards.get("same_tenant"),
+                guards.get("tenant_match"),
+            )
         )
-        sets_auth = tr.get("sets_auth") if isinstance(tr.get("sets_auth"), bool) else None
+        sets_auth = _parse_optional_bool(tr.get("sets_auth")) if "sets_auth" in tr else None
         grants_role = (
             str(tr.get("grants_role")).strip().lower()
             if tr.get("grants_role")
@@ -1012,7 +1206,7 @@ def parse_state_machine(source: Union[str, Path, Dict[str, Any]]) -> StateMachin
         )
         if grants_role:
             roles.append(grants_role)
-        sets_mfa = tr.get("sets_mfa") if isinstance(tr.get("sets_mfa"), bool) else None
+        sets_mfa = _parse_optional_bool(tr.get("sets_mfa")) if "sets_mfa" in tr else None
 
         transitions.append(
             StateTransitionIR(
@@ -1112,7 +1306,7 @@ def _validate_formal_model_dict(data: Any) -> Tuple[bool, Optional[str]]:
         return False, f"Unexpected keys in formal model: {sorted(unknown_keys)}"
 
     serialized = json.dumps(data, ensure_ascii=False)
-    if _WEAPONIZED_ARTIFACT_RE.search(serialized):
+    if _contains_weaponized_artifact(data) or _WEAPONIZED_ARTIFACT_RE.search(serialized):
         return False, "Rejected formal model containing disallowed command/payload markers."
 
     states = data.get("states")
@@ -1347,7 +1541,7 @@ def verify_openapi_invariants(
         return []
 
     all_roles = _dedupe_preserve(
-        ["anonymous", "guest", "user", "service", "admin"]
+        ["anonymous", "guest", "user", "readonly", "service", "admin"]
         + [r for ep in model.endpoints for r in ep.required_roles]
     )
     role_to_id = {r: i for i, r in enumerate(all_roles)}
@@ -1388,7 +1582,7 @@ def verify_openapi_invariants(
         priv_role_ids = [
             role_to_id[r]
             for r in all_roles
-            if r in _PRIVILEGED_ROLE_TOKENS or any(tok in r for tok in _PRIVILEGED_ROLE_TOKENS)
+            if _is_privileged_role(r)
         ]
         for sc, sc_var in scope_vars.items():
             solver.add(z3.Implies(z3.Not(caller_auth), z3.Not(sc_var), ctx))
@@ -1403,12 +1597,51 @@ def verify_openapi_invariants(
 
         for idx, ep in enumerate(model.endpoints):
             conds: List[z3.BoolRef] = []
-            if ep.auth_required and not ep.allows_anonymous:
-                conds.append(caller_auth)
-            if ep.required_roles:
-                conds.append(z3.Or([caller_role == role_to_id[r] for r in ep.required_roles]))
-            if ep.required_scopes:
-                conds.append(z3.And([scope_vars[sc] for sc in ep.required_scopes]))
+            has_valid_auth = ep.auth_required and not ep.allows_anonymous
+            if has_valid_auth:
+                if ep.security_requirements:
+                    req_branches: List[z3.BoolRef] = []
+                    all_branches_authenticated = True
+                    for req in ep.security_requirements:
+                        if not req:
+                            req_branches.append(z3.BoolVal(True, ctx=ctx))
+                            all_branches_authenticated = False
+                            continue
+                        if not all(s in model.security_schemes for s in req):
+                            # Unresolved security scheme cannot authenticate caller -> fail-open branch
+                            req_branches.append(z3.BoolVal(True, ctx=ctx))
+                            all_branches_authenticated = False
+                            continue
+                        req_scopes = [sc for sc_list in req.values() for sc in sc_list]
+                        b_conds: List[z3.BoolRef] = [caller_auth]
+                        for sc in req_scopes:
+                            if sc in scope_vars:
+                                b_conds.append(scope_vars[sc])
+                        req_branches.append(z3.And(b_conds))
+                    conds.append(z3.Or(req_branches))
+                    sec_scopes = {
+                        sc
+                        for req in ep.security_requirements
+                        for sc_list in req.values()
+                        for sc in sc_list
+                    }
+                    extra_scopes = [
+                        sc for sc in ep.required_scopes if sc not in sec_scopes and sc in scope_vars
+                    ]
+                    if all_branches_authenticated:
+                        if ep.required_roles:
+                            conds.append(z3.Or([caller_role == role_to_id[r] for r in ep.required_roles]))
+                        if extra_scopes:
+                            conds.append(z3.And([scope_vars[sc] for sc in extra_scopes]))
+                else:
+                    conds.append(caller_auth)
+                    if ep.required_roles:
+                        conds.append(z3.Or([caller_role == role_to_id[r] for r in ep.required_roles]))
+                    if ep.required_scopes:
+                        conds.append(z3.And([scope_vars[sc] for sc in ep.required_scopes if sc in scope_vars]))
+            # When allows_anonymous or not auth_required (including all-unresolved schemes),
+            # neither caller_auth nor required_roles can be enforced against unauthenticated callers.
+
             if ep.is_tenant_scoped and ep.tenant_ownership_enforced:
                 admin_ids = [
                     role_to_id[r] for r in all_roles if r in ("admin", "superadmin", "superuser")
@@ -1524,8 +1757,11 @@ def verify_openapi_invariants(
             )
 
     # Invariant 2: Low-privilege role escalation to privileged endpoints
+    non_priv_roles = _dedupe_preserve(
+        [r for r in all_roles if (r in _LOW_PRIVILEGE_ROLES) or (not _is_privileged_role(r))]
+    )
     if priv_indices:
-        low_priv_ids = [role_to_id[r] for r in _LOW_PRIVILEGE_ROLES if r in role_to_id]
+        low_priv_ids = [role_to_id[r] for r in non_priv_roles if r in role_to_id]
         t0 = time.perf_counter()
         ctx, solver, syms = _build_openapi_solver()
         solver.add(z3.Or([syms["caller_role"] == rid for rid in low_priv_ids]))
@@ -1581,7 +1817,7 @@ def verify_openapi_invariants(
                     cwe="CWE-862",
                     title="Privileged endpoint RBAC isolation invariant proven",
                     summary=(
-                        f"Z3 formally proved low-privilege roles ({', '.join(_LOW_PRIVILEGE_ROLES)}) "
+                        f"Z3 formally proved low-privilege roles ({', '.join(non_priv_roles)}) "
                         f"cannot satisfy access rules for any of the {len(priv_indices)} privileged endpoints."
                     ),
                     file_path=model.source_path,
@@ -1611,7 +1847,7 @@ def verify_openapi_invariants(
 
     # Invariant 3: Cross-tenant IDOR access on tenant-scoped endpoints
     if tenant_indices:
-        low_priv_ids = [role_to_id[r] for r in _LOW_PRIVILEGE_ROLES if r in role_to_id]
+        low_priv_ids = [role_to_id[r] for r in non_priv_roles if r in role_to_id]
         t0 = time.perf_counter()
         ctx, solver, syms = _build_openapi_solver()
         solver.add(syms["caller_tenant"] != syms["target_tenant"])
@@ -1705,31 +1941,144 @@ def _iam_glob_match(pattern: str, candidate: str) -> bool:
     return False
 
 
+_PRIVILEGED_IAM_PRINCIPAL_TOKENS = frozenset(
+    {
+        "root",
+        "admin",
+        "administrator",
+        "administratoraccess",
+        "superuser",
+        "superadmin",
+        "system",
+        "service",
+        "operator",
+        "security",
+        "iam",
+        "billing",
+        "owner",
+        "staff",
+    }
+)
+
+
+def _is_privileged_principal(principal: str) -> bool:
+    raw = (principal or "").strip()
+    if not raw:
+        return False
+    low = raw.lower()
+    if low in ("anonymous", "guest", "user", "readonly", "__wildcard_other__"):
+        return False
+    tail = raw.rsplit("/", 1)[-1]
+    if ":" in tail:
+        tail = tail.rsplit(":", 1)[-1]
+    tail_low = tail.strip().lower()
+    if not tail_low:
+        return False
+    if tail_low in _PRIVILEGED_IAM_PRINCIPAL_TOKENS:
+        return True
+    camel_split = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", tail)
+    tokens = set(re.split(r"[:._/\-\s]+", tail_low)) | set(
+        re.split(r"[:._/\-\s]+", camel_split.lower())
+    )
+    tokens.discard("")
+    return any(tok in _PRIVILEGED_IAM_PRINCIPAL_TOKENS for tok in tokens)
+
+
 def _is_privileged_iam_action(action: str) -> bool:
     low = (action or "").strip().lower()
     if low in ("*", "*:*", "__wildcard_other__"):
         return True
-    return any(
+    if any(
         tok in low
         for tok in ("admin", "iam:", "delete", "write", "put", "create", "update", "escalat", "root", "passrole")
-    )
+    ):
+        return True
+    if ":" in low:
+        svc, act = low.split(":", 1)
+        read_only_svcs = ("read", "readonly", "get", "list", "describe", "view")
+        if svc not in read_only_svcs and (act.startswith("*") or act.startswith("?")):
+            return True
+    return False
+
+
+def _synthesize_iam_action_witnesses(pattern: str) -> List[str]:
+    pat = (pattern or "").strip()
+    if not pat or pat in ("*", "*:*"):
+        return []
+    if "*" not in pat and "?" not in pat:
+        return [pat]
+    subs = ("delete", "create", "put", "action1") if _is_privileged_iam_action(pat) else ("object", "item1", "item2")
+    out: List[str] = [pat.replace("*", star_sub).replace("?", "a") for star_sub in subs]
+    if "?" in pat:
+        out.append(pat.replace("*", subs[0]).replace("?", "b"))
+    return _dedupe_preserve(out)
+
+
+def _parse_iam_cidr(raw: str) -> Optional[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]]:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    try:
+        net = ipaddress.ip_network(s, strict=False)
+        if isinstance(net, ipaddress.IPv6Network):
+            v4_mapped = ipaddress.IPv6Network("::ffff:0:0/96")
+            if net.subnet_of(v4_mapped) and net.prefixlen >= 96:
+                v4_addr = ipaddress.IPv4Address(int(net.network_address) & 0xFFFFFFFF)
+                return ipaddress.IPv4Network(f"{v4_addr}/{net.prefixlen - 96}", strict=False)
+        return net
+    except ValueError:
+        return None
+
+
+def _iam_like_match(pattern: str, candidate: str, *, ignore_case: bool = False, is_like: bool = True) -> bool:
+    if candidate == "__other__":
+        return is_like and pattern == "*"
+    if not is_like:
+        return candidate.lower() == pattern.lower() if ignore_case else candidate == pattern
+    flags = re.IGNORECASE if ignore_case else 0
+    regex_parts: List[str] = []
+    for ch in pattern:
+        if ch == "*":
+            regex_parts.append(".*")
+        elif ch == "?":
+            regex_parts.append(".")
+        else:
+            regex_parts.append(re.escape(ch))
+    return re.fullmatch("".join(regex_parts), candidate, flags=flags) is not None
+
+
+def _format_iam_source_ip(model: z3.ModelRef, syms: Dict[str, Any]) -> str:
+    if _model_eval_bool(model, syms["source_ip_is_v6"], False):
+        ip_int = max(0, min(_model_eval_int(model, syms["source_ip_v6"], 0), (1 << 128) - 1))
+        return str(ipaddress.IPv6Address(ip_int))
+    ip_int = max(0, min(_model_eval_int(model, syms["source_ip_v4"], 0), 0xFFFFFFFF))
+    return str(ipaddress.IPv4Address(ip_int))
 
 
 def _encode_iam_conditions(
     conditions: Dict[str, Any],
     ctx: z3.Context,
+    *,
+    stmt_sid: str,
+    stmt_effect: str,
     mfa_present: z3.BoolRef,
+    mfa_key_present: z3.BoolRef,
     source_ip_trusted: z3.BoolRef,
     principal_tenant: z3.IntRef,
     resource_tenant: z3.IntRef,
     extra_str_vars: Dict[str, Tuple[z3.IntRef, Dict[str, int]]],
     extra_num_vars: Dict[str, z3.IntRef],
-    solver: z3.Solver,
+    key_present_vars: Dict[str, z3.BoolRef],
+    ip_key_vars: Dict[str, Tuple[z3.BoolRef, z3.IntRef, z3.IntRef]],
+    ip_used: Dict[str, bool],
+    deferred_like_preds: List[Tuple[str, z3.BoolRef, List[str], bool, bool, bool]],
+    unsupported_conditions: List[Dict[str, Any]],
 ) -> z3.BoolRef:
     if not conditions:
         return z3.BoolVal(True, ctx=ctx)
 
     clauses: List[z3.BoolRef] = []
+    fallback_val = z3.BoolVal(False if stmt_effect == "Deny" else True, ctx=ctx)
 
     def _get_str_var(key_name: str, literal_val: str) -> Tuple[z3.IntRef, int]:
         if key_name not in extra_str_vars:
@@ -1746,80 +2095,222 @@ def _encode_iam_conditions(
             extra_num_vars[key_name] = z3.Int(f"cond_num_{len(extra_num_vars)}", ctx=ctx)
         return extra_num_vars[key_name]
 
+    def _get_key_present(key_name: str) -> z3.BoolRef:
+        if "mfa" in key_name or "multifactor" in key_name:
+            return mfa_key_present
+        if key_name not in key_present_vars:
+            key_present_vars[key_name] = z3.Bool(f"cond_present_{len(key_present_vars)}", ctx=ctx)
+        return key_present_vars[key_name]
+
+    def _get_ip_vars(key_name: str) -> Tuple[z3.BoolRef, z3.IntRef, z3.IntRef]:
+        if key_name not in ip_key_vars:
+            idx = len(ip_key_vars)
+            ip_key_vars[key_name] = (
+                z3.Bool(f"ip_is_v6_{idx}", ctx=ctx),
+                z3.Int(f"ip_v4_{idx}", ctx=ctx),
+                z3.Int(f"ip_v6_{idx}", ctx=ctx),
+            )
+        return ip_key_vars[key_name]
+
+    def _record_unsupported(op_label: str, key_label: str, reason: str) -> None:
+        unsupported_conditions.append(
+            {
+                "sid": stmt_sid,
+                "effect": stmt_effect,
+                "operator": str(op_label),
+                "key": str(key_label),
+                "reason": reason,
+                "conservative_truth_value": (stmt_effect != "Deny"),
+            }
+        )
+
     for op_name, cond_body in conditions.items():
         op_low = str(op_name).strip().lower()
         if not isinstance(cond_body, dict):
+            _record_unsupported(op_name, "*", "non_dict_condition_body")
+            clauses.append(fallback_val)
             continue
+
+        is_bool_if_exists = op_low == "boolifexists"
+        if op_low != "boolifexists" and op_low.endswith("ifexists"):
+            base_op = op_low[:-8]
+            if_exists = True
+        else:
+            base_op = op_low
+            if_exists = is_bool_if_exists
+
         for c_key, c_val in cond_body.items():
             key_low = str(c_key).strip().lower()
             vals = _as_str_list(c_val) if not isinstance(c_val, bool) else [str(c_val).lower()]
             if not vals:
+                _record_unsupported(op_name, c_key, "empty_condition_values")
+                clauses.append(fallback_val)
                 continue
 
-            if op_low in ("bool", "boolifexists"):
-                want_true = vals[0].lower() in ("true", "1", "yes")
-                if "mfa" in key_low or "multifactor" in key_low:
-                    clauses.append(mfa_present if want_true else z3.Not(mfa_present))
-                elif "trusted" in key_low or "securetransport" in key_low:
-                    clauses.append(source_ip_trusted if want_true else z3.Not(source_ip_trusted))
-                elif "tenant" in key_low:
-                    clauses.append(
-                        (principal_tenant == resource_tenant)
-                        if want_true
-                        else (principal_tenant != resource_tenant)
-                    )
+            if base_op in ("bool", "boolifexists"):
+                bool_exprs: List[z3.BoolRef] = []
+                for v in vals:
+                    want_true = v.lower() in ("true", "1", "yes", "on")
+                    if "mfa" in key_low or "multifactor" in key_low:
+                        bool_exprs.append(mfa_present if want_true else z3.Not(mfa_present))
+                    elif "trusted" in key_low or "securetransport" in key_low:
+                        bool_exprs.append(source_ip_trusted if want_true else z3.Not(source_ip_trusted))
+                    elif "tenant" in key_low:
+                        bool_exprs.append(
+                            (principal_tenant == resource_tenant)
+                            if want_true
+                            else (principal_tenant != resource_tenant)
+                        )
+                    else:
+                        sym, lit_id = _get_str_var(key_low, "true" if want_true else "false")
+                        bool_exprs.append(sym == lit_id)
+                val_expr = z3.Or(bool_exprs) if len(bool_exprs) > 1 else bool_exprs[0]
+                kp = _get_key_present(key_low)
+                clauses.append(z3.Or(z3.Not(kp), val_expr) if if_exists else z3.And(kp, val_expr))
+
+            elif base_op == "null":
+                is_null = _parse_bool(vals[0], default=False)
+                kp = _get_key_present(key_low)
+                clauses.append(z3.Not(kp) if is_null else kp)
+
+            elif base_op in ("ipaddress", "notipaddress"):
+                parsed_nets: List[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]] = []
+                bad_cidr = False
+                for v in vals:
+                    net = _parse_iam_cidr(v)
+                    if net is None:
+                        bad_cidr = True
+                        break
+                    parsed_nets.append(net)
+                if bad_cidr or not parsed_nets:
+                    _record_unsupported(op_name, c_key, "unparsed_cidr")
+                    clauses.append(fallback_val)
+                    continue
+
+                ip_used[key_low] = True
+                k_v6, k_v4, k_ip6 = _get_ip_vars(key_low)
+                net_exprs: List[z3.BoolRef] = []
+                for net in parsed_nets:
+                    start_int = int(net.network_address)
+                    end_int = int(net.broadcast_address)
+                    if isinstance(net, ipaddress.IPv4Network):
+                        net_exprs.append(z3.And(z3.Not(k_v6), k_v4 >= start_int, k_v4 <= end_int))
+                    else:
+                        net_exprs.append(z3.And(k_v6, k_ip6 >= start_int, k_ip6 <= end_int))
+                match_expr = z3.Or(net_exprs) if len(net_exprs) > 1 else net_exprs[0]
+                ip_expr = z3.Not(match_expr) if base_op == "notipaddress" else match_expr
+                if if_exists:
+                    kp = _get_key_present(key_low)
+                    clauses.append(z3.Or(z3.Not(kp), ip_expr))
                 else:
-                    sym, lit_id = _get_str_var(key_low, "true" if want_true else "false")
-                    clauses.append(sym == lit_id)
+                    clauses.append(ip_expr)
 
-            elif op_low in ("null",):
-                is_null = vals[0].lower() in ("true", "1", "yes")
-                if "mfa" in key_low or "multifactor" in key_low:
-                    clauses.append(z3.Not(mfa_present) if is_null else mfa_present)
-
-            elif op_low in ("ipaddress", "notipaddress"):
-                clauses.append(source_ip_trusted if op_low == "ipaddress" else z3.Not(source_ip_trusted))
-
-            elif op_low in ("stringequals", "stringequalsignorecase", "stringnotequals", "stringnotequalsignorecase"):
-                negate = "not" in op_low
-                is_tenant_eq = (
-                    "tenant" in key_low
-                    and any(
-                        "${" in v and ("resource" in v.lower() or "tenant" in v.lower())
-                        for v in vals
+            elif base_op in (
+                "stringequals",
+                "stringequalsignorecase",
+                "stringnotequals",
+                "stringnotequalsignorecase",
+                "arnequals",
+                "arnequalsignorecase",
+                "arnnotequals",
+                "arnnotequalsignorecase",
+            ):
+                negate = "not" in base_op
+                ignore_case = "ignorecase" in base_op
+                is_tenant_eq = base_op.startswith("string") and (
+                    (
+                        "tenant" in key_low
+                        and any(
+                            "${" in v and ("resource" in v.lower() or "tenant" in v.lower())
+                            for v in vals
+                        )
                     )
-                ) or (key_low in ("same_tenant", "tenant_match"))
+                    or (key_low in ("same_tenant", "tenant_match"))
+                )
                 if is_tenant_eq:
                     expr = principal_tenant == resource_tenant
                     clauses.append(z3.Not(expr) if negate else expr)
                 else:
-                    eq_opts = []
-                    for v in vals:
-                        sym, lit_id = _get_str_var(key_low, v.lower())
-                        eq_opts.append(sym == lit_id)
-                    combined = z3.Or(eq_opts)
-                    clauses.append(z3.Not(combined) if negate else combined)
+                    if not ignore_case:
+                        eq_opts: List[z3.BoolRef] = []
+                        for v in vals:
+                            sym, lit_id = _get_str_var(key_low, v)
+                            eq_opts.append(sym == lit_id)
+                        combined = z3.Or(eq_opts) if len(eq_opts) > 1 else eq_opts[0]
+                        str_expr: z3.BoolRef = z3.Not(combined) if negate else combined
+                    else:
+                        for v in vals:
+                            _get_str_var(key_low, v)
+                        like_var = z3.Bool(f"cond_like_{stmt_sid}_{len(deferred_like_preds)}", ctx=ctx)
+                        deferred_like_preds.append((key_low, like_var, list(vals), negate, True, False))
+                        str_expr = like_var
+                    kp = _get_key_present(key_low)
+                    clauses.append(z3.Or(z3.Not(kp), str_expr) if if_exists else z3.And(kp, str_expr))
 
-            elif op_low in ("numericlessthan", "numericgreaterthan", "numericequals", "numericlessthanequals", "numericgreaterthanequals"):
+            elif base_op in (
+                "stringlike",
+                "stringlikeignorecase",
+                "stringnotlike",
+                "stringnotlikeignorecase",
+                "arnlike",
+                "arnlikeignorecase",
+                "arnnotlike",
+                "arnnotlikeignorecase",
+            ):
+                negate = "not" in base_op
+                ignore_case = "ignorecase" in base_op
+                _get_str_var(key_low, "__other__")
+                for v in vals:
+                    if "*" in v or "?" in v:
+                        for star_sub, q_sub in (
+                            ("alpha", "x"),
+                            ("beta1", "y"),
+                            ("w99", "x"),
+                            ("k9q", "y"),
+                            ("", "x"),
+                        ):
+                            witness = v.replace("*", star_sub).replace("?", q_sub)
+                            _get_str_var(key_low, witness)
+                    else:
+                        _get_str_var(key_low, v)
+                like_var = z3.Bool(f"cond_like_{stmt_sid}_{len(deferred_like_preds)}", ctx=ctx)
+                deferred_like_preds.append((key_low, like_var, list(vals), negate, ignore_case, True))
+                kp = _get_key_present(key_low)
+                clauses.append(z3.Or(z3.Not(kp), like_var) if if_exists else z3.And(kp, like_var))
+
+            elif base_op in (
+                "numericlessthan",
+                "numericgreaterthan",
+                "numericequals",
+                "numericlessthanequals",
+                "numericgreaterthanequals",
+                "numericnotequals",
+            ):
                 try:
                     num_target = int(float(vals[0]))
                 except ValueError:
+                    _record_unsupported(op_name, c_key, "invalid_numeric")
+                    clauses.append(fallback_val)
                     continue
                 sym = _get_num_var(key_low)
-                if op_low == "numericlessthan":
-                    clauses.append(sym < num_target)
-                elif op_low == "numericlessthanequals":
-                    clauses.append(sym <= num_target)
-                elif op_low == "numericgreaterthan":
-                    clauses.append(sym > num_target)
-                elif op_low == "numericgreaterthanequals":
-                    clauses.append(sym >= num_target)
+                if base_op == "numericlessthan":
+                    cmp_expr = sym < num_target
+                elif base_op == "numericlessthanequals":
+                    cmp_expr = sym <= num_target
+                elif base_op == "numericgreaterthan":
+                    cmp_expr = sym > num_target
+                elif base_op == "numericgreaterthanequals":
+                    cmp_expr = sym >= num_target
+                elif base_op == "numericnotequals":
+                    cmp_expr = sym != num_target
                 else:
-                    clauses.append(sym == num_target)
+                    cmp_expr = sym == num_target
+                kp = _get_key_present(key_low)
+                clauses.append(z3.Or(z3.Not(kp), cmp_expr) if if_exists else z3.And(kp, cmp_expr))
 
-    # Bound dynamic string condition domains after collection
-    for sym, mapping in extra_str_vars.values():
-        solver.add(sym >= 0, sym <= max(len(mapping), 1))
+            else:
+                _record_unsupported(op_name, c_key, "unsupported_operator")
+                clauses.append(fallback_val)
 
     return z3.And(clauses) if clauses else z3.BoolVal(True, ctx=ctx)
 
@@ -1834,10 +2325,27 @@ def verify_iam_invariants(
     if not policy.statements:
         return []
 
+    synthesized_principals: List[str] = []
+    for s in policy.statements:
+        for p in s.principals + s.not_principals:
+            if p == "*":
+                continue
+            if "*" in p or "?" in p:
+                synthesized_principals.append(
+                    p.replace("*", "member" if p.endswith(("/", ":")) else "_x").replace("?", "a")
+                )
+            else:
+                synthesized_principals.append(p)
+
     principals_universe = _dedupe_preserve(
         ["anonymous", "guest", "user", "readonly", "admin", "__wildcard_other__"]
-        + [p for s in policy.statements for p in (s.principals + s.not_principals) if p != "*"]
+        + synthesized_principals
     )
+    synthesized_actions: List[str] = []
+    for s in policy.statements:
+        for a in s.actions + s.not_actions:
+            synthesized_actions.extend(_synthesize_iam_action_witnesses(a))
+
     actions_universe = _dedupe_preserve(
         [
             "read:profile",
@@ -1848,7 +2356,7 @@ def verify_iam_invariants(
             "delete:resource",
             "__wildcard_other__",
         ]
-        + [a for s in policy.statements for a in (s.actions + s.not_actions) if "*" not in a]
+        + synthesized_actions
     )
     resources_universe = _dedupe_preserve(
         [
@@ -1870,6 +2378,7 @@ def verify_iam_invariants(
         p
         for p in principals_universe
         if p.lower() in ("anonymous", "guest", "user", "readonly", "__wildcard_other__")
+        or not _is_privileged_principal(p)
     ]
     priv_actions = [a for a in actions_universe if _is_privileged_iam_action(a)]
 
@@ -1882,6 +2391,7 @@ def verify_iam_invariants(
         action_sym = z3.Int("action_id", ctx=ctx)
         resource_sym = z3.Int("resource_id", ctx=ctx)
         mfa_present = z3.Bool("mfa_present", ctx=ctx)
+        mfa_key_present = z3.Bool("mfa_key_present", ctx=ctx)
         source_ip_trusted = z3.Bool("source_ip_trusted", ctx=ctx)
         principal_tenant = z3.Int("principal_tenant", ctx=ctx)
         resource_tenant = z3.Int("resource_tenant", ctx=ctx)
@@ -1891,9 +2401,21 @@ def verify_iam_invariants(
         solver.add(resource_sym >= 0, resource_sym < len(resources_universe))
         solver.add(principal_tenant >= 0, principal_tenant <= 1)
         solver.add(resource_tenant >= 0, resource_tenant <= 1)
+        solver.add(z3.Implies(mfa_present, mfa_key_present, ctx))
 
         extra_str_vars: Dict[str, Tuple[z3.IntRef, Dict[str, int]]] = {}
         extra_num_vars: Dict[str, z3.IntRef] = {}
+        key_present_vars: Dict[str, z3.BoolRef] = {}
+        ip_key_vars: Dict[str, Tuple[z3.BoolRef, z3.IntRef, z3.IntRef]] = {
+            "aws:sourceip": (
+                z3.Bool("source_ip_is_v6", ctx=ctx),
+                z3.Int("source_ip_v4", ctx=ctx),
+                z3.Int("source_ip_v6", ctx=ctx),
+            )
+        }
+        ip_used: Dict[str, bool] = {}
+        deferred_like_preds: List[Tuple[str, z3.BoolRef, List[str], bool, bool, bool]] = []
+        unsupported_conditions: List[Dict[str, Any]] = []
 
         allow_formulas: List[z3.BoolRef] = []
         deny_formulas: List[z3.BoolRef] = []
@@ -1976,13 +2498,20 @@ def verify_iam_invariants(
             c_expr = _encode_iam_conditions(
                 stmt.conditions,
                 ctx,
-                mfa_present,
-                source_ip_trusted,
-                principal_tenant,
-                resource_tenant,
-                extra_str_vars,
-                extra_num_vars,
-                solver,
+                stmt_sid=stmt.sid,
+                stmt_effect=stmt.effect,
+                mfa_present=mfa_present,
+                mfa_key_present=mfa_key_present,
+                source_ip_trusted=source_ip_trusted,
+                principal_tenant=principal_tenant,
+                resource_tenant=resource_tenant,
+                extra_str_vars=extra_str_vars,
+                extra_num_vars=extra_num_vars,
+                key_present_vars=key_present_vars,
+                ip_key_vars=ip_key_vars,
+                ip_used=ip_used,
+                deferred_like_preds=deferred_like_preds,
+                unsupported_conditions=unsupported_conditions,
             )
 
             stmt_expr = z3.And(p_expr, a_expr, r_expr, c_expr)
@@ -1991,25 +2520,72 @@ def verify_iam_invariants(
             else:
                 deny_formulas.append(stmt_expr)
 
+        # Bound dynamic string/IP condition domains ONCE after all statements are collected
+        for sym, mapping in extra_str_vars.values():
+            solver.add(sym >= 0, sym < len(mapping))
+        for _, k_v4, k_ip6 in ip_key_vars.values():
+            solver.add(k_v4 >= 0, k_v4 <= 0xFFFFFFFF)
+            solver.add(k_ip6 >= 0, k_ip6 <= (1 << 128) - 1)
+        for key_low, like_var, patterns, negate, ignore_case, is_like in deferred_like_preds:
+            sym, mapping = extra_str_vars[key_low]
+            matched_ids = [
+                lit_id
+                for lit_val, lit_id in mapping.items()
+                if any(
+                    _iam_like_match(pat, lit_val, ignore_case=ignore_case, is_like=is_like)
+                    for pat in patterns
+                )
+            ]
+            pos_expr = (
+                z3.Or([sym == lid for lid in matched_ids])
+                if matched_ids
+                else z3.BoolVal(False, ctx=ctx)
+            )
+            solver.add(like_var == (z3.Not(pos_expr) if negate else pos_expr))
+
         explicit_allow = z3.Or(allow_formulas) if allow_formulas else z3.BoolVal(False, ctx=ctx)
         explicit_deny = z3.Or(deny_formulas) if deny_formulas else z3.BoolVal(False, ctx=ctx)
         effective_allow = z3.And(explicit_allow, z3.Not(explicit_deny))
 
+        src_ip_v6_flag, src_ip_v4, src_ip_v6 = ip_key_vars["aws:sourceip"]
         syms = {
             "principal_sym": principal_sym,
             "action_sym": action_sym,
             "resource_sym": resource_sym,
             "mfa_present": mfa_present,
+            "mfa_key_present": mfa_key_present,
             "source_ip_trusted": source_ip_trusted,
+            "source_ip_is_v6": src_ip_v6_flag,
+            "source_ip_v4": src_ip_v4,
+            "source_ip_v6": src_ip_v6,
+            "has_source_ip_constraint": bool(ip_used.get("aws:sourceip", False)),
             "principal_tenant": principal_tenant,
             "resource_tenant": resource_tenant,
             "explicit_allow": explicit_allow,
             "explicit_deny": explicit_deny,
             "effective_allow": effective_allow,
+            "unsupported_conditions": unsupported_conditions,
         }
         return ctx, solver, syms
 
     findings: List[FormalVerificationFinding] = []
+
+    def _attach_unsup_to_cert(cert: Dict[str, Any], unsup: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if unsup:
+            cert["warnings"] = [
+                f"Conservative over-approximation applied to {len(unsup)} unsupported condition(s)."
+            ]
+            cert["unsupported_conditions"] = list(unsup)
+        return cert
+
+    def _unsup_summary_suffix(unsup: List[Dict[str, Any]]) -> str:
+        if not unsup:
+            return ""
+        ops = ", ".join(_dedupe_preserve([str(u.get("operator") or "") for u in unsup])[:4])
+        return (
+            f" (Warning: {len(unsup)} unsupported IAM condition(s) [{ops}] "
+            "conservatively approximated.)"
+        )
 
     # Invariant 1: Explicit Deny precedence soundness
     t0 = time.perf_counter()
@@ -2019,6 +2595,7 @@ def verify_iam_invariants(
     res = solver.check()
     elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 3)
     if res == z3.unsat:
+        unsup = list(syms["unsupported_conditions"])
         findings.append(
             FormalVerificationFinding(
                 finding_id=_deterministic_finding_id("iam", "explicit_deny_precedence", policy.version),
@@ -2033,10 +2610,20 @@ def verify_iam_invariants(
                     "can achieve effective_allow when an explicit Deny statement matches."
                 ),
                 file_path=policy.source_path,
-                proof_certificate=_make_proof_certificate(
-                    solver, domain="iam", invariant_name="explicit_deny_precedence"
+                proof_certificate=_attach_unsup_to_cert(
+                    _make_proof_certificate(
+                        solver, domain="iam", invariant_name="explicit_deny_precedence"
+                    ),
+                    unsup,
                 ),
-                proof_summary="UNSAT: explicit_deny strictly overrides explicit_allow.",
+                proof_summary=(
+                    "UNSAT: explicit_deny strictly overrides explicit_allow."
+                    + (
+                        f" [Conservative approximation: {len(unsup)} unsupported condition(s)]"
+                        if unsup
+                        else ""
+                    )
+                ),
                 remediation="No remediation required; explicit Deny precedence holds.",
                 solver_time_ms=elapsed_ms,
             )
@@ -2057,6 +2644,18 @@ def verify_iam_invariants(
             p_name = id_to_p.get(_model_eval_int(m, syms["principal_sym"]), "anonymous")
             a_name = id_to_a.get(_model_eval_int(m, syms["action_sym"]), "admin:*")
             r_name = id_to_r.get(_model_eval_int(m, syms["resource_sym"]), "*")
+            unsup = list(syms["unsupported_conditions"])
+            ce: Dict[str, Any] = {
+                "principal": p_name,
+                "action": a_name,
+                "resource": r_name,
+                "mfa_present": _model_eval_bool(m, syms["mfa_present"], False),
+                "source_ip_trusted": _model_eval_bool(m, syms["source_ip_trusted"], False),
+            }
+            if syms["has_source_ip_constraint"]:
+                ce["source_ip"] = _format_iam_source_ip(m, syms)
+            if unsup:
+                ce["unsupported_conditions"] = unsup
             findings.append(
                 FormalVerificationFinding(
                     finding_id=_deterministic_finding_id("iam", "unauthenticated_or_low_priv_admin_access", f"{p_name}:{a_name}"),
@@ -2069,15 +2668,10 @@ def verify_iam_invariants(
                     summary=_sanitize_defensive_text(
                         f"Z3 produced a satisfying assignment allowing principal '{p_name}' to execute "
                         f"privileged IAM action '{a_name}' on resource '{r_name}'."
+                        + _unsup_summary_suffix(unsup)
                     ),
                     file_path=policy.source_path,
-                    counterexample={
-                        "principal": p_name,
-                        "action": a_name,
-                        "resource": r_name,
-                        "mfa_present": _model_eval_bool(m, syms["mfa_present"], False),
-                        "source_ip_trusted": _model_eval_bool(m, syms["source_ip_trusted"], False),
-                    },
+                    counterexample=ce,
                     remediation=(
                         f"Narrow IAM policy Principal/Action scope away from '{a_name}' for low-privilege "
                         "or wildcard principals, add explicit `Deny` guards, and enforce MFA/tenant conditions."
@@ -2086,6 +2680,7 @@ def verify_iam_invariants(
                 )
             )
         elif res == z3.unsat:
+            unsup = list(syms["unsupported_conditions"])
             findings.append(
                 FormalVerificationFinding(
                     finding_id=_deterministic_finding_id("iam", "unauthenticated_or_low_priv_admin_access", "proven"),
@@ -2100,10 +2695,20 @@ def verify_iam_invariants(
                         "privileged actions under the policy's Allow/Deny and Condition constraints."
                     ),
                     file_path=policy.source_path,
-                    proof_certificate=_make_proof_certificate(
-                        solver, domain="iam", invariant_name="unauthenticated_or_low_priv_admin_access"
+                    proof_certificate=_attach_unsup_to_cert(
+                        _make_proof_certificate(
+                            solver, domain="iam", invariant_name="unauthenticated_or_low_priv_admin_access"
+                        ),
+                        unsup,
                     ),
-                    proof_summary="UNSAT: Privileged IAM actions are unreachable by low-privilege principals.",
+                    proof_summary=(
+                        "UNSAT: Privileged IAM actions are unreachable by low-privilege principals."
+                        + (
+                            f" [Conservative approximation: {len(unsup)} unsupported condition(s)]"
+                            if unsup
+                            else ""
+                        )
+                    ),
                     remediation="No remediation required.",
                     solver_time_ms=elapsed_ms,
                 )
@@ -2124,6 +2729,18 @@ def verify_iam_invariants(
             p_name = id_to_p.get(_model_eval_int(m, syms["principal_sym"]), "user")
             a_name = id_to_a.get(_model_eval_int(m, syms["action_sym"]), "admin:*")
             r_name = id_to_r.get(_model_eval_int(m, syms["resource_sym"]), "*")
+            unsup = list(syms["unsupported_conditions"])
+            ce3: Dict[str, Any] = {
+                "principal": p_name,
+                "action": a_name,
+                "resource": r_name,
+                "mfa_present": False,
+                "mfa_key_present": _model_eval_bool(m, syms["mfa_key_present"], False),
+            }
+            if syms["has_source_ip_constraint"]:
+                ce3["source_ip"] = _format_iam_source_ip(m, syms)
+            if unsup:
+                ce3["unsupported_conditions"] = unsup
             findings.append(
                 FormalVerificationFinding(
                     finding_id=_deterministic_finding_id("iam", "condition_bypass_access", f"{p_name}:{a_name}"),
@@ -2136,14 +2753,10 @@ def verify_iam_invariants(
                     summary=_sanitize_defensive_text(
                         f"Z3 proved principal '{p_name}' can execute '{a_name}' on '{r_name}' "
                         "with mfa_present=False."
+                        + _unsup_summary_suffix(unsup)
                     ),
                     file_path=policy.source_path,
-                    counterexample={
-                        "principal": p_name,
-                        "action": a_name,
-                        "resource": r_name,
-                        "mfa_present": False,
-                    },
+                    counterexample=ce3,
                     remediation=(
                         "Require `Bool: {\"aws:MultiFactorAuthPresent\": \"true\"}` (and explicit Deny "
                         "when MFA is absent) on all privileged Allow statements."
@@ -2152,6 +2765,7 @@ def verify_iam_invariants(
                 )
             )
         elif res == z3.unsat:
+            unsup = list(syms["unsupported_conditions"])
             findings.append(
                 FormalVerificationFinding(
                     finding_id=_deterministic_finding_id("iam", "condition_bypass_access", "proven"),
@@ -2163,10 +2777,20 @@ def verify_iam_invariants(
                     title="Privileged IAM MFA condition enforcement proven",
                     summary="Z3 formally proved no privileged action can succeed when mfa_present=False.",
                     file_path=policy.source_path,
-                    proof_certificate=_make_proof_certificate(
-                        solver, domain="iam", invariant_name="condition_bypass_access"
+                    proof_certificate=_attach_unsup_to_cert(
+                        _make_proof_certificate(
+                            solver, domain="iam", invariant_name="condition_bypass_access"
+                        ),
+                        unsup,
                     ),
-                    proof_summary="UNSAT: MFA condition or explicit Deny prevents unverified privileged actions.",
+                    proof_summary=(
+                        "UNSAT: MFA condition or explicit Deny prevents unverified privileged actions."
+                        + (
+                            f" [Conservative approximation: {len(unsup)} unsupported condition(s)]"
+                            if unsup
+                            else ""
+                        )
+                    ),
                     remediation="No remediation required.",
                     solver_time_ms=elapsed_ms,
                 )
@@ -2185,6 +2809,18 @@ def verify_iam_invariants(
         p_name = id_to_p.get(_model_eval_int(m, syms["principal_sym"]), "user")
         a_name = id_to_a.get(_model_eval_int(m, syms["action_sym"]), "*")
         r_name = id_to_r.get(_model_eval_int(m, syms["resource_sym"]), "*")
+        unsup = list(syms["unsupported_conditions"])
+        ce4: Dict[str, Any] = {
+            "principal": p_name,
+            "action": a_name,
+            "resource": r_name,
+            "principal_tenant": _model_eval_int(m, syms["principal_tenant"], 0),
+            "resource_tenant": _model_eval_int(m, syms["resource_tenant"], 1),
+        }
+        if syms["has_source_ip_constraint"]:
+            ce4["source_ip"] = _format_iam_source_ip(m, syms)
+        if unsup:
+            ce4["unsupported_conditions"] = unsup
         findings.append(
             FormalVerificationFinding(
                 finding_id=_deterministic_finding_id("iam", "cross_tenant_iam_access", f"{p_name}:{a_name}:{r_name}"),
@@ -2197,15 +2833,10 @@ def verify_iam_invariants(
                 summary=_sanitize_defensive_text(
                     f"Z3 proved principal '{p_name}' with principal_tenant != resource_tenant "
                     f"achieves effective_allow=True on action '{a_name}', resource '{r_name}'."
+                    + _unsup_summary_suffix(unsup)
                 ),
                 file_path=policy.source_path,
-                counterexample={
-                    "principal": p_name,
-                    "action": a_name,
-                    "resource": r_name,
-                    "principal_tenant": _model_eval_int(m, syms["principal_tenant"], 0),
-                    "resource_tenant": _model_eval_int(m, syms["resource_tenant"], 1),
-                },
+                counterexample=ce4,
                 remediation=(
                     "Bind tenant identity via `StringEquals: {\"aws:PrincipalTag/tenant\": \"${resource:tenant}\"}` "
                     "on Allow statements so cross-tenant access is denied."
@@ -2214,6 +2845,7 @@ def verify_iam_invariants(
             )
         )
     elif res == z3.unsat:
+        unsup = list(syms["unsupported_conditions"])
         findings.append(
             FormalVerificationFinding(
                 finding_id=_deterministic_finding_id("iam", "cross_tenant_iam_access", "proven"),
@@ -2225,10 +2857,20 @@ def verify_iam_invariants(
                 title="Cross-tenant IAM isolation invariant proven",
                 summary="Z3 formally proved cross-tenant access (principal_tenant != resource_tenant) is impossible.",
                 file_path=policy.source_path,
-                proof_certificate=_make_proof_certificate(
-                    solver, domain="iam", invariant_name="cross_tenant_iam_access"
+                proof_certificate=_attach_unsup_to_cert(
+                    _make_proof_certificate(
+                        solver, domain="iam", invariant_name="cross_tenant_iam_access"
+                    ),
+                    unsup,
                 ),
-                proof_summary="UNSAT: Tenant condition or explicit Deny prevents cross-tenant access.",
+                proof_summary=(
+                    "UNSAT: Tenant condition or explicit Deny prevents cross-tenant access."
+                    + (
+                        f" [Conservative approximation: {len(unsup)} unsupported condition(s)]"
+                        if unsup
+                        else ""
+                    )
+                ),
                 remediation="No remediation required.",
                 solver_time_ms=elapsed_ms,
             )
@@ -2269,7 +2911,7 @@ def verify_state_machine_invariants(
             str(k)
             for tr in sm.transitions
             for k, v in tr.guards.items()
-            if isinstance(v, bool)
+            if _parse_optional_bool(v) is not None
             and str(k).lower()
             not in (
                 "mfa",
@@ -2350,18 +2992,22 @@ def verify_state_machine_invariants(
 
                 for gk, gv in tr.guards.items():
                     gk_low = str(gk).lower()
+                    gv_bool = _parse_optional_bool(gv)
                     if gk_low in ("mfa", "mfa_verified", "mfa_present", "step_up"):
-                        tr_clauses.append(mfa_vars[t] == bool(gv))
+                        if gv_bool is not None:
+                            tr_clauses.append(mfa_vars[t] == gv_bool)
                     elif gk_low in ("same_tenant", "tenant_match"):
-                        tr_clauses.append(
-                            (principal_tenant == target_tenant)
-                            if bool(gv)
-                            else (principal_tenant != target_tenant)
-                        )
+                        if gv_bool is not None:
+                            tr_clauses.append(
+                                (principal_tenant == target_tenant)
+                                if gv_bool
+                                else (principal_tenant != target_tenant)
+                            )
                     elif gk_low in ("auth", "authenticated"):
-                        tr_clauses.append(auth_vars[t] == bool(gv))
-                    elif isinstance(gv, bool) and str(gk) in custom_vars:
-                        tr_clauses.append(custom_vars[str(gk)][t] == gv)
+                        if gv_bool is not None:
+                            tr_clauses.append(auth_vars[t] == gv_bool)
+                    elif gv_bool is not None and str(gk) in custom_vars:
+                        tr_clauses.append(custom_vars[str(gk)][t] == gv_bool)
 
                 # Propagate auth/role/mfa/custom guards to t+1
                 if tr.sets_auth is not None:
@@ -2529,7 +3175,10 @@ def verify_state_machine_invariants(
         )
 
     # Invariant 2: Low-privilege authenticated user reaching privileged state
-    low_ids = [role_to_id[r] for r in ("guest", "user", "readonly") if r in role_to_id]
+    low_priv_sm_roles = [
+        r for r in roles_universe if r != "anonymous" and not _is_privileged_role(r)
+    ]
+    low_ids = [role_to_id[r] for r in low_priv_sm_roles if r in role_to_id]
     t0 = time.perf_counter()
     ctx, solver, syms = _build_bmc_solver()
     solver.add(syms["state_vars"][0] == state_to_id[sm.initial_state])

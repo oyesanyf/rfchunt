@@ -16,6 +16,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Dict, List, Optional, Sequence
 
 import pytest
@@ -508,3 +509,133 @@ def test_mcp_bb_run_all_scan_dry_run_embedded_live_and_degraded(
     assert fail_data["exit_code"] != 0
     assert "toolchain_status" in fail_data
     assert "ensemble" in fail_data
+
+
+def test_swarm_live_all_ensemble_clean_hardened_repo_no_fabrication(tmp_path: Path) -> None:
+    """Clean hardened repo (src/utils.py + hardened GHA workflow) yields clusters == [] at quorum 2 and quorum 1."""
+    clean_hardened = _create_git_repo(
+        tmp_path / "clean_hardened_repo",
+        {
+            "src/utils.py": (
+                "def safe_add(a: int, b: int) -> int:\n"
+                "    return a + b\n"
+            ),
+            ".github/workflows/hardened.yml": (
+                "name: Hardened CI\n"
+                "on: [push]\n"
+                "permissions: read-all\n"
+                "jobs:\n"
+                "  build:\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11\n"
+                "        with:\n"
+                "          persist-credentials: false\n"
+                "      - run: echo ok\n"
+            ),
+        },
+    )
+
+    for label, extra_quorum_args in (("default_q2", []), ("q1", ["--quorum", "1"])):
+        out_dir = tmp_path / f"swarm_clean_{label}"
+        db_path = tmp_path / f"swarm_clean_{label}.db"
+        proc = _run_cli(
+            "rfc_hunt_swarm.py",
+            [
+                "--all",
+                "--repo",
+                str(clean_hardened),
+                "--ensemble",
+                *extra_quorum_args,
+                "--output-dir",
+                str(out_dir),
+                "--db",
+                str(db_path),
+                "--no-external-scanners",
+                "--no-preflight-live",
+                "--no-include-models",
+                "--no-auto-install",
+                "--json",
+            ],
+        )
+        assert proc.returncode == 0, f"[{label}] stderr={proc.stderr}\nstdout={proc.stdout}"
+        data = json.loads(proc.stdout)
+        assert data["ensemble"]["clusters"] == [], f"[{label}] fabricated clusters: {data['ensemble']['clusters']}"
+        assert data["ensemble"]["counts_by_disposition"].get("SUBMISSION_READY", 0) == 0
+
+    git_clean = subprocess.run(
+        ["git", "-C", str(clean_hardened), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+    assert git_clean.stdout.strip() == ""
+
+
+def test_swarm_essample_alias_and_zero_quorum_freshness_dry_run(
+    vulnerable_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """`--essample` alias parity + `is not None` handling for `--freshness-hours 0` and `--quorum 0`."""
+    proc = _run_cli(
+        "rfc_hunt_swarm.py",
+        [
+            "--all",
+            "--repo",
+            str(vulnerable_repo),
+            "--essample",
+            "--freshness-hours",
+            "0",
+            "--quorum",
+            "0",
+            "--dry-run",
+            "--json",
+            "--output-dir",
+            str(tmp_path / "essample_dry_out"),
+            "--db",
+            str(tmp_path / "essample_dry.db"),
+        ],
+    )
+    assert proc.returncode == 0, f"stderr={proc.stderr}\nstdout={proc.stdout}"
+    plan = json.loads(proc.stdout)
+    assert plan["status"] == "dry_run_plan_ready"
+    assert plan["ensemble"] is True
+    assert plan["freshness_hours"] == 0
+    assert plan["quorum"] == 1
+    assert "EnsembleWhiteboardOrchestrator(Planner-Worker-Verifier+Lean4)" in plan["planned_modules"]
+
+
+def test_revenue_cli_external_out_dir_stages_unified_reports_in_temp(
+    clean_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Arbitrary `--out` outside %TEMP% and rfchunt/ still runs `run_unified_all_scans` cleanly via temp staging."""
+    isolated_sys_tmp = tmp_path / "isolated_sys_tmp"
+    isolated_sys_tmp.mkdir(parents=True, exist_ok=True)
+    ext_out = tmp_path / "external_out_dir"
+
+    monkeypatch.setenv("TMP", str(isolated_sys_tmp))
+    monkeypatch.setenv("TEMP", str(isolated_sys_tmp))
+    monkeypatch.setenv("TMPDIR", str(isolated_sys_tmp))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+
+    rc = revenue_cli.run_revenue_cli(
+        [
+            "ensemble-audit",
+            "--target",
+            str(clean_repo),
+            "--all",
+            "--ensemble",
+            "--out",
+            str(ext_out),
+        ]
+    )
+    assert rc == 0
+    rep = json.loads((ext_out / "ensemble_report.json").read_text(encoding="utf-8"))
+    assert rep["all_scan_summary"]["status"] == "completed"
+    assert rep["clusters"] == []
+    assert not (ext_out / "_unified_all").exists()
+    assert list(isolated_sys_tmp.glob("rfchunt_unified_*")) == []
+

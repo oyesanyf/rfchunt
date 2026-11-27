@@ -23,6 +23,7 @@ from engine.execution_policy import sanitize_for_llm_prompt
 from engine.z3_formal_verifier import (
     STATUS_SAT_VIOLATION,
     STATUS_UNSAT_PROVEN,
+    FormalVerificationFinding,
     FormalVerificationReport,
     ScopeGateDeniedError,
     _validate_formal_model_dict,
@@ -37,7 +38,19 @@ from engine.z3_formal_verifier import (
 )
 
 _WEAPONIZED_PATTERN = re.compile(
-    r"(?i)(?:\b(?:curl|sqlmap|nmap|wget|hydra|msfconsole|bash\s+-c)\b|HTTP/1\.[01]\s*\r?\n|#!/bin/)"
+    r"(?i)(?:"
+    r"\b(?:curl|sqlmap|nmap|wget|hydra|msfconsole|powershell|pwsh|mkfifo)\b"
+    r"|\b(?:ba|da|z|k|a)?sh\s+-[a-z]*[ic][a-z]*\b"
+    r"|\bpython(?:\d+(?:\.\d+)*)?\s+-[a-z]*c[a-z]*\b"
+    r"|\b(?:perl|ruby|node)\s+-e\b"
+    r"|\bphp\s+-r\b"
+    r"|\bcmd(?:\.exe)?\s+/c\b"
+    r"|\b(?:nc|ncat|netcat)\s+-[el]\b"
+    r"|\brm\s+-rf\b"
+    r"|#!\s*/usr/bin/env\b"
+    r"|#!\s*/(?:usr/)?bin/(?:[^\s]*sh\b|python)"
+    r"|HTTP/1\.[01](?:\b|\s|$)"
+    r")"
 )
 
 _SARIF_MINIMAL_SCHEMA: Dict[str, Any] = {
@@ -646,6 +659,12 @@ def test_deterministic_parsers_reject_invalid_inputs(tmp_path: Path) -> None:
         parse_openapi_spec({"info": {"title": "Not OpenAPI"}})
 
     with pytest.raises(ValueError):
+        parse_openapi_spec("{not valid yaml: [")
+
+    with pytest.raises(ValueError):
+        parse_iam_policy("{not json")
+
+    with pytest.raises(ValueError):
         parse_iam_policy({"Statement": [{"Effect": "Maybe", "Action": "s3:*"}]})
 
     with pytest.raises(ValueError):
@@ -766,6 +785,7 @@ def test_f4_schema_validator_and_local_loopback_ollama_translation(monkeypatch: 
     finally:
         server.shutdown()
         server.server_close()
+        thread.join(timeout=3.0)
 
 
 def test_combined_multidomain_run_and_iam_conditions() -> None:
@@ -829,4 +849,752 @@ def test_combined_multidomain_run_and_iam_conditions() -> None:
     _assert_defensive_only(report)
     sarif = report.to_sarif()
     jsonschema.validate(instance=sarif, schema=_SARIF_MINIMAL_SCHEMA)
+
+
+# ---------------------------------------------------------------------------
+# 12+: Iteration 2 Zero-Mock Soundness & Safety Regression Tests
+# ---------------------------------------------------------------------------
+
+
+def test_openapi_disjunctive_security_or_list_yields_sat_violation() -> None:
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "Disjunctive Auth API", "version": "1.0.0"},
+        "components": {
+            "securitySchemes": {
+                "oauth2": {"type": "oauth2", "flows": {}},
+                "apiKey": {"type": "apiKey", "in": "header", "name": "X-API-Key"},
+            }
+        },
+        "paths": {
+            "/admin/audit-logs": {
+                "get": {
+                    "operationId": "getAuditLogs",
+                    "security": [{"oauth2": ["admin:write"]}, {"apiKey": []}],
+                    "responses": {"200": {"description": "OK"}},
+                }
+            }
+        },
+    }
+    ir = parse_openapi_spec(spec)
+    assert len(ir.endpoints) == 1
+    assert ir.endpoints[0].security_requirements == [
+        {"oauth2": ["admin:write"]},
+        {"apiKey": []},
+    ]
+    assert "admin" not in ir.endpoints[0].required_roles
+
+    findings = verify_openapi_invariants(ir)
+    by_name = {f.invariant_name: f for f in findings}
+    assert by_name["unauthenticated_privileged_access"].status == STATUS_UNSAT_PROVEN
+    assert by_name["low_privilege_role_escalation"].status == STATUS_SAT_VIOLATION
+
+
+def test_openapi_optional_empty_security_with_x_required_role_yields_sat_violation() -> None:
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "Optional Auth Role Conflict", "version": "1.0.0"},
+        "components": {
+            "securitySchemes": {
+                "bearerAuth": {"type": "http", "scheme": "bearer"},
+            }
+        },
+        "paths": {
+            "/admin/audit": {
+                "get": {
+                    "operationId": "adminAudit",
+                    "security": [{"bearerAuth": []}, {}],
+                    "x-required-role": ["admin"],
+                    "responses": {"200": {"description": "OK"}},
+                }
+            }
+        },
+    }
+    findings = verify_openapi_invariants(spec)
+    by_name = {f.invariant_name: f for f in findings}
+    assert by_name["unauthenticated_privileged_access"].status == STATUS_SAT_VIOLATION
+
+
+def test_openapi_unknown_security_scheme_reference_detected() -> None:
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "UnknownScheme", "version": "1.0.0"},
+        "components": {"securitySchemes": {}},
+        "paths": {
+            "/admin/panel": {
+                "get": {
+                    "security": [{"missingScheme": []}],
+                    "x-roles": ["admin"],
+                    "responses": {"200": {"description": "OK"}},
+                }
+            }
+        },
+    }
+    ir = parse_openapi_spec(spec)
+    assert ir.endpoints[0].unresolved_schemes == ["missingScheme"]
+    assert ir.endpoints[0].auth_required is False
+
+    findings = verify_openapi_invariants(ir)
+    by_name = {f.invariant_name: f for f in findings}
+    assert by_name["unauthenticated_privileged_access"].status == STATUS_SAT_VIOLATION
+    assert all(f.status != STATUS_UNSAT_PROVEN for f in findings)
+
+
+def test_iam_extra_str_vars_multistatement_no_false_unsat() -> None:
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "Stmt1",
+                "Effect": "Allow",
+                "Principal": "admin",
+                "Action": "read:profile",
+                "Resource": "*",
+                "Condition": {"StringEquals": {"aws:PrincipalTag/env": "prod"}},
+            },
+            {
+                "Sid": "Stmt2",
+                "Effect": "Allow",
+                "Principal": "admin",
+                "Action": "read:profile",
+                "Resource": "*",
+                "Condition": {"StringEquals": {"aws:PrincipalTag/env": "staging"}},
+            },
+            {
+                "Sid": "Stmt3",
+                "Effect": "Allow",
+                "Principal": "user",
+                "Action": "admin:users",
+                "Resource": "*",
+                "Condition": {"StringEquals": {"aws:PrincipalTag/env": "dev"}},
+            },
+        ],
+    }
+    findings = verify_iam_invariants(policy)
+    by_name = {f.invariant_name: f for f in findings}
+    assert by_name["unauthenticated_or_low_priv_admin_access"].status == STATUS_SAT_VIOLATION
+    assert by_name["condition_bypass_access"].status == STATUS_SAT_VIOLATION
+
+
+def test_iam_conditional_deny_stringlike_and_unrecognized_operators_not_unconditional() -> None:
+    policy_stringlike = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "BroadUserAdmin",
+                "Effect": "Allow",
+                "Principal": "user",
+                "Action": "admin:*",
+                "Resource": "*",
+            },
+            {
+                "Sid": "DenyBlockedOnly",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "*",
+                "Resource": "*",
+                "Condition": {"StringLike": {"aws:userid": "blocked-*"}},
+            },
+        ],
+    }
+    findings_like = verify_iam_invariants(policy_stringlike)
+    by_like = {f.invariant_name: f for f in findings_like}
+    assert by_like["unauthenticated_or_low_priv_admin_access"].status == STATUS_SAT_VIOLATION
+    assert by_like["condition_bypass_access"].status == STATUS_SAT_VIOLATION
+
+    # ArnEquals / ArnLike match vs Deny
+    policy_arn = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowUserAdmin",
+                "Effect": "Allow",
+                "Principal": "user",
+                "Action": "admin:users",
+                "Resource": "*",
+                "Condition": {"ArnEquals": {"aws:SourceArn": "arn:aws:iam::123:role/dev"}},
+            },
+            {
+                "Sid": "DenyProdArn",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "*",
+                "Resource": "*",
+                "Condition": {"ArnLike": {"aws:SourceArn": "arn:aws:iam::123:role/prod-*"}},
+            },
+        ],
+    }
+    findings_arn = verify_iam_invariants(policy_arn)
+    by_arn = {f.invariant_name: f for f in findings_arn}
+    assert by_arn["unauthenticated_or_low_priv_admin_access"].status == STATUS_SAT_VIOLATION
+
+    # Unrecognized operator on Deny must fail conservatively (not unconditional Deny *) and emit warning
+    policy_unsup = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowUserAdmin",
+                "Effect": "Allow",
+                "Principal": "user",
+                "Action": "admin:*",
+                "Resource": "*",
+            },
+            {
+                "Sid": "ConditionalDenyForAnyValue",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "*",
+                "Resource": "*",
+                "Condition": {"ForAnyValue:StringEquals": {"aws:TagKeys": ["locked"]}},
+            },
+        ],
+    }
+    findings_unsup = verify_iam_invariants(policy_unsup)
+    by_unsup = {f.invariant_name: f for f in findings_unsup}
+    viol = by_unsup["unauthenticated_or_low_priv_admin_access"]
+    assert viol.status == STATUS_SAT_VIOLATION
+    assert "unsupported_conditions" in viol.counterexample
+    assert viol.counterexample["unsupported_conditions"][0]["operator"] == "ForAnyValue:StringEquals"
+
+
+def test_iam_bool_if_exists_mfa_bypass_and_conflict() -> None:
+    policy_if_exists = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowMfaIfExists",
+                "Effect": "Allow",
+                "Principal": "admin",
+                "Action": "iam:PassRole",
+                "Resource": "*",
+                "Condition": {"BoolIfExists": {"aws:MultiFactorAuthPresent": "true"}},
+            }
+        ],
+    }
+    findings_bypass = verify_iam_invariants(policy_if_exists)
+    by_bypass = {f.invariant_name: f for f in findings_bypass}
+    assert by_bypass["condition_bypass_access"].status == STATUS_SAT_VIOLATION
+    assert by_bypass["condition_bypass_access"].counterexample["mfa_key_present"] is False
+
+    # Conflicting Bool true + BoolIfExists false (T2-F2-05) must remain UNSAT_PROVEN
+    policy_conflict = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "ConflictingMfa",
+                "Effect": "Allow",
+                "Principal": {"AWS": "role/user"},
+                "Action": "iam:CreateUser",
+                "Resource": "*",
+                "Condition": {
+                    "Bool": {"aws:MultiFactorAuthPresent": "true"},
+                    "BoolIfExists": {"aws:MultiFactorAuthPresent": "false"},
+                },
+            }
+        ],
+    }
+    findings_conflict = verify_iam_invariants(policy_conflict)
+    assert all(f.status == STATUS_UNSAT_PROVEN for f in findings_conflict)
+
+
+def test_iam_ipaddress_and_notipaddress_cidr_semantics() -> None:
+    # Disjoint CIDRs: Allow 203.0.113.0/24 + Deny NotIpAddress 10.0.0.0/8 -> always denied -> UNSAT_PROVEN
+    disjoint_denied = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowTestNet",
+                "Effect": "Allow",
+                "Principal": "user",
+                "Action": "admin:users",
+                "Resource": "*",
+                "Condition": {"IpAddress": {"aws:SourceIp": "203.0.113.0/24"}},
+            },
+            {
+                "Sid": "DenyOutsideCorp",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "*",
+                "Resource": "*",
+                "Condition": {"NotIpAddress": {"aws:SourceIp": "10.0.0.0/8"}},
+            },
+        ],
+    }
+    findings_disjoint = verify_iam_invariants(disjoint_denied)
+    assert all(f.status == STATUS_UNSAT_PROVEN for f in findings_disjoint)
+
+    # Disjoint Allow/Deny IPv4 CIDRs -> Allow 10.0.0.0/8 not blocked by Deny 192.168.1.0/24 -> SAT_VIOLATION
+    allowed_v4 = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowCorp",
+                "Effect": "Allow",
+                "Principal": "user",
+                "Action": "admin:users",
+                "Resource": "*",
+                "Condition": {"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}},
+            },
+            {
+                "Sid": "DenyBranch",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "*",
+                "Resource": "*",
+                "Condition": {"IpAddress": {"aws:SourceIp": "192.168.1.0/24"}},
+            },
+        ],
+    }
+    findings_v4 = verify_iam_invariants(allowed_v4)
+    by_v4 = {f.invariant_name: f for f in findings_v4}
+    assert by_v4["unauthenticated_or_low_priv_admin_access"].status == STATUS_SAT_VIOLATION
+    assert "source_ip" in by_v4["unauthenticated_or_low_priv_admin_access"].counterexample
+
+    # IPv6 subnet parity: Allow 2001:db8:1::/48 inside Deny NotIpAddress 2001:db8::/32 -> SAT_VIOLATION
+    allowed_v6 = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowV6Sub",
+                "Effect": "Allow",
+                "Principal": "user",
+                "Action": "admin:users",
+                "Resource": "*",
+                "Condition": {"IpAddress": {"aws:SourceIp": "2001:db8:1::/48"}},
+            },
+            {
+                "Sid": "DenyOutsideV6",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "*",
+                "Resource": "*",
+                "Condition": {"NotIpAddress": {"aws:SourceIp": "2001:db8::/32"}},
+            },
+        ],
+    }
+    findings_v6 = verify_iam_invariants(allowed_v6)
+    by_v6 = {f.invariant_name: f for f in findings_v6}
+    assert by_v6["unauthenticated_or_low_priv_admin_access"].status == STATUS_SAT_VIOLATION
+    assert ":" in by_v6["unauthenticated_or_low_priv_admin_access"].counterexample["source_ip"]
+
+
+def test_string_false_boolean_coercion_openapi_and_state_machine() -> None:
+    oa_spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "StringFalseAPI", "version": "1.0.0"},
+        "components": {"securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}}},
+        "paths": {
+            "/accounts/{account_id}/billing": {
+                "get": {
+                    "security": [{"bearerAuth": []}],
+                    "x-tenant-isolated": "false",
+                    "parameters": [
+                        {"name": "account_id", "in": "path", "required": True, "schema": {"type": "string"}}
+                    ],
+                    "responses": {"200": {"description": "OK"}},
+                }
+            }
+        },
+    }
+    oa_ir = parse_openapi_spec(oa_spec)
+    assert oa_ir.endpoints[0].tenant_ownership_enforced is False
+    oa_findings = {f.invariant_name: f for f in verify_openapi_invariants(oa_ir)}
+    assert oa_findings["cross_tenant_idor_access"].status == STATUS_SAT_VIOLATION
+
+    sm_doc = {
+        "name": "string_false_sm",
+        "initial_state": "start",
+        "states": ["start", "admin_panel"],
+        "privileged_states": ["admin_panel"],
+        "transitions": [
+            {
+                "from": "start",
+                "to": "admin_panel",
+                "action": "enter_admin",
+                "required_auth": "false",
+                "guards": {"mfa": "false"},
+            }
+        ],
+    }
+    sm_ir = parse_state_machine(sm_doc)
+    assert sm_ir.transitions[0].required_auth is False
+    sm_findings = {f.invariant_name: f for f in verify_state_machine_invariants(sm_ir)}
+    assert sm_findings["unauthenticated_privileged_reachability"].status == STATUS_SAT_VIOLATION
+    assert sm_findings["low_privilege_escalation_reachability"].status == STATUS_SAT_VIOLATION
+
+
+def test_custom_non_privileged_role_member_idor_and_sm_escalation() -> None:
+    oa_spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "CustomRoleAPI", "version": "1.0.0"},
+        "components": {"securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}}},
+        "paths": {
+            "/tenants/{tenantId}/invoices": {
+                "get": {
+                    "security": [{"bearerAuth": []}],
+                    "x-required-role": ["member"],
+                    "parameters": [
+                        {"name": "tenantId", "in": "path", "required": True, "schema": {"type": "string"}}
+                    ],
+                    "responses": {"200": {"description": "OK"}},
+                }
+            }
+        },
+    }
+    oa_findings = {f.invariant_name: f for f in verify_openapi_invariants(oa_spec)}
+    assert oa_findings["cross_tenant_idor_access"].status == STATUS_SAT_VIOLATION
+    assert oa_findings["cross_tenant_idor_access"].counterexample["caller_role"] == "member"
+
+    sm_doc = {
+        "name": "custom_role_sm",
+        "initial_state": "home",
+        "states": ["home", "admin_panel"],
+        "privileged_states": ["admin_panel"],
+        "roles": ["member", "admin"],
+        "transitions": [
+            {
+                "from": "home",
+                "to": "admin_panel",
+                "action": "open_admin",
+                "required_auth": True,
+                "required_roles": ["member"],
+            }
+        ],
+    }
+    sm_findings = {f.invariant_name: f for f in verify_state_machine_invariants(sm_doc)}
+    assert sm_findings["low_privilege_escalation_reachability"].status == STATUS_SAT_VIOLATION
+
+
+def test_f4_weaponized_artifact_bypasses_and_report_sanitization() -> None:
+    adversarial_actions = [
+        "sh -c 'cat /etc/passwd'",
+        "python -c 'import os'",
+        "#!/usr/bin/env bash\nid",
+        "POST /admin HTTP/1.1\r\nHost: target\r\n\r\n",
+    ]
+    for bad_action in adversarial_actions:
+        ok, err = _validate_formal_model_dict(
+            {
+                "name": "bad_model",
+                "initial_state": "init",
+                "states": ["init", "admin"],
+                "transitions": [{"from": "init", "to": "admin", "action": bad_action}],
+            }
+        )
+        assert not ok, f"Expected rejection for action={bad_action!r}"
+        assert "disallowed" in (err or "").lower()
+
+    # Nested dict/guard values must also be inspected recursively
+    ok_nested, _ = _validate_formal_model_dict(
+        {
+            "name": "bad_nested",
+            "initial_state": "init",
+            "states": ["init", "admin"],
+            "transitions": [
+                {
+                    "from": "init",
+                    "to": "admin",
+                    "action": "safe_step",
+                    "guards": {"note": "POST /admin HTTP/1.1\r\nHost: target"},
+                }
+            ],
+        }
+    )
+    assert not ok_nested
+
+    # Report/EngineFinding/SARIF pervasive sanitization across title, counterexample, trace, remediation
+    dirty_finding = FormalVerificationFinding(
+        finding_id="Z3-TEST-1",
+        domain="state_machine",
+        invariant_name="unauthenticated_privileged_reachability",
+        status=STATUS_SAT_VIOLATION,
+        severity="HIGH",
+        cwe="CWE-306",
+        title="Unauth via curl http://127.0.0.1",
+        summary="Reached via sh -c 'id'",
+        counterexample={"action": "python -c 'print(1)'"},
+        trace=[{"step": 0, "next_action": "#!/usr/bin/env bash"}],
+        remediation="Do not run pwsh or HTTP/1.1 raw requests",
+    )
+    rep = FormalVerificationReport(
+        target="sanitized_target",
+        status=STATUS_SAT_VIOLATION,
+        findings=[dirty_finding],
+        violations_count=1,
+    )
+    _assert_defensive_only(rep)
+    ef = rep.to_engine_findings()[0]
+    assert not _WEAPONIZED_PATTERN.search(ef.title)
+    assert not _WEAPONIZED_PATTERN.search(json.dumps(ef.metadata, ensure_ascii=False))
+    sarif = rep.to_sarif()
+    sarif_str = json.dumps(sarif, ensure_ascii=False)
+    assert not _WEAPONIZED_PATTERN.search(sarif_str)
+    jsonschema.validate(instance=sarif, schema=_SARIF_MINIMAL_SCHEMA)
+
+
+def test_openapi_basepath_public_auth_and_privileged_segment_matching() -> None:
+    spec = {
+        "swagger": "2.0",
+        "info": {"title": "BasePath & Segment API", "version": "1.0.0"},
+        "host": "api.example.test",
+        "basePath": "/api/v1",
+        "definitions": {},
+        "parameters": {
+            "TenantId": {"name": "tenant_id", "in": "path", "required": True, "type": "string"},
+            "CyclicParam": {"$ref": "#/parameters/CyclicParam"},
+        },
+        "paths": {
+            "/login": {
+                "post": {
+                    "operationId": "loginUser",
+                    "security": [],
+                    "responses": {"200": {"description": "OK"}},
+                }
+            },
+            "/service-status": {
+                "get": {
+                    "operationId": "serviceStatus",
+                    "security": [],
+                    "responses": {"200": {"description": "OK"}},
+                }
+            },
+            "/tenants/{tenant_id}/items": {
+                "get": {
+                    "operationId": "listTenantItems",
+                    "parameters": [{"$ref": "#/parameters/TenantId"}, {"$ref": "#/parameters/CyclicParam"}],
+                    "responses": {"200": {"description": "OK"}},
+                }
+            },
+        },
+    }
+    ir = parse_openapi_spec(spec)
+    by_op = {ep.operation_id: ep for ep in ir.endpoints}
+    assert by_op["loginUser"].is_state_changing is False
+    assert by_op["loginUser"].is_privileged is False
+    assert by_op["serviceStatus"].is_privileged is False
+    assert by_op["listTenantItems"].is_tenant_scoped is True
+
+    findings = verify_openapi_invariants(ir)
+    unauth = [
+        f
+        for f in findings
+        if f.invariant_name == "unauthenticated_privileged_access" and f.status == STATUS_SAT_VIOLATION
+    ]
+    assert unauth == []
+
+
+# ---------------------------------------------------------------------------
+# 13+: Iteration 3 IAM Soundness & F4 Shell-Flag Regression Tests
+# ---------------------------------------------------------------------------
+
+
+def test_iam_wildcard_actions_privileged_vs_readonly() -> None:
+    for priv_action in ("s3:Delete*", "iam:Put*", "ec2:*", "s3:*", "*:Delete*"):
+        policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "OpenWildcard",
+                    "Effect": "Allow",
+                    "Principal": "anonymous",
+                    "Action": priv_action,
+                    "Resource": "*",
+                }
+            ],
+        }
+        findings = {f.invariant_name: f for f in verify_iam_invariants(policy)}
+        assert findings["unauthenticated_or_low_priv_admin_access"].status == STATUS_SAT_VIOLATION, (
+            f"Expected SAT_VIOLATION for wildcard action {priv_action!r}"
+        )
+
+    # Read-only s3:GetObject / s3:Get* must remain non-privileged on admin-access invariant
+    for ro_action in ("s3:GetObject", "s3:Get*", "read:profile"):
+        ro_policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "ReadOnlyAllow",
+                    "Effect": "Allow",
+                    "Principal": "anonymous",
+                    "Action": ro_action,
+                    "Resource": "*",
+                }
+            ],
+        }
+        ro_findings = {f.invariant_name: f for f in verify_iam_invariants(ro_policy)}
+        assert ro_findings["unauthenticated_or_low_priv_admin_access"].status == STATUS_UNSAT_PROVEN, (
+            f"Read-only action {ro_action!r} falsely flagged as privileged"
+        )
+
+
+def test_iam_custom_non_admin_principal_vs_admin_role() -> None:
+    member_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "MemberCreatesUsers",
+                "Effect": "Allow",
+                "Principal": {"AWS": "arn:aws:iam::123456789012:role/member"},
+                "Action": "iam:CreateUser",
+                "Resource": "*",
+            }
+        ],
+    }
+    member_findings = {f.invariant_name: f for f in verify_iam_invariants(member_policy)}
+    viol = member_findings["unauthenticated_or_low_priv_admin_access"]
+    assert viol.status == STATUS_SAT_VIOLATION
+    assert viol.counterexample["principal"] == "arn:aws:iam::123456789012:role/member"
+
+    for priv_principal in (
+        "arn:aws:iam::123456789012:role/AdminRole",
+        "arn:aws:iam::123456789012:root",
+        "arn:aws:iam::123456789012:role/AdministratorAccess",
+        "superuser",
+        "superadmin",
+        "system",
+        "service",
+        "operator",
+        "security",
+        "iam",
+        "billing",
+    ):
+        priv_policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "PrivilegedRole",
+                    "Effect": "Allow",
+                    "Principal": {"AWS": priv_principal},
+                    "Action": "iam:CreateUser",
+                    "Resource": "*",
+                }
+            ],
+        }
+        priv_findings = {f.invariant_name: f for f in verify_iam_invariants(priv_policy)}
+        assert priv_findings["unauthenticated_or_low_priv_admin_access"].status == STATUS_UNSAT_PROVEN, (
+            f"Privileged principal {priv_principal!r} falsely triggered low-priv escalation"
+        )
+
+
+def test_iam_stringlike_multi_witness_collision_avoidance() -> None:
+    # Allow team-* + Deny StringEquals team-val -> team-alpha etc. still permitted -> SAT_VIOLATION
+    p_eq_collision = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowTeamWildcard",
+                "Effect": "Allow",
+                "Principal": "user",
+                "Action": "admin:users",
+                "Resource": "*",
+                "Condition": {"StringLike": {"aws:userid": "team-*"}},
+            },
+            {
+                "Sid": "DenySingleVal",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "*",
+                "Resource": "*",
+                "Condition": {"StringEquals": {"aws:userid": "team-val"}},
+            },
+        ],
+    }
+    f_eq = {f.invariant_name: f for f in verify_iam_invariants(p_eq_collision)}
+    assert f_eq["unauthenticated_or_low_priv_admin_access"].status == STATUS_SAT_VIOLATION
+
+    # Allow user-* + Deny StringLike *-val -> user-alpha etc. still permitted -> SAT_VIOLATION
+    p_like_collision = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowUserWildcard",
+                "Effect": "Allow",
+                "Principal": "user",
+                "Action": "admin:users",
+                "Resource": "*",
+                "Condition": {"StringLike": {"aws:userid": "user-*"}},
+            },
+            {
+                "Sid": "DenySuffixVal",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "*",
+                "Resource": "*",
+                "Condition": {"StringLike": {"aws:userid": "*-val"}},
+            },
+        ],
+    }
+    f_like = {f.invariant_name: f for f in verify_iam_invariants(p_like_collision)}
+    assert f_like["unauthenticated_or_low_priv_admin_access"].status == STATUS_SAT_VIOLATION
+
+    # Universal Deny StringLike user-* against Allow StringLike user-* -> UNSAT_PROVEN
+    p_universal_deny = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowUserWildcard",
+                "Effect": "Allow",
+                "Principal": "user",
+                "Action": "admin:users",
+                "Resource": "*",
+                "Condition": {"StringLike": {"aws:userid": "user-*"}},
+            },
+            {
+                "Sid": "DenySameWildcard",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "*",
+                "Resource": "*",
+                "Condition": {"StringLike": {"aws:userid": "user-*"}},
+            },
+        ],
+    }
+    f_univ = verify_iam_invariants(p_universal_deny)
+    assert all(f.status == STATUS_UNSAT_PROVEN for f in f_univ)
+
+
+def test_f4_combined_shell_flags_rejected_and_sanitized() -> None:
+    combined_cmds = [
+        "bash -lc 'id'",
+        "sh -xc 'whoami'",
+        "zsh -lic 'env'",
+        "python3 -uc 'import os'",
+        "python -uc 'import sys'",
+    ]
+    for bad_cmd in combined_cmds:
+        ok, err = _validate_formal_model_dict(
+            {
+                "name": "bad_combined_flags",
+                "initial_state": "init",
+                "states": ["init", "admin"],
+                "transitions": [{"from": "init", "to": "admin", "action": bad_cmd}],
+            }
+        )
+        assert not ok, f"Expected F4 validation rejection for {bad_cmd!r}"
+        assert "disallowed" in (err or "").lower()
+
+    dirty = FormalVerificationFinding(
+        finding_id="Z3-TEST-FLAGS",
+        domain="state_machine",
+        invariant_name="unauthenticated_privileged_reachability",
+        status=STATUS_SAT_VIOLATION,
+        severity="HIGH",
+        cwe="CWE-306",
+        title="Unsafe bash -lc 'id' pattern",
+        summary="Sanitize sh -xc 'whoami' and python3 -uc 'import os'",
+        counterexample={"action": "bash -lc 'id'"},
+        remediation="Avoid python -uc 'import os'",
+    )
+    rep = FormalVerificationReport(
+        target="flag_sanitization",
+        status=STATUS_SAT_VIOLATION,
+        findings=[dirty],
+        violations_count=1,
+    )
+    _assert_defensive_only(rep)
+    sarif = rep.to_sarif()
+    assert not _WEAPONIZED_PATTERN.search(json.dumps(sarif, ensure_ascii=False))
+    jsonschema.validate(instance=sarif, schema=_SARIF_MINIMAL_SCHEMA)
+
+
 

@@ -464,7 +464,7 @@ def test_t1_f3_02_probe_optional_backends_schema() -> None:
     assert probe_alias is probe_optional_backends
 
     res = probe_optional_backends(lean_dir=REPO_ROOT / "formal" / "lean4")
-    expected = {
+    core_expected = {
         "docker",
         "wsl2",
         "lean4",
@@ -473,13 +473,12 @@ def test_t1_f3_02_probe_optional_backends_schema() -> None:
         "klee",
         "semgrep",
     }
-    assert set(res.keys()) == expected
-    for key in expected:
-        entry = res[key]
-        assert set(entry.keys()) >= {"available", "status", "reason", "path_or_module"}
-        assert isinstance(entry["available"], bool)
-        assert isinstance(entry["status"], str) and entry["status"]
-        assert isinstance(entry["reason"], str) and entry["reason"]
+    assert core_expected.issubset(res.keys())
+    for key, entry in res.items():
+        assert set(entry.keys()) >= {"available", "status", "reason", "path_or_module"}, key
+        assert isinstance(entry["available"], bool), key
+        assert isinstance(entry["status"], str) and entry["status"], key
+        assert isinstance(entry["reason"], str) and entry["reason"], key
 
 
 def test_t1_f3_03_run_symbolic_hook_angr_and_klee_contract(policy_guard_repo: Path) -> None:

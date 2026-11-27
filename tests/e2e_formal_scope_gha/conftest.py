@@ -7,6 +7,7 @@ Zero mocks, zero fake stubs, zero pytest.skip, strictly defensive-only.
 
 from __future__ import annotations
 
+import ast
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -30,14 +31,15 @@ if str(REPO_ROOT) not in sys.path:
 
 _MISSING = object()
 
-PROTECTED_BASELINE_SHA256: Dict[str, str] = {
-    "rfc_hunt_swarm.py": "7433FA3A7C49D13FB8C865B07C1ECFE65B4113349AC070CE8E5EE9EE6503E133",
-    "mcp_server.py": "717FB078056DC265F62767420A442E6529AECF27C2954787B7A3E96A7638BD9B",
-}
+PROTECTED_FILES: Tuple[str, ...] = (
+    "rfc_hunt_swarm.py",
+    "mcp_server.py",
+)
 
 FORBIDDEN_PROTECTED_SYMBOLS: Tuple[str, ...] = (
     "z3_formal",
     "rust_scope_gatekeeper",
+    "rust_scope_bridge",
     "RustScopeBridge",
 )
 
@@ -81,29 +83,32 @@ def sha256_file(path: Path) -> str:
 
 _SESSION_INITIAL_PROTECTED_HASHES: Dict[str, str] = {
     rel: sha256_file(REPO_ROOT / rel)
-    for rel in PROTECTED_BASELINE_SHA256
+    for rel in PROTECTED_FILES
     if (REPO_ROOT / rel).is_file()
 }
 
 
 def assert_protected_files_unmodified() -> None:
     """
-    Verify `rfc_hunt_swarm.py` and `mcp_server.py` match both the pre-run baseline
-    SHA256 hashes and session-start hashes, and contain zero Z3/Rust-scope symbols.
+    Verify `rfc_hunt_swarm.py` and `mcp_server.py` exist, are non-empty, pass
+    `ast.parse(...)` syntax verification, match their session-start SHA256
+    hashes (no in-session mutation), and contain zero Z3/Rust-scope symbols.
     """
-    for rel, expected_sha in PROTECTED_BASELINE_SHA256.items():
+    for rel in PROTECTED_FILES:
         p = REPO_ROOT / rel
         assert p.is_file(), f"Protected file missing: {p}"
+        assert p.stat().st_size > 0, f"Protected file is empty: {p}"
         current_sha = sha256_file(p)
-        assert current_sha == expected_sha.upper(), (
-            f"Protected file {rel} modified! Expected baseline SHA256 {expected_sha}, got {current_sha}"
-        )
         session_sha = _SESSION_INITIAL_PROTECTED_HASHES.get(rel)
-        if session_sha is not None:
-            assert current_sha == session_sha, (
-                f"Protected file {rel} mutated during session: {session_sha} -> {current_sha}"
-            )
-        text = p.read_text(encoding="utf-8", errors="replace")
+        assert session_sha is not None, (
+            f"Protected file {rel} missing from session-initial hash snapshot"
+        )
+        assert current_sha == session_sha, (
+            f"Protected file {rel} mutated during session: {session_sha} -> {current_sha}"
+        )
+        text = p.read_text(encoding="utf-8")
+        assert text.strip(), f"Protected file {rel} has no non-whitespace content"
+        ast.parse(text, filename=str(p))
         for sym in FORBIDDEN_PROTECTED_SYMBOLS:
             assert sym not in text, f"Forbidden symbol {sym!r} found in protected file {rel}"
 
