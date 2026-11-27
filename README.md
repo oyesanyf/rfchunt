@@ -848,19 +848,22 @@ RFCHunt integrates pure-Python stdlib ML pipelines (adapted from ACDSO with zero
 - **Hybrid `/boost` Decision Adapter (`engine/boost_decision_adapter.py`)**: Strict `<= 400ms` health probes against local ModelFusion (`:5000`) / Ollama (`:11434`) with deterministic local fallback for Pareto near-ties (`<= 0.02`) and top-3 Stage 3 anti-slop stress testing (never overriding `poc_verified`, Lean 4, Z3, or differential oracle proofs).
 - **Unified Master CLI (`rfc_hunt_swarm.py`) & Agent MCP Tools (`mcp_server.py`, `bugbounty_mcp_server.py`)**:
   - **Single Master Entrypoint (`rfc_hunt_swarm.py`)**: Calls everything in RFCHunt from one command:
-    - Pass `--hunt` (+ `--dry-run`, `--sync-public-directory`, `--once`, `--headless-only`, `--embedded`, `--no-llm`, `--target`, `--repo`, `--program`, `--install-schedule`) to run the turnkey autonomous bug bounty pipeline (`python hunt.py` remains available as a thin alias).
-    - Omit `--hunt` to run regular pentests (`--all`, `--all --ensemble`, `--host`, `--deep-audit`, `--proxy`, `--poc`, `--raptor`, `--mantis`, `--phi`, `--crlf-desync`, `--web-llm`, `--pe-audit`) — and BOTH `--all` and `--ensemble` automatically run ALL local defensive tools (TruffleHog, Mobile/MobSF, API/JWT/SD-JWT, AI Infra Guard, Parity/Invariants, Zizmor/Actionlint/GHA Agent, Z3 Formal, JS Bundle Analyzer + Recon Clustering, Lean 4 Formal Verifier, and ACDSO Stage-2 Pareto ranking) even without `--hunt`.
+    - Pass `--hunt` (+ `--hunt-url`, `--browser-hunt`/`--no-browser-hunt`, `--browser-profile`, `--cdp-url`, `--login-timeout`, `--probe-report-id`, `--swarm`, `--swarm-workers`, `--repo`, `--folder`, `--clone-unlocked`/`--no-clone-unlocked`, `--dry-run`, `--sync-public-directory`, `--once`, `--headless-only`, `--embedded`, `--no-llm`, `--target`, `--program`, `--install-schedule`) to open the official bug hunt URL (`https://hackerone.com/opportunities/all` by default), wait for you to sign in (human handles login/2FA/CAPTCHA), automatically perform every `/browser` workflow (inbox, cooldown `can_submit_draft?`, Signal sync, unlocked program/scope/GitHub repo discovery), run all RFCHunt + ModelFusion + Lean 4 scanners in parallel, and stage verified QA-PASS drafts up to your manual Submit click (`python hunt.py` remains available as a thin alias).
+    - Pass `--swarm` (+ `--swarm-workers N`) standalone on local repos/folders (`--all` + `--ensemble` + `--fast-ooda` + `--swarm-board`), combined with `--hunt` for parallel multi-target auditing, or against an authorized `--host` for the 12-agent LangGraph protocol swarm.
+    - Omit `--hunt` to run regular pentests (`--all`, `--all --ensemble`, `--swarm`, `--host`, `--deep-audit`, `--proxy`, `--poc`, `--raptor`, `--mantis`, `--phi`, `--crlf-desync`, `--web-llm`, `--pe-audit`) — and BOTH `--all` and `--ensemble` automatically run ALL local defensive tools (TruffleHog, Mobile/MobSF, API/JWT/SD-JWT, AI Infra Guard, Parity/Invariants, Zizmor/Actionlint/GHA Agent, Z3 Formal, JS Bundle Analyzer + Recon Clustering, Lean 4 Formal Verifier, and ACDSO Stage-2 Pareto ranking) even without `--hunt`.
   - **First-Class MCP Agent Tools**: Both `bugbounty_mcp_server.py` (`bb_run_autonomous_hunt`, `bb_sync_public_directory`, `bb_qa_drafts`, `bb_check_drafts`, `bb_rank_programs`, `bb_score_fresh_commits`, `bb_cluster_recon_assets`, `bb_analyze_js_bundles`, `bb_classify_http_responses`, `bb_record_hunt_outcome`, `bb_atlas_llm_eval`, `bb_freshness_watch`, `bb_run_fast_ooda`, `bb_stage_hackerone_draft`) and `mcp_server.py` (`run_autonomous_hunt`, `run_fast_ooda`, `rank_bounty_programs`, `sync_hackerone_directory`, `score_fresh_commits`, `cluster_recon_assets`, `analyze_js_bundles`, `classify_http_responses`, `qa_bounty_drafts`, `check_bounty_drafts`) expose every capability to autonomous IDE/LLM agents.
 
 ```powershell
-# 0. SINGLE MASTER CLI (`rfc_hunt_swarm.py`) — Autonomous Hunt Mode (--hunt) & Regular Pentest Mode (without --hunt):
+# 0. SINGLE MASTER CLI (`rfc_hunt_swarm.py`) — Interactive Browser Hunt (--hunt), Parallel Swarm (--swarm) & Regular Pentest:
+python rfc_hunt_swarm.py --hunt --hunt-url https://hackerone.com/opportunities/all --swarm --swarm-workers 4
+python rfc_hunt_swarm.py --hunt --hunt-url https://hackerone.com/anthropic --cdp-url http://127.0.0.1:9222 --dry-run
 python rfc_hunt_swarm.py --hunt --sync-public-directory --dry-run
-python rfc_hunt_swarm.py --hunt --sync-public-directory --once
-python rfc_hunt_swarm.py --hunt --repo D:\path\to\repo --folder D:\path\to\folder --clone-unlocked --dry-run
+python rfc_hunt_swarm.py --hunt --repo D:\path\to\repo --folder D:\path\to\folder --clone-unlocked --swarm --dry-run
 python rfc_hunt_swarm.py --all --repo D:\path\to\repo --folder D:\path\to\folder --hunt --clone-unlocked --dry-run
 python rfc_hunt_swarm.py --hunt --repo anthropics/claude-code --folder D:\path\to\folder --program anthropic --once --headless-only
 
-# Regular Pentest (without --hunt) — --all, --ensemble & --fast-ooda run ALL tools + ModelFusion + ACDSO + Lean 4/Z3:
+# Regular Pentest & Swarm (without --hunt) — --swarm, --all, --ensemble & --fast-ooda run ALL tools + ModelFusion + ACDSO + Lean 4/Z3:
+python rfc_hunt_swarm.py --swarm --repo D:\path\to\repo --folder D:\path\to\folder --swarm-workers 4 --dry-run
 python rfc_hunt_swarm.py --all --repo D:\path\to\repo --dry-run
 python rfc_hunt_swarm.py --all --repo D:\path\to\repo --start-modelfusion
 python rfc_hunt_swarm.py --all --ensemble --fast-ooda --repo D:\path\to\repo --program generic

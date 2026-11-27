@@ -54,10 +54,13 @@ if str(RFCHUNT_ROOT) not in sys.path:
 
 import shutil
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from engine.hackerone_porter import (
+    DEFAULT_BUG_HUNT_URL,
     HackerOneComputerUsePorter,
     HackerOnePorter,
+    validate_bug_hunt_url,
     validate_hackerone_url,
 )
 from engine.program_eligibility_db import ProgramEligibilityDB
@@ -75,6 +78,91 @@ _SECRET_LEAK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 _HTML_ENTITY_LEAK_RE = re.compile(r"&(?:lt|gt|amp|quot);")
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffd]")
+
+# Operational Markdown files (queues, summaries, QA dashboards, PoC transcripts, client bundles)
+# that are NOT HackerOne vulnerability report drafts and must be excluded from `qa-drafts`.
+NON_DRAFT_MD_NAMES: frozenset[str] = frozenset(
+    {
+        "latest_summary.md",
+        "drafts_ready_to_submit.md",
+        "qa_draft_audit.md",
+        "cycle_qa_audit.md",
+        "ready_to_click_submit.md",
+        "fresh_hunt_queue.md",
+        "ensemble_audit_report.md",
+        "ensemble_summary.md",
+        "executive_summary.md",
+        "01_executive_summary.md",
+        "02_technical_findings.md",
+        "poc_transcript.md",
+        "remediation_roadmap.md",
+        "validation_checklist.md",
+        "readme.md",
+    }
+)
+NON_DRAFT_MD_PREFIXES: tuple[str, ...] = (
+    "fresh_hunt_queue",
+    "poc_transcript",
+    "cycle_qa_",
+    "qa_draft_",
+)
+NON_DRAFT_PARENT_DIRS: frozenset[str] = frozenset(
+    {
+        "client_audit_bundle",
+        "repos_cache",
+        "h1_browser_profile",
+        ".git",
+    }
+)
+NON_DRAFT_HEADING_PREFIXES: tuple[str, ...] = (
+    "# rfchunt daily fresh hunt queue",
+    "# rfchunt autonomous hunt summary",
+    "# rfchunt ensemble security audit summary",
+    "# hackerone draft quality assurance",
+    "# ready to review & click submit",
+    "# security audit executive summary",
+    "# technical security findings",
+)
+
+
+def is_non_draft_markdown(
+    md_path: Path,
+    markdown_text: str | None = None,
+    *,
+    base_dir: Path | None = None,
+) -> bool:
+    """
+    Returns True when a Markdown file is an operational queue, cycle summary, QA report,
+    client bundle document, or PoC transcript rather than a HackerOne vulnerability draft.
+    Prevents Stage 5 `qa-drafts --strict` from flagging `fresh_hunt_queue.md` (and variants)
+    for missing HackerOne report headings.
+    """
+    name_low = md_path.name.lower()
+    if name_low in NON_DRAFT_MD_NAMES:
+        return True
+    if any(name_low.startswith(prefix) for prefix in NON_DRAFT_MD_PREFIXES):
+        return True
+
+    parent_parts: tuple[str, ...]
+    if base_dir is not None:
+        try:
+            parent_parts = md_path.relative_to(base_dir).parts[:-1]
+        except ValueError:
+            parent_parts = md_path.parts[:-1]
+    else:
+        parent_parts = md_path.parts[:-1]
+    if any(part.lower() in NON_DRAFT_PARENT_DIRS for part in parent_parts):
+        return True
+
+    if markdown_text is not None:
+        for raw_line in markdown_text.splitlines():
+            stripped = raw_line.strip().lower()
+            if not stripped:
+                continue
+            if any(stripped.startswith(h) for h in NON_DRAFT_HEADING_PREFIXES):
+                return True
+            break
+    return False
 
 
 def utc_now_iso() -> str:
@@ -556,6 +644,70 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
     steps: list[dict[str, Any]] = []
     targets_to_audit: list[tuple[str, Path]] = []
 
+    # Stage 0A: Interactive Browser Hunt Session (opens --hunt-url, waits for human login/2FA/CAPTCHA,
+    # syncs inbox/cooldown `can_submit_draft?`/Signal, discovers unlocked programs & GitHub repos)
+    raw_hunt_url = str(getattr(args, "hunt_url", None) or DEFAULT_BUG_HUNT_URL).strip()
+    browser_hunt_active = (
+        bool(getattr(args, "browser_hunt", False))
+        and not bool(getattr(args, "no_browser_hunt", False))
+        and not args.embedded
+    )
+    if browser_hunt_active or raw_hunt_url != DEFAULT_BUG_HUNT_URL:
+        # Fail closed on untrusted/non-bounty URLs even in --dry-run
+        validate_bug_hunt_url(raw_hunt_url)
+
+    browser_hunt_session: dict[str, Any] = {
+        "status": "disabled",
+        "browser_launched": False,
+        "hunt_url": raw_hunt_url,
+        "auto_submit_forbidden": True,
+        "captcha_bypass_forbidden": True,
+        "final_submit_blocked_for_hitl": True,
+        "discovered_repos": [],
+        "unlocked_programs": [],
+    }
+    if browser_hunt_active:
+        browser_hunt_session = HackerOneComputerUsePorter().run_interactive_browser_hunt_session(
+            hunt_url=raw_hunt_url,
+            cdp_url=getattr(args, "cdp_url", None),
+            profile_dir=getattr(args, "browser_profile", None),
+            login_timeout_sec=float(getattr(args, "login_timeout", 300.0) or 300.0),
+            max_programs=max(4, int(getattr(args, "portfolio_capacity", 6) or 6) * 2),
+            probe_report_id=int(getattr(args, "probe_report_id", 4243972) or 4243972),
+            eligibility_db_path=args.eligibility_db,
+            draft_tracker_db_path=(out_root / "draft_submit_tracker.sqlite3" if not args.dry_run else None),
+            dry_run=args.dry_run,
+        )
+        b_status = str(browser_hunt_session.get("status") or "")
+        steps.append(
+            {
+                "label": "stage0_interactive_browser_hunt",
+                "status": "dry_run_planned"
+                if args.dry_run
+                else (
+                    "ok"
+                    if b_status
+                    in (
+                        "browser_hunt_session_completed",
+                        "playwright_not_installed_manual_ready",
+                        "login_timeout_hitl_required",
+                    )
+                    else "error"
+                ),
+                "exit_code": 0,
+                "hunt_url": browser_hunt_session.get("hunt_url", raw_hunt_url),
+                "browser_status": b_status,
+                "discovered_repos_count": int(browser_hunt_session.get("discovered_repos_count") or 0),
+                "unlocked_programs_count": int(browser_hunt_session.get("unlocked_programs_count") or 0),
+            }
+        )
+        live_sig = browser_hunt_session.get("signal_score")
+        if live_sig is not None and not isinstance(live_sig, bool):
+            try:
+                args.signal_score = float(live_sig)
+            except (TypeError, ValueError):
+                pass
+
     # Stage 0.2: Optional Public HackerOne Program Directory Sync (newest launches, >=min_efficiency%)
     if getattr(args, "sync_public_directory", False) and not args.embedded:
         sync_cmd = [
@@ -672,11 +824,25 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
             )
         )
 
-    # Shallow-clone explicit `--repo owner/repo` slugs and (when `--clone-unlocked`) unlocked watchlist repos
+    # Shallow-clone explicit `--repo owner/repo` slugs, browser-discovered unlocked repos,
+    # and (when `--clone-unlocked`) unlocked watchlist repos
     explicit_repo_items = [
         {"program": validate_program_handle(args.program), "repo": validate_repo_slug(r)}
         for r in (args.repos or [])
     ]
+    for disc in browser_hunt_session.get("discovered_repos") or []:
+        if not isinstance(disc, dict):
+            continue
+        d_repo = str(disc.get("repo") or "").strip()
+        d_prog = str(disc.get("program") or args.program or "generic").strip()
+        if not d_repo:
+            continue
+        try:
+            explicit_repo_items.append(
+                {"program": validate_program_handle(d_prog), "repo": validate_repo_slug(d_repo)}
+            )
+        except ValueError:
+            continue
     if (args.clone_unlocked or explicit_repo_items) and not args.embedded:
         repos_cache = out_root / "repos_cache"
         wl_items: list[dict[str, str]] = []
@@ -745,28 +911,33 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
     # Stage 2 & Stage 3: Fast 3-Stage OODA + Exhaustive Multi-Engine Ensemble Audit per eligible target
     per_target_results: list[dict[str, Any]] = []
     blackboard_db = str(Path(args.blackboard_db).resolve()) if args.blackboard_db else str(out_root / "blackboard.sqlite3")
+    swarm_enabled = bool(getattr(args, "swarm", False))
+    raw_sw = getattr(args, "swarm_workers", None)
+    eff_swarm_workers = (
+        max(1, min(8, int(raw_sw)))
+        if raw_sw is not None
+        else min(4, max(2, (os.cpu_count() or 2) // 2))
+    )
 
-    for idx, (prog, target_dir) in enumerate(targets_to_audit, start=1):
+    def _audit_single_target(idx: int, prog: str, target_dir: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        local_steps: list[dict[str, Any]] = []
         eligible, elig_reason = check_program_eligibility(
             prog,
             eligibility_db_path=args.eligibility_db,
             allow_blocked=args.allow_blocked,
         )
         if not eligible:
-            per_target_results.append(
-                {
-                    "program": prog,
-                    "target": str(target_dir),
-                    "status": "skipped_ineligible",
-                    "reason": elig_reason,
-                }
-            )
-            continue
+            return local_steps, {
+                "program": prog,
+                "target": str(target_dir),
+                "status": "skipped_ineligible",
+                "reason": elig_reason,
+            }
 
         t_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{idx}_{prog}_{target_dir.name}")[:64]
         t_out = cycle_dir / t_slug
 
-        # Stage 2: Fast 3-Stage OODA Funnel (Loop 3 + Loop 4 Auto-PoC Gate; zero browser)
+        # Stage 2: Fast 3-Stage OODA Funnel (Loop 3 + Loop 4 Auto-PoC Gate)
         ooda_cmd = [
             sys.executable,
             str(RFCHUNT_ROOT / "rfc_hunt_swarm.py"),
@@ -803,7 +974,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
             timeout_sec=args.step_timeout_sec,
             dry_run=args.dry_run,
         )
-        steps.append(ooda_res)
+        local_steps.append(ooda_res)
 
         # Stage 3: Exhaustive Multi-Engine Violation & Security Audit (`--all --ensemble` + SARIF)
         ens_res: dict[str, Any] | None = None
@@ -851,18 +1022,17 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
                 timeout_sec=args.step_timeout_sec,
                 dry_run=args.dry_run,
             )
-            steps.append(ens_res)
+            local_steps.append(ens_res)
 
-        per_target_results.append(
-            {
-                "program": prog,
-                "target": str(target_dir),
-                "eligibility": elig_reason,
-                "fast_ooda_status": ooda_res["status"],
-                "ensemble_audit_status": ens_res["status"] if ens_res else "skipped",
-                "output_dir": str(t_out),
-            }
-        )
+        t_res: dict[str, Any] = {
+            "program": prog,
+            "target": str(target_dir),
+            "eligibility": elig_reason,
+            "fast_ooda_status": ooda_res["status"],
+            "ensemble_audit_status": ens_res["status"] if ens_res else "skipped",
+            "output_dir": str(t_out),
+            "swarm_parallel": swarm_enabled,
+        }
 
         # Stage 3.5: Auto-Port verified findings into QA-checked, secret/PHI-redacted HackerOne drafts
         if not args.dry_run:
@@ -878,8 +1048,31 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
                     dry_run=False,
                     enforce_eligibility=(not args.allow_blocked and prog != "generic"),
                 )
-                per_target_results[-1]["ported_drafts_count"] = int(port_res.get("eligible_drafts_count") or 0)
-                per_target_results[-1]["ported_drafts"] = list(port_res.get("drafts") or [])
+                t_res["ported_drafts_count"] = int(port_res.get("eligible_drafts_count") or 0)
+                t_res["ported_drafts"] = list(port_res.get("drafts") or [])
+
+        return local_steps, t_res
+
+    if swarm_enabled and len(targets_to_audit) > 1 and not args.dry_run:
+        indexed_out: dict[int, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
+        max_w = min(eff_swarm_workers, len(targets_to_audit))
+        with ThreadPoolExecutor(max_workers=max_w) as pool:
+            futs = {
+                pool.submit(_audit_single_target, idx, prog, target_dir): idx
+                for idx, (prog, target_dir) in enumerate(targets_to_audit, start=1)
+            }
+            for fut in as_completed(futs):
+                orig_idx = futs[fut]
+                indexed_out[orig_idx] = fut.result()
+        for orig_idx in sorted(indexed_out):
+            l_steps, t_res = indexed_out[orig_idx]
+            steps.extend(l_steps)
+            per_target_results.append(t_res)
+    else:
+        for idx, (prog, target_dir) in enumerate(targets_to_audit, start=1):
+            l_steps, t_res = _audit_single_target(idx, prog, target_dir)
+            steps.extend(l_steps)
+            per_target_results.append(t_res)
 
     # Stage 4: Lean 4 Formal Proof Kernel Verification
     if not args.skip_lean:
@@ -901,27 +1094,22 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
     staged_browser_drafts: list[dict[str, Any]] = []
 
     draft_dirs = [cycle_dir, RFCHUNT_ROOT / "reports" / "hackerone"]
-    non_draft_md_names = {
-        "latest_summary.md",
-        "drafts_ready_to_submit.md",
-        "qa_draft_audit.md",
-        "cycle_qa_audit.md",
-        "ready_to_click_submit.md",
-        "fresh_hunt_queue.md",
-        "ensemble_audit_report.md",
-        "ensemble_summary.md",
-        "executive_summary.md",
-        "remediation_roadmap.md",
-        "validation_checklist.md",
-        "readme.md",
-    }
+    program_by_draft_path: dict[str, str] = {}
+    for tr in per_target_results:
+        prog_h = str(tr.get("program") or "").strip()
+        for d_item in tr.get("ported_drafts") or []:
+            if isinstance(d_item, dict):
+                mp = str(d_item.get("markdown_path") or "").strip()
+                if mp and not mp.startswith("[dry-run]") and prog_h:
+                    program_by_draft_path[str(Path(mp).resolve())] = prog_h
+
     seen_md: set[Path] = set()
     qa_status_by_path: dict[str, str] = {}
     for d_root in draft_dirs:
         if not d_root.is_dir():
             continue
         for md_path in sorted(d_root.rglob("*.md")):
-            if md_path.name.lower() in non_draft_md_names:
+            if is_non_draft_markdown(md_path, base_dir=d_root):
                 continue
             if md_path in seen_md:
                 continue
@@ -932,12 +1120,17 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
                 md_text = md_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
+            if is_non_draft_markdown(md_path, md_text, base_dir=d_root):
+                continue
             v_list = scan_draft_safety_violations(md_text)
             if v_list:
                 draft_violations.append({"file": str(md_path), "violations": v_list})
 
             qa_passed = len(v_list) == 0
             if not args.skip_qa_drafts:
+                eff_prog = validate_program_handle(
+                    program_by_draft_path.get(str(md_path.resolve()), args.program)
+                )
                 qa_cmd = [
                     sys.executable,
                     str(RFCHUNT_ROOT / "rfc_hunt_swarm.py"),
@@ -945,9 +1138,11 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
                     "--markdown-file",
                     str(md_path),
                     "--program",
-                    validate_program_handle(args.program),
+                    eff_prog,
                     "--db",
                     str(cycle_dir / "cycle_qa_tracker.sqlite3"),
+                    "--submit-db",
+                    "",
                     "--out-md",
                     str(cycle_dir / "cycle_qa_audit.md"),
                     "--out-edit-queue",
@@ -1076,8 +1271,13 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
         "started_utc": cycle_started,
         "finished_utc": utc_now_iso(),
         "dry_run": bool(args.dry_run),
-        "browser_used": bool(staged_browser_drafts),
+        "browser_used": bool(staged_browser_drafts) or bool(browser_hunt_session.get("browser_launched")),
+        "browser_hunt_enabled": bool(browser_hunt_active),
+        "browser_hunt_session": browser_hunt_session,
+        "swarm_enabled": swarm_enabled,
+        "swarm_workers": eff_swarm_workers,
         "auto_submit_forbidden": True,
+        "captcha_bypass_forbidden": True,
         "anti_junk_guard_enabled": True,
         "modelfusion_endpoint": mf_endpoint,
         "modelfusion_reachable": mf_reachable,
@@ -1222,6 +1422,49 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-qa-drafts", action="store_true", default=False)
     p.add_argument("--skip-check-drafts", action="store_true", default=False)
     p.add_argument(
+        "--browser-hunt",
+        action="store_true",
+        default=False,
+        help="Open --hunt-url in visible Chromium, wait for human login/2FA/CAPTCHA, sync inbox/cooldown/Signal, discover unlocked scopes & GitHub repos, and stage verified drafts (NEVER clicks Submit).",
+    )
+    p.add_argument(
+        "--no-browser-hunt",
+        action="store_true",
+        default=False,
+        help="Disable opening --hunt-url in interactive browser mode.",
+    )
+    p.add_argument(
+        "--hunt-url",
+        "--bug-hunt-url",
+        dest="hunt_url",
+        default=DEFAULT_BUG_HUNT_URL,
+        help=f"Official bug bounty directory or program URL opened by --browser-hunt (default: {DEFAULT_BUG_HUNT_URL}).",
+    )
+    p.add_argument(
+        "--login-timeout",
+        type=float,
+        default=300.0,
+        help="Seconds to wait for human login/2FA/CAPTCHA during --browser-hunt (default: 300).",
+    )
+    p.add_argument(
+        "--probe-report-id",
+        type=int,
+        default=4243972,
+        help="HackerOne draft report ID probed read-only for cooldown `can_submit_draft?` status (default: 4243972).",
+    )
+    p.add_argument(
+        "--swarm",
+        action="store_true",
+        default=False,
+        help="Enable parallel multi-agent swarm auditing across discovered and local targets.",
+    )
+    p.add_argument(
+        "--swarm-workers",
+        type=int,
+        default=None,
+        help="Bounded concurrent target swarm workers when --swarm is active (1..8).",
+    )
+    p.add_argument(
         "--stage-drafts",
         action="store_true",
         default=False,
@@ -1274,7 +1517,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     last_exit = 0
     while True:
         cycle_num += 1
-        summary = execute_hunt_cycle(args, cycle_num)
+        try:
+            summary = execute_hunt_cycle(args, cycle_num)
+        except (PermissionError, ValueError) as exc:
+            print(f"[SAFETY BLOCK] {exc}", file=sys.stderr)
+            return 1
         if args.json_out:
             print(json.dumps(summary, indent=2))
         else:

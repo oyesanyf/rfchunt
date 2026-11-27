@@ -117,6 +117,24 @@ def build_hunt_argv(ns: argparse.Namespace) -> list[str]:
         argv.append("--no-llm")
     if ns.allow_blocked:
         argv.append("--allow-blocked")
+    if getattr(ns, "hunt_url", None):
+        argv.extend(["--hunt-url", str(ns.hunt_url)])
+    if getattr(ns, "browser_profile", None):
+        argv.extend(["--browser-profile", str(ns.browser_profile)])
+    if getattr(ns, "cdp_url", None):
+        argv.extend(["--cdp-url", str(ns.cdp_url)])
+    if getattr(ns, "login_timeout", None) is not None and float(ns.login_timeout) != 300.0:
+        argv.extend(["--login-timeout", str(float(ns.login_timeout))])
+    if getattr(ns, "probe_report_id", None) is not None and int(ns.probe_report_id) != 4243972:
+        argv.extend(["--probe-report-id", str(int(ns.probe_report_id))])
+    if getattr(ns, "swarm", False):
+        argv.append("--swarm")
+    if getattr(ns, "swarm_workers", None) is not None:
+        argv.extend(["--swarm-workers", str(max(1, int(ns.swarm_workers)))])
+    if getattr(ns, "no_browser_hunt", False):
+        argv.append("--no-browser-hunt")
+    elif getattr(ns, "browser_hunt", False) or (not ns.headless_only and not ns.embedded):
+        argv.append("--browser-hunt")
     if not ns.headless_only:
         argv.extend(["--stage-drafts", "--open-chrome"])
     if not ns.once and not ns.dry_run:
@@ -228,7 +246,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--interval-minutes", type=float, default=60.0, help="Minutes between cycles (default: 60).")
     p.add_argument("--max-cycles", type=int, default=0, help="Stop after N cycles (0 = run continuously).")
     p.add_argument("--once", action="store_true", default=False, help="Run one complete cycle and exit.")
-    p.add_argument("--headless-only", action="store_true", default=False, help="Do not stage drafts or open Chrome; write READY_TO_CLICK_SUBMIT.md only.")
+    p.add_argument("--hunt-url", "--bug-hunt-url", dest="hunt_url", default=None, help="Official bug bounty URL opened in browser for human login + discovery (default: https://hackerone.com/opportunities/all).")
+    p.add_argument("--browser-hunt", action="store_true", default=False, help="Open --hunt-url in Chromium, wait for login/2FA/CAPTCHA, sync inbox/cooldown/scopes, and stage verified drafts.")
+    p.add_argument("--no-browser-hunt", action="store_true", default=False, help="Disable interactive browser login/discovery phase on --hunt-url.")
+    p.add_argument("--browser-profile", default=None, help="Persistent local Chromium profile directory so login persists across cycles.")
+    p.add_argument("--cdp-url", default=None, help="Attach to an already-logged-in Chrome / HugOS Browser CDP endpoint (e.g. http://127.0.0.1:9222).")
+    p.add_argument("--login-timeout", type=float, default=300.0, help="Seconds to wait for human login/2FA/CAPTCHA in browser (default: 300).")
+    p.add_argument("--probe-report-id", type=int, default=4243972, help="HackerOne report ID probed read-only for cooldown can_submit_draft? status (default: 4243972).")
+    p.add_argument("--swarm", action="store_true", default=False, help="Enable parallel multi-agent swarm auditing across discovered and local targets.")
+    p.add_argument("--swarm-workers", type=int, default=None, help="Bounded concurrent swarm target workers (1..8).")
+    p.add_argument("--headless-only", action="store_true", default=False, help="Do not open browser, stage drafts, or launch Chrome; write READY_TO_CLICK_SUBMIT.md only.")
     p.add_argument("--model", default=None, help="Explicit abliterated Ollama model override.")
     p.add_argument("--out", default="out/autonomous_hunt", help="Output directory (default: out/autonomous_hunt).")
     p.add_argument("--embedded", action="store_true", default=False, help="Offline deterministic checks only.")

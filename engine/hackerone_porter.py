@@ -52,16 +52,32 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 
 from engine.advisory_exporter import _redact_inline_tokens
 
 HACKERONE_BASE_URL = "https://hackerone.com"
 HACKERONE_API_BASE_URL = "https://api.hackerone.com/v1"
 HACKERONE_ALLOWED_HOSTS = frozenset({"hackerone.com", "www.hackerone.com", "api.hackerone.com"})
+DEFAULT_BUG_HUNT_URL = "https://hackerone.com/opportunities/all"
+BUG_BOUNTY_ALLOWED_HOSTS = frozenset(
+    {
+        "hackerone.com",
+        "www.hackerone.com",
+        "api.hackerone.com",
+        "bugcrowd.com",
+        "www.bugcrowd.com",
+        "immunefi.com",
+        "www.immunefi.com",
+        "intigriti.com",
+        "app.intigriti.com",
+    }
+)
 ALLOWED_SOURCE_REPO_HOSTS = frozenset({"github.com", "gitlab.com", "bitbucket.org"})
 
 _SEVERITY_RANK: Dict[str, int] = {
@@ -144,6 +160,400 @@ def validate_hackerone_url(url: str) -> str:
     if parsed.scheme != "https" or (parsed.hostname or "").lower() not in HACKERONE_ALLOWED_HOSTS:
         raise PermissionError(f"Refusing non-HackerOne URL: {url!r}")
     return str(url).strip()
+
+
+def validate_bug_hunt_url(url: str) -> str:
+    """
+    Enforces strict HTTPS origin pinning for interactive `--hunt --hunt-url` browser sessions.
+    Only official bug bounty platforms (`hackerone.com`, `bugcrowd.com`, `immunefi.com`,
+    `intigriti.com`) are permitted; fails closed with `PermissionError` on any other URL.
+    """
+    raw = str(url or "").strip()
+    if not raw or any(ch in raw for ch in ("\r", "\n", "\x00")):
+        raise PermissionError(f"Refusing empty or control-character bug hunt URL: {url!r}")
+    parsed = urllib.parse.urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    if parsed.username or parsed.password:
+        raise PermissionError(f"Refusing URL with embedded credentials: {url!r}")
+    if parsed.scheme != "https" or host not in BUG_BOUNTY_ALLOWED_HOSTS:
+        raise PermissionError(
+            f"Refusing untrusted bug hunt URL {url!r}; allowed hosts: {sorted(BUG_BOUNTY_ALLOWED_HOSTS)}"
+        )
+    return raw
+
+
+_NON_REPO_GITHUB_OWNERS = frozenset(
+    {
+        "about",
+        "account",
+        "apps",
+        "blog",
+        "collections",
+        "contact",
+        "customer-stories",
+        "enterprise",
+        "events",
+        "explore",
+        "features",
+        "issues",
+        "join",
+        "login",
+        "logout",
+        "marketplace",
+        "new",
+        "notifications",
+        "orgs",
+        "organizations",
+        "pricing",
+        "pulls",
+        "readme",
+        "search",
+        "security",
+        "sessions",
+        "settings",
+        "signup",
+        "site",
+        "solutions",
+        "sponsors",
+        "team",
+        "topics",
+        "trending",
+        "users",
+    }
+)
+
+_NON_PROGRAM_H1_PATHS = frozenset(
+    {
+        "auth",
+        "bugs",
+        "careers",
+        "customers",
+        "directory",
+        "disclosure-guidelines",
+        "graphql",
+        "hacktivity",
+        "inbox",
+        "leaderboard",
+        "login",
+        "notifications",
+        "opportunities",
+        "organizations",
+        "privacy",
+        "product",
+        "reports",
+        "resources",
+        "security",
+        "settings",
+        "sign_in",
+        "sign_up",
+        "terms",
+        "users",
+    }
+)
+
+
+def _extract_repo_slug_from_url(url: str) -> Optional[Tuple[str, str]]:
+    """Extracts `(canonical_https_url, 'owner/repo')` from a trusted source repo URL, or None."""
+    try:
+        clean_url = validate_source_repo_url(url)
+    except (PermissionError, ValueError):
+        return None
+    parsed = urllib.parse.urlparse(clean_url)
+    parts = [p for p in parsed.path.split("/") if p]
+    if len(parts) < 2:
+        return None
+    owner, repo = parts[0], parts[1].removesuffix(".git")
+    if owner.lower() in _NON_REPO_GITHUB_OWNERS:
+        return None
+    if not re.match(r"^[A-Za-z0-9_.-]+$", owner) or not re.match(r"^[A-Za-z0-9_.-]+$", repo):
+        return None
+    return clean_url, f"{owner}/{repo}"
+
+
+def _detect_bounty_platform(hunt_url: str) -> str:
+    host = (urllib.parse.urlparse(hunt_url).hostname or "").lower()
+    if "hackerone.com" in host:
+        return "hackerone"
+    if "bugcrowd.com" in host:
+        return "bugcrowd"
+    if "immunefi.com" in host:
+        return "immunefi"
+    if "intigriti.com" in host:
+        return "intigriti"
+    return "hackerone"
+
+
+def extract_unlocked_programs_and_repos_from_page_data(
+    *,
+    hunt_url: str,
+    current_user: Optional[Dict[str, Any]] = None,
+    probe_report: Optional[Dict[str, Any]] = None,
+    probe_report_id: int = 4243972,
+    inbox_counts: Optional[Dict[str, Any]] = None,
+    program_cards: Optional[Sequence[Dict[str, Any]]] = None,
+    page_links: Optional[Sequence[str]] = None,
+    eligibility_db_path: Optional[Union[str, Path]] = None,
+    draft_tracker_db_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, Any]:
+    """
+    Deterministic parser & SQLite WAL persister for authenticated `/browser` hunt captures.
+
+    Processes live or snapshot browser captures of:
+      1. Authenticated researcher identity + Signal/Impact/Reputation (`/current_user.json`)
+      2. Account cooldown probe (`/reports/<id>.json` -> `can_submit_draft?`)
+      3. Inbox open/triaged/draft counts
+      4. Discovered bug bounty programs, Signal eligibility gates, RoE policies, and
+         in-scope `github.com/<owner>/<repo>` targets.
+
+    Persists unlocked/blocked programs into `ProgramEligibilityDB` v2 and cooldown state
+    into `DraftSubmitTrackerDB`, returning ONLY repos belonging to `UNLOCKED` programs.
+    """
+    validated_url = validate_bug_hunt_url(hunt_url)
+    platform = _detect_bounty_platform(validated_url)
+
+    # 1. Extract researcher identity & live Signal score
+    user_dict = current_user if isinstance(current_user, dict) else {}
+    auth_user = str(user_dict.get("username") or user_dict.get("handle") or user_dict.get("name") or "").strip()
+    signal_score: Optional[float] = None
+    for sig_key in ("signal", "signal_score", "signal_percentile"):
+        raw_sig = user_dict.get(sig_key)
+        if raw_sig is not None and not isinstance(raw_sig, bool):
+            try:
+                signal_score = float(raw_sig)
+                break
+            except (TypeError, ValueError):
+                pass
+
+    # 2. Parse cooldown probe (`/reports/<id>.json`) & persist into DraftSubmitTrackerDB
+    cooldown_outcome: Dict[str, Any] = {}
+    cooldown_cleared = False
+    cooldown_status = "UNKNOWN"
+    if isinstance(probe_report, dict) and probe_report:
+        from engine.draft_submit_checker import DraftSubmitTrackerDB, parse_hackerone_report_json
+
+        outcome = parse_hackerone_report_json(int(probe_report_id), probe_report, http_status=200)
+        cooldown_outcome = outcome.to_dict()
+        cooldown_cleared = outcome.readiness == "READY_TO_SUBMIT"
+        if outcome.readiness == "READY_TO_SUBMIT":
+            cooldown_status = "CLEARED"
+        elif outcome.readiness == "COOLDOWN_LOCKED":
+            cooldown_status = "COOLDOWN_ACTIVE"
+        elif outcome.readiness == "ALREADY_SUBMITTED":
+            cooldown_status = "ALREADY_SUBMITTED"
+        else:
+            cooldown_status = outcome.readiness
+
+        if draft_tracker_db_path is not None:
+            tracker = DraftSubmitTrackerDB(draft_tracker_db_path)
+            tracker.seed_default_queue()
+            tracker.apply_probe_outcome(outcome)
+            tracker.record_check_run(
+                probe_report_id=int(probe_report_id),
+                account_status=cooldown_status,
+                ready_count=1 if cooldown_cleared else 0,
+                locked_count=1 if cooldown_status == "COOLDOWN_ACTIVE" else 0,
+                http_status=200,
+                source="browser_hunt",
+            )
+
+    # 3. Parse discovered programs, Signal eligibility, RoE, and in-scope repos
+    elig_db = None
+    if eligibility_db_path is not None:
+        from engine.program_eligibility_db import ProgramEligibilityDB
+
+        elig_db = ProgramEligibilityDB(db_path=eligibility_db_path)
+        if signal_score is not None:
+            elig_db.update_account_state(
+                signal_established=(signal_score >= 0.0),
+                signal_score=signal_score,
+            )
+
+    unlocked_programs: List[Dict[str, Any]] = []
+    blocked_programs: List[Dict[str, Any]] = []
+    discovered_repos: List[Dict[str, str]] = []
+    seen_repo_keys: set[str] = set()
+    seen_handles: set[str] = set()
+
+    for card in program_cards or []:
+        if not isinstance(card, dict):
+            continue
+        raw_handle = str(card.get("handle") or "").strip().strip("/")
+        if not raw_handle or raw_handle.lower() in _NON_PROGRAM_H1_PATHS:
+            continue
+        try:
+            handle = validate_hackerone_handle(raw_handle)
+        except ValueError:
+            continue
+        if handle in seen_handles:
+            continue
+        seen_handles.add(handle)
+
+        sub_state = str(card.get("submission_state") or "open").strip().lower()
+        policy_text = str(card.get("policy_text") or "")
+        structured_scopes = card.get("structured_scopes")
+        if not isinstance(structured_scopes, list):
+            structured_scopes = None
+
+        rules = parse_hackerone_program_policy(
+            handle,
+            policy_text,
+            structured_scopes=structured_scopes,
+            researcher_username=auth_user,
+        )
+
+        # Collect in-scope source repo URLs & slugs from policy rules + card links/repos
+        card_repo_urls: List[str] = []
+        card_repo_slugs: List[str] = []
+        seen_card_slugs: set[str] = set()
+
+        def _add_card_repo(raw_candidate: str) -> None:
+            cand = str(raw_candidate or "").strip()
+            if not cand:
+                return
+            if "/" in cand and not cand.lower().startswith("http"):
+                cand = f"https://github.com/{cand.strip('/')}"
+            parsed_pair = _extract_repo_slug_from_url(cand)
+            if parsed_pair is None:
+                return
+            r_url, r_slug = parsed_pair
+            if r_slug.lower() not in seen_card_slugs:
+                seen_card_slugs.add(r_slug.lower())
+                card_repo_urls.append(r_url)
+                card_repo_slugs.append(r_slug)
+
+        for r_u in rules.in_scope_repos:
+            _add_card_repo(r_u)
+        for r_u in card.get("in_scope_repos") or []:
+            _add_card_repo(str(r_u))
+        for raw_link in card.get("links") or []:
+            for m in _GIT_REPO_URL_RX.findall(str(raw_link)):
+                _add_card_repo(m)
+
+        raw_sig_req = card.get("signal_required")
+        sig_req: Optional[float] = None
+        if raw_sig_req is not None and not isinstance(raw_sig_req, bool):
+            try:
+                sig_req = float(raw_sig_req)
+            except (TypeError, ValueError):
+                sig_req = None
+
+        low_policy = policy_text.lower()
+        explicit_signal_blocked = bool(card.get("signal_blocked", False)) or (
+            "your signal is too low" in low_policy
+            or "requires a minimum signal" in low_policy
+            or "do not meet the signal requirement" in low_policy
+        )
+        if sub_state in ("paused", "disabled", "closed", "soft_launched"):
+            prog_status = "PAUSED"
+        elif explicit_signal_blocked or (
+            sig_req is not None and signal_score is not None and float(signal_score) < sig_req
+        ):
+            prog_status = "BLOCKED_SIGNAL"
+        else:
+            prog_status = "UNLOCKED"
+
+        resp_eff = card.get("response_efficiency_pct")
+        eff_pct = float(resp_eff) if resp_eff is not None and not isinstance(resp_eff, bool) else None
+        b_min = int(card["bounty_min_usd"]) if card.get("bounty_min_usd") is not None else None
+        b_max = int(card["bounty_max_usd"]) if card.get("bounty_max_usd") is not None else None
+        offers_b = card.get("offers_bounties")
+        offers_b_bool = bool(offers_b) if offers_b is not None else (bool(b_max and b_max > 0))
+        submit_url = str(card.get("submit_url") or "")
+        if not submit_url and platform == "hackerone":
+            submit_url = f"{HACKERONE_BASE_URL}/{handle}/reports/new"
+
+        if elig_db is not None:
+            elig_db.upsert(
+                handle,
+                prog_status,
+                platform=platform,
+                signal_required=sig_req,
+                bounty_min_usd=b_min,
+                bounty_max_usd=b_max,
+                submit_url=submit_url,
+                scope_summary=str(card.get("scope_summary") or "")[:500],
+                notes=f"Discovered via interactive browser hunt ({validated_url})",
+                response_efficiency_pct=eff_pct,
+                offers_bounties=offers_b_bool,
+                is_vdp=(not offers_b_bool),
+                submission_state=sub_state,
+                source_repo_count=len(card_repo_slugs),
+                in_scope_assets=list(rules.in_scope_hosts),
+                in_scope_repos=card_repo_slugs,
+                out_of_scope_assets=list(rules.out_of_scope_assets),
+                roe_automation_tier=rules.automation_tier,
+                roe_automated_prohibited=rules.automated_scanning_prohibited,
+                roe_max_rps=rules.max_rps,
+                roe_required_headers=list(rules.required_headers),
+                roe_user_agent=rules.required_user_agent,
+                roe_ai_disclosure_required=rules.ai_disclosure_required,
+                roe_no_oos_redirects=rules.no_out_of_scope_redirects,
+            )
+
+        prog_summary = {
+            "handle": handle,
+            "name": str(card.get("name") or handle),
+            "platform": platform,
+            "status": prog_status,
+            "submission_state": sub_state,
+            "offers_bounties": offers_b_bool,
+            "response_efficiency_pct": eff_pct,
+            "bounty_min_usd": b_min,
+            "bounty_max_usd": b_max,
+            "signal_required": sig_req,
+            "submit_url": submit_url,
+            "in_scope_repos": card_repo_slugs,
+            "in_scope_hosts": list(rules.in_scope_hosts),
+            "roe_automation_tier": rules.automation_tier,
+        }
+        if prog_status == "UNLOCKED":
+            unlocked_programs.append(prog_summary)
+            for r_url, r_slug in zip(card_repo_urls, card_repo_slugs):
+                key = f"{handle}:{r_slug.lower()}"
+                if key not in seen_repo_keys:
+                    seen_repo_keys.add(key)
+                    discovered_repos.append({"program": handle, "repo": r_slug, "url": r_url})
+        else:
+            blocked_programs.append(prog_summary)
+
+    # Also harvest standalone repo links from top-level page_links when a single program URL is targeted
+    url_parts = [p for p in urllib.parse.urlparse(validated_url).path.split("/") if p]
+    default_handle = "generic"
+    if len(url_parts) >= 1 and url_parts[0].lower() not in _NON_PROGRAM_H1_PATHS:
+        try:
+            default_handle = validate_hackerone_handle(url_parts[0])
+        except ValueError:
+            default_handle = "generic"
+    default_is_blocked = any(bp["handle"] == default_handle for bp in blocked_programs)
+    if not default_is_blocked:
+        for raw_link in page_links or []:
+            for m in _GIT_REPO_URL_RX.findall(str(raw_link)):
+                pair = _extract_repo_slug_from_url(m)
+                if pair is None:
+                    continue
+                r_url, r_slug = pair
+                key = f"{default_handle}:{r_slug.lower()}"
+                if key not in seen_repo_keys:
+                    seen_repo_keys.add(key)
+                    discovered_repos.append({"program": default_handle, "repo": r_slug, "url": r_url})
+
+    return {
+        "hunt_url": validated_url,
+        "platform": platform,
+        "authenticated_user": auth_user,
+        "signal_score": signal_score,
+        "cooldown_status": cooldown_status,
+        "cooldown_cleared": cooldown_cleared,
+        "cooldown_probe": cooldown_outcome,
+        "inbox_counts": dict(inbox_counts or {}),
+        "unlocked_programs": unlocked_programs,
+        "unlocked_programs_count": len(unlocked_programs),
+        "blocked_programs": blocked_programs,
+        "blocked_programs_count": len(blocked_programs),
+        "discovered_repos": discovered_repos,
+        "discovered_repos_count": len(discovered_repos),
+        "eligibility_db_updated": elig_db is not None,
+    }
 
 
 def validate_source_repo_url(url: str) -> str:
@@ -1818,6 +2228,392 @@ class HackerOneComputerUsePorter:
             "filled_fields": filled_fields,
             "draft_saved": draft_saved,
             "markdown_path": draft.markdown_path,
+        }
+
+    def run_interactive_browser_hunt_session(
+        self,
+        *,
+        hunt_url: str = DEFAULT_BUG_HUNT_URL,
+        cdp_url: Optional[str] = None,
+        profile_dir: Optional[Union[str, Path]] = None,
+        login_timeout_sec: float = 300.0,
+        max_programs: int = 12,
+        probe_report_id: int = 4243972,
+        eligibility_db_path: Optional[Union[str, Path]] = None,
+        draft_tracker_db_path: Optional[Union[str, Path]] = None,
+        dry_run: bool = False,
+        wait_for_human_fn: Optional[Callable[[str], str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Full interactive `/browser`-equivalent autonomous bug bounty session:
+          1. Opens `hunt_url` (strictly pinned to official bug bounty origins) in a visible
+             Chromium window (`connect_over_cdp` if reachable within 400ms, else persistent profile).
+          2. Pauses and waits up to `login_timeout_sec` for the human researcher to sign in
+             and complete 2FA / CAPTCHA / Turnstile directly (NEVER bypasses CAPTCHAs/auth).
+          3. Once logged in, performs every read-only `/browser` operation automatically:
+             - Syncs live researcher Signal/Reputation/Impact (`/current_user.json`)
+             - Probes live draft cooldown (`can_submit_draft?` on `/reports/<probe_id>.json`)
+             - Reads inbox Open/Triaged/Draft counts (`/bugs`)
+             - Discovers UNLOCKED programs, RoE policies, structured scopes, and in-scope
+               `github.com/<owner>/<repo>` targets and persists them to `ProgramEligibilityDB` v2.
+          4. Hands discovered repos & unlocked programs directly into RFCHunt's scanning +
+             3-Stage Parallel OODA + Swarm pipeline, and leaves the logged-in browser ready
+             for HITL draft staging (NEVER clicks final Submit or Delete).
+        """
+        validated_url = validate_bug_hunt_url(hunt_url)
+        platform = _detect_bounty_platform(validated_url)
+        eff_cdp = (cdp_url or os.environ.get("RFCHUNT_HUGOS_CDP_URL") or "http://127.0.0.1:9222").rstrip("/")
+        eff_profile = str(Path(profile_dir or "out/autonomous_hunt/h1_browser_profile").resolve())
+        eff_timeout = max(5.0, min(3600.0, float(login_timeout_sec or 300.0)))
+        eff_max_progs = max(1, min(30, int(max_programs or 12)))
+
+        base_meta: Dict[str, Any] = {
+            "schema": "rfchunt.interactive_browser_hunt.v1",
+            "hunt_url": validated_url,
+            "platform": platform,
+            "cdp_url": eff_cdp,
+            "profile_dir": eff_profile,
+            "login_timeout_sec": eff_timeout,
+            "max_programs": eff_max_progs,
+            "probe_report_id": int(probe_report_id),
+            "auto_submit_forbidden": True,
+            "captcha_bypass_forbidden": True,
+            "final_submit_blocked_for_hitl": True,
+            "phases": [
+                "1_open_bug_hunt_url_and_wait_human_login_hitl",
+                "2_sync_inbox_cooldown_can_submit_draft_and_signal",
+                "3_discover_unlocked_programs_scopes_and_github_repos",
+                "4_handoff_targets_to_rfchunt_swarm_and_stage_verified_drafts_hitl",
+            ],
+        }
+
+        if dry_run:
+            return {
+                **base_meta,
+                "status": "dry_run_browser_hunt_planned",
+                "dry_run": True,
+                "browser_launched": False,
+                "authenticated_user": "",
+                "signal_score": None,
+                "cooldown_status": "DRY_RUN_PLANNED",
+                "cooldown_cleared": False,
+                "unlocked_programs": [],
+                "unlocked_programs_count": 0,
+                "blocked_programs": [],
+                "blocked_programs_count": 0,
+                "discovered_repos": [],
+                "discovered_repos_count": 0,
+            }
+
+        if not self._is_playwright_available():
+            try:
+                webbrowser.open_new_tab(validated_url)
+                opened_fallback = True
+            except Exception:
+                opened_fallback = False
+            return {
+                **base_meta,
+                "status": "playwright_not_installed_manual_ready",
+                "dry_run": False,
+                "browser_launched": opened_fallback,
+                "install_hint": "python -m pip install playwright && playwright install chromium",
+                "authenticated_user": "",
+                "signal_score": None,
+                "cooldown_status": "UNKNOWN",
+                "cooldown_cleared": False,
+                "unlocked_programs": [],
+                "unlocked_programs_count": 0,
+                "blocked_programs": [],
+                "blocked_programs_count": 0,
+                "discovered_repos": [],
+                "discovered_repos_count": 0,
+            }
+
+        cdp_reachable = False
+        try:
+            with urllib.request.urlopen(f"{eff_cdp}/json/version", timeout=0.4) as resp:
+                cdp_reachable = int(resp.status) == 200
+        except Exception:
+            cdp_reachable = False
+
+        from playwright.sync_api import sync_playwright
+
+        connection_mode = "cdp" if cdp_reachable else "persistent_profile"
+        current_user: Dict[str, Any] = {}
+        probe_report: Dict[str, Any] = {}
+        inbox_counts: Dict[str, Any] = {}
+        program_cards: List[Dict[str, Any]] = []
+        page_links: List[str] = []
+        logged_in = False
+
+        with sync_playwright() as p:
+            browser = None
+            context = None
+            page = None
+            try:
+                if cdp_reachable:
+                    browser = p.chromium.connect_over_cdp(eff_cdp)
+                    context = browser.contexts[0] if browser.contexts else browser.new_context()
+                    page = context.new_page()
+                else:
+                    p_dir = Path(eff_profile)
+                    p_dir.mkdir(parents=True, exist_ok=True)
+                    context = p.chromium.launch_persistent_context(str(p_dir), headless=False)
+                    page = context.new_page()
+
+                page.goto(validated_url, wait_until="domcontentloaded", timeout=45_000)
+                page.wait_for_timeout(1200)
+
+                print(
+                    f"\n[RFCHunt --hunt] Browser opened at: {validated_url}\n"
+                    f"  -> Please complete sign-in, 2FA, and any human verification directly in the browser.\n"
+                    f"  -> Auto-Submit: FORBIDDEN | CAPTCHA Bypass: FORBIDDEN | Timeout: {int(eff_timeout)}s\n",
+                    flush=True,
+                )
+
+                if wait_for_human_fn is not None:
+                    wait_for_human_fn(
+                        f"Complete login on {validated_url} in the browser window, then press ENTER to begin hunting: "
+                    )
+
+                def _check_auth_state() -> Tuple[bool, Dict[str, Any]]:
+                    cur_url = (page.url or "").lower()
+                    body_low = ""
+                    try:
+                        body_low = (page.inner_text("body") or "")[:3000].lower()
+                    except Exception:
+                        body_low = ""
+                    if any(
+                        gate in cur_url
+                        for gate in ("/users/sign_in", "/login", "/signin", "/auth/login")
+                    ) or any(
+                        gate in body_low
+                        for gate in (
+                            "verify you are human",
+                            "just a moment",
+                            "two-factor authentication",
+                            "sign in to hackerone",
+                        )
+                    ):
+                        return False, {}
+                    if platform == "hackerone":
+                        try:
+                            cu = page.evaluate(
+                                """async () => {
+                                    try {
+                                        const r = await fetch('/current_user.json', {credentials: 'same-origin'});
+                                        if (!r.ok) return null;
+                                        return await r.json();
+                                    } catch (e) { return null; }
+                                }"""
+                            )
+                            if isinstance(cu, dict) and (cu.get("username") or cu.get("id")):
+                                return True, cu
+                        except Exception:
+                            pass
+                        return False, {}
+                    # Non-HackerOne official bounty portals (Bugcrowd / Immunefi / Intigriti)
+                    return True, {"username": "authenticated_session"}
+
+                deadline = time.monotonic() + eff_timeout
+                while time.monotonic() < deadline:
+                    logged_in, current_user = _check_auth_state()
+                    if logged_in:
+                        break
+                    if wait_for_human_fn is not None:
+                        break
+                    time.sleep(2.0)
+
+                if not logged_in:
+                    return {
+                        **base_meta,
+                        "status": "login_timeout_hitl_required",
+                        "dry_run": False,
+                        "browser_launched": True,
+                        "connection_mode": connection_mode,
+                        "authenticated_user": "",
+                        "signal_score": None,
+                        "cooldown_status": "AUTH_REQUIRED",
+                        "cooldown_cleared": False,
+                        "unlocked_programs": [],
+                        "unlocked_programs_count": 0,
+                        "blocked_programs": [],
+                        "blocked_programs_count": 0,
+                        "discovered_repos": [],
+                        "discovered_repos_count": 0,
+                        "note": (
+                            f"Login not completed within {int(eff_timeout)}s on {validated_url}. "
+                            "Re-run with a larger --login-timeout or attach to an already-signed-in browser via --cdp-url."
+                        ),
+                    }
+
+                # Phase 2: Read-only authenticated inbox, cooldown (`can_submit_draft?`) & Signal sync
+                if platform == "hackerone":
+                    try:
+                        pr_data = page.evaluate(
+                            f"""async () => {{
+                                try {{
+                                    const r = await fetch('/reports/{int(probe_report_id)}.json', {{credentials: 'same-origin'}});
+                                    if (!r.ok) return null;
+                                    return await r.json();
+                                }} catch (e) {{ return null; }}
+                            }}"""
+                        )
+                        if isinstance(pr_data, dict):
+                            probe_report = pr_data
+                    except Exception:
+                        probe_report = {}
+
+                    try:
+                        bugs_data = page.evaluate(
+                            """async () => {
+                                try {
+                                    const r = await fetch('/bugs.json?subject=user&report_id=0&view=all&substates[]=new&substates[]=triaged&substates[]=needs-more-info&substates[]=editing&text_query=&program_states[]=2&program_states[]=3&program_states[]=4&program_states[]=5&sort_type=latest_activity&sort_direction=descending&limit=50&page=1', {credentials: 'same-origin'});
+                                    if (!r.ok) return null;
+                                    return await r.json();
+                                } catch (e) { return null; }
+                            }"""
+                        )
+                        if isinstance(bugs_data, dict):
+                            reports_arr = bugs_data.get("reports") or []
+                            if isinstance(reports_arr, list):
+                                inbox_counts = {
+                                    "total_visible": len(reports_arr),
+                                    "draft_reports": sum(
+                                        1 for x in reports_arr if isinstance(x, dict) and str(x.get("state", "")).lower() == "draft"
+                                    ),
+                                    "triaged_reports": sum(
+                                        1 for x in reports_arr if isinstance(x, dict) and str(x.get("substate", "")).lower() == "triaged"
+                                    ),
+                                    "open_reports": sum(
+                                        1 for x in reports_arr if isinstance(x, dict) and str(x.get("state", "")).lower() != "draft"
+                                    ),
+                                }
+                    except Exception:
+                        inbox_counts = {}
+
+                # Phase 3: Discover unlocked programs, scopes, and in-scope GitHub repositories
+                if (page.url or "").rstrip("/") != validated_url.rstrip("/"):
+                    try:
+                        page.goto(validated_url, wait_until="domcontentloaded", timeout=30_000)
+                        page.wait_for_timeout(1500)
+                    except Exception:
+                        pass
+
+                try:
+                    raw_hrefs = page.evaluate(
+                        """() => Array.from(document.querySelectorAll('a[href]')).map(a => a.href).slice(0, 600)"""
+                    )
+                    if isinstance(raw_hrefs, list):
+                        page_links = [str(u) for u in raw_hrefs if isinstance(u, str)]
+                except Exception:
+                    page_links = []
+
+                candidate_handles: List[str] = []
+                parsed_root = urllib.parse.urlparse(validated_url)
+                root_parts = [pt for pt in parsed_root.path.split("/") if pt]
+                if platform == "hackerone":
+                    if len(root_parts) >= 1 and root_parts[0].lower() not in _NON_PROGRAM_H1_PATHS:
+                        candidate_handles.append(root_parts[0].lower())
+                    else:
+                        for href in page_links:
+                            hp = urllib.parse.urlparse(href)
+                            if (hp.hostname or "").lower() not in HACKERONE_ALLOWED_HOSTS:
+                                continue
+                            segs = [s for s in hp.path.split("/") if s]
+                            if len(segs) == 1:
+                                cand = segs[0].lower()
+                                if (
+                                    cand not in _NON_PROGRAM_H1_PATHS
+                                    and _HANDLE_RE.match(cand)
+                                    and cand not in candidate_handles
+                                ):
+                                    candidate_handles.append(cand)
+
+                    for handle in candidate_handles[:eff_max_progs]:
+                        prog_url = validate_hackerone_url(f"{HACKERONE_BASE_URL}/{handle}")
+                        try:
+                            page.goto(prog_url, wait_until="domcontentloaded", timeout=25_000)
+                            page.wait_for_timeout(900)
+                            p_body = (page.inner_text("body") or "")[:15000]
+                            p_links = page.evaluate(
+                                """() => Array.from(document.querySelectorAll('a[href]')).map(a => a.href).slice(0, 300)"""
+                            )
+                            eff_match = re.search(r"(\d{1,3})\s*%\s*(?:response\s+efficiency|met\s+response)", p_body, re.IGNORECASE)
+                            bounty_vals = [
+                                int(v.replace(",", ""))
+                                for v in re.findall(r"\$\s*([0-9][0-9,]{1,6})", p_body)
+                                if v.replace(",", "").isdigit()
+                            ]
+                            sig_match = re.search(r"signal\s*(?:of|>=|requirement)?\s*(-?\d+(?:\.\d+)?)", p_body, re.IGNORECASE)
+                            program_cards.append(
+                                {
+                                    "handle": handle,
+                                    "name": handle,
+                                    "submission_state": "paused" if "submissions are paused" in p_body.lower() else "open",
+                                    "offers_bounties": bool(bounty_vals) or ("offers bounties" in p_body.lower()),
+                                    "response_efficiency_pct": float(eff_match.group(1)) if eff_match else None,
+                                    "bounty_min_usd": min(bounty_vals) if bounty_vals else None,
+                                    "bounty_max_usd": max(bounty_vals) if bounty_vals else None,
+                                    "signal_required": float(sig_match.group(1)) if sig_match else None,
+                                    "signal_blocked": (
+                                        "your signal is too low" in p_body.lower()
+                                        or "do not meet the signal requirement" in p_body.lower()
+                                    ),
+                                    "submit_url": f"{HACKERONE_BASE_URL}/{handle}/reports/new",
+                                    "policy_text": p_body,
+                                    "links": p_links if isinstance(p_links, list) else [],
+                                }
+                            )
+                        except Exception:
+                            continue
+                else:
+                    # Generic official bounty portal capture (Bugcrowd / Immunefi / Intigriti)
+                    p_body = ""
+                    try:
+                        p_body = (page.inner_text("body") or "")[:15000]
+                    except Exception:
+                        p_body = ""
+                    slug = root_parts[-1] if root_parts else platform
+                    if not _HANDLE_RE.match(slug):
+                        slug = platform
+                    program_cards.append(
+                        {
+                            "handle": slug,
+                            "name": slug,
+                            "submission_state": "open",
+                            "offers_bounties": True,
+                            "submit_url": validated_url,
+                            "policy_text": p_body,
+                            "links": page_links,
+                        }
+                    )
+            finally:
+                # Close temporary context cleanly when done? Keep persistent profile flushed on disk.
+                if not cdp_reachable and context is not None:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+
+        extracted = extract_unlocked_programs_and_repos_from_page_data(
+            hunt_url=validated_url,
+            current_user=current_user,
+            probe_report=probe_report,
+            probe_report_id=int(probe_report_id),
+            inbox_counts=inbox_counts,
+            program_cards=program_cards,
+            page_links=page_links,
+            eligibility_db_path=eligibility_db_path,
+            draft_tracker_db_path=draft_tracker_db_path,
+        )
+        return {
+            **base_meta,
+            **extracted,
+            "status": "browser_hunt_session_completed",
+            "dry_run": False,
+            "browser_launched": True,
+            "connection_mode": connection_mode,
         }
 
 

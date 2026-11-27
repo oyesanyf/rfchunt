@@ -4343,6 +4343,8 @@ def cmd_dry_run_plan(
         planned_modules.append("Module-23-PreflightDiscovery(14-Categories+PQC+HackerOne+SafeSkills)")
     if getattr(args, "ensemble", False):
         planned_modules.append("EnsembleWhiteboardOrchestrator(Planner-Worker-Verifier+Lean4)")
+    if getattr(args, "enable_swarm", False) or active_mode == "swarm":
+        planned_modules.append("MultiAgentSwarmOrchestrator(Parallel-OODA+Ensemble-Whiteboard+SwarmBoard)")
     if (
         getattr(args, "enable_pe_audit", False)
         or active_mode in ("pe-audit", "pe_audit", "pe-dotnet", "pe_dotnet")
@@ -4420,6 +4422,8 @@ def cmd_dry_run_plan(
         "planned_modules": planned_modules,
         "enabled_flags": enabled_flags,
         "ensemble": bool(getattr(args, "ensemble", False)),
+        "swarm": bool(getattr(args, "enable_swarm", False) or active_mode == "swarm"),
+        "swarm_workers": getattr(args, "swarm_workers", None),
         "program": str(getattr(args, "program", "generic") or "generic"),
         "freshness_hours": int(_dry_fh_val) if _dry_fh_val is not None else 72,
         "quorum": max(1, int(_dry_q_val)) if _dry_q_val is not None else 2,
@@ -5485,6 +5489,24 @@ def build_autonomous_hunt_argv(args, raw_argv: Optional[List[str]] = None) -> Li
         hunt_argv.extend(["--max-cycles", str(int(args.max_cycles))])
     if getattr(args, "hunt_once", False):
         hunt_argv.append("--once")
+    if getattr(args, "hunt_url", None):
+        hunt_argv.extend(["--hunt-url", str(args.hunt_url)])
+    if getattr(args, "browser_hunt", False):
+        hunt_argv.append("--browser-hunt")
+    if getattr(args, "no_browser_hunt", False):
+        hunt_argv.append("--no-browser-hunt")
+    if getattr(args, "browser_profile", None):
+        hunt_argv.extend(["--browser-profile", str(args.browser_profile)])
+    if getattr(args, "cdp_url", None):
+        hunt_argv.extend(["--cdp-url", str(args.cdp_url)])
+    if getattr(args, "login_timeout", None) is not None and float(args.login_timeout) != 300.0:
+        hunt_argv.extend(["--login-timeout", str(float(args.login_timeout))])
+    if getattr(args, "probe_report_id", None) is not None and int(args.probe_report_id) != 4243972:
+        hunt_argv.extend(["--probe-report-id", str(int(args.probe_report_id))])
+    if getattr(args, "enable_swarm", False):
+        hunt_argv.append("--swarm")
+    if getattr(args, "swarm_workers", None) is not None:
+        hunt_argv.extend(["--swarm-workers", str(max(1, int(args.swarm_workers)))])
     if getattr(args, "headless_only", False):
         hunt_argv.append("--headless-only")
     if getattr(args, "embedded", False):
@@ -8047,7 +8069,7 @@ ALL_MODES = [
     "invariants", "sandbox-invariants", "sandbox_invariants", "poe-verify", "poe_verify",
     "poc", "poc-verify", "poc_verify", "docker-doctor", "docker_doctor", "doctor-docker",
     "deep-audit", "deep_audit",
-    "novelty", "novelty-refresh", "novelty_refresh", "swarm-board", "swarm_board", "board",
+    "novelty", "novelty-refresh", "novelty_refresh", "swarm", "swarm-board", "swarm_board", "board",
     "phi", "preflight", "hackerone", "hackone",
     "pe-audit", "pe_audit", "pe-dotnet", "pe_dotnet",
 ]
@@ -8691,7 +8713,9 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--novelty-threshold", dest="novelty_threshold", type=float, default=0.72, help="Maximum structural similarity threshold below which 3-trial invariant-violating findings are tagged novel (default: 0.72)")
     parser.add_argument("--novelty-export", dest="novelty_export", type=str, default=None, help="Optional output JSON path to export the merged novelty corpus catalog")
 
-    # Pure-CLI Swarm Overview & Live Terminal Status Board (Zero GUI)
+    # Pure-CLI Swarm Overview, Multi-Agent Swarm Mode (--swarm) & Live Terminal Status Board (Zero GUI)
+    parser.add_argument("--swarm", dest="enable_swarm", action="store_true", default=False, help="Enable full multi-agent parallel Swarm orchestration (--all + --ensemble + --fast-ooda + --swarm-board on repos/folders, parallel target fan-out on --hunt, or 12-agent LangGraph protocol swarm on --host)")
+    parser.add_argument("--swarm-workers", dest="swarm_workers", type=int, default=None, help="Bounded concurrent worker count for --swarm target fan-out and parallel CPU checks (1..8)")
     parser.add_argument("--swarm-board", dest="swarm_board", action="store_true", default=False, help="Render live pure-CLI Swarm Overview board with color emojis & pipeline graph during --all and OODA Swarm runs (--plain for ASCII, zero GUI)")
     parser.add_argument("--no-swarm-board", dest="swarm_board", action="store_false", help="Disable pure-CLI Swarm Overview board rendering")
     parser.add_argument("--emoji", dest="board_emoji", action="store_true", default=None, help="Explicitly enable color emoji icons on the Swarm Overview board (auto-enabled on UTF-8 terminals)")
@@ -8791,7 +8815,14 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--interval-minutes", dest="interval_minutes", type=float, default=60.0, help="Minutes between continuous --hunt cycles (default: 60.0)")
     parser.add_argument("--max-cycles", dest="max_cycles", type=int, default=0, help="Stop --hunt after N cycles (0 = run continuously unless --once or --dry-run)")
     parser.add_argument("--once", dest="hunt_once", action="store_true", default=False, help="Run a single complete --hunt cycle and exit")
-    parser.add_argument("--headless-only", dest="headless_only", action="store_true", default=False, help="During --hunt, write READY_TO_CLICK_SUBMIT.md only without staging drafts or opening Chrome")
+    parser.add_argument("--hunt-url", "--bug-hunt-url", dest="hunt_url", type=str, default=None, help="Official bug bounty directory or program URL opened in Chromium by --hunt so you log in and RFCHunt runs every /browser workflow automatically (default: https://hackerone.com/opportunities/all)")
+    parser.add_argument("--browser-hunt", dest="browser_hunt", action="store_true", default=False, help="Explicitly enable interactive browser hunt on --hunt-url (auto-enabled by --hunt unless --headless-only, --embedded, or --no-browser-hunt is set)")
+    parser.add_argument("--no-browser-hunt", dest="no_browser_hunt", action="store_true", default=False, help="Disable opening --hunt-url in interactive browser mode during --hunt")
+    parser.add_argument("--browser-profile", dest="browser_profile", type=str, default=None, help="Persistent Chromium profile directory for --hunt so your bug bounty login persists across cycles (default: out/autonomous_hunt/h1_browser_profile)")
+    parser.add_argument("--cdp-url", dest="cdp_url", type=str, default=None, help="Attach --hunt to an already-signed-in Chrome or HugOS Browser CDP endpoint (e.g. http://127.0.0.1:9222)")
+    parser.add_argument("--login-timeout", dest="login_timeout", type=float, default=300.0, help="Maximum seconds --hunt waits for you to complete login, 2FA, and any CAPTCHA directly in the browser (default: 300.0)")
+    parser.add_argument("--probe-report-id", dest="probe_report_id", type=int, default=4243972, help="HackerOne report ID probed read-only during --hunt to check live account cooldown (`can_submit_draft?`, default: 4243972)")
+    parser.add_argument("--headless-only", dest="headless_only", action="store_true", default=False, help="During --hunt, skip browser login/discovery, draft staging, and Chrome launch; write READY_TO_CLICK_SUBMIT.md only")
     parser.add_argument("--allow-blocked", dest="allow_blocked", action="store_true", default=False, help="Allow Signal-blocked programs for local offline research during --hunt")
     parser.add_argument("--install-schedule", dest="install_schedule", action="store_true", default=False, help="Install recurring native OS schedule for `rfc_hunt_swarm.py --hunt --once` (zero Registry/PATH mutation)")
     parser.add_argument("--uninstall-schedule", dest="uninstall_schedule", action="store_true", default=False, help="Remove the recurring native OS schedule for --hunt")
@@ -8803,7 +8834,17 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
 
 
 _CURATED_FLAG_EXAMPLES: Dict[str, str] = {
-    "--hunt": "python rfc_hunt_swarm.py --hunt --sync-public-directory --dry-run",
+    "--swarm": "python rfc_hunt_swarm.py --swarm --repo . --dry-run",
+    "--swarm-workers": "python rfc_hunt_swarm.py --swarm --swarm-workers 4 --repo . --folder ./extra --dry-run",
+    "--hunt": "python rfc_hunt_swarm.py --hunt --hunt-url https://hackerone.com/opportunities/all --dry-run",
+    "--hunt-url": "python rfc_hunt_swarm.py --hunt --hunt-url https://hackerone.com/opportunities/all --dry-run",
+    "--bug-hunt-url": "python rfc_hunt_swarm.py --hunt --bug-hunt-url https://hackerone.com/anthropic --dry-run",
+    "--browser-hunt": "python rfc_hunt_swarm.py --hunt --browser-hunt --hunt-url https://hackerone.com/opportunities/all --dry-run",
+    "--no-browser-hunt": "python rfc_hunt_swarm.py --hunt --no-browser-hunt --once --dry-run",
+    "--browser-profile": "python rfc_hunt_swarm.py --hunt --browser-profile out/autonomous_hunt/h1_browser_profile --dry-run",
+    "--cdp-url": "python rfc_hunt_swarm.py --hunt --cdp-url http://127.0.0.1:9222 --dry-run",
+    "--login-timeout": "python rfc_hunt_swarm.py --hunt --login-timeout 180 --dry-run",
+    "--probe-report-id": "python rfc_hunt_swarm.py --hunt --probe-report-id 4243972 --dry-run",
     "--hunt-target": "python rfc_hunt_swarm.py --hunt --hunt-target ./target_repo --program common_codes --once --dry-run",
     "--hunt-repo": "python rfc_hunt_swarm.py --hunt --hunt-repo Shopify/shopify-app-js --once --dry-run",
     "--clone-unlocked": "python rfc_hunt_swarm.py --hunt --repo ./my_repo --folder ./my_folder --clone-unlocked --dry-run",
@@ -9349,7 +9390,7 @@ def _normalize_all_positional_target(
             break
         if tok.startswith("-"):
             opt_key = tok.split("=", 1)[0]
-            if opt_key in ("--all", "--run-all", "--all-scans", "--hunt", "--fast-ooda", "--ensemble", "--essemble", "--essample"):
+            if opt_key in ("--all", "--run-all", "--all-scans", "--hunt", "--fast-ooda", "--ensemble", "--essemble", "--essample", "--swarm"):
                 has_all_flag = True
             elif opt_key == "--mode":
                 if "=" in tok:
@@ -9489,7 +9530,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "deep_audit", "proxy_target", "live_proxy_fuzz", "trust_boundary_review",
             "coverage_fuzz", "enable_poc", "enable_phi", "enable_hackerone", "hackerone_auto",
             "serve_ui", "network_lifecycle", "dry_run", "enable_pe_audit", "enable_autonomous_hunt",
-            "enable_fast_ooda", "start_modelfusion",
+            "enable_fast_ooda", "start_modelfusion", "enable_swarm",
         )
     ) and getattr(args, "hint", None) is None and not getattr(args, "dispatch", None):
         build_swarm_parser().print_help()
@@ -9568,6 +9609,50 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             file=(sys.stderr if _as_json_cli else sys.stdout),
         )
         sys.exit(1)
+    _swarm_workers_val = getattr(args, "swarm_workers", None)
+    if _swarm_workers_val is not None and int(_swarm_workers_val) < 1:
+        print(
+            "[!] --swarm-workers must be >= 1.",
+            file=(sys.stderr if _as_json_cli else sys.stdout),
+        )
+        sys.exit(1)
+
+    # Multi-Agent Swarm Mode (--swarm / positional `swarm`):
+    # - With `--hunt`: enables parallel multi-agent target fan-out inside `--hunt`.
+    # - With local `--repo` / `--folder` / `--path` (or no explicit network `--host`):
+    #   activates full `--all` + `--ensemble` + `--fast-ooda` + `--swarm-board` orchestration.
+    # - With explicit network `--host` only: routes into 12-Agent LangGraph `ProtocolResearchSwarm` + `--swarm-board`.
+    if getattr(args, "enable_swarm", False) or active_mode == "swarm":
+        args.enable_swarm = True
+        if not any(t == "--no-swarm-board" for t in raw_argv) and not _as_json_cli:
+            args.swarm_board = True
+        if _swarm_workers_val is not None:
+            _bounded_sw = max(1, min(16, int(_swarm_workers_val)))
+            if not getattr(args, "cpu_workers", None):
+                args.cpu_workers = min(8, _bounded_sw)
+            if "concurrency" not in explicit_dests:
+                args.concurrency = _bounded_sw
+        if not getattr(args, "enable_autonomous_hunt", False) and not getattr(args, "dispatch", None):
+            _swarm_has_local = bool(
+                getattr(args, "repo", None)
+                or getattr(args, "path", None)
+                or getattr(args, "raptor_target", None)
+                or getattr(args, "hunt_targets", None)
+                or getattr(args, "additional_local_targets", None)
+            )
+            _swarm_has_net_host = (
+                "host" in explicit_dests
+                or any(
+                    a in ("--host", "--target") or a.startswith(("--host=", "--target="))
+                    for a in raw_argv
+                )
+            ) and bool(getattr(args, "host", None)) and not os.path.isdir(str(getattr(args, "host", "") or ""))
+            if _swarm_has_local or not _swarm_has_net_host:
+                args.run_all_scans = True
+                args.ensemble = True
+                args.enable_fast_ooda = True
+            else:
+                active_mode = "terminator"
 
     # Turnkey Autonomous Bug Bounty Hunter (--hunt):
     # - Standalone `--hunt` (without `--all`) dispatches directly BEFORE generic `--dry-run`.
@@ -9794,7 +9879,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "enable_rea_only", "install_tools", "tool_status",
             "raptor_status", "raptor_findings", "raptor_setup",
             "harness2_report", "mantis_report", "aiscan_report",
-            "preflight_only", "enable_pe_audit", "enable_autonomous_hunt",
+            "preflight_only", "enable_pe_audit", "enable_autonomous_hunt", "enable_swarm",
         )
     )
     if active_mode == "hint" or (
@@ -10729,6 +10814,7 @@ if __name__ == "__main__":
     _cli_argv = sys.argv[1:]
     _has_hunt_flag = any(t == "--hunt" for t in _cli_argv)
     _has_fast_ooda_flag = any(t == "--fast-ooda" for t in _cli_argv)
+    _has_swarm_flag = any(t == "--swarm" for t in _cli_argv)
     _has_embedded = any(t in ("--embedded", "--embeded") for t in _cli_argv)
     _has_all_flag = (
         any(t in ("--all", "--run-all", "--all-scans", "all", "all_scans") for t in _cli_argv)
@@ -10740,7 +10826,7 @@ if __name__ == "__main__":
             for idx in range(len(_cli_argv))
         )
     )
-    if not _has_hunt_flag and not _has_fast_ooda_flag:
+    if not _has_hunt_flag and not _has_fast_ooda_flag and not _has_swarm_flag:
         from revenue_cli import REVENUE_SUBCOMMANDS, maybe_dispatch_revenue_cli
 
         _is_rev_subcmd = bool(_cli_argv) and (_cli_argv[0] in REVENUE_SUBCOMMANDS)

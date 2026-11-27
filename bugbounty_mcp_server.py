@@ -176,8 +176,12 @@ def run_rfchunt_all_scan(
 ) -> dict[str, Any]:
     """Executes RFCHunt `--all` (optionally `--ensemble` / `--embedded`) safely (`shell=False`) plus Lean 4 check."""
     try:
-        if isinstance(freshness_hours, bool) or isinstance(ensemble_quorum, bool):
-            raise TypeError("freshness_hours and ensemble_quorum must be integers, not bool.")
+        if (
+            isinstance(freshness_hours, bool)
+            or isinstance(ensemble_quorum, bool)
+            or isinstance(timeout_sec, bool)
+        ):
+            raise TypeError("freshness_hours, ensemble_quorum, and timeout_sec must be numeric, not bool.")
         eff_freshness_hours = int(freshness_hours)
         eff_quorum = max(1, int(ensemble_quorum))
         eff_timeout_sec = float(timeout_sec)
@@ -377,6 +381,24 @@ def _coerce_strict_bool(val: Any) -> bool:
     if isinstance(val, str):
         return val.strip().lower() in {"true", "1", "yes", "on"}
     return False
+
+
+def _parse_strict_bool_arg(val: Any, *, field_name: str = "value") -> bool:
+    """Strictly parse MCP boolean arguments, raising ValueError/TypeError on invalid inputs."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, int) and not isinstance(val, bool):
+        if val in (0, 1):
+            return val == 1
+        raise ValueError(f"Invalid integer boolean for {field_name}: {val!r}")
+    if isinstance(val, str):
+        norm = val.strip().lower()
+        if norm in ("true", "1", "yes", "on"):
+            return True
+        if norm in ("false", "0", "no", "off"):
+            return False
+        raise ValueError(f"Invalid boolean string for {field_name}: {val!r}")
+    raise TypeError(f"Invalid boolean value for {field_name}: {val!r}")
 
 
 def _redact_draft_text(text: str) -> str:
@@ -899,6 +921,13 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "embedded": {"type": "boolean", "default": False},
                 "no_llm": {"type": "boolean", "default": False},
                 "allow_blocked": {"type": "boolean", "default": False},
+                "browser_hunt": {"type": "boolean", "default": False, "description": "Opt-in interactive browser hunt on hunt_url (opens browser for human login/2FA/CAPTCHA; auto-submit strictly forbidden)"},
+                "hunt_url": {"type": "string", "description": "Official bug bounty URL (hackerone.com, bugcrowd.com, immunefi.com, intigriti.com)"},
+                "cdp_url": {"type": "string", "description": "Optional Chrome/HugOS CDP endpoint (e.g. http://127.0.0.1:9222)"},
+                "browser_profile": {"type": "string", "description": "Persistent Chromium profile directory"},
+                "login_timeout": {"type": "number", "default": 300.0},
+                "swarm": {"type": "boolean", "default": False, "description": "Enable parallel multi-agent swarm auditing across targets"},
+                "swarm_workers": {"type": "integer"},
                 "dry_run": {"type": "boolean", "default": True},
                 "model": {"type": "string"},
             },
@@ -1050,7 +1079,7 @@ class BugBountyMCPServer:
             transcript = runner.run_poc(
                 language=str(args["language"]),
                 repo_path=str(args["repo_path"]),
-                cmd=list(args["cmd"]),
+                cmd=args["cmd"],
                 image_override=args.get("image_override"),
             )
             out = transcript.to_dict()
@@ -1081,7 +1110,10 @@ class BugBountyMCPServer:
                 impact=str(args["impact"]),
                 poc_verified=_coerce_strict_bool(args["poc_verified"]),
                 out_path=str(args["out_path"]),
-                require_verified_poc=bool(args.get("require_verified_poc", True)),
+                require_verified_poc=_parse_strict_bool_arg(
+                    args.get("require_verified_poc", True),
+                    field_name="require_verified_poc",
+                ),
                 eligibility_db_path=args.get("eligibility_db_path"),
                 poc_transcript=str(args.get("poc_transcript") or ""),
                 report_id=args.get("report_id"),
@@ -1101,32 +1133,48 @@ class BugBountyMCPServer:
             return verify_lean_workspace(str(args.get("lean_dir", "formal/lean4"))).to_dict()
 
         if name == "bb_run_all_scan":
+            extra_flags_raw = args.get("extra_flags")
+            if extra_flags_raw is not None and (
+                isinstance(extra_flags_raw, (str, bytes, bytearray, dict))
+                or not isinstance(extra_flags_raw, (list, tuple))
+            ):
+                raise TypeError("extra_flags must be a list of flag strings, not str/bytes/dict.")
             return run_rfchunt_all_scan(
                 target=str(args["target"]),
                 output_dir=str(args.get("output_dir", "reports")),
-                dry_run=bool(args.get("dry_run", False)),
-                ensemble=bool(args.get("ensemble", False)),
+                dry_run=_parse_strict_bool_arg(args.get("dry_run", False), field_name="dry_run"),
+                ensemble=_parse_strict_bool_arg(args.get("ensemble", False), field_name="ensemble"),
                 program=str(args.get("program", "generic")),
-                freshness_hours=int(args.get("freshness_hours", 72)),
-                ensemble_quorum=int(args.get("ensemble_quorum", 2)),
-                embedded=bool(args.get("embedded", False)),
+                freshness_hours=args.get("freshness_hours", 72),
+                ensemble_quorum=args.get("ensemble_quorum", 2),
+                embedded=_parse_strict_bool_arg(args.get("embedded", False), field_name="embedded"),
                 model=args.get("model"),
-                include_lean_verify=bool(args.get("include_lean_verify", True)),
-                timeout_sec=float(args.get("timeout_sec", 300.0)),
-                extra_flags=list(args.get("extra_flags") or []),
+                include_lean_verify=_parse_strict_bool_arg(
+                    args.get("include_lean_verify", True),
+                    field_name="include_lean_verify",
+                ),
+                timeout_sec=args.get("timeout_sec", 300.0),
+                extra_flags=list(extra_flags_raw or []),
             )
 
         if name == "bb_gha_workflow_audit":
             from engine.ensemble_orchestrator import EnsembleOrchestrator
 
-            embedded_flag = bool(args.get("embedded", False))
+            embedded_flag = _parse_strict_bool_arg(args.get("embedded", False), field_name="embedded")
+            quorum_raw = args.get("quorum", 2)
+            if isinstance(quorum_raw, bool):
+                raise TypeError("quorum must be an integer, not bool.")
+            enable_llm_raw = _parse_strict_bool_arg(
+                args.get("enable_llm_verify", True),
+                field_name="enable_llm_verify",
+            )
             orch = EnsembleOrchestrator(
                 program=str(args.get("program", "generic")),
-                quorum=int(args.get("quorum", 2)),
+                quorum=int(quorum_raw),
                 exhaustive_default=True,
                 embedded=embedded_flag,
                 model=args.get("model"),
-                enable_llm_verify=(not embedded_flag and bool(args.get("enable_llm_verify", True))),
+                enable_llm_verify=(not embedded_flag and enable_llm_raw),
                 gha_only=True,
             )
             rep = orch.run(
@@ -1328,8 +1376,27 @@ class BugBountyMCPServer:
 
         if name == "bb_run_autonomous_hunt":
             import rfc_hunt_swarm
+            from engine.hackerone_porter import validate_bug_hunt_url
 
-            swarm_argv: list[str] = ["--hunt", "--once", "--headless-only", "--json"]
+            use_browser_hunt = _coerce_strict_bool(args.get("browser_hunt", False))
+            swarm_argv: list[str] = ["--hunt", "--once", "--json"]
+            if use_browser_hunt:
+                swarm_argv.append("--browser-hunt")
+            else:
+                swarm_argv.append("--headless-only")
+            if args.get("hunt_url"):
+                validated_h_url = validate_bug_hunt_url(str(args["hunt_url"]).strip())
+                swarm_argv.extend(["--hunt-url", validated_h_url])
+            if args.get("cdp_url"):
+                swarm_argv.extend(["--cdp-url", str(args["cdp_url"]).strip()])
+            if args.get("browser_profile"):
+                swarm_argv.extend(["--browser-profile", str(args["browser_profile"]).strip()])
+            if args.get("login_timeout") is not None:
+                swarm_argv.extend(["--login-timeout", str(float(args["login_timeout"]))])
+            if _coerce_strict_bool(args.get("swarm", False)):
+                swarm_argv.append("--swarm")
+            if args.get("swarm_workers") is not None:
+                swarm_argv.extend(["--swarm-workers", str(max(1, int(args["swarm_workers"])))])
             for t in args.get("targets") or []:
                 t_s = str(t).strip()
                 if t_s:

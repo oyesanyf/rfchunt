@@ -19,9 +19,12 @@ import rfc_hunt_swarm
 from bugbounty_mcp_server import BugBountyMCPServer
 from engine.ensemble_orchestrator import EnsembleOrchestrator
 from engine.hackerone_porter import (
+    DEFAULT_BUG_HUNT_URL,
     HackerOneCampaign,
     HackerOneComputerUsePorter,
     HackerOneReportDraft,
+    extract_unlocked_programs_and_repos_from_page_data,
+    validate_bug_hunt_url,
 )
 from engine.program_eligibility_db import ProgramEligibilityDB
 from mcp_server import TerminatorMCPServer
@@ -30,6 +33,7 @@ from scripts.autonomous_hunt import (
     check_program_eligibility,
     execute_hunt_cycle,
     extract_verified_findings_from_cycle,
+    is_non_draft_markdown,
     open_urls_in_chrome,
     scan_draft_safety_violations,
     validate_repo_slug,
@@ -833,3 +837,303 @@ def test_scan_repo_and_folder_and_hunt_together(tmp_path: Path) -> None:
     assert len(extra) == 1
     assert Path(extra[0]["target_path"]).resolve() == folder_dir.resolve()
     assert extra[0]["status"] == "completed"
+
+
+def test_interactive_browser_hunt_url_validation_extraction_and_dry_run(tmp_path: Path) -> None:
+    # 1. Fail-closed bug hunt URL allowlist validation
+    assert validate_bug_hunt_url(DEFAULT_BUG_HUNT_URL) == DEFAULT_BUG_HUNT_URL
+    assert validate_bug_hunt_url("https://hackerone.com/anthropic") == "https://hackerone.com/anthropic"
+    assert validate_bug_hunt_url("https://bugcrowd.com/engagements") == "https://bugcrowd.com/engagements"
+    assert validate_bug_hunt_url("https://immunefi.com/bug-bounty/") == "https://immunefi.com/bug-bounty/"
+    assert validate_bug_hunt_url("https://app.intigriti.com/programs") == "https://app.intigriti.com/programs"
+    for bad_url in (
+        "http://hackerone.com/opportunities/all",
+        "https://evil.example.com/opportunities/all",
+        "https://hackerone.com.evil.com/anthropic",
+        "https://user:pass@hackerone.com/opportunities/all",
+        "javascript:alert(1)",
+        "https://hackerone.com/opportunities/all\r\nX-Inject: 1",
+    ):
+        with pytest.raises(PermissionError):
+            validate_bug_hunt_url(bad_url)
+
+    # 2. Zero-mock browser page data extraction -> SQLite WAL persistence (ProgramEligibilityDB + DraftSubmitTrackerDB)
+    elig_db_p = tmp_path / "browser_elig.sqlite3"
+    tracker_db_p = tmp_path / "browser_tracker.sqlite3"
+    extracted = extract_unlocked_programs_and_repos_from_page_data(
+        hunt_url="https://hackerone.com/opportunities/all",
+        current_user={"username": "researcher_x", "signal": 0.5, "impact": 12.0},
+        probe_report={
+            "state": "Draft",
+            "substate": "editing",
+            "abilities": {"can_submit_draft?": True, "can_delete_draft?": True},
+            "team": {"handle": "anthropic"},
+            "title": "Probe Draft",
+        },
+        probe_report_id=4243972,
+        inbox_counts={"open_reports": 4, "triaged_reports": 1, "draft_reports": 12},
+        program_cards=[
+            {
+                "handle": "open_bounty_prog",
+                "name": "Open Bounty Program",
+                "submission_state": "open",
+                "offers_bounties": True,
+                "response_efficiency_pct": 94.0,
+                "bounty_min_usd": 500,
+                "bounty_max_usd": 15000,
+                "signal_required": 0.0,
+                "policy_text": "Rate limit 5 requests per second. Source: https://github.com/open-org/core-gateway",
+                "links": ["https://github.com/open-org/core-gateway", "https://github.com/features/actions"],
+            },
+            {
+                "handle": "signal_locked_prog",
+                "name": "Locked Signal Program",
+                "submission_state": "open",
+                "offers_bounties": True,
+                "signal_required": 3.0,
+                "policy_text": "Your signal is too low. Source: https://github.com/locked-org/secret-repo",
+                "links": ["https://github.com/locked-org/secret-repo"],
+            },
+            {
+                "handle": "paused_prog",
+                "name": "Paused Program",
+                "submission_state": "paused",
+                "links": ["https://github.com/paused-org/paused-repo"],
+            },
+        ],
+        eligibility_db_path=elig_db_p,
+        draft_tracker_db_path=tracker_db_p,
+    )
+    assert extracted["authenticated_user"] == "researcher_x"
+    assert extracted["signal_score"] == 0.5
+    assert extracted["cooldown_status"] == "CLEARED"
+    assert extracted["cooldown_cleared"] is True
+    assert extracted["unlocked_programs_count"] == 1
+    assert extracted["blocked_programs_count"] == 2
+    assert [r["repo"] for r in extracted["discovered_repos"]] == ["open-org/core-gateway"]
+    assert elig_db_p.is_file()
+    assert tracker_db_p.is_file()
+    elig_db = ProgramEligibilityDB(db_path=elig_db_p)
+    assert elig_db.is_eligible("open_bounty_prog") is True
+    assert elig_db.is_eligible("signal_locked_prog") is False
+    assert elig_db.is_eligible("paused_prog") is False
+
+    # 3. Master CLI `--hunt` dry-run plans full 4-phase interactive browser hunt with 0 side effects
+    swarm_script = Path(__file__).resolve().parents[1] / "rfc_hunt_swarm.py"
+    prof_dir = tmp_path / "h1_profile"
+    p_ok = subprocess.run(
+        [
+            sys.executable,
+            str(swarm_script),
+            "--hunt",
+            "--hunt-url",
+            "https://hackerone.com/anthropic",
+            "--cdp-url",
+            "http://127.0.0.1:9222",
+            "--browser-profile",
+            str(prof_dir),
+            "--login-timeout",
+            "180",
+            "--probe-report-id",
+            "4243972",
+            "--dry-run",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=90,
+        check=False,
+    )
+    assert p_ok.returncode == 0, f"stderr={p_ok.stderr}\nstdout={p_ok.stdout}"
+    d_ok = json.loads(p_ok.stdout)
+    assert d_ok["dry_run"] is True
+    assert d_ok["browser_used"] is False
+    assert d_ok["browser_hunt_enabled"] is True
+    assert d_ok["auto_submit_forbidden"] is True
+    assert d_ok["captcha_bypass_forbidden"] is True
+    b_sess = d_ok["browser_hunt_session"]
+    assert b_sess["status"] == "dry_run_browser_hunt_planned"
+    assert b_sess["hunt_url"] == "https://hackerone.com/anthropic"
+    assert b_sess["cdp_url"] == "http://127.0.0.1:9222"
+    assert b_sess["login_timeout_sec"] == 180.0
+    assert b_sess["final_submit_blocked_for_hitl"] is True
+    assert len(b_sess["phases"]) == 4
+    assert not prof_dir.exists()
+
+    # 4. Untrusted --hunt-url fails closed with non-zero exit code
+    p_bad = subprocess.run(
+        [
+            sys.executable,
+            str(swarm_script),
+            "--hunt",
+            "--hunt-url",
+            "https://evil.example.com/phish",
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+        check=False,
+    )
+    assert p_bad.returncode != 0
+
+    # 5. MCP tool `bb_run_autonomous_hunt` supports browser_hunt + hunt_url + swarm safely and fails closed on bad URL
+    bb = BugBountyMCPServer()
+    mcp_ok = bb.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 91,
+            "method": "tools/call",
+            "params": {
+                "name": "bb_run_autonomous_hunt",
+                "arguments": {
+                    "browser_hunt": True,
+                    "hunt_url": "https://hackerone.com/opportunities/all",
+                    "swarm": True,
+                    "swarm_workers": 3,
+                    "dry_run": True,
+                    "out_dir": str(tmp_path / "mcp_bh_dry"),
+                },
+            },
+        }
+    )
+    assert mcp_ok["result"]["isError"] is False
+    mcp_data = json.loads(mcp_ok["result"]["content"][0]["text"])
+    assert mcp_data["browser_hunt_enabled"] is True
+    assert mcp_data["swarm_enabled"] is True
+    assert mcp_data["swarm_workers"] == 3
+    assert mcp_data["browser_hunt_session"]["status"] == "dry_run_browser_hunt_planned"
+
+    mcp_bad = bb.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 92,
+            "method": "tools/call",
+            "params": {
+                "name": "bb_run_autonomous_hunt",
+                "arguments": {
+                    "browser_hunt": True,
+                    "hunt_url": "https://evil.example.com/nope",
+                    "dry_run": True,
+                },
+            },
+        }
+    )
+    assert mcp_bad["result"]["isError"] is True
+
+
+def test_swarm_flag_standalone_combined_and_embedded(tmp_path: Path) -> None:
+    repo_dir = tmp_path / "swarm_repo_a"
+    folder_dir = tmp_path / "swarm_folder_b"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    folder_dir.mkdir(parents=True, exist_ok=True)
+    (repo_dir / "main.py").write_text("def hello():\n    return 'ok'\n", encoding="utf-8")
+    (folder_dir / "helper.py").write_text("def square(x: int) -> int:\n    return x * x\n", encoding="utf-8")
+    swarm_script = Path(__file__).resolve().parents[1] / "rfc_hunt_swarm.py"
+
+    # 1. Standalone `--swarm --repo <dir> --dry-run --json` activates Swarm + Ensemble + --all plan
+    p1 = subprocess.run(
+        [
+            sys.executable,
+            str(swarm_script),
+            "--swarm",
+            "--swarm-workers",
+            "4",
+            "--repo",
+            str(repo_dir),
+            "--dry-run",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=90,
+        check=False,
+    )
+    assert p1.returncode == 0, f"stderr={p1.stderr}\nstdout={p1.stdout}"
+    d1 = json.loads(p1.stdout)
+    assert d1["dry_run"] is True
+    assert d1["swarm"] is True
+    assert d1["swarm_workers"] == 4
+    assert d1["ensemble"] is True
+    assert any("MultiAgentSwarmOrchestrator" in m for m in d1["planned_modules"])
+
+    # 2. Combined `--swarm --swarm-workers 2 --hunt` real parallel embedded cycle over both local targets
+    out_dir = tmp_path / "swarm_hunt_out"
+    p2 = subprocess.run(
+        [
+            sys.executable,
+            str(swarm_script),
+            "--swarm",
+            "--swarm-workers",
+            "2",
+            "--hunt",
+            "--repo",
+            str(repo_dir),
+            "--folder",
+            str(folder_dir),
+            "--once",
+            "--headless-only",
+            "--embedded",
+            "--no-llm",
+            "--out",
+            str(out_dir),
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+        check=False,
+    )
+    assert p2.returncode == 0, f"stderr={p2.stderr}\nstdout={p2.stdout}"
+    d2 = json.loads(p2.stdout)
+    assert d2["swarm_enabled"] is True
+    assert d2["swarm_workers"] == 2
+    assert len(d2["targets_audited"]) == 2
+    assert all(t.get("swarm_parallel") is True for t in d2["targets_audited"])
+
+    # 3. Invalid `--swarm-workers 0` fails closed
+    p3 = subprocess.run(
+        [sys.executable, str(swarm_script), "--swarm", "--swarm-workers", "0", "--dry-run"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+        check=False,
+    )
+    assert p3.returncode != 0
+
+
+def test_stage5_excludes_fresh_hunt_queue_and_non_draft_markdown(tmp_path: Path) -> None:
+    cycle_dir = tmp_path / "cycle_test"
+    drafts_dir = cycle_dir / "hackerone_drafts"
+    bundle_dir = cycle_dir / "client_audit_bundle"
+    drafts_dir.mkdir(parents=True, exist_ok=True)
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    # Queue tables, renamed freshness queues, client bundle docs, and PoC transcripts must be excluded
+    assert is_non_draft_markdown(cycle_dir / "fresh_hunt_queue.md", base_dir=cycle_dir) is True
+    assert is_non_draft_markdown(cycle_dir / "fresh_hunt_queue_20261127.md", base_dir=cycle_dir) is True
+    assert (
+        is_non_draft_markdown(
+            cycle_dir / "daily_targets.md",
+            "# RFCHunt Daily Fresh Hunt Queue\n\n| Score | Repo |\n",
+            base_dir=cycle_dir,
+        )
+        is True
+    )
+    assert is_non_draft_markdown(bundle_dir / "01_EXECUTIVE_SUMMARY.md", base_dir=cycle_dir) is True
+    assert is_non_draft_markdown(cycle_dir / "poc_transcript_01.md", base_dir=cycle_dir) is True
+
+    # Real HackerOne report drafts MUST still be scanned by Stage 5 qa-drafts
+    valid_draft = drafts_dir / "H1-ANTHROPIC-001.md"
+    valid_body = (
+        "# Summary\nConcrete issue.\n\n"
+        "## Steps to Reproduce\n1. Run test.\n\n"
+        "## Impact\nPrivilege boundary bypass.\n\n"
+        "## Remediation\nValidate input.\n"
+    )
+    assert is_non_draft_markdown(valid_draft, valid_body, base_dir=cycle_dir) is False
