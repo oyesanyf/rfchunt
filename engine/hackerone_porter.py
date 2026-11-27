@@ -52,7 +52,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -210,6 +210,8 @@ class HackerOnePolicyRules:
     in_scope_repos: List[str] = field(default_factory=list)
     in_scope_hosts: List[str] = field(default_factory=list)
     out_of_scope_assets: List[str] = field(default_factory=list)
+    bounty_eligible_assets: List[str] = field(default_factory=list)
+    max_severity_by_asset: Dict[str, str] = field(default_factory=dict)
     safe_harbor_status: str = "protected_compliant"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -299,10 +301,12 @@ def parse_hackerone_program_policy(
 
     ai_disclosure = bool(_AI_DISCLOSURE_RX.search(policy))
 
-    # 4. Extract in-scope repos, in-scope hosts, and out-of-scope assets
+    # 4. Extract in-scope repos, in-scope hosts, out-of-scope assets, and bounty/severity scope metadata
     in_scope_repos: List[str] = []
     in_scope_hosts: List[str] = []
     out_of_scope_assets: List[str] = []
+    bounty_eligible_assets: List[str] = []
+    max_severity_by_asset: Dict[str, str] = {}
 
     def _add_unique(lst: List[str], val: str) -> None:
         v = str(val or "").strip()
@@ -321,6 +325,11 @@ def parse_hackerone_program_policy(
         if not eligible:
             _add_unique(out_of_scope_assets, ident)
             continue
+        if attrs.get("eligible_for_bounty") is True:
+            _add_unique(bounty_eligible_assets, ident)
+        max_sev = str(attrs.get("max_severity") or "").strip().lower()
+        if max_sev:
+            max_severity_by_asset[ident] = max_sev
         if atype == "SOURCE_CODE" or _GIT_REPO_URL_RX.match(ident):
             try:
                 _add_unique(in_scope_repos, validate_source_repo_url(ident))
@@ -364,6 +373,8 @@ def parse_hackerone_program_policy(
         in_scope_repos=in_scope_repos,
         in_scope_hosts=in_scope_hosts,
         out_of_scope_assets=out_of_scope_assets,
+        bounty_eligible_assets=bounty_eligible_assets,
+        max_severity_by_asset=max_severity_by_asset,
         safe_harbor_status=sh_status,
     )
 
@@ -504,23 +515,54 @@ def validate_finding_against_scope(
     finding: Dict[str, Any],
     campaign: HackerOneCampaign,
 ) -> str:
-    """Checks whether a finding's asset/file matches a campaign's in-scope or out-of-scope assets."""
-    target_blob = " ".join(
-        [
-            str(finding.get("file_path") or ""),
-            str(finding.get("asset_identifier") or ""),
-            str(finding.get("title") or ""),
-        ]
-    ).lower()
+    """
+    Checks whether a finding's asset/file matches a campaign's in-scope or out-of-scope assets
+    using strict DNS label-boundary matching for hostnames/URLs (preventing `*.amazon.com`
+    from matching `notamazon.com` or `amazon.com.evil.tld`).
+    """
+    from engine.program_eligibility_db import _normalize_hostname, host_matches_scope_pattern
+
+    raw_asset = str(finding.get("asset_identifier") or "").strip()
+    raw_file = str(finding.get("file_path") or "").strip()
+    raw_title = str(finding.get("title") or "").strip()
+
+    candidate_hosts: List[str] = []
+    for cand in (raw_asset, raw_file):
+        h = _normalize_hostname(cand)
+        if h and "." in h and not h.endswith((".py", ".ts", ".js", ".go", ".rs", ".java", ".rb", ".c", ".cpp", ".h", ".yml", ".yaml", ".json", ".md", ".sh", ".ps1")):
+            candidate_hosts.append(h)
+
+    target_blob = " ".join([raw_file, raw_asset, raw_title]).lower()
+
+    def _asset_matches(scope_entry: str) -> bool:
+        entry = str(scope_entry or "").strip().lower()
+        if not entry:
+            return False
+        # Strict DNS label-boundary matching for domain/wildcard/URL scope entries
+        is_domain_or_url = (
+            "://" in entry
+            or entry.startswith("*.")
+            or (bool(re.match(r"^[a-z0-9*.-]+\.[a-z*]{2,}$", entry.split("/", 1)[0])) and "github.com/" not in entry)
+        )
+        if is_domain_or_url and not entry.startswith("https://github.com/"):
+            if candidate_hosts:
+                return any(host_matches_scope_pattern(ch, entry) for ch in candidate_hosts)
+            # Extract hostname tokens from target_blob and verify exact DNS label match
+            for tok in re.findall(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b", target_blob):
+                if host_matches_scope_pattern(tok, entry):
+                    return True
+            return False
+        # Source repository URL or package identifier match
+        norm_entry = entry.rstrip("/").removesuffix(".git")
+        return bool(norm_entry) and (norm_entry in target_blob or norm_entry == campaign.handle.lower())
+
     for oos in campaign.out_of_scope_assets:
-        tok = str(oos or "").strip().lower().lstrip("*.")
-        if tok and tok in target_blob:
+        if _asset_matches(oos):
             return "out_of_scope"
     if not campaign.in_scope_assets:
         return "manual_verify_required"
     for ins in campaign.in_scope_assets:
-        tok = str(ins or "").strip().lower().lstrip("*.")
-        if tok and (tok in target_blob or tok == campaign.handle.lower()):
+        if _asset_matches(ins):
             return "in_scope"
     return "manual_verify_required"
 
@@ -698,36 +740,56 @@ class HackerOneApiClient:
         query: str = "",
         bounties_only: bool = False,
         limit: int = 25,
+        max_pages: int = 5,
     ) -> List[HackerOneCampaign]:
-        data = self._request_json(f"hackers/programs?page[size]={min(100, max(1, int(limit)))}")
+        """Paginated HackerOne Hacker API v1 program listing capturing launch/efficiency metadata."""
         q_low = str(query or "").strip().lower()
         out: List[HackerOneCampaign] = []
-        for item in data.get("data") or []:
-            attrs = item.get("attributes") or {}
-            handle = str(attrs.get("handle") or "").strip()
-            if not handle or not _HANDLE_RE.match(handle):
-                continue
-            name = str(attrs.get("name") or handle)
-            offers = bool(attrs.get("offers_bounties", False))
-            if bounties_only and not offers:
-                continue
-            if q_low and q_low not in handle.lower() and q_low not in name.lower():
-                continue
-            out.append(
-                HackerOneCampaign(
-                    handle=handle.lower(),
-                    name=name,
-                    url=f"{HACKERONE_BASE_URL}/{handle.lower()}",
-                    submit_url=f"{HACKERONE_BASE_URL}/{handle.lower()}/reports/new",
-                    offers_bounties=offers,
-                    state=str(attrs.get("state") or "public_mode"),
-                    submission_state=str(attrs.get("submission_state") or "open"),
-                    source="hackerone_api_v1",
-                )
-            )
-        return out[:limit]
+        target_cap = max(1, int(limit))
+        page_size = min(100, max(25, target_cap))
 
-    def fetch_campaign_scope(self, handle: str, *, researcher_username: str = "") -> HackerOneCampaign:
+        for page_num in range(1, max(1, int(max_pages)) + 1):
+            data = self._request_json(f"hackers/programs?page[size]={page_size}&page[number]={page_num}")
+            items = data.get("data") or []
+            if not items:
+                break
+            for item in items:
+                attrs = item.get("attributes") or {}
+                handle = str(attrs.get("handle") or "").strip()
+                if not handle or not _HANDLE_RE.match(handle):
+                    continue
+                name = str(attrs.get("name") or handle)
+                offers = bool(attrs.get("offers_bounties", False))
+                if bounties_only and not offers:
+                    continue
+                if q_low and q_low not in handle.lower() and q_low not in name.lower():
+                    continue
+                out.append(
+                    HackerOneCampaign(
+                        handle=handle.lower(),
+                        name=name,
+                        url=f"{HACKERONE_BASE_URL}/{handle.lower()}",
+                        submit_url=f"{HACKERONE_BASE_URL}/{handle.lower()}/reports/new",
+                        offers_bounties=offers,
+                        state=str(attrs.get("state") or "public_mode"),
+                        submission_state=str(attrs.get("submission_state") or "open"),
+                        source="hackerone_api_v1",
+                    )
+                )
+                if len(out) >= target_cap:
+                    return out[:target_cap]
+            next_link = (data.get("links") or {}).get("next") if isinstance(data.get("links"), dict) else None
+            if not next_link:
+                break
+        return out[:target_cap]
+
+    def fetch_campaign_scope(
+        self,
+        handle: str,
+        *,
+        researcher_username: str = "",
+        eligibility_db: Optional[Any] = None,
+    ) -> HackerOneCampaign:
         clean_handle = validate_hackerone_handle(handle)
         prog = self._request_json(f"hackers/programs/{clean_handle}")
         attrs = (prog.get("data") or {}).get("attributes") or {}
@@ -736,13 +798,19 @@ class HackerOneApiClient:
         scope_items = list(scopes_resp.get("data") or [])
         in_scope: List[str] = []
         out_scope: List[str] = []
+        asset_type_counts: Dict[str, int] = {}
+        bounty_eligible_cnt = 0
         for sc in scope_items:
             s_attrs = sc.get("attributes") or {}
             ident = str(s_attrs.get("asset_identifier") or "").strip()
+            atype = str(s_attrs.get("asset_type") or "OTHER").strip().upper()
             if not ident:
                 continue
             if bool(s_attrs.get("eligible_for_submission", True)):
                 in_scope.append(ident)
+                asset_type_counts[atype] = asset_type_counts.get(atype, 0) + 1
+                if bool(s_attrs.get("eligible_for_bounty", False)):
+                    bounty_eligible_cnt += 1
             else:
                 out_scope.append(ident)
 
@@ -753,7 +821,7 @@ class HackerOneApiClient:
             structured_scopes=scope_items,
             researcher_username=eff_user,
         )
-        return HackerOneCampaign(
+        camp = HackerOneCampaign(
             handle=clean_handle,
             name=str(attrs.get("name") or clean_handle),
             url=f"{HACKERONE_BASE_URL}/{clean_handle}",
@@ -767,6 +835,50 @@ class HackerOneApiClient:
             policy_rules=rules.to_dict(),
             source="hackerone_api_v1",
         )
+        if eligibility_db is not None:
+            sub_state = camp.submission_state.lower()
+            status = "UNLOCKED" if sub_state == "open" else "PAUSED"
+            resp_eff = attrs.get("response_efficiency_percentage")
+            eligibility_db.upsert(
+                clean_handle,
+                status,
+                submit_url=camp.submit_url,
+                scope_summary=", ".join(in_scope[:10]),
+                notes=f"Synced from HackerOne API v1 (state={camp.state}, submission_state={camp.submission_state}).",
+                launched_at_utc=str(attrs.get("started_accepting_at") or ""),
+                response_efficiency_pct=float(resp_eff) if resp_eff is not None else None,
+                resolved_count=int(attrs.get("resolved_report_count") or 0),
+                offers_bounties=camp.offers_bounties,
+                is_vdp=not camp.offers_bounties,
+                gold_standard=bool(attrs.get("gold_standard_safe_harbor", False)),
+                fast_payments=bool(attrs.get("fast_payments", False)),
+                submission_state=sub_state,
+                wildcard_count=int(asset_type_counts.get("WILDCARD", 0)),
+                domain_count=int(asset_type_counts.get("URL", 0) + asset_type_counts.get("DOMAIN", 0)),
+                api_asset_count=int(asset_type_counts.get("API", 0)),
+                mobile_asset_count=int(
+                    asset_type_counts.get("GOOGLE_PLAY_APP_ID", 0)
+                    + asset_type_counts.get("APPLE_STORE_APP_ID", 0)
+                    + asset_type_counts.get("OTHER_APK", 0)
+                    + asset_type_counts.get("OTHER_IPA", 0)
+                    + asset_type_counts.get("MOBILE", 0)
+                ),
+                source_repo_count=len(rules.in_scope_repos) or int(asset_type_counts.get("SOURCE_CODE", 0)),
+                ai_asset_count=int(asset_type_counts.get("AI_MODEL", 0)),
+                bounty_eligible_asset_count=bounty_eligible_cnt,
+                in_scope_assets=in_scope,
+                in_scope_repos=rules.in_scope_repos,
+                out_of_scope_assets=out_scope,
+                scope_asset_types=asset_type_counts,
+                roe_automation_tier=rules.automation_tier,
+                roe_automated_prohibited=rules.automated_scanning_prohibited,
+                roe_max_rps=rules.max_rps,
+                roe_required_headers=rules.required_headers,
+                roe_user_agent=rules.required_user_agent or "",
+                roe_ai_disclosure_required=rules.ai_disclosure_required,
+                roe_no_oos_redirects=rules.no_out_of_scope_redirects,
+            )
+        return camp
 
     def submit_report_api(
         self,
@@ -829,6 +941,311 @@ class HackerOneApiClient:
                 resp.setdefault("report_id", remote_id)
                 resp.setdefault("report_url", f"{HACKERONE_BASE_URL}/reports/{remote_id}")
         return resp
+
+
+class HackerOnePublicDirectoryClient:
+    """
+    Zero-credential public HackerOne Program Directory client (`https://hackerone.com/graphql`).
+    Queries publicly accessible VDPs and paid bug bounty programs sorted by newest launch date,
+    filters for actively accepting submissions (`open`) and response efficiency (`>= min_efficiency_pct`),
+    extracts structured scope breadth counts, and persists them into `ProgramEligibilityDB` v2.
+    Enforces strict host pinning (or explicit loopback test server) and `TokenBucketRateLimiter` pacing.
+    """
+
+    PUBLIC_GRAPHQL_URL = "https://hackerone.com/graphql"
+
+    _DIRECTORY_QUERY = """
+    query DirectoryQuery($cursor: String, $where: FiltersOpportunitiesFilterInput, $order_by: OpportunityOrderInput) {
+      opportunities_search(first: 25, after: $cursor, where: $where, order_by: $order_by) {
+        pageInfo { endCursor hasNextPage }
+        nodes {
+          ... on Team {
+            handle
+            name
+            state
+            submission_state
+            started_accepting_at
+            offers_bounties
+            response_efficiency_percentage
+            resolved_report_count
+            gold_standard_safe_harbor
+            fast_payments
+            first_program_response_time
+            structured_scopes(first: 50) {
+              nodes {
+                asset_identifier
+                asset_type
+                eligible_for_submission
+                eligible_for_bounty
+                max_severity
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+
+    def __init__(
+        self,
+        *,
+        endpoint_url: Optional[str] = None,
+        timeout_sec: float = 12.0,
+        max_rps: float = 1.0,
+    ) -> None:
+        raw_url = str(endpoint_url or self.PUBLIC_GRAPHQL_URL).strip()
+        parsed = urllib.parse.urlparse(raw_url)
+        host = (parsed.hostname or "").lower()
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            raw_url = validate_hackerone_url(raw_url)
+        self.endpoint_url = raw_url
+        self.timeout_sec = max(2.0, float(timeout_sec))
+        from engine.request_hygiene import TokenBucketRateLimiter
+
+        self._limiter = TokenBucketRateLimiter(max(0.1, min(float(max_rps), 2.0)))
+
+    @staticmethod
+    def parse_directory_payload(
+        payload: Dict[str, Any],
+        *,
+        min_efficiency_pct: float = 0.0,
+        only_open: bool = True,
+        bounties_only: bool = False,
+        vdp_only: bool = False,
+    ) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
+        """
+        Parses a HackerOne public directory GraphQL (or REST/JSON) response into
+        normalized `ProgramEligibilityDB` v2 upsert dicts sorted by newest `launched_at_utc`.
+        Returns `(records, next_cursor, has_next_page)`.
+        """
+        search = (
+            ((payload.get("data") or {}).get("opportunities_search"))
+            if isinstance(payload.get("data"), dict)
+            else None
+        )
+        if isinstance(search, dict):
+            nodes = list(search.get("nodes") or [])
+            page_info = search.get("pageInfo") if isinstance(search.get("pageInfo"), dict) else {}
+            next_cursor = page_info.get("endCursor")
+            has_next = bool(page_info.get("hasNextPage", False))
+        else:
+            nodes = list(payload.get("programs") or payload.get("nodes") or [])
+            next_cursor = None
+            has_next = False
+
+        parsed_rows: List[Dict[str, Any]] = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            handle = str(node.get("handle") or "").strip().lower()
+            if not handle or not _HANDLE_RE.match(handle):
+                continue
+            sub_state = str(node.get("submission_state") or "open").strip().lower()
+            if only_open and sub_state != "open":
+                continue
+            offers_bounties = bool(node.get("offers_bounties", False))
+            if bounties_only and not offers_bounties:
+                continue
+            if vdp_only and offers_bounties:
+                continue
+            raw_eff = node.get("response_efficiency_percentage")
+            if raw_eff is None:
+                raw_eff = node.get("response_efficiency_pct")
+            eff_pct = float(raw_eff) if raw_eff is not None else None
+            if eff_pct is not None and eff_pct < float(min_efficiency_pct):
+                continue
+
+            raw_scopes = node.get("structured_scopes")
+            if isinstance(raw_scopes, dict):
+                scope_nodes = list(raw_scopes.get("nodes") or [])
+            elif isinstance(raw_scopes, list):
+                scope_nodes = list(raw_scopes)
+            else:
+                scope_nodes = []
+
+            in_scope: List[str] = []
+            out_scope: List[str] = []
+            in_repos: List[str] = []
+            asset_counts: Dict[str, int] = {}
+            bounty_eligible_cnt = 0
+            for sc in scope_nodes:
+                if not isinstance(sc, dict):
+                    continue
+                ident = str(sc.get("asset_identifier") or "").strip()
+                atype = str(sc.get("asset_type") or "OTHER").strip().upper()
+                if not ident:
+                    continue
+                if bool(sc.get("eligible_for_submission", True)):
+                    in_scope.append(ident)
+                    asset_counts[atype] = asset_counts.get(atype, 0) + 1
+                    if bool(sc.get("eligible_for_bounty", False)):
+                        bounty_eligible_cnt += 1
+                    if atype == "SOURCE_CODE" or _GIT_REPO_URL_RX.match(ident):
+                        try:
+                            norm_u = validate_source_repo_url(ident)
+                            if norm_u not in in_repos:
+                                in_repos.append(norm_u)
+                        except (PermissionError, ValueError):
+                            pass
+                else:
+                    out_scope.append(ident)
+
+            launched = str(node.get("started_accepting_at") or node.get("launched_at_utc") or "").strip()
+            first_resp = node.get("first_program_response_time")
+            if first_resp is None:
+                first_resp = node.get("first_response_hours")
+
+            parsed_rows.append(
+                {
+                    "handle": handle,
+                    "name": str(node.get("name") or handle),
+                    "status": "UNLOCKED" if sub_state == "open" else "PAUSED",
+                    "submit_url": f"{HACKERONE_BASE_URL}/{handle}/reports/new",
+                    "launched_at_utc": launched,
+                    "response_efficiency_pct": eff_pct,
+                    "first_response_hours": float(first_resp) if first_resp is not None else None,
+                    "resolved_count": int(node.get("resolved_report_count") or node.get("resolved_count") or 0),
+                    "offers_bounties": offers_bounties,
+                    "is_vdp": not offers_bounties,
+                    "gold_standard": bool(node.get("gold_standard_safe_harbor", node.get("gold_standard", False))),
+                    "fast_payments": bool(node.get("fast_payments", False)),
+                    "submission_state": sub_state,
+                    "wildcard_count": int(asset_counts.get("WILDCARD", 0)),
+                    "domain_count": int(asset_counts.get("URL", 0) + asset_counts.get("DOMAIN", 0)),
+                    "api_asset_count": int(asset_counts.get("API", 0)),
+                    "mobile_asset_count": int(
+                        asset_counts.get("GOOGLE_PLAY_APP_ID", 0)
+                        + asset_counts.get("APPLE_STORE_APP_ID", 0)
+                        + asset_counts.get("OTHER_APK", 0)
+                        + asset_counts.get("OTHER_IPA", 0)
+                        + asset_counts.get("MOBILE", 0)
+                    ),
+                    "source_repo_count": len(in_repos) or int(asset_counts.get("SOURCE_CODE", 0)),
+                    "ai_asset_count": int(asset_counts.get("AI_MODEL", 0)),
+                    "bounty_eligible_asset_count": bounty_eligible_cnt,
+                    "in_scope_assets": in_scope,
+                    "in_scope_repos": in_repos,
+                    "out_of_scope_assets": out_scope,
+                    "scope_asset_types": asset_counts,
+                    "scope_summary": ", ".join(in_scope[:10]),
+                }
+            )
+
+        parsed_rows.sort(key=lambda r: (r["launched_at_utc"], r["handle"]), reverse=True)
+        return parsed_rows, (str(next_cursor) if next_cursor else None), has_next
+
+    def fetch_and_sync_directory(
+        self,
+        *,
+        eligibility_db: Optional[Any] = None,
+        query: str = "",
+        limit: int = 25,
+        min_efficiency_pct: float = 80.0,
+        bounties_only: bool = False,
+        vdp_only: bool = False,
+        max_pages: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        Fetches public HackerOne directory entries sorted by newest launch date (`launched_at: DESC`)
+        without requiring API credentials, and optionally upserts them into `ProgramEligibilityDB`.
+        """
+        collected: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        cap = max(1, int(limit))
+        q_low = str(query or "").strip().lower()
+
+        where_filter: Dict[str, Any] = {"submission_state": {"_eq": "open"}}
+        if bounties_only:
+            where_filter["offers_bounties"] = {"_eq": True}
+        elif vdp_only:
+            where_filter["offers_bounties"] = {"_eq": False}
+
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        for _ in range(max(1, int(max_pages))):
+            self._limiter.acquire()
+            body = json.dumps(
+                {
+                    "query": self._DIRECTORY_QUERY,
+                    "variables": {
+                        "cursor": cursor,
+                        "where": where_filter,
+                        "order_by": {"field": "launched_at", "direction": "DESC"},
+                    },
+                }
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                self.endpoint_url,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": "RFCHunt-PublicDirectorySync/1.0",
+                },
+                method="POST",
+            )
+            with opener.open(req, timeout=self.timeout_sec) as resp:
+                raw_json = json.loads(resp.read().decode("utf-8", errors="replace"))
+            rows, next_cursor, has_next = self.parse_directory_payload(
+                raw_json,
+                min_efficiency_pct=min_efficiency_pct,
+                only_open=True,
+                bounties_only=bounties_only,
+                vdp_only=vdp_only,
+            )
+            for row in rows:
+                if q_low and q_low not in row["handle"] and q_low not in row["name"].lower():
+                    continue
+                collected.append(row)
+                if len(collected) >= cap:
+                    break
+            if len(collected) >= cap or not has_next or not next_cursor:
+                break
+            cursor = next_cursor
+
+        collected.sort(key=lambda r: (r["launched_at_utc"], r["handle"]), reverse=True)
+        collected = collected[:cap]
+
+        upserted: List[str] = []
+        if eligibility_db is not None:
+            for row in collected:
+                eligibility_db.upsert(
+                    row["handle"],
+                    row["status"],
+                    submit_url=row["submit_url"],
+                    scope_summary=row["scope_summary"],
+                    notes="Synced from HackerOne Public Program Directory (sorted newest launch first).",
+                    launched_at_utc=row["launched_at_utc"],
+                    response_efficiency_pct=row["response_efficiency_pct"],
+                    first_response_hours=row["first_response_hours"],
+                    resolved_count=row["resolved_count"],
+                    offers_bounties=row["offers_bounties"],
+                    is_vdp=row["is_vdp"],
+                    gold_standard=row["gold_standard"],
+                    fast_payments=row["fast_payments"],
+                    submission_state=row["submission_state"],
+                    wildcard_count=row["wildcard_count"],
+                    domain_count=row["domain_count"],
+                    api_asset_count=row["api_asset_count"],
+                    mobile_asset_count=row["mobile_asset_count"],
+                    source_repo_count=row["source_repo_count"],
+                    ai_asset_count=row["ai_asset_count"],
+                    bounty_eligible_asset_count=row["bounty_eligible_asset_count"],
+                    in_scope_assets=row["in_scope_assets"],
+                    in_scope_repos=row["in_scope_repos"],
+                    out_of_scope_assets=row["out_of_scope_assets"],
+                    scope_asset_types=row["scope_asset_types"],
+                )
+                upserted.append(row["handle"])
+
+        return {
+            "source": "hackerone_public_directory",
+            "sorted_by": "launched_at_desc",
+            "min_efficiency_pct": float(min_efficiency_pct),
+            "fetched_count": len(collected),
+            "upserted_count": len(upserted),
+            "upserted": upserted,
+            "programs": collected,
+        }
 
 
 class HackerOneComputerUsePorter:
@@ -1225,6 +1642,184 @@ class HackerOneComputerUsePorter:
             "spec": spec,
         }
 
+    def stage_draft_ready_to_submit(
+        self,
+        campaign: HackerOneCampaign,
+        draft: HackerOneReportDraft,
+        *,
+        cdp_url: Optional[str] = None,
+        profile_dir: Optional[Union[str, Path]] = None,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Pre-fills a single QA-verified HackerOne draft on `/reports/new` and saves it
+        as a Draft (or leaves the filled form open for human review) so the user ONLY
+        needs to review and click Submit manually.
+
+        Hard Safety Invariants:
+          - NEVER clicks any Submit / Publish / Send button (`auto_submit_forbidden=True`).
+          - NEVER solves or bypasses login, 2FA, CAPTCHA, or Turnstile gates; pauses and
+            reports `auth_or_captcha_checkpoint_required` if a gate is detected.
+          - Prefers attaching to an already-logged-in HugOS Browser / Chromium CDP (`:9222`),
+            falling back to a persistent visible Playwright profile (`profile_dir`).
+        """
+        validated_submit_url = validate_hackerone_url(draft.submit_url or campaign.submit_url)
+        eff_cdp = (cdp_url or os.environ.get("RFCHUNT_HUGOS_CDP_URL") or "http://127.0.0.1:9222").rstrip("/")
+
+        base_meta = {
+            "draft_id": draft.draft_id,
+            "program_handle": campaign.handle,
+            "submit_url": validated_submit_url,
+            "cdp_url": eff_cdp,
+            "final_submit_blocked_for_hitl": True,
+            "auto_submit_forbidden": True,
+            "captcha_bypass_forbidden": True,
+            "auto_submitted": False,
+        }
+
+        if dry_run:
+            return {
+                **base_meta,
+                "status": "dry_run_draft_stage_planned",
+                "dry_run": True,
+                "draft_url": validated_submit_url,
+                "filled_fields": [],
+            }
+
+        if not self._is_playwright_available():
+            return {
+                **base_meta,
+                "status": "playwright_not_installed_manual_ready",
+                "dry_run": False,
+                "draft_url": validated_submit_url,
+                "markdown_path": draft.markdown_path,
+                "install_hint": "python -m pip install playwright && playwright install chromium",
+            }
+
+        cdp_reachable = False
+        try:
+            with urllib.request.urlopen(f"{eff_cdp}/json/version", timeout=0.4) as resp:
+                cdp_reachable = int(resp.status) == 200
+        except Exception:
+            cdp_reachable = False
+
+        from playwright.sync_api import sync_playwright
+
+        filled_fields: List[str] = []
+        draft_saved = False
+        final_url = validated_submit_url
+        auth_blocked = False
+        connection_mode = "cdp" if cdp_reachable else "persistent_profile"
+
+        with sync_playwright() as p:
+            browser = None
+            context = None
+            page = None
+            close_browser_on_exit = False
+            try:
+                if cdp_reachable:
+                    browser = p.chromium.connect_over_cdp(eff_cdp)
+                    context = browser.contexts[0] if browser.contexts else browser.new_context()
+                    page = context.new_page()
+                else:
+                    p_dir = Path(profile_dir or (Path("out/autonomous_hunt/h1_browser_profile"))).resolve()
+                    p_dir.mkdir(parents=True, exist_ok=True)
+                    context = p.chromium.launch_persistent_context(str(p_dir), headless=False)
+                    page = context.new_page()
+                    close_browser_on_exit = False  # Keep tab open for human review/submit or close only on auth error
+
+                page.goto(validated_submit_url, wait_until="domcontentloaded", timeout=30_000)
+                page.wait_for_timeout(1500)
+                cur_url = (page.url or "").lower()
+                page_text_low = ""
+                try:
+                    page_text_low = (page.inner_text("body") or "")[:4000].lower()
+                except Exception:
+                    page_text_low = ""
+
+                # Strictly stop on login, 2FA, or CAPTCHA/Turnstile — NEVER attempt bypass
+                if (
+                    "/users/sign_in" in cur_url
+                    or "verify you are human" in page_text_low
+                    or "just a moment" in page_text_low
+                    or "two-factor authentication" in page_text_low
+                ):
+                    auth_blocked = True
+                    final_url = page.url or validated_submit_url
+                else:
+                    selector_map = (
+                        ("title", ['input[name*="title"]', 'input[id*="title"]', 'input[placeholder*="Title" i]'], draft.title),
+                        (
+                            "vulnerability_information",
+                            [
+                                'textarea[name*="vulnerability_information"]',
+                                'textarea[id*="vulnerability_information"]',
+                                'textarea[placeholder*="Describe" i]',
+                            ],
+                            draft.vulnerability_information,
+                        ),
+                        (
+                            "impact",
+                            ['textarea[name*="impact"]', 'textarea[id*="impact"]', 'textarea[placeholder*="Impact" i]'],
+                            draft.impact,
+                        ),
+                    )
+                    for field_name, selectors, value in selector_map:
+                        for sel in selectors:
+                            loc = page.locator(sel)
+                            if loc.count() > 0:
+                                loc.first.fill(value)
+                                filled_fields.append(field_name)
+                                break
+
+                    # Click ONLY explicit Draft button — strictly forbid Submit/Publish/Send buttons
+                    for btn_sel in (
+                        'button:has-text("Save draft")',
+                        'button:has-text("Create draft")',
+                        'button:has-text("Save as draft")',
+                    ):
+                        btn = page.locator(btn_sel)
+                        if btn.count() > 0:
+                            label_txt = (btn.first.inner_text() or "").strip().lower()
+                            if "submit" not in label_txt and "publish" not in label_txt and "send" not in label_txt:
+                                btn.first.click()
+                                page.wait_for_timeout(2000)
+                                draft_saved = True
+                                break
+
+                    final_url = page.url or validated_submit_url
+            finally:
+                if close_browser_on_exit:
+                    try:
+                        if context is not None:
+                            context.close()
+                        if browser is not None:
+                            browser.close()
+                    except Exception:
+                        pass
+
+        if auth_blocked:
+            return {
+                **base_meta,
+                "status": "auth_or_captcha_checkpoint_required",
+                "connection_mode": connection_mode,
+                "draft_url": final_url,
+                "filled_fields": filled_fields,
+                "draft_saved": False,
+                "markdown_path": draft.markdown_path,
+                "note": "Sign into HackerOne or complete the human check in your browser once, then re-run.",
+            }
+
+        return {
+            **base_meta,
+            "status": "draft_saved_ready_for_submit_click" if draft_saved else "form_prefilled_ready_for_submit_click",
+            "connection_mode": connection_mode,
+            "draft_url": final_url,
+            "filled_fields": filled_fields,
+            "draft_saved": draft_saved,
+            "markdown_path": draft.markdown_path,
+        }
+
 
 class HackerOnePorter:
     """
@@ -1290,16 +1885,47 @@ class HackerOnePorter:
         researcher_username: str = "",
         policy_text_override: str = "",
         dry_run: bool = False,
+        eligibility_db: Optional[Any] = None,
     ) -> Tuple[HackerOneCampaign, List[HackerOneCampaign]]:
-        """Resolves a target HackerOne campaign and returns `(selected_campaign, matching_campaigns)`."""
+        """
+        Resolves a target HackerOne campaign and returns `(selected_campaign, matching_campaigns)`.
+        When multiple campaigns match and `eligibility_db` is available (or API returns multiple),
+        ranks candidates via `ml_program_selector.rank_hackerone_programs()` rather than blindly
+        picking `matches[0]`.
+        """
         matches: List[HackerOneCampaign] = []
         if use_api and not dry_run and self.api_client.has_credentials:
             if program_handle:
-                camp = self.api_client.fetch_campaign_scope(program_handle, researcher_username=researcher_username)
+                camp = self.api_client.fetch_campaign_scope(
+                    program_handle,
+                    researcher_username=researcher_username,
+                    eligibility_db=eligibility_db,
+                )
                 return camp, [camp]
             matches = self.api_client.list_campaigns(query=query, bounties_only=bounties_only, limit=25)
             if matches:
-                selected = self.api_client.fetch_campaign_scope(matches[0].handle, researcher_username=researcher_username)
+                # Filter out known BLOCKED_SIGNAL / PAUSED programs before picking via ML ranker
+                chosen_handle = matches[0].handle
+                if eligibility_db is not None:
+                    unlocked_matches = [m for m in matches if eligibility_db.is_eligible(m.handle)]
+                    if unlocked_matches:
+                        try:
+                            from engine.ml_program_selector import rank_hackerone_programs
+
+                            ranked = rank_hackerone_programs(eligibility_db=eligibility_db)
+                            rank_idx = {
+                                str(r["handle"]).lower(): int(r["rank"])
+                                for r in (ranked.get("ranked_programs") or [])
+                            }
+                            unlocked_matches.sort(key=lambda m: (rank_idx.get(m.handle.lower(), 9999), m.handle))
+                        except Exception:
+                            pass
+                        chosen_handle = unlocked_matches[0].handle
+                selected = self.api_client.fetch_campaign_scope(
+                    chosen_handle,
+                    researcher_username=researcher_username,
+                    eligibility_db=eligibility_db,
+                )
                 return selected, matches
 
         if program_handle:
@@ -1611,8 +2237,25 @@ class HackerOneAutonomousRunner:
             if program_handle:
                 campaigns.append(self.porter.api_client.fetch_campaign_scope(program_handle, researcher_username=eff_user))
             else:
-                listed = self.porter.api_client.list_campaigns(query=query, limit=max(1, int(max_programs or 2)))
-                for c_item in listed[: max(1, int(max_programs or 2))]:
+                target_n = max(1, int(max_programs or 2))
+                listed = self.porter.api_client.list_campaigns(query=query, limit=max(10, target_n * 4))
+                if eff_elig_db is not None and listed:
+                    eligible_listed = [c for c in listed if eff_elig_db.is_eligible(c.handle)]
+                    if eligible_listed:
+                        listed = eligible_listed
+                    try:
+                        from engine.ml_program_selector import rank_hackerone_programs
+
+                        ranked_res = rank_hackerone_programs(eligibility_db=eff_elig_db)
+                        rank_order = {
+                            str(r["handle"]).lower(): int(r.get("rank", 9999))
+                            for r in (ranked_res.get("ranked_programs") or [])
+                            if isinstance(r, dict) and r.get("handle")
+                        }
+                        listed = sorted(listed, key=lambda c: (rank_order.get(c.handle.lower(), 9999), c.handle.lower()))
+                    except Exception:
+                        pass
+                for c_item in listed[:target_n]:
                     campaigns.append(self.porter.api_client.fetch_campaign_scope(c_item.handle, researcher_username=eff_user))
             discovery_meta = {"source": "hackerone_api_v1", "campaigns_count": len(campaigns)}
         elif use_browser:

@@ -13,7 +13,9 @@ and consulting workflows:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional
@@ -44,9 +46,15 @@ def build_rfchunt_all_argv(
     swarm_script: Optional[Path] = None,
 ) -> List[str]:
     """Builds a fail-closed argv invoking `rfc_hunt_swarm.py --all [--ensemble] [--embedded] <target>` (`shell=False`)."""
-    t = str(target).strip()
+    t = str(target or "").strip()
     if not t:
         raise ValueError("target is required for bb_run_all_scan.")
+    if t.startswith("-"):
+        raise ValueError(
+            f"Invalid target {t!r}: target must not start with '-' (argument injection blocked)."
+        )
+    if isinstance(freshness_hours, bool) or isinstance(ensemble_quorum, bool):
+        raise TypeError("freshness_hours and ensemble_quorum must be integers, not bool.")
     script = swarm_script or (Path(__file__).resolve().parent / "rfc_hunt_swarm.py")
     argv = [sys.executable, str(script), "--all", t, "--output-dir", str(output_dir)]
     if ensemble:
@@ -77,6 +85,24 @@ def build_rfchunt_all_argv(
     return argv
 
 
+_ALL_TOOLCHAIN_KEYS = (
+    "docker",
+    "wsl2",
+    "lean4",
+    "rfchunt_lean_oracle",
+    "angr",
+    "klee",
+    "semgrep",
+    "rea",
+    "trufflehog",
+    "jadx",
+    "subfinder",
+    "httpx",
+    "katana",
+    "schemathesis",
+)
+
+
 def _probe_toolchain_status_safe(lean_dir: Optional[Path], embedded: bool) -> Dict[str, Any]:
     """Return non-destructive backend availability status, degrading gracefully on probe errors."""
     if embedded:
@@ -85,7 +111,15 @@ def _probe_toolchain_status_safe(lean_dir: Optional[Path], embedded: bool) -> Di
 
             return _embedded_toolchain_status()
         except Exception:
-            return {}
+            return {
+                name: {
+                    "available": False,
+                    "status": "skipped_embedded",
+                    "reason": "Subprocess toolchain probes skipped in embedded=True mode.",
+                    "path_or_module": None,
+                }
+                for name in _ALL_TOOLCHAIN_KEYS
+            }
     try:
         from engine.linux_poc_runner import probe_optional_backends
 
@@ -93,13 +127,13 @@ def _probe_toolchain_status_safe(lean_dir: Optional[Path], embedded: bool) -> Di
         return probe_optional_backends(lean_dir=eff_lean, timeout_sec=2.5)
     except Exception as exc:
         return {
-            "docker": {"available": False, "status": "unavailable", "reason": str(exc), "path_or_module": None},
-            "wsl2": {"available": False, "status": "unavailable", "reason": str(exc), "path_or_module": None},
-            "lean4": {"available": False, "status": "unavailable", "reason": str(exc), "path_or_module": None},
-            "rfchunt_lean_oracle": {"available": False, "status": "unavailable", "reason": str(exc), "path_or_module": None},
-            "angr": {"available": False, "status": "unavailable", "reason": str(exc), "path_or_module": None},
-            "klee": {"available": False, "status": "unavailable", "reason": str(exc), "path_or_module": None},
-            "semgrep": {"available": False, "status": "unavailable", "reason": str(exc), "path_or_module": None},
+            name: {
+                "available": False,
+                "status": "unavailable",
+                "reason": str(exc),
+                "path_or_module": None,
+            }
+            for name in _ALL_TOOLCHAIN_KEYS
         }
 
 
@@ -135,14 +169,29 @@ def run_rfchunt_all_scan(
     extra_flags: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Executes RFCHunt `--all` (optionally `--ensemble` / `--embedded`) safely (`shell=False`) plus Lean 4 check."""
+    try:
+        if isinstance(freshness_hours, bool) or isinstance(ensemble_quorum, bool):
+            raise TypeError("freshness_hours and ensemble_quorum must be integers, not bool.")
+        eff_freshness_hours = int(freshness_hours)
+        eff_quorum = max(1, int(ensemble_quorum))
+        eff_timeout_sec = float(timeout_sec)
+    except (TypeError, ValueError) as exc:
+        return {
+            "ok": False,
+            "status": "error",
+            "error": f"Invalid numeric parameter for bb_run_all_scan: {exc}",
+            "target": str(target or ""),
+            "output_dir": str(output_dir),
+        }
+
     argv = build_rfchunt_all_argv(
         target=target,
         output_dir=output_dir,
         dry_run=dry_run,
         ensemble=ensemble,
         program=program,
-        freshness_hours=freshness_hours,
-        ensemble_quorum=ensemble_quorum,
+        freshness_hours=eff_freshness_hours,
+        ensemble_quorum=eff_quorum,
         embedded=embedded,
         model=model,
         extra_flags=extra_flags,
@@ -166,7 +215,7 @@ def run_rfchunt_all_scan(
             "target": target,
             "output_dir": output_dir,
             "program": program,
-            "freshness_hours": freshness_hours,
+            "freshness_hours": eff_freshness_hours,
             "embedded": bool(embedded),
             "model": model,
             "lean_verification": lean_summary,
@@ -176,8 +225,8 @@ def run_rfchunt_all_scan(
             dry_payload["ensemble"] = {
                 "target": target,
                 "program": str(program).strip() or "generic",
-                "freshness_hours": int(freshness_hours),
-                "quorum": max(1, int(ensemble_quorum)),
+                "freshness_hours": eff_freshness_hours,
+                "quorum": eff_quorum,
                 "whiteboard": {
                     "enabled": True,
                     "dry_run": True,
@@ -196,8 +245,8 @@ def run_rfchunt_all_scan(
 
         orch = EnsembleOrchestrator(
             program=program,
-            freshness_hours=freshness_hours,
-            quorum=ensemble_quorum,
+            freshness_hours=eff_freshness_hours,
+            quorum=eff_quorum,
             exhaustive_default=True,
             embedded=True,
             model=model,
@@ -228,7 +277,7 @@ def run_rfchunt_all_scan(
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=timeout_sec,
+        timeout=eff_timeout_sec,
     )
     payload: Dict[str, Any] = {
         "status": "completed" if proc.returncode == 0 else "failed",
@@ -284,8 +333,8 @@ def run_rfchunt_all_scan(
             payload["ensemble"] = {
                 "target": target,
                 "program": str(program).strip() or "generic",
-                "freshness_hours": int(freshness_hours),
-                "quorum": max(1, int(ensemble_quorum)),
+                "freshness_hours": eff_freshness_hours,
+                "quorum": eff_quorum,
                 "whiteboard": {
                     "enabled": True,
                     "status": "completed" if proc.returncode == 0 else "failed",
@@ -313,6 +362,34 @@ SUPPORTED_PLATFORMS = {
 }
 
 
+def _coerce_strict_bool(val: Any) -> bool:
+    """Strictly coerce booleans without fail-open bool('false') / bool('0')."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, int) and not isinstance(val, bool):
+        return val == 1
+    if isinstance(val, str):
+        return val.strip().lower() in {"true", "1", "yes", "on"}
+    return False
+
+
+def _redact_draft_text(text: str) -> str:
+    raw = str(text or "")
+    try:
+        from engine.advisory_exporter import _redact_inline_tokens
+
+        raw = _redact_inline_tokens(raw)
+    except Exception:
+        pass
+    try:
+        from engine.hackerone_porter import _scrub_secrets_and_phi
+
+        raw = _scrub_secrets_and_phi(raw)
+    except Exception:
+        pass
+    return raw
+
+
 def validate_and_stage_hackerone_draft(
     *,
     program_handle: str,
@@ -322,34 +399,77 @@ def validate_and_stage_hackerone_draft(
     title: str,
     vulnerability_information: str,
     impact: str,
-    poc_verified: bool,
+    poc_verified: Any,
     out_path: str,
     require_verified_poc: bool = True,
+    eligibility_db: Optional[Any] = None,
+    eligibility_db_path: Optional[str] = None,
+    poc_transcript: str = "",
+    report_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Validates a bug bounty draft against strict signal-protection gates before staging
-    it for browser review/submission.
+    Validates a bug bounty draft against strict signal-protection and ProgramEligibilityDB
+    fail-closed gates before staging it for browser review/submission.
     """
+    handle_clean = str(program_handle or "").strip()
+    asset_clean = str(asset or "").strip()
+    weakness_clean = str(weakness_cwe or "").strip()
+    title_clean = _redact_draft_text(str(title or "")).strip()
+    vuln_clean = _redact_draft_text(str(vulnerability_information or ""))
+    impact_clean = _redact_draft_text(str(impact or ""))
+    transcript_clean = _redact_draft_text(str(poc_transcript or ""))
+
     issues: List[str] = []
-    if not program_handle.strip():
-        issues.append("program_handle is required.")
-    if not asset.strip():
+    elig_blocked = False
+    is_valid_handle = bool(
+        handle_clean
+        and "\x00" not in handle_clean
+        and ".." not in handle_clean
+        and "/" not in handle_clean
+        and "\\" not in handle_clean
+    )
+    if not is_valid_handle:
+        elig_blocked = True
+        issues.append("program_handle is required and must not contain path traversal or control characters.")
+    else:
+        from engine.program_eligibility_db import ProgramEligibilityDB
+
+        if eligibility_db is not None:
+            elig_store = eligibility_db
+        elif eligibility_db_path and str(eligibility_db_path).strip():
+            elig_store = ProgramEligibilityDB(str(eligibility_db_path).strip())
+        elif os.environ.get("RFCHUNT_ELIGIBILITY_DB", "").strip():
+            elig_store = ProgramEligibilityDB(os.environ["RFCHUNT_ELIGIBILITY_DB"].strip())
+        else:
+            elig_store = ProgramEligibilityDB()
+        try:
+            if not elig_store.is_eligible(handle_clean):
+                elig_blocked = True
+                issues.append(
+                    f"Program {handle_clean!r} is not UNLOCKED in ProgramEligibilityDB (blocked by signal/eligibility gate)."
+                )
+        except Exception as exc:
+            elig_blocked = True
+            issues.append(f"ProgramEligibilityDB fail-closed block for {handle_clean!r}: {exc}")
+
+    if not asset_clean:
         issues.append("in-scope asset is required.")
-    if not title.strip():
+    if not title_clean:
         issues.append("title is required.")
-    elif len(title.strip()) >= HACKERONE_MAX_TITLE_LEN:
+    elif len(title_clean) >= HACKERONE_MAX_TITLE_LEN:
         issues.append(
-            f"title length ({len(title.strip())}) must be < {HACKERONE_MAX_TITLE_LEN} characters."
+            f"title length ({len(title_clean)}) must be < {HACKERONE_MAX_TITLE_LEN} characters."
         )
-    if len(vulnerability_information.strip()) < 100:
+    if len(vuln_clean.strip()) < 100:
         issues.append("vulnerability_information is too short (< 100 chars).")
-    if not impact.strip():
+    if not impact_clean.strip():
         issues.append("impact section is required.")
     if severity_rating not in ("None", "Low", "Medium", "High", "Critical"):
         issues.append(
             f"severity_rating {severity_rating!r} must be one of None/Low/Medium/High/Critical."
         )
-    if require_verified_poc and not poc_verified:
+    eff_poc_verified = _coerce_strict_bool(poc_verified)
+    if require_verified_poc and not eff_poc_verified:
         issues.append(
             "poc_verified is False — run `bb_run_linux_poc` first to attach verbatim Linux runtime output before submission."
         )
@@ -357,29 +477,50 @@ def validate_and_stage_hackerone_draft(
     from engine.ensemble_orchestrator import evaluate_vendor_threat_model
 
     tm = evaluate_vendor_threat_model(
-        title=title,
-        summary=f"{vulnerability_information}\n{impact}",
-        file_path=asset,
-        program=program_handle,
-        poc_verified=bool(poc_verified),
+        title=title_clean,
+        summary=f"{vuln_clean}\n{impact_clean}",
+        file_path=asset_clean,
+        program=handle_clean,
+        poc_verified=eff_poc_verified,
     )
     if not tm.passed:
         issues.extend(tm.reasons)
 
-    status = "staged_ready" if not issues else "blocked_quality_gate"
+    if not issues:
+        status = "staged_ready"
+    elif elig_blocked and len(issues) == 1:
+        status = "blocked_eligibility_gate"
+    else:
+        status = "blocked_quality_gate"
+
+    eff_report_id: Optional[str] = None
+    report_url: Optional[str] = None
+    if status == "staged_ready":
+        if report_id and str(report_id).strip():
+            eff_report_id = str(report_id).strip()
+        else:
+            digest = hashlib.sha256(
+                f"{handle_clean}|{asset_clean}|{title_clean}".encode("utf-8")
+            ).hexdigest()[:10]
+            eff_report_id = f"draft-{digest}"
+        report_url = f"https://hackerone.com/reports/{eff_report_id}"
+
     payload = {
         "status": status,
         "quality_gate_issues": issues,
-        "program_handle": program_handle.strip(),
-        "submit_url": SUPPORTED_PLATFORMS["hackerone"].format(handle=program_handle.strip()),
-        "asset": asset.strip(),
-        "weakness_cwe": weakness_cwe.strip(),
+        "program_handle": handle_clean,
+        "submit_url": SUPPORTED_PLATFORMS["hackerone"].format(handle=handle_clean) if is_valid_handle else None,
+        "report_id": eff_report_id,
+        "report_url": report_url,
+        "asset": asset_clean,
+        "weakness_cwe": weakness_clean,
         "severity_rating": severity_rating,
-        "title": title.strip(),
-        "title_length": len(title.strip()),
-        "vulnerability_information": vulnerability_information,
-        "impact": impact,
-        "poc_verified": bool(poc_verified),
+        "title": title_clean,
+        "title_length": len(title_clean),
+        "vulnerability_information": vuln_clean,
+        "impact": impact_clean,
+        "poc_verified": eff_poc_verified,
+        "poc_transcript": transcript_clean,
     }
 
     dest = Path(out_path)
@@ -390,6 +531,8 @@ def validate_and_stage_hackerone_draft(
         "staged_file": str(dest),
         "quality_gate_issues": issues,
         "submit_url": payload["submit_url"],
+        "report_id": eff_report_id,
+        "report_url": report_url,
     }
 
 
@@ -519,6 +662,12 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 "poc_verified": {"type": "boolean"},
                 "out_path": {"type": "string"},
                 "require_verified_poc": {"type": "boolean", "default": True},
+                "eligibility_db_path": {
+                    "type": "string",
+                    "description": "Optional path to ProgramEligibilityDB SQLite file",
+                },
+                "poc_transcript": {"type": "string"},
+                "report_id": {"type": "string"},
             },
         },
     },
@@ -591,7 +740,7 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
     },
     {
         "name": "bb_atlas_llm_eval",
-        "description": "Sync live MITRE ATLAS STIX 2.1 (with ETag cache & golden fallback), synthesize stack-adaptive skills, and evaluate an LLM target across 74-language / low-resource, canary, SSRF/tool, and dynamic ATLAS probes.",
+        "description": "Sync live MITRE ATLAS STIX 2.1 (with ETag cache & golden fallback), synthesize stack-adaptive skills, and evaluate an LLM target across 74-language / low-resource, canary, indirect_exfil, SSRF/tool, and dynamic ATLAS probes (enforces fail-closed AI-in-scope ProgramComplianceContext when program_handle is specified).",
         "inputSchema": {
             "type": "object",
             "required": ["llm_target"],
@@ -602,6 +751,126 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 "suites": {"type": "array", "items": {"type": "string"}},
                 "refresh_stix": {"type": "boolean", "default": True},
                 "concurrency": {"type": "integer", "default": 8},
+                "program_handle": {"type": "string", "description": "Optional HackerOne program handle (fails closed unless AI assets are in scope)"},
+                "eligibility_db_path": {"type": "string"},
+                "researcher_handle": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "bb_run_fast_ooda",
+        "description": "Run Loop 3 3-stage parallel OODA triage funnel (ProcessPoolExecutor CPU checks -> ACDSO Pareto/Anomaly top 3-5 -> single-slot OllamaConcurrencyGuard) and optional Loop 4 auto-PoC submission staging.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["target"],
+            "properties": {
+                "target": {"type": "string", "description": "Local repository path"},
+                "program": {"type": "string", "default": "generic"},
+                "cpu_workers": {"type": "integer"},
+                "blackboard_db": {
+                    "type": "string",
+                    "default": "reports/ensemble_hunt/blackboard.sqlite3",
+                },
+                "out_dir": {"type": "string", "default": "out/fast_ooda"},
+                "embedded": {"type": "boolean", "default": False},
+                "resume": {"type": "boolean", "default": False},
+                "signal_score": {"type": "number", "default": 0.0},
+                "eligibility_db_path": {"type": "string"},
+                "model": {"type": "string"},
+                "trigger_browser": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "bb_rank_programs",
+        "description": "Rank UNLOCKED public HackerOne programs via ACDSO-adapted survival, LTR, 6-objective Pareto knee, online bandit & Two-Phase Lane 1/2 knapsack.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "eligibility_db_path": {"type": "string"},
+                "min_efficiency_pct": {"type": "number", "default": 80.0},
+                "preset": {"type": "string", "enum": ["signal_fast", "balanced", "max_ev"]},
+                "capacity": {"type": "integer", "default": 6},
+                "budget_minutes": {"type": "number", "default": 120.0},
+                "include_deferred": {"type": "boolean", "default": False},
+                "use_boost_tie_break": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "bb_score_fresh_commits",
+        "description": "Score and prioritize <72h commits/PRs/releases with ACDSO CommitDiffRanker, velocity burst detection, and diff-scoped SurfaceToScannerRouter.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["candidates"],
+            "properties": {
+                "candidates": {"type": "array", "items": {"type": "object"}},
+                "program_scores": {"type": "object"},
+                "repo_stars_map": {"type": "object"},
+            },
+        },
+    },
+    {
+        "name": "bb_cluster_recon_assets",
+        "description": "Cluster HTTP recon endpoints and JS bundles via K-Means++ + inductive p95 noise threshold and classify anomalous HTTP responses.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["assets"],
+            "properties": {
+                "assets": {"type": "array", "items": {"type": "object"}},
+                "program_handle": {"type": "string"},
+                "eligibility_db_path": {"type": "string"},
+                "max_clusters": {"type": "integer", "default": 8},
+            },
+        },
+    },
+    {
+        "name": "bb_analyze_js_bundles",
+        "description": "Analyze JavaScript bundles for hidden API/GraphQL/OIDC endpoints, DOM/postMessage sinks, source map leaks, and scoped recon clustering.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["bundles"],
+            "properties": {
+                "bundles": {"type": "array", "items": {"type": "object"}},
+                "program_handle": {"type": "string"},
+                "eligibility_db_path": {"type": "string"},
+                "cluster": {"type": "boolean", "default": True},
+            },
+        },
+    },
+    {
+        "name": "bb_classify_http_responses",
+        "description": "Classify anomalous HTTP responses via Welford streaming outlier scoring and optional baseline-vs-probe differential comparison (enforcing program scope allowlist when specified).",
+        "inputSchema": {
+            "type": "object",
+            "required": ["responses"],
+            "properties": {
+                "responses": {"type": "array", "items": {"type": "object"}},
+                "baseline": {"type": "object"},
+                "program_handle": {"type": "string"},
+                "eligibility_db_path": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "bb_record_hunt_outcome",
+        "description": "Record a HackerOne submission triage outcome (TRIAGED, RESOLVED, DUPLICATE, INFORMATIVE, etc.) to update ProgramEligibilityDB ML survival, LTR & bandit models.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["handle", "outcome"],
+            "properties": {
+                "handle": {"type": "string"},
+                "outcome": {"type": "string"},
+                "repo": {"type": "string", "default": ""},
+                "commit_sha": {"type": "string", "default": ""},
+                "lane": {"type": "integer", "default": 1},
+                "target_age_hours": {"type": "number", "default": 0.0},
+                "signal_delta": {"type": "number", "default": 0.0},
+                "bounty_usd": {"type": "number", "default": 0.0},
+                "triage_hours_observed": {"type": "number"},
+                "cycle_id": {"type": "string", "default": ""},
+                "eligibility_db_path": {"type": "string"},
+                "update_signal_score": {"type": "number"},
             },
         },
     },
@@ -723,9 +992,12 @@ class BugBountyMCPServer:
                 title=str(args["title"]),
                 vulnerability_information=str(args["vulnerability_information"]),
                 impact=str(args["impact"]),
-                poc_verified=bool(args["poc_verified"]),
+                poc_verified=_coerce_strict_bool(args["poc_verified"]),
                 out_path=str(args["out_path"]),
                 require_verified_poc=bool(args.get("require_verified_poc", True)),
+                eligibility_db_path=args.get("eligibility_db_path"),
+                poc_transcript=str(args.get("poc_transcript") or ""),
+                report_id=args.get("report_id"),
             )
 
         if name == "bb_browser_handoff_spec":
@@ -782,6 +1054,12 @@ class BugBountyMCPServer:
         if name == "bb_atlas_llm_eval":
             from engine.atlas_llm_evaluator import AtlasLLMEvaluator, LLMTargetAdapter
 
+            elig_db = None
+            prog_h = str(args.get("program_handle") or "").strip() or None
+            if prog_h:
+                from engine.program_eligibility_db import ProgramEligibilityDB
+
+                elig_db = ProgramEligibilityDB(db_path=args.get("eligibility_db_path"))
             adapter = LLMTargetAdapter(
                 target=str(args["llm_target"]),
                 model=args.get("model"),
@@ -790,12 +1068,176 @@ class BugBountyMCPServer:
                 adapter=adapter,
                 concurrency=int(args.get("concurrency", 8)),
             )
-            suites = list(args.get("suites") or ["low_resource", "canary", "ssrf_tool", "atlas_dynamic"])
+            suites = list(args.get("suites") or ["low_resource", "canary", "indirect_exfil", "ssrf_tool", "atlas_dynamic"])
             return evaluator.evaluate(
                 suites=suites,
                 repo_path=args.get("repo_path"),
                 refresh_stix=bool(args.get("refresh_stix", True)),
+                program_handle=prog_h,
+                eligibility_db=elig_db,
+                researcher_handle=args.get("researcher_handle"),
             ).to_dict()
+
+        if name == "bb_run_fast_ooda":
+            target = str(args.get("target") or "").strip()
+            if not target:
+                raise ValueError("target is required for bb_run_fast_ooda.")
+            from engine.ensemble_orchestrator import EnsembleOrchestrator
+            from engine.program_eligibility_db import ProgramEligibilityDB
+
+            program = str(args.get("program") or "generic").strip() or "generic"
+            embedded_flag = _coerce_strict_bool(args.get("embedded", False))
+            cpu_workers_val = args.get("cpu_workers")
+            cpu_workers_int = int(cpu_workers_val) if cpu_workers_val is not None else None
+            orch = EnsembleOrchestrator(
+                program=program,
+                embedded=embedded_flag,
+                model=args.get("model"),
+                max_workers=(max(1, cpu_workers_int) if cpu_workers_int else 4),
+            )
+            elig_path = args.get("eligibility_db_path") or os.environ.get("RFCHUNT_ELIGIBILITY_DB")
+            elig_db = (
+                ProgramEligibilityDB(str(elig_path).strip())
+                if elig_path and str(elig_path).strip()
+                else None
+            )
+            eff_out_dir = str(args.get("out_dir") or "out/fast_ooda").strip() or "out/fast_ooda"
+            ooda_res = orch.run_fast_parallel_ooda(
+                target,
+                program=program,
+                blackboard_db=str(args.get("blackboard_db") or "reports/ensemble_hunt/blackboard.sqlite3"),
+                max_cpu_workers=cpu_workers_int,
+                resume=_coerce_strict_bool(args.get("resume", False)),
+                signal_score=float(args.get("signal_score", 0.0) or 0.0),
+                eligibility_db=elig_db,
+                out_dir=eff_out_dir,
+                trigger_browser=_coerce_strict_bool(args.get("trigger_browser", False)),
+            )
+            out_dir_path = Path(eff_out_dir)
+            out_dir_path.mkdir(parents=True, exist_ok=True)
+            report_path = out_dir_path / "fast_ooda_report.json"
+            report_path.write_text(json.dumps(ooda_res, indent=2, default=str), encoding="utf-8")
+            ooda_res["out_dir"] = str(out_dir_path)
+            ooda_res["report_path"] = str(report_path)
+            return ooda_res
+
+        if name == "bb_rank_programs":
+            from engine.ml_program_selector import rank_hackerone_programs
+
+            res = rank_hackerone_programs(
+                db_path=args.get("eligibility_db_path"),
+                min_efficiency_pct=float(args.get("min_efficiency_pct", 80.0)),
+                preset=args.get("preset"),
+                capacity=int(args.get("capacity", 6)),
+                budget_minutes=float(args.get("budget_minutes", 120.0)),
+                include_deferred=_coerce_strict_bool(args.get("include_deferred", False)),
+            )
+            if _coerce_strict_bool(args.get("use_boost_tie_break", False)) and res.get("tie_break_needed"):
+                from engine.boost_decision_adapter import BoostDecisionAdapter
+
+                tb = BoostDecisionAdapter().tie_break_pareto_knee(res.get("ranked_programs") or [])
+                res["boost_tie_break"] = {k: v for k, v in tb.items() if k != "ordered"}
+                if tb.get("tie_broken") and tb.get("ordered"):
+                    res["ranked_programs"] = tb["ordered"]
+            return res
+
+        if name == "bb_score_fresh_commits":
+            from engine.ml_diff_and_recon_ranker import CommitDiffRanker
+
+            cands = list(args.get("candidates") or [])
+            ranker = CommitDiffRanker()
+            ranked = ranker.rank_candidates(
+                cands,
+                program_scores=args.get("program_scores"),
+                repo_stars_map=args.get("repo_stars_map"),
+            )
+            return {
+                "total_candidates": len(ranked),
+                "ranked_candidates": ranked,
+            }
+
+        if name == "bb_cluster_recon_assets":
+            from engine.ml_diff_and_recon_ranker import ReconAssetClusterer
+
+            assets = list(args.get("assets") or [])
+            compliance_ctx = None
+            prog_h = str(args.get("program_handle") or "").strip()
+            if prog_h:
+                from engine.program_eligibility_db import ProgramEligibilityDB
+                from engine.request_hygiene import build_program_compliance_context
+
+                elig_db = ProgramEligibilityDB(db_path=args.get("eligibility_db_path"))
+                compliance_ctx = build_program_compliance_context(prog_h, eligibility_db=elig_db)
+
+            clusterer = ReconAssetClusterer(max_clusters=int(args.get("max_clusters", 8)))
+            return clusterer.cluster_and_prioritize(assets, compliance_ctx=compliance_ctx)
+
+        if name == "bb_analyze_js_bundles":
+            from engine.ml_diff_and_recon_ranker import JavaScriptBundleAnalyzer
+
+            bundles = list(args.get("bundles") or [])
+            compliance_ctx = None
+            prog_h = str(args.get("program_handle") or "").strip()
+            if prog_h:
+                from engine.program_eligibility_db import ProgramEligibilityDB
+                from engine.request_hygiene import build_program_compliance_context
+
+                elig_db = ProgramEligibilityDB(db_path=args.get("eligibility_db_path"))
+                compliance_ctx = build_program_compliance_context(prog_h, eligibility_db=elig_db)
+
+            return JavaScriptBundleAnalyzer().analyze_bundles(
+                bundles,
+                compliance_ctx=compliance_ctx,
+                cluster=_coerce_strict_bool(args.get("cluster", True)),
+            )
+
+        if name == "bb_classify_http_responses":
+            from engine.ml_diff_and_recon_ranker import HTTPResponseAnomalyClassifier
+
+            responses = list(args.get("responses") or [])
+            compliance_ctx = None
+            prog_h = str(args.get("program_handle") or "").strip()
+            if prog_h:
+                from engine.program_eligibility_db import ProgramEligibilityDB
+                from engine.request_hygiene import build_program_compliance_context
+
+                elig_db = ProgramEligibilityDB(db_path=args.get("eligibility_db_path"))
+                compliance_ctx = build_program_compliance_context(prog_h, eligibility_db=elig_db)
+
+            classified = HTTPResponseAnomalyClassifier().classify_responses(
+                responses,
+                baseline=args.get("baseline") if isinstance(args.get("baseline"), dict) else None,
+                compliance_ctx=compliance_ctx,
+            )
+            return {
+                "total_responses": len(classified),
+                "anomalous_count": sum(1 for r in classified if r["is_anomalous"]),
+                "classified_responses": classified,
+            }
+
+        if name == "bb_record_hunt_outcome":
+            from engine.program_eligibility_db import ProgramEligibilityDB
+
+            db = ProgramEligibilityDB(db_path=args.get("eligibility_db_path"))
+            rec = db.record_hunt_outcome(
+                handle=str(args["handle"]),
+                outcome=str(args["outcome"]),
+                repo=str(args.get("repo") or ""),
+                commit_sha=str(args.get("commit_sha") or ""),
+                lane=int(args.get("lane", 1)),
+                target_age_hours=float(args.get("target_age_hours", 0.0)),
+                signal_delta=float(args.get("signal_delta", 0.0)),
+                bounty_usd=float(args.get("bounty_usd", 0.0)),
+                triage_hours_observed=args.get("triage_hours_observed"),
+                cycle_id=str(args.get("cycle_id") or ""),
+            )
+            acct = None
+            if args.get("update_signal_score") is not None:
+                acct = db.update_account_state(
+                    signal_established=True,
+                    signal_score=float(args["update_signal_score"]),
+                ).to_dict()
+            return {"status": "recorded", "outcome": rec.to_dict(), "account_state": acct}
 
         raise ValueError(f"Unknown tool: {name}")
 

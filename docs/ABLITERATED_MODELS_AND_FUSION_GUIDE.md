@@ -188,3 +188,26 @@ tests/test_abliteration_fusion.py::TestModelFusionPanelPrioritization::test_fusi
 tests/test_abliteration_fusion.py::TestCLIAbliterationFlags::test_rfc_hunt_swarm_abliteration_flag PASSED
 tests/test_abliteration_fusion.py::TestCLIAbliterationFlags::test_main_abliteration_flag PASSED
 ```
+
+---
+
+## 7. ModelFusion HTTP Server (`:5000`) Bridge & Deterministic Anti-Junk Grounding Guards
+
+RFCHunt synchronizes its 15-model abliterated security catalog directly with **ModelFusion** (`d:\harfile\ModelFusion`, `crates/model_selection/src/memory.rs`) and routes local security triage through ModelFusion's HTTP server (`http://127.0.0.1:5000`, falling back automatically to direct Ollama at `http://127.0.0.1:11434` within a strict `400ms` health probe timeout):
+
+- **Runtime-Memory-Gated Abliterated Catalog (`15` Models):**
+  - Compact/Edge (`>= 6 GB` free RAM): `hf.co/bartowski/glm-4-9b-chat-abliterated-GGUF:Q4_K_M`, `hf.co/byroneverson/glm-4-9b-chat-abliterated`, `hf.co/byroneverson/LongWriter-glm4-9b-abliterated`.
+  - Mid-Tier (`>= 8–10 GB` free RAM): `huihui_ai/foundation-sec-abliterated:8b`, `huihui_ai/deepseek-r1-abliterated:8b`, `hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M`, `fenkohq/foundation-sec-8b:latest`.
+  - Workstation MoE (`>= 16 GB` free RAM / `>= 14 GB` free VRAM): `hf.co/audnai/penclaw-GLM-5.3-abliterated`, `hf.co/msuiche/GLM-5.3-abliterated-cyber-GLP-77`, `hf.co/huihui-ai/GLM-5.3-abliterated`, `huihui_ai/glm-4.7-flash-abliterated:latest`.
+  - High-Memory vLLM Docker Tier (`>= 256–512 GB` free RAM, never auto-pulled into Ollama): `OpenYourMind/GLM-5.2-abliterated` (432B), `skyblanket/GLM-5-abliterated` (744B).
+- **Deterministic Anti-Junk & Hallucination Guards (`model_adapter.py`, `engine/gha_llm_verifier.py`, and ModelFusion `crates/core/src/fusion_engine/anti_junk_guard.rs`):**
+  1. Strips `<think>...</think>` blocks and dangling unclosed `<think>` reasoning fragments.
+  2. Rejects degenerate GGUF repetition loops (`>= 24` repeated chars, `>= 3` repeated lines, `>= 4` repeated 6-word n-grams, or `< 20%` lexical diversity).
+  3. Rejects generic meta-commentary slop and unfilled placeholder stubs (`"rationale": "..."`).
+  4. Grounded file-path verification (`verify_grounding`): rejects security triage verdicts that invent ungrounded source paths not present in the supplied prompt context.
+  5. Enforces strict JSON schema parsing whenever structured triage output is requested.
+
+Verify parity and anti-junk guards end-to-end with:
+```powershell
+pytest -q -o addopts="" tests/test_modelfusion_rfchunt_adaptation.py tests/test_draft_qa_checker.py tests/test_draft_submit_checker.py
+```

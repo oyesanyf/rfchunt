@@ -15,11 +15,10 @@ import csv
 import hashlib
 import io
 import json
-import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from engine.secret_store import SecretBox
 
@@ -96,8 +95,22 @@ def redact_sensitive_headers(headers: Optional[Dict[str, Any]]) -> Dict[str, str
 def _redact_inline_tokens(text: str) -> str:
     if not text:
         return ""
-    out = re.sub(r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}", "<REDACTED_JWT>", text)
+    out = re.sub(
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        "<REDACTED_PRIVATE_KEY>",
+        str(text),
+    )
+    out = re.sub(r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}", "<REDACTED_JWT>", out)
     out = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}", "Bearer <REDACTED>", out)
+    out = re.sub(r"\bgh[pous]_[A-Za-z0-9]{20,}\b", "<REDACTED_GITHUB_TOKEN>", out)
+    out = re.sub(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", "<REDACTED_GITHUB_PAT>", out)
+    out = re.sub(r"\bsk-ant-[A-Za-z0-9_-]{16,}\b", "<REDACTED_ANTHROPIC_KEY>", out)
+    out = re.sub(r"\bsk-proj-[A-Za-z0-9_-]{20,}\b", "<REDACTED_OPENAI_KEY>", out)
+    out = re.sub(r"\bsk-[A-Za-z0-9]{48}\b", "<REDACTED_OPENAI_KEY>", out)
+    out = re.sub(r"\bAIza[0-9A-Za-z_-]{35}\b", "<REDACTED_GOOGLE_API_KEY>", out)
+    out = re.sub(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "<REDACTED_AWS_KEY>", out)
+    out = re.sub(r"\b[sr]k_live_[A-Za-z0-9]{16,}\b", "<REDACTED_STRIPE_KEY>", out)
+    out = re.sub(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", "<REDACTED_SLACK_TOKEN>", out)
     return out
 
 
@@ -238,7 +251,8 @@ class AdvisoryExporter:
                     desc = str(step.get("desc") or step.get("description") or step.get("finding_id") or "").replace("|", "\\|").replace("\r", " ").replace("\n", " ")
                     lines.append(f"| {s_num} | `{cap}` | `{sc}` | {desc} |")
                 else:
-                    lines.append(f"| {idx} | `STEP` | `-` | {str(step).replace('|', '\\|').replace('\r', ' ').replace('\n', ' ')} |")
+                    clean_step = str(step).replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+                    lines.append(f"| {idx} | `STEP` | `-` | {clean_step} |")
             lines.append("")
 
         if evidence_quote:

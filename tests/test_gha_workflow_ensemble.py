@@ -22,7 +22,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pytest
 
@@ -56,7 +56,23 @@ from engine.gha_workflow_scanners import (
     run_actionlint_scan,
     run_zizmor_scan,
 )
+from engine.ollama_concurrency_guard import OllamaConcurrencyGuard
 from revenue_cli import maybe_dispatch_revenue_cli, run_revenue_cli
+
+
+@pytest.fixture(autouse=True)
+def _isolate_gha_ollama_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> Iterator[None]:
+    import engine.ollama_concurrency_guard as ocg
+
+    monkeypatch.setenv("RFCHUNT_OLLAMA_LOCK_PATH", str(tmp_path / "gha_ollama_slot.lock"))
+    ocg._SHARED_GUARD = None
+    try:
+        yield
+    finally:
+        ocg._SHARED_GUARD = None
 
 
 def _assert_valid_sarif_210(sarif: Dict[str, Any], *, require_results: bool = False) -> None:
@@ -629,6 +645,10 @@ def test_r3_ollama_abliterated_selection_override_and_400ms_timeout(
     assert primary == "huihui_ai/foundation-sec-abliterated:8b"
     assert "nomic-embed-text:latest" not in [primary, *fallbacks]
 
+    from engine.ollama_concurrency_guard import OllamaConcurrencyGuard
+
+    r3_guard = OllamaConcurrencyGuard(lock_path=tmp_path / "r3_guard.lock")
+
     # 2. Loopback Ollama server with refusal fallback -> rescues via abliterated model
     srv, url, reqs = _start_loopback_ollama_server(
         models=[
@@ -640,7 +660,9 @@ def test_r3_ollama_abliterated_selection_override_and_400ms_timeout(
     )
     try:
         # Auto-selection picks foundation-sec-abliterated directly
-        llm_findings, tele = verify_gha_findings_with_llm(tmp_path, [], ollama_endpoint=url)
+        llm_findings, tele = verify_gha_findings_with_llm(
+            tmp_path, [], ollama_endpoint=url, guard=r3_guard
+        )
         assert tele["status"] == "completed"
         assert tele["model"] == "huihui_ai/foundation-sec-abliterated:8b"
         assert len(llm_findings) >= 1
@@ -652,14 +674,20 @@ def test_r3_ollama_abliterated_selection_override_and_400ms_timeout(
 
         # Explicit RFCHUNT_LLM_MODEL="qwen2.5:7b" triggers refusal -> falls back to abliterated model
         monkeypatch.setenv("RFCHUNT_LLM_MODEL", "qwen2.5:7b")
-        llm_fb, tele_fb = verify_gha_findings_with_llm(tmp_path, [], ollama_endpoint=url)
+        llm_fb, tele_fb = verify_gha_findings_with_llm(
+            tmp_path, [], ollama_endpoint=url, guard=r3_guard
+        )
         assert tele_fb["status"] == "completed"
         assert tele_fb["model"] == "huihui_ai/foundation-sec-abliterated:8b"
         assert len(llm_fb) >= 1
 
         # Explicit `--model` parameter overrides `RFCHUNT_LLM_MODEL`
         llm_ov, tele_ov = verify_gha_findings_with_llm(
-            tmp_path, [], model="huihui_ai/foundation-sec-abliterated:8b", ollama_endpoint=url
+            tmp_path,
+            [],
+            model="huihui_ai/foundation-sec-abliterated:8b",
+            ollama_endpoint=url,
+            guard=r3_guard,
         )
         assert tele_ov["model"] == "huihui_ai/foundation-sec-abliterated:8b"
         assert len(llm_ov) >= 1
@@ -671,7 +699,9 @@ def test_r3_ollama_abliterated_selection_override_and_400ms_timeout(
     srv_slow, url_slow, _ = _start_loopback_ollama_server(models=["qwen2.5:7b"], sleep_on_tags_sec=1.2)
     try:
         t0 = time.monotonic()
-        res_slow = resolve_gha_llm_backend(ollama_endpoint=url_slow, probe_timeout_sec=0.4)
+        res_slow = resolve_gha_llm_backend(
+            ollama_endpoint=url_slow, probe_timeout_sec=0.4, guard=r3_guard
+        )
         elapsed = time.monotonic() - t0
         assert res_slow.status == "skipped_unreachable"
         assert elapsed < 1.0
@@ -685,7 +715,7 @@ def test_r3_ollama_abliterated_selection_override_and_400ms_timeout(
     closed_port = sock.getsockname()[1]
     sock.close()
     res_dead, tele_dead = verify_gha_findings_with_llm(
-        tmp_path, [], ollama_endpoint=f"http://127.0.0.1:{closed_port}"
+        tmp_path, [], ollama_endpoint=f"http://127.0.0.1:{closed_port}", guard=r3_guard
     )
     assert res_dead == []
     assert tele_dead["status"] == "skipped_unreachable"
@@ -722,7 +752,10 @@ def test_r3_paid_model_env_local_and_deterministic_override_immunity(
         monkeypatch.setenv("RFCHUNT_ENV_LOCAL", str(env_local))
         monkeypatch.setenv("RFCHUNT_OFFLINE", "1")  # Loopback paid endpoint remains permitted
 
-        llm_findings, tele = verify_gha_findings_with_llm(tmp_path, [], env_local_path=env_local)
+        paid_guard = OllamaConcurrencyGuard(lock_path=tmp_path / "r3_paid_guard.lock")
+        llm_findings, tele = verify_gha_findings_with_llm(
+            tmp_path, [], env_local_path=env_local, guard=paid_guard
+        )
         assert tele["backend"] == "paid_api"
         assert tele["status"] == "completed"
         assert len(reqs) >= 1
@@ -1075,6 +1108,8 @@ def test_iter2_explicit_ollama_model_bypasses_paid_env_local(
         monkeypatch.setenv("RFCHUNT_ENV_LOCAL", str(env_local))
         monkeypatch.setenv("RFCHUNT_OFFLINE", "1")
 
+        iter2_guard = OllamaConcurrencyGuard(lock_path=tmp_path / "iter2_guard.lock")
+
         # 1. Explicit Ollama tag bypasses `.env.local` paid config and uses Ollama
         findings_ov, tele_ov = verify_gha_findings_with_llm(
             tmp_path,
@@ -1082,6 +1117,7 @@ def test_iter2_explicit_ollama_model_bypasses_paid_env_local(
             model="huihui_ai/foundation-sec-abliterated:8b",
             ollama_endpoint=ollama_url,
             env_local_path=env_local,
+            guard=iter2_guard,
         )
         assert tele_ov["backend"] == "ollama"
         assert tele_ov["status"] == "completed"
@@ -1097,6 +1133,7 @@ def test_iter2_explicit_ollama_model_bypasses_paid_env_local(
             [],
             ollama_endpoint=ollama_url,
             env_local_path=env_local,
+            guard=iter2_guard,
         )
         assert tele_env["backend"] == "ollama"
         assert tele_env["model"] == "llama3:8b"
@@ -1111,6 +1148,7 @@ def test_iter2_explicit_ollama_model_bypasses_paid_env_local(
             model="gpt-4o-mini",
             ollama_endpoint=ollama_url,
             env_local_path=env_local,
+            guard=iter2_guard,
         )
         assert tele_paid["backend"] == "paid_api"
         assert tele_paid["model"] == "gpt-4o-mini"

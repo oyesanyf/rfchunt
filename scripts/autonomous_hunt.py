@@ -51,7 +51,14 @@ RFCHUNT_ROOT = Path(__file__).resolve().parent.parent
 if str(RFCHUNT_ROOT) not in sys.path:
     sys.path.insert(0, str(RFCHUNT_ROOT))
 
+from engine.hackerone_porter import (  # noqa: E402
+    HackerOneComputerUsePorter,
+    HackerOnePorter,
+    validate_hackerone_url,
+)
 from engine.program_eligibility_db import ProgramEligibilityDB  # noqa: E402
+import shutil  # noqa: E402
+import webbrowser  # noqa: E402
 
 _REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _HANDLE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
@@ -329,6 +336,137 @@ def check_program_eligibility(
         return True, f"eligibility_db_unavailable:{exc}"
 
 
+def extract_verified_findings_from_cycle(target_out_dir: Path) -> List[Dict[str, Any]]:
+    """
+    Collects verified, PoC-backed or corroborated findings from `fast_ooda_report.json`,
+    `READY_TO_SUBMIT.json`, and `ensemble_audit` JSON outputs inside `target_out_dir`.
+    Strictly drops speculative/unverified items so only high-signal findings reach draft staging.
+    """
+    collected: List[Dict[str, Any]] = []
+    seen_keys: set[str] = set()
+
+    def _add_candidate(item: Dict[str, Any]) -> None:
+        if not isinstance(item, dict):
+            return
+        disp = str(item.get("disposition") or "").upper()
+        lane = str(item.get("evidence_lane") or "").upper()
+        poc_ok = bool(item.get("poc_verified", False))
+        confirmed = bool(item.get("confirmed", False))
+        poe_lvl = int(item.get("poe_level", 0) or 0)
+        if not (poc_ok or confirmed or disp in ("CONFIRMED", "LIKELY_VALID") or lane in ("LANE_1_POC", "LANE_2_CORROBORATED") or poe_lvl >= 2):
+            return
+        fp = str(item.get("file_path") or item.get("file") or "")
+        ln = int(item.get("line") or 1)
+        rid = str(item.get("rule_id") or item.get("cwe") or item.get("title") or "finding")
+        dedup_k = f"{fp}:{ln}:{rid}".lower()
+        if dedup_k in seen_keys:
+            return
+        seen_keys.add(dedup_k)
+        # Normalize shape for HackerOnePorter.port_findings
+        norm = dict(item)
+        norm.setdefault("file_path", fp)
+        norm.setdefault("line", ln)
+        norm.setdefault("rule_id", rid)
+        norm.setdefault("severity", str(item.get("severity") or "MEDIUM").upper())
+        if poc_ok and not norm.get("evidence_lane"):
+            norm["evidence_lane"] = "LANE_1_POC"
+            norm["poe_level"] = max(poe_lvl, 3)
+        elif not norm.get("evidence_lane"):
+            norm["evidence_lane"] = "LANE_2_CORROBORATED"
+            norm["poe_level"] = max(poe_lvl, 2)
+        collected.append(norm)
+
+    if not target_out_dir.is_dir():
+        return collected
+
+    for json_path in sorted(target_out_dir.rglob("*.json")):
+        if json_path.name in ("summary.json", "latest_summary.json", "submission_ledger.json"):
+            continue
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+        if isinstance(data, list):
+            for entry in data:
+                if isinstance(entry, dict):
+                    _add_candidate(entry)
+        elif isinstance(data, dict):
+            for key in ("ready_findings", "verified_findings", "findings", "clusters", "staged_submissions"):
+                arr = data.get(key)
+                if isinstance(arr, list):
+                    for entry in arr:
+                        if isinstance(entry, dict):
+                            _add_candidate(entry)
+            if data.get("poc_verified") or data.get("disposition") in ("CONFIRMED", "LIKELY_VALID"):
+                _add_candidate(data)
+    return collected
+
+
+def find_chrome_executable() -> Optional[str]:
+    """Locates Google Chrome (`chrome.exe`) across standard Windows/Linux/macOS install paths."""
+    candidates: List[str] = []
+    if os.name == "nt":
+        for base in (
+            os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+            os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+            os.environ.get("LOCALAPPDATA", ""),
+        ):
+            if base:
+                candidates.append(str(Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe"))
+        for name in ("chrome.exe", "chrome"):
+            found = shutil.which(name)
+            if found:
+                candidates.append(found)
+    else:
+        for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+            found = shutil.which(name)
+            if found:
+                candidates.append(found)
+        mac_chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        if Path(mac_chrome).is_file():
+            candidates.append(mac_chrome)
+
+    for cand in candidates:
+        if cand and Path(cand).is_file():
+            return str(Path(cand))
+    return None
+
+
+def open_urls_in_chrome(urls: Sequence[str], *, dry_run: bool = False) -> Dict[str, Any]:
+    """
+    Validates every URL strictly against `https://hackerone.com/...` and opens them
+    in Google Chrome (`shell=False`) so the user can review and manually click Submit.
+    """
+    validated: List[str] = []
+    seen: set[str] = set()
+    for raw in urls:
+        clean = validate_hackerone_url(str(raw or "").strip())
+        if clean not in seen:
+            seen.add(clean)
+            validated.append(clean)
+
+    chrome_exe = find_chrome_executable()
+    if not validated:
+        return {"status": "skipped_no_urls", "chrome_exe": chrome_exe, "opened_urls": []}
+    if dry_run:
+        return {"status": "dry_run_chrome_planned", "chrome_exe": chrome_exe, "opened_urls": validated}
+
+    if chrome_exe:
+        try:
+            subprocess.Popen(
+                [chrome_exe, "--new-tab", *validated],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return {"status": "opened_in_chrome", "chrome_exe": chrome_exe, "opened_urls": validated}
+        except OSError:
+            pass
+
+    for u in validated:
+        webbrowser.open_new_tab(u)
+    return {"status": "opened_in_default_browser", "chrome_exe": chrome_exe, "opened_urls": validated}
+
+
 def maybe_start_modelfusion_server(
     cli_path: Path,
     db_path: Path,
@@ -416,13 +554,78 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
     steps: List[Dict[str, Any]] = []
     targets_to_audit: List[Tuple[str, Path]] = []
 
+    # Stage 0.2: Optional Public HackerOne Program Directory Sync (newest launches, >=min_efficiency%)
+    if getattr(args, "sync_public_directory", False) and not args.embedded:
+        sync_cmd = [
+            sys.executable,
+            str(RFCHUNT_ROOT / "revenue_cli.py"),
+            "sync-directory",
+            "--public-directory",
+            "--min-efficiency",
+            str(getattr(args, "min_efficiency", 80.0)),
+            "--limit",
+            "25",
+            "--json",
+        ]
+        if args.eligibility_db:
+            sync_cmd.extend(["--db", args.eligibility_db])
+        steps.append(
+            run_step(
+                "stage0_sync_public_directory",
+                sync_cmd,
+                cwd=RFCHUNT_ROOT,
+                env=env,
+                timeout_sec=120.0,
+                dry_run=args.dry_run,
+            )
+        )
+
+    # Stage 0.5: ACDSO-Adapted ML Public HackerOne Program Selection & Two-Lane Portfolio
+    ml_program_selection: Dict[str, Any] = {"status": "skipped"}
+    if not getattr(args, "skip_ml_ranking", False):
+        if args.dry_run:
+            rank_cmd = [
+                sys.executable,
+                str(RFCHUNT_ROOT / "revenue_cli.py"),
+                "rank-programs",
+                "--min-efficiency",
+                str(getattr(args, "min_efficiency", 80.0)),
+                "--capacity",
+                str(max(1, int(getattr(args, "portfolio_capacity", 6)))),
+                "--json",
+            ]
+            if args.eligibility_db:
+                rank_cmd.extend(["--db", args.eligibility_db])
+            steps.append(
+                run_step(
+                    "stage0_ml_program_ranking",
+                    rank_cmd,
+                    cwd=RFCHUNT_ROOT,
+                    env=env,
+                    timeout_sec=60.0,
+                    dry_run=True,
+                )
+            )
+            ml_program_selection = {"status": "dry_run_planned", "min_efficiency_pct": float(getattr(args, "min_efficiency", 80.0))}
+        else:
+            try:
+                from engine.ml_program_selector import rank_hackerone_programs
+
+                ml_program_selection = rank_hackerone_programs(
+                    db_path=args.eligibility_db,
+                    min_efficiency_pct=float(getattr(args, "min_efficiency", 80.0)),
+                    capacity=max(1, int(getattr(args, "portfolio_capacity", 6))),
+                )
+            except Exception as exc:
+                ml_program_selection = {"status": "error", "error": str(exc)}
+
     # Collect explicit local targets (`--target PATH[:PROGRAM]`)
     for raw_t in args.targets or []:
         t_path = Path(raw_t).resolve()
         prog = validate_program_handle(args.program)
         targets_to_audit.append((prog, t_path))
 
-    # Stage 1: Freshness Watch across watchlist
+    # Stage 1: Freshness Watch across watchlist (or dynamically from UNLOCKED Eligibility DB)
     watchlist_path = Path(args.watchlist)
     if not watchlist_path.is_absolute():
         watchlist_path = (RFCHUNT_ROOT / watchlist_path).resolve()
@@ -432,15 +635,26 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
             sys.executable,
             str(RFCHUNT_ROOT / "revenue_cli.py"),
             "freshness-watch",
-            "--watchlist",
-            str(watchlist_path),
             "--hours",
             str(args.freshness_hours),
             "--min-score",
             str(args.min_score),
             "--out",
             str(cycle_dir / "fresh_hunt_queue"),
+            "--ml-rank",
         ]
+        if getattr(args, "from_eligibility_db", False):
+            fresh_cmd.extend(
+                [
+                    "--from-eligibility-db",
+                    "--min-efficiency",
+                    str(getattr(args, "min_efficiency", 80.0)),
+                ]
+            )
+            if args.eligibility_db:
+                fresh_cmd.extend(["--eligibility-db", args.eligibility_db])
+        else:
+            fresh_cmd.extend(["--watchlist", str(watchlist_path)])
         for r in args.repos or []:
             fresh_cmd.extend(["--repo", validate_repo_slug(r)])
         if args.mark_seen:
@@ -459,7 +673,22 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
     # Optionally shallow-clone unlocked watchlist repos into local cache for full white-box auditing
     if args.clone_unlocked and not args.embedded:
         repos_cache = out_root / "repos_cache"
-        wl_items = load_watchlist_targets(watchlist_path)
+        if getattr(args, "from_eligibility_db", False) and (
+            not args.dry_run
+            or args.eligibility_db is None
+            or Path(args.eligibility_db).exists()
+        ):
+            from engine.ml_diff_and_recon_ranker import build_unlocked_watchlist_from_db
+
+            wl_items = [
+                {"program": t["program"], "repo": t["repo"]}
+                for t in build_unlocked_watchlist_from_db(
+                    db_path=args.eligibility_db,
+                    min_efficiency_pct=float(getattr(args, "min_efficiency", 80.0)),
+                )
+            ]
+        else:
+            wl_items = load_watchlist_targets(watchlist_path)
         for r in args.repos or []:
             wl_items.append({"program": validate_program_handle(args.program), "repo": validate_repo_slug(r)})
         for item in wl_items[: max(1, int(args.max_repos))]:
@@ -605,6 +834,23 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
             }
         )
 
+        # Stage 3.5: Auto-Port verified findings into QA-checked, secret/PHI-redacted HackerOne drafts
+        if not args.dry_run:
+            verified_findings = extract_verified_findings_from_cycle(t_out)
+            if verified_findings:
+                porter = HackerOnePorter(output_dir=str(t_out / "hackerone_drafts"), workspace_root=RFCHUNT_ROOT)
+                port_res = porter.port_findings(
+                    verified_findings,
+                    program_handle=prog,
+                    use_api=False,
+                    use_browser=False,
+                    submit_api=False,
+                    dry_run=False,
+                    enforce_eligibility=(not args.allow_blocked and prog != "generic"),
+                )
+                per_target_results[-1]["ported_drafts_count"] = int(port_res.get("eligible_drafts_count") or 0)
+                per_target_results[-1]["ported_drafts"] = list(port_res.get("drafts") or [])
+
     # Stage 4: Lean 4 Formal Proof Kernel Verification
     if not args.skip_lean:
         lean_cmd = [sys.executable, str(RFCHUNT_ROOT / "revenue_cli.py"), "lean-verify"]
@@ -619,15 +865,31 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
             )
         )
 
-    # Stage 5: Hard Safety Violation Check + Strict QA Audit (`qa-drafts --strict`) on Staged Markdown Drafts
+    # Stage 5: Hard Safety Violation Check + Strict QA Audit (`qa-drafts --strict`) + Optional Draft-Only Staging
     draft_violations: List[Dict[str, Any]] = []
+    ready_to_click_submit: List[Dict[str, Any]] = []
+    staged_browser_drafts: List[Dict[str, Any]] = []
+
     draft_dirs = [cycle_dir, RFCHUNT_ROOT / "reports" / "hackerone"]
+    non_draft_md_names = {
+        "latest_summary.md",
+        "drafts_ready_to_submit.md",
+        "qa_draft_audit.md",
+        "ready_to_click_submit.md",
+        "fresh_hunt_queue.md",
+        "ensemble_audit_report.md",
+        "executive_summary.md",
+        "remediation_roadmap.md",
+        "validation_checklist.md",
+        "readme.md",
+    }
     seen_md: set[Path] = set()
+    qa_status_by_path: Dict[str, str] = {}
     for d_root in draft_dirs:
         if not d_root.is_dir():
             continue
         for md_path in sorted(d_root.rglob("*.md")):
-            if md_path.name in ("latest_summary.md", "drafts_ready_to_submit.md", "qa_draft_audit.md"):
+            if md_path.name.lower() in non_draft_md_names:
                 continue
             if md_path in seen_md:
                 continue
@@ -642,6 +904,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
             if v_list:
                 draft_violations.append({"file": str(md_path), "violations": v_list})
 
+            qa_passed = len(v_list) == 0
             if not args.skip_qa_drafts:
                 qa_cmd = [
                     sys.executable,
@@ -651,22 +914,92 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
                     str(md_path),
                     "--program",
                     validate_program_handle(args.program),
+                    "--db",
+                    str(cycle_dir / "cycle_qa_tracker.sqlite3"),
+                    "--out-md",
+                    str(cycle_dir / "cycle_qa_audit.md"),
+                    "--out-edit-queue",
+                    str(cycle_dir / "cycle_qa_edit_queue.json"),
                     "--write-repaired",
                     str(md_path),
                     "--strict",
                 ]
                 if args.embedded:
                     qa_cmd.append("--no-verify-sources")
-                steps.append(
-                    run_step(
-                        f"stage5_qa_draft:{md_path.name}",
-                        qa_cmd,
-                        cwd=RFCHUNT_ROOT,
-                        env=env,
-                        timeout_sec=60.0,
-                        dry_run=args.dry_run,
-                    )
+                qa_step = run_step(
+                    f"stage5_qa_draft:{md_path.name}",
+                    qa_cmd,
+                    cwd=RFCHUNT_ROOT,
+                    env=env,
+                    timeout_sec=60.0,
+                    dry_run=args.dry_run,
                 )
+                steps.append(qa_step)
+                # Re-scan after auto-repair so repaired HTML entities are cleared
+                try:
+                    repaired_text = md_path.read_text(encoding="utf-8", errors="replace")
+                    v_after = scan_draft_safety_violations(repaired_text)
+                except OSError:
+                    v_after = v_list
+                qa_passed = (qa_step["exit_code"] == 0) and (len(v_after) == 0)
+            qa_status_by_path[str(md_path.resolve())] = "PASS" if qa_passed else "FAIL"
+
+    # Stage 5C: Stage ONLY zero-violation, QA-PASS ported drafts ready for the human's final Submit click
+    browser_stager = HackerOneComputerUsePorter()
+    for tr in per_target_results:
+        prog_handle = str(tr.get("program") or "generic")
+        for d_item in tr.get("ported_drafts") or []:
+            if not isinstance(d_item, dict):
+                continue
+            md_p = str(d_item.get("markdown_path") or "")
+            resolved_md = str(Path(md_p).resolve()) if md_p and not md_p.startswith("[dry-run]") else ""
+            if resolved_md and qa_status_by_path.get(resolved_md) == "FAIL":
+                continue
+            entry = {
+                "program": prog_handle,
+                "draft_id": str(d_item.get("draft_id") or ""),
+                "title": str(d_item.get("title") or ""),
+                "severity": str(d_item.get("severity_rating") or "medium"),
+                "submit_url": str(d_item.get("submit_url") or f"https://hackerone.com/{prog_handle}/reports/new"),
+                "draft_url": str(d_item.get("submit_url") or f"https://hackerone.com/{prog_handle}/reports/new"),
+                "markdown_path": md_p,
+                "qa_status": qa_status_by_path.get(resolved_md, "PASS"),
+                "auto_submitted": False,
+            }
+            if args.stage_drafts and prog_handle != "generic":
+                porter = HackerOnePorter(output_dir=str(cycle_dir / "hackerone_drafts"), workspace_root=RFCHUNT_ROOT)
+                camp, _ = porter.resolve_campaign(program_handle=prog_handle, dry_run=args.dry_run)
+                from engine.hackerone_porter import HackerOneReportDraft
+
+                draft_obj = HackerOneReportDraft(
+                    draft_id=entry["draft_id"],
+                    fingerprint=str(d_item.get("fingerprint") or ""),
+                    program_handle=prog_handle,
+                    submit_url=entry["submit_url"],
+                    title=entry["title"],
+                    weakness_cwe=str(d_item.get("weakness_cwe") or "CWE-20"),
+                    severity_rating=entry["severity"],
+                    asset_identifier=str(d_item.get("asset_identifier") or ""),
+                    evidence_lane=str(d_item.get("evidence_lane") or "LANE_1_POC"),
+                    poe_level=int(d_item.get("poe_level") or 2),
+                    vulnerability_information=str(d_item.get("vulnerability_information") or ""),
+                    impact=str(d_item.get("impact") or ""),
+                    source_rule_id=str(d_item.get("source_rule_id") or ""),
+                    source_scanner=str(d_item.get("source_scanner") or ""),
+                    scope_match_status=str(d_item.get("scope_match_status") or "in_scope"),
+                    markdown_path=md_p,
+                )
+                stage_res = browser_stager.stage_draft_ready_to_submit(
+                    camp,
+                    draft_obj,
+                    cdp_url=args.cdp_url,
+                    profile_dir=args.browser_profile,
+                    dry_run=args.dry_run,
+                )
+                staged_browser_drafts.append(stage_res)
+                entry["draft_url"] = str(stage_res.get("draft_url") or entry["submit_url"])
+                entry["stage_status"] = str(stage_res.get("status") or "")
+            ready_to_click_submit.append(entry)
 
     # Stage 5B: Headless Cooldown / Draft Submission Readiness Check (`check-drafts`)
     if not args.skip_check_drafts:
@@ -690,6 +1023,16 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
             )
         )
 
+    # Stage 5D: Open every verified ready-to-submit HackerOne URL in Google Chrome for manual Submit click
+    urls_to_submit: List[str] = [
+        str(item["draft_url"])
+        for item in ready_to_click_submit
+        if str(item.get("draft_url") or "").startswith("https://hackerone.com/")
+    ]
+    chrome_launch: Dict[str, Any] = {"status": "disabled", "opened_urls": []}
+    if args.open_chrome and urls_to_submit:
+        chrome_launch = open_urls_in_chrome(urls_to_submit, dry_run=args.dry_run)
+
     critical_violations = [
         v for item in draft_violations for v in item["violations"] if v.get("severity") == "CRITICAL"
     ]
@@ -701,7 +1044,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
         "started_utc": cycle_started,
         "finished_utc": utc_now_iso(),
         "dry_run": bool(args.dry_run),
-        "browser_used": False,
+        "browser_used": bool(staged_browser_drafts),
         "auto_submit_forbidden": True,
         "anti_junk_guard_enabled": True,
         "modelfusion_endpoint": mf_endpoint,
@@ -709,7 +1052,20 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
         "ollama_endpoint": ollama_endpoint,
         "ollama_models_count": len(ollama_tags),
         "installed_abliterated_models": abliterated_tags,
+        "ml_program_selection": {
+            "pareto_knee_winner": ml_program_selection.get("pareto_knee_winner"),
+            "preset": ml_program_selection.get("preset"),
+            "ranked_count": len(ml_program_selection.get("ranked_programs") or []),
+            "daily_hunt_portfolio": ml_program_selection.get("daily_hunt_portfolio"),
+            "ai_in_scope_programs": ml_program_selection.get("ai_in_scope_programs") or [],
+            "status": ml_program_selection.get("status", "ok"),
+        },
         "targets_audited": per_target_results,
+        "ready_to_click_submit_count": len(ready_to_click_submit),
+        "ready_to_click_submit": ready_to_click_submit,
+        "ready_urls": urls_to_submit,
+        "staged_browser_drafts": staged_browser_drafts,
+        "chrome_launch": chrome_launch,
         "safety_violations_count": len(draft_violations),
         "critical_safety_violations": critical_violations,
         "draft_violations": draft_violations,
@@ -722,15 +1078,33 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> Dict[str, An
         (cycle_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
         (out_root / "latest_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
+        ready_lines = [
+            f"# Ready To Review & Click Submit (Cycle #{cycle_num} — {summary['finished_utc']})",
+            "",
+            "> Every item below passed PoC/corroboration gating, secret/PHI redaction, and strict QA checks.",
+            "> Final submission is **always manual** — open each link, review, and click **Submit report**.",
+            "",
+        ]
+        if ready_to_click_submit:
+            for item in ready_to_click_submit:
+                ready_lines.append(
+                    f"- **[{item['program']} | {item['severity'].upper()} | QA={item['qa_status']}]** "
+                    f"[{item['title']}]({item['draft_url']})  "
+                    f"(`{item.get('stage_status', 'local_md_ready')}` | draft: `{item['markdown_path']}`)"
+                )
+        else:
+            ready_lines.append("- *(No new QA-verified findings ready to submit in this cycle.)*")
+        (out_root / "READY_TO_CLICK_SUBMIT.md").write_text("\n".join(ready_lines) + "\n", encoding="utf-8")
+
         md_lines = [
             f"# RFCHunt Autonomous Hunt Summary (Cycle #{cycle_num})",
             "",
             f"- **Started (UTC)**: `{summary['started_utc']}`",
             f"- **Finished (UTC)**: `{summary['finished_utc']}`",
-            f"- **Headless / Zero `/browser`**: `True` (`auto_submit_forbidden=True`)",
+            "- **Headless / Zero `/browser`**: `True` (`auto_submit_forbidden=True`)",
             f"- **ModelFusion HTTP (`:5000`)**: `{'ONLINE' if mf_reachable else 'FALLBACK_TO_OLLAMA'}`",
             f"- **Ollama Abliterated Models**: `{', '.join(abliterated_tags) or 'none detected'}`",
-            f"- **Anti-Junk & Grounding Guard**: `ENABLED`",
+            "- **Anti-Junk & Grounding Guard**: `ENABLED`",
             f"- **Safety Violations Detected**: `{len(draft_violations)}` (critical: `{len(critical_violations)}`)",
             f"- **Failed Steps**: `{', '.join(failed_steps) or 'none'}`",
             "",
@@ -791,6 +1165,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cpu-workers", type=int, default=None, help="Bounded ProcessPoolExecutor worker count (2..8).")
     p.add_argument("--signal-score", type=float, default=0.0, help="Current HackerOne Signal score for two-lane scheduling.")
     p.add_argument("--eligibility-db", default=None, help="Optional ProgramEligibilityDB SQLite path.")
+    p.add_argument("--sync-public-directory", action="store_true", default=False, help="Sync public HackerOne Directory (sorted newest-first) before ML ranking.")
+    p.add_argument("--from-eligibility-db", action="store_true", default=False, help="Derive freshness-watch & clone targets dynamically from UNLOCKED programs in ProgramEligibilityDB.")
+    p.add_argument("--min-efficiency", type=float, default=80.0, help="Minimum HackerOne response efficiency %% for ML program ranking & watchlist filtering (default: 80).")
+    p.add_argument("--portfolio-capacity", type=int, default=6, help="Daily Two-Phase Knapsack portfolio capacity (default: 6).")
+    p.add_argument("--skip-ml-ranking", action="store_true", default=False, help="Skip Stage 0.5 ML HackerOne program ranking.")
     p.add_argument("--allow-blocked", action="store_true", default=False, help="Override eligibility DB skip for local research.")
     p.add_argument("--blackboard-db", default=None, help="SQLite WAL Blackboard DB path for crash-safe resume.")
     p.add_argument("--out", default="out/autonomous_hunt", help="Output directory for summaries, SARIF, and logs.")
@@ -810,6 +1189,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-lean", action="store_true", default=False)
     p.add_argument("--skip-qa-drafts", action="store_true", default=False)
     p.add_argument("--skip-check-drafts", action="store_true", default=False)
+    p.add_argument(
+        "--stage-drafts",
+        action="store_true",
+        default=False,
+        help="Prefill & save QA-verified drafts in HugOS Browser CDP (:9222) or persistent Chromium profile (NEVER clicks Submit).",
+    )
+    p.add_argument(
+        "--cdp-url",
+        default=os.environ.get("RFCHUNT_HUGOS_CDP_URL", "http://127.0.0.1:9222"),
+        help="Chromium / HugOS Browser CDP endpoint used when --stage-drafts is set (default: http://127.0.0.1:9222).",
+    )
+    p.add_argument(
+        "--browser-profile",
+        default="out/autonomous_hunt/h1_browser_profile",
+        help="Persistent local browser profile directory so you only sign into HackerOne once.",
+    )
+    p.add_argument(
+        "--open-chrome",
+        action="store_true",
+        default=False,
+        help="Automatically open every verified ready-to-submit HackerOne URL in Google Chrome for your manual Submit click.",
+    )
     p.add_argument("--step-timeout-sec", type=float, default=600.0, help="Per-stage timeout in seconds (default: 600).")
     p.add_argument("--dry-run", action="store_true", default=False, help="Print full execution plan with zero disk/network side effects.")
     p.add_argument("--watch", action="store_true", default=False, help="Run continuously on a repeating schedule.")
@@ -845,12 +1246,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.json_out:
             print(json.dumps(summary, indent=2))
         else:
+            mode_tag = " [DRY-RUN]" if summary.get("dry_run") else ""
             print(
-                f"[RFCHunt] Cycle #{cycle_num} complete | targets={len(summary['targets_audited'])} "
+                f"[RFCHunt] Cycle #{cycle_num}{mode_tag} complete | targets={len(summary['targets_audited'])} "
+                f"| steps_planned={len(summary['steps'])} "
+                f"| ready_to_click_submit={summary['ready_to_click_submit_count']} "
                 f"| safety_violations={summary['safety_violations_count']} "
                 f"| failed_steps={len(summary['failed_steps'])} "
                 f"| modelfusion={'UP' if summary['modelfusion_reachable'] else 'OLLAMA_DIRECT'}"
             )
+            if summary.get("dry_run"):
+                for st in summary.get("steps") or []:
+                    cmd_preview = " ".join(str(x) for x in (st.get("command") or []))
+                    print(f"  [DRY-RUN STEP] {st.get('label')}: {cmd_preview or st.get('status')}")
+            for item in summary.get("ready_to_click_submit") or []:
+                print(
+                    f"  [READY FOR YOUR SUBMIT CLICK] {item['draft_url']} "
+                    f"({item['program']} | {item['severity'].upper()}) — {item['title']}"
+                )
+            if (summary.get("chrome_launch") or {}).get("opened_urls"):
+                print(
+                    f"  [CHROME OPENED] {summary['chrome_launch']['status']}: "
+                    + ", ".join(summary["chrome_launch"]["opened_urls"])
+                )
             if summary["critical_safety_violations"]:
                 print(
                     f"[SAFETY BLOCK] Critical secret leak(s) detected: {summary['critical_safety_violations']}",

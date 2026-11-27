@@ -8,9 +8,11 @@ from pathlib import Path
 import subprocess
 
 from engine.ensemble_orchestrator import (
+    ENGINE_WEIGHTS,
     EngineFinding,
     EnsembleConsensusVoter,
     EnsembleOrchestrator,
+    _embedded_toolchain_status,
     evaluate_vendor_threat_model,
     inspect_repo_freshness,
 )
@@ -226,3 +228,207 @@ def test_deterministic_override_immunity_and_artifact_export(tmp_path: Path) -> 
     assert (out_dir / "ensemble_report.json").is_file()
     assert (out_dir / "ensemble_summary.md").is_file()
     assert (out_dir / "client_audit_bundle").is_dir()
+
+
+def test_m3_engine_weights_and_embedded_toolchain_14_keys() -> None:
+    expected = {
+        "trufflehog": 0.90,
+        "mobile_mobsf": 0.78,
+        "api_jwt_sdjwt": 0.84,
+        "ai_infra_guard": 0.76,
+        "parity_auditor": 0.82,
+        "z3_formal": 0.92,
+    }
+    for k, v in expected.items():
+        assert k in ENGINE_WEIGHTS
+        assert abs(ENGINE_WEIGHTS[k] - v) < 1e-6
+
+    tc = _embedded_toolchain_status()
+    expected_backends = {
+        "docker",
+        "wsl2",
+        "lean4",
+        "rfchunt_lean_oracle",
+        "angr",
+        "klee",
+        "semgrep",
+        "rea",
+        "trufflehog",
+        "jadx",
+        "subfinder",
+        "httpx",
+        "katana",
+        "schemathesis",
+    }
+    assert expected_backends.issubset(tc.keys())
+    assert all(tc[b]["available"] is False and tc[b]["status"] == "skipped_embedded" for b in expected_backends)
+
+
+def test_m3_non_production_noise_downranks_while_preserving_lean4_and_poc() -> None:
+    voter = EnsembleConsensusVoter(program="generic", quorum=2)
+
+    noise_f = EngineFinding(
+        engine="trufflehog",
+        title="Fixture secret",
+        file_path="tests/fixtures/secret_fixture.py",
+        line=4,
+        severity="HIGH",
+        confidence=0.90,
+        non_production_noise=True,
+    )
+    lean_noise_path = EngineFinding(
+        engine="lean4",
+        title="Deterministic Lean 4 theorem violation",
+        file_path="tests/fixtures/http_framing_witness.rs",
+        line=10,
+        cwe="CWE-444",
+        severity="CRITICAL",
+        confidence=0.95,
+        deterministic=True,
+        confirmed=True,
+        non_production_noise=True,
+    )
+    poc_verified_f = EngineFinding(
+        engine="api_jwt_sdjwt",
+        title="Verified auth bypass",
+        file_path="examples/repro_target.py",
+        line=12,
+        cwe="CWE-287",
+        severity="HIGH",
+        confidence=0.85,
+        non_production_noise=True,
+        poc_verified=True,
+    )
+
+    c_noise = voter.fuse([noise_f])
+    assert len(c_noise) == 1
+    assert c_noise[0].disposition == "LOW_CONFIDENCE_NOISE"
+
+    c_lean = voter.fuse([lean_noise_path])
+    assert len(c_lean) == 1
+    assert c_lean[0].lean_verified is True
+    assert c_lean[0].disposition == "ENSEMBLE_CORROBORATED_STATIC"
+
+    c_poc = voter.fuse([poc_verified_f])
+    assert len(c_poc) == 1
+    assert c_poc[0].poc_verified is True
+    assert c_poc[0].disposition == "SUBMISSION_READY"
+
+
+def test_m3_six_new_vendor_threat_model_profiles() -> None:
+    assert evaluate_vendor_threat_model(
+        title="[hygiene_only] Missing security.txt",
+        summary="Informational banner only.",
+        file_path="README.md",
+        program="henkel_vdp",
+    ).passed is False
+    assert evaluate_vendor_threat_model(
+        title="SQLi in portal",
+        summary="Unauthenticated SQL injection on production API.",
+        file_path="src/api.py",
+        program="henkel_vdp",
+    ).passed is True
+
+    assert evaluate_vendor_threat_model(
+        title="Self-XSS in profile field",
+        summary="self-xss only",
+        file_path="src/ui.ts",
+        program="servicenow-disclosure",
+    ).passed is False
+
+    assert evaluate_vendor_threat_model(
+        title="Issue in demo",
+        summary="Demo only",
+        file_path="examples/demo.py",
+        program="common_codes",
+    ).passed is False
+
+    assert evaluate_vendor_threat_model(
+        title="Physical access attack",
+        summary="Requires unlocked bootloader.",
+        file_path="android/boot.kt",
+        program="oppo_bbp",
+    ).passed is False
+
+    assert evaluate_vendor_threat_model(
+        title="AWS EC2 metadata endpoint",
+        summary="AWS core infrastructure endpoint check.",
+        file_path="infra/aws.tf",
+        program="amazonvrp",
+    ).passed is False
+    assert evaluate_vendor_threat_model(
+        title="Prompt injection in Prime Video GenAI assistant",
+        summary="GenAI app under primevideo.com allows cross-user data leakage.",
+        file_path="src/genai/primevideo_chat.py",
+        program="amazonvrp",
+    ).passed is True
+
+    assert evaluate_vendor_threat_model(
+        title="Self-XSS in Temu widget",
+        summary="self-xss without cross-user impact",
+        file_path="src/widget.ts",
+        program="temu",
+    ).passed is False
+
+
+def test_m3_run_exhaustive_local_engines_wires_m1_and_z3_embedded(tmp_path: Path) -> None:
+    repo = tmp_path / "polyglot_m3"
+    (repo / "src").mkdir(parents=True)
+    (repo / "packages" / "a").mkdir(parents=True)
+    (repo / "packages" / "b").mkdir(parents=True)
+
+    tok = "ghp_" + "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8"
+    (repo / "src" / "cfg.py").write_text(f'TOKEN = "{tok}"\n', encoding="utf-8")
+    (repo / "src" / "jwt_check.py").write_text(
+        'import jwt\ndef parse(t):\n    return jwt.decode(t, options={"verify_signature": False})\n',
+        encoding="utf-8",
+    )
+    (repo / "src" / "loader.py").write_text(
+        "import pickle\ndef load_obj(b):\n    return pickle.loads(b)\n",
+        encoding="utf-8",
+    )
+    (repo / "packages" / "a" / "auth.ts").write_text(
+        "export function handleInbound(req: any) { verifySignature(req); return sanitizeInput(req); }\n",
+        encoding="utf-8",
+    )
+    (repo / "packages" / "b" / "auth.ts").write_text(
+        "export function handleInbound(req: any) { return req; }\n",
+        encoding="utf-8",
+    )
+    (repo / "AndroidManifest.xml").write_text(
+        '<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.rfchunt.test"><application><activity android:name=".Web" android:exported="true"/></application></manifest>\n',
+        encoding="utf-8",
+    )
+    (repo / "openapi.json").write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.0",
+                "info": {"title": "TestAPI", "version": "1.0.0"},
+                "paths": {
+                    "/admin/users": {
+                        "delete": {
+                            "operationId": "deleteUser",
+                            "responses": {"200": {"description": "ok"}},
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    findings, telemetry = EnsembleOrchestrator.run_exhaustive_local_engines(
+        repo,
+        embedded=True,
+        no_external_scanners=True,
+        program="common_codes",
+    )
+    executed = set(telemetry.get("engines_executed") or [])
+    for eng in ("trufflehog", "mobile_mobsf", "api_jwt_sdjwt", "ai_infra_guard", "parity_auditor", "z3_formal"):
+        assert eng in executed
+
+    emitted_engines = {f.engine for f in findings}
+    assert {"trufflehog", "mobile_mobsf", "api_jwt_sdjwt", "ai_infra_guard", "parity_auditor", "z3_formal"}.issubset(
+        emitted_engines
+    )
+    assert all(tok not in f.summary for f in findings)

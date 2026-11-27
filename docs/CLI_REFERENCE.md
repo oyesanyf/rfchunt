@@ -490,3 +490,63 @@ python -u main.py --repo D:\path\to\repo --proxy --plain
 python -u rfc_hunt_swarm.py docker-doctor --plain
 python -u rfc_hunt_swarm.py docker-doctor --fix --include-all-wsl --plain
 ```
+
+### 12. Revenue Engine, HackerOne QA Phase (`qa-drafts`), Cooldown Monitor (`check-drafts`), Autonomous Hunt & ConPTY Watchdog
+```powershell
+# 1. QA Phase: audit & auto-repair a local draft Markdown file before staging
+python revenue_cli.py qa-drafts --markdown-file draft.md --title "My Report Title" --program oppo_bbp --write-repaired draft_clean.md --strict
+
+# 2. QA Phase: batch-audit exported HackerOne draft JSONs with live raw.githubusercontent.com line & #define checks
+python revenue_cli.py qa-drafts --snapshot-json reports/ensemble_hunt/drafts_snapshot.json --out-md reports/ensemble_hunt/qa_draft_audit.md --out-edit-queue reports/ensemble_hunt/qa_edit_queue.json --strict
+
+# 3. Cooldown Monitor: probe whether HackerOne `can_submit_draft?` has cleared (1 polite request)
+python revenue_cli.py check-drafts --probe-only
+
+# 4. Cooldown Monitor: inspect seeded priority queue offline or run continuous watch loop
+python revenue_cli.py check-drafts --seed-only
+python revenue_cli.py check-drafts --watch --interval-minutes 120 --max-per-day 2
+python revenue_cli.py check-drafts --mark-submitted 4243972
+
+# 5. Exhaustive Stage 0-5 ensemble audit & fast OODA funnel
+python -u revenue_cli.py ensemble-audit --target D:\path\to\repo --program anthropic --all --ensemble --proxy auto --out reports/ensemble_hunt/out
+python -u revenue_cli.py fast-ooda --target D:\path\to\repo --program common_codes --out out/fast_ooda --json
+
+# 6. Standalone headless autonomous hunting runner (zero /browser) & Windows Scheduled Task installer
+python scripts/autonomous_hunt.py --target D:\path\to\repo --program common_codes --dry-run
+python scripts/autonomous_hunt.py --target D:\path\to\repo --embedded --json
+powershell -ExecutionPolicy Bypass -File scripts/install_hunt_schedule.ps1 -IntervalMinutes 60 -CloneUnlocked
+
+# 7. Global Windows ConPTY deadlock cleaner & 5-minute OS-level Scheduled Task watchdog
+powershell -ExecutionPolicy Bypass -File scripts/clear_conpty_deadlocks.ps1 -DryRun
+powershell -ExecutionPolicy Bypass -File scripts/install_global_deadlock_watchdog.ps1
+```
+
+### 13. One-Command Turnkey Runner (`hunt.py`) & ACDSO ML Program Selection, JS Analysis, Recon Clustering & ATLAS AI Gate
+```powershell
+# 0. ONE-COMMAND TURNKEY PYTHON RUNNER (runs ML ranking, unlocked freshness watch, OODA, ensemble audit, Lean 4, QA & Chrome handoff)
+python hunt.py --dry-run
+python hunt.py --sync-public-directory --once
+python hunt.py
+
+# 1. Rank UNLOCKED HackerOne programs (newest launches, >=80% efficiency, wide scope, Lane 1/2 portfolio knapsack)
+python revenue_cli.py rank-programs --min-efficiency 80 --capacity 6 --budget-minutes 120 --json
+python revenue_cli.py rank-programs --preset signal_fast --use-boost --json
+
+# 2. Sync HackerOne public directory & structured scopes into ProgramEligibilityDB v2 (public newest-first, API, or offline snapshot)
+python revenue_cli.py sync-directory --public-directory --min-efficiency 80 --limit 25 --json
+python revenue_cli.py sync-directory --snapshot-json h1_directory.json --json
+python revenue_cli.py sync-directory --query "api" --limit 25 --json
+
+# 3. Poll fresh <72h diffs strictly from UNLOCKED DB repos with invariant ETag caching + CommitDiffRanker ML scoring
+python revenue_cli.py freshness-watch --from-eligibility-db --ml-rank --hours 72 --min-score 20
+
+# 4. Analyze JavaScript bundles & cluster/classify anomalous HTTP responses (enforces strict DNS-boundary scope allowlist)
+python revenue_cli.py analyze-js --input ./js_bundles --program common_codes --json
+python revenue_cli.py cluster-recon --input recon_endpoints.json --program common_codes --json
+
+# 5. Adversarial LLM prompt injection / indirect data exfiltration / guardrail bypass (fails closed unless AI is in scope)
+python revenue_cli.py atlas-llm-eval --llm-target https://ai.example.com --program anthropic --suites low_resource,canary,indirect_exfil,ssrf_tool
+
+# 6. Log real HackerOne report triage outcomes to continuously update Cox survival, GroupKFold LTR & LinUCB/Thompson models
+python revenue_cli.py record-outcome --handle henkel_vdp --outcome TRIAGED --lane 1 --signal-delta 7.0 --bounty-usd 0 --triage-hours 16
+```

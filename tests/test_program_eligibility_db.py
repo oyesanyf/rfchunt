@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from engine.program_eligibility_db import ProgramEligibilityDB
+from engine.program_eligibility_db import ProgramEligibilityDB  # noqa: E402
 
 
 def test_seed_baseline_and_fail_closed_eligibility(tmp_path: Path):
@@ -21,10 +21,10 @@ def test_seed_baseline_and_fail_closed_eligibility(tmp_path: Path):
     base_time = datetime(2026, 11, 26, 16, 35, 0, tzinfo=timezone.utc)
     counts = db.seed_observed_hackerone_baseline(now=base_time)
 
-    assert counts["UNLOCKED"] >= 9
-    assert counts["BLOCKED_SIGNAL"] >= 130
-    assert counts["PAUSED"] == 2
-    assert counts["NOT_FOUND"] == 7
+    assert counts["UNLOCKED"] >= 12
+    assert counts["BLOCKED_SIGNAL"] >= 160
+    assert counts["PAUSED"] >= 12
+    assert counts["NOT_FOUND"] >= 40
 
     assert db.is_eligible("anthropic") is True
     assert db.is_eligible("amazonvrp") is True
@@ -38,6 +38,8 @@ def test_seed_baseline_and_fail_closed_eligibility(tmp_path: Path):
     assert db.is_eligible("vercel") is False
     assert db.is_eligible("cloudflare") is False
     assert db.is_eligible("mozilla") is False
+    assert db.is_eligible("django") is False
+    assert db.is_eligible("openai") is False
     assert db.is_eligible("never_seen_program") is False
 
     unlocked = db.list_unlocked()

@@ -29,6 +29,8 @@ keys/
 bin/
 tools/
 generated/
+out/
+.pytest_tmp*/
 .pytest_tmp_e2e/
 engine/research_detectors/
 engine/security_skills_catalog/

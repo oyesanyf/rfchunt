@@ -94,11 +94,15 @@ _PROXY_ENV_KEYS = (
 
 
 @pytest.fixture(autouse=True)
-def isolated_ensemble_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def isolated_ensemble_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> Iterator[None]:
     """
     Enforce offline, non-destructive safety invariants and restore singleton policy gates
     before and after every test.
     """
+    import engine.ollama_concurrency_guard as ocg
     from engine.execution_policy import ExecutionPolicy
     from mcp_server import TargetAuthorizationGate
 
@@ -108,6 +112,7 @@ def isolated_ensemble_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     ExecutionPolicy.reset_instance()
     TargetAuthorizationGate.ALLOWED_TARGETS = {"127.0.0.1", "localhost", "::1", "[::1]"}
     TargetAuthorizationGate._request_history.clear()
+    ocg._SHARED_GUARD = None
 
     monkeypatch.setenv("CI", "true")
     monkeypatch.setenv("RFCHUNT_OFFLINE", "1")
@@ -118,6 +123,7 @@ def isolated_ensemble_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("NO_COLOR", "1")
     monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
     monkeypatch.setenv("SEMGREP_SEND_METRICS", "off")
+    monkeypatch.setenv("RFCHUNT_OLLAMA_LOCK_PATH", str(tmp_path / "ollama_slot.lock"))
     monkeypatch.delenv("RFCHUNT_ALLOW_DESTRUCTIVE", raising=False)
     monkeypatch.delenv("RFCHUNT_AUTHORIZED_TARGETS", raising=False)
     for pkey in _PROXY_ENV_KEYS:
@@ -126,6 +132,7 @@ def isolated_ensemble_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     try:
         yield
     finally:
+        ocg._SHARED_GUARD = None
         ExecutionPolicy.reset_instance()
         TargetAuthorizationGate.ALLOWED_TARGETS = orig_targets
         TargetAuthorizationGate._request_history.clear()

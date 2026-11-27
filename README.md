@@ -44,6 +44,9 @@
 11. [Google Research Harness² Integration & Attribution](#google-research-harness-integration--attribution)
 12. [Abliterated Models & Refusal-Free ModelFusion Guide](docs/ABLITERATED_MODELS_AND_FUSION_GUIDE.md)
 13. [Full Capability Matrix & Operational Rigor Specification](docs/MASTER_SCORECARD.md)
+14. [HackerOne QA Phase, Cooldown Readiness & Autonomous Headless Hunting](#hackerone-qa-phase-cooldown-readiness--autonomous-headless-hunting)
+15. [ACDSO-Adapted ML HackerOne Program Selection, Diff Ranking & Recon Clustering](#acdso-adapted-ml-hackerone-program-selection-diff-ranking--recon-clustering)
+16. [Global Windows ConPTY Deadlock Cleaner & Watchdog](#global-windows-conpty-deadlock-cleaner--watchdog)
 
 ---
 
@@ -766,6 +769,125 @@ python -u rfc_hunt_swarm.py prompt_smuggle --host target.example.com --port 8080
 
 # 4. Run full swarm scan with aiscan, dual-graph chaining, and prompt smuggling enabled:
 python -u rfc_hunt_swarm.py --mode single --rfc 9112 --host target.example.com --port 8080 --aiscan --artex --prompt-smuggle
+```
+
+---
+
+## HackerOne QA Phase, Cooldown Readiness & Autonomous Headless Hunting
+
+RFCHunt includes a complete, fail-closed disclosure quality-assurance pipeline and standalone headless hunting runner backed by local ModelFusion (`http://127.0.0.1:5000`) + Ollama (`http://127.0.0.1:11434`):
+
+### 1. Quality Assurance (QA Phase) Checker & Auto-Fixer (`qa-drafts`)
+- **Engine:** `engine/draft_qa_checker.py` (wired automatically into `engine/hackerone_porter.py` and `engine/draft_submit_checker.py`).
+- **14 Automated QA Checks & Lossless Auto-Repairs:**
+  - Unescapes literal HTML entities (`&lt;`, `&gt;`, `&amp;`, `&quot;`, `&#39;`) inside Markdown inline code spans, fenced code blocks, and prose.
+  - Strips ASCII control characters (`0x00–0x08`, `0x0B`, `0x0C`, `0x0E–0x1F`), `U+FFFD` replacement glyphs, and cp1252 mojibake; checks balanced code fences and HackerOne's 150-character title cap.
+  - Verifies required triager headings (`Summary`, `Verification`/`Steps to Reproduce`, `Remediation`, `Impact`), clickable `https://github.com/.../blob/...` URLs, accurate code line-range labels, Android SELinux `NETLINK_GENERIC` framing, and Netlink `NLA_HDRLEN` length accounting.
+  - Runs semaphore-bounded async `raw.githubusercontent.com` source-truth verification to confirm HTTP 200 reachability, verbatim quoted line numbers, and `#define` macro / Generic Netlink family name parity.
+- **Hard Pre-Submit Gate:** `build_hackerone_report_draft()` auto-repairs newly built drafts, `submit_report_api()` blocks submission on any `CRITICAL` QA defect, and `check-drafts` refuses to recommend submitting any draft with an unresolved QA status (`FAIL`, `NEEDS_SOURCE_EDIT`, `AUTO_FIXED_PENDING_PUSH`).
+- **Outputs:** Clickable Markdown QA report (`reports/ensemble_hunt/qa_draft_audit.md`) and machine-readable edit queue (`reports/ensemble_hunt/qa_edit_queue.json`).
+
+```powershell
+# Audit and auto-repair a local draft Markdown file before staging:
+python revenue_cli.py qa-drafts --markdown-file draft.md --title "Report title" --program oppo_bbp --write-repaired draft_clean.md --strict
+
+# Audit a JSON export of saved HackerOne drafts with live raw.githubusercontent.com source verification:
+python revenue_cli.py qa-drafts --snapshot-json reports/ensemble_hunt/drafts_snapshot.json --strict
+```
+
+### 2. HackerOne Draft Cooldown-Clearance Monitor (`check-drafts`)
+- **Engine:** `engine/draft_submit_checker.py` (SQLite WAL state at `reports/ensemble_hunt/draft_submit_tracker.sqlite3`).
+- **Probe-First Politeness:** Probes a single anchor draft (`--probe-id 4243972`) via `/reports/<id>.json` to detect when HackerOne's rolling account cooldown clears (`abilities["can_submit_draft?"] == true`) before fanning out at <= 2 RPS.
+- **Safe Daily Pacing & Hard QA Gate:** Recommends at most `--max-per-day 2` QA-passed drafts per day and writes a clickable submission checklist (`reports/ensemble_hunt/drafts_ready_to_submit.md`). Strictly read-only — never clicks Submit or Delete.
+
+```powershell
+# Probe whether HackerOne account cooldown has cleared (1 polite request):
+python revenue_cli.py check-drafts --probe-only
+
+# Watch periodically and alert when `can_submit_draft?` flips to true:
+python revenue_cli.py check-drafts --watch --interval-minutes 120 --max-per-day 2
+
+# Record a manual submission to keep safe daily pacing accurate:
+python revenue_cli.py check-drafts --mark-submitted 4243972
+```
+
+### 3. Standalone Headless Autonomous Hunting & Scheduling (`scripts/autonomous_hunt.py`)
+- Executes `freshness-watch`, `fast-ooda`, `ensemble-audit`, `lean-verify`, `qa-drafts`, and `check-drafts` headlessly with zero browser requirement, ModelFusion HTTP (`:5000`) + Ollama fallback, and deterministic anti-junk & path-grounding guards (`model_adapter.py`, `engine/gha_llm_verifier.py`).
+- Supports Draft-only HugOS Browser CDP handoff (`HackerOneComputerUsePorter.stage_draft_via_hugos_cdp`, port `9222`, strictly hard-stopped before final Submit).
+
+```powershell
+# Preview full headless execution plan with zero side effects:
+python scripts/autonomous_hunt.py --target D:\path\to\repo --program common_codes --dry-run
+
+# Run 100% offline deterministic embedded audit cycle:
+python scripts/autonomous_hunt.py --target D:\path\to\repo --embedded --json
+
+# Install recurring Windows Task Scheduler headless hunt (zero Registry/PATH mutation):
+powershell -ExecutionPolicy Bypass -File scripts/install_hunt_schedule.ps1 -IntervalMinutes 60 -CloneUnlocked
+```
+
+---
+
+## ACDSO-Adapted ML HackerOne Program Selection, Diff Ranking & Recon Clustering
+
+RFCHunt integrates pure-Python stdlib ML pipelines (adapted from ACDSO with zero mandatory `numpy`/`scikit-learn` runtime dependencies) to select high-EV, newly launched, responsive public HackerOne programs and focus scans on fresh diffs & outlier recon endpoints while strictly honoring per-program Rules of Engagement (RoE):
+
+- **ML Program Selector & Portfolio Optimizer (`engine/ml_program_selector.py`)**:
+  - **Fail-Closed Compliance & Signal Gating:** Excludes `BLOCKED_SIGNAL`, `PAUSED`, and closed programs via `ProgramEligibilityDB` (Schema v2) and enforces `ProgramComplianceContext` (`engine/request_hygiene.py`: DNS label-boundary scope allowlist, SSRF blocking, Tier 1 automated-scanning ban, fractional sub-1 RPS `TokenBucketRateLimiter`, dynamic attribution headers, `follow_redirects=False`, and explicit in-scope AI/LLM gating).
+  - **Multi-Stage ML Pipeline:** Signed-`log1p` + hashed scope features, Empirical Bayes yield smoothing, Harrell C-index + Breslow Cox anti-saturation survival, 3-tier sample-size curriculum Learning-to-Rank with `GroupKFold` NDCG@5 promotion gate, generalized 6-objective Pareto knee selection (`engine/acdso_bridge.py`), Disjoint LinUCB + Discounted Beta-Thompson contextual bandit, and Two-Phase Reserved-Quota Knapsack guaranteeing Lane 1 VDP fast-Signal floor (`>= 50%` slots while Signal is unestablished or `< 1.0`).
+- **ML Diff Prioritizer, Surface Router, JS Bundle Analyzer & HTTP Anomaly Classifier (`engine/ml_diff_and_recon_ranker.py`)**:
+  - **`CommitDiffRanker` + `CommitVelocityBurstDetector`:** Scores `<72h` commits, merged PRs, and releases via exponential recency decay, security-fix token density, Welford online burst z-scores, and `SurfaceToScannerRouter` diff-scoped scanner routing (all Stage 1 scanners accept `target_files`).
+  - **`JavaScriptBundleAnalyzer` + `ReconAssetClusterer` + `HTTPResponseAnomalyClassifier`:** Extracts hidden API/GraphQL/OIDC endpoints, DOM/`postMessage` sinks, and `sourceMappingURL` leaks from `.js`/`.mjs`/`.js.map` bundles, classifies anomalous HTTP responses (`SERVER_ERROR_OR_STACKTRACE`, `SENSITIVE_CONTENT_LEAK`, `AUTH_BOUNDARY_ANOMALY`, `HIGH_VALUE_API_SURFACE`, `SIZE_OR_STRUCTURE_OUTLIER`), and clusters homogeneous CDN/marketing bulk pages via K-Means++ + inductive p95 noise thresholds.
+- **Public HackerOne Directory Sync, AI-in-Scope ATLAS Gate & Differential RoE (`engine/hackerone_porter.py`, `engine/atlas_llm_evaluator.py`, `engine/differential_oracle.py`)**:
+  - **`HackerOnePublicDirectoryClient`:** Syncs public HackerOne programs sorted by newest launch date (`launched_at DESC`), actively accepting submissions (`open`), and `>= 80%` response efficiency without requiring API tokens.
+  - **Fail-Closed AI/LLM & Differential Protocol RoE:** `AtlasLLMEvaluator` (including prompt injection, `indirect_exfil`, canary, and guardrail bypass suites) fails closed unless `ProgramComplianceContext.ai_testing_allowed` is `True`; `MultiImplementationDifferentialOracle` enforces scope allowlists, fractional sub-1 RPS throttling, and custom policy headers/`User-Agent`.
+- **Hybrid `/boost` Decision Adapter (`engine/boost_decision_adapter.py`)**: Strict `<= 400ms` health probes against local ModelFusion (`:5000`) / Ollama (`:11434`) with deterministic local fallback for Pareto near-ties (`<= 0.02`) and top-3 Stage 3 anti-slop stress testing (never overriding `poc_verified`, Lean 4, Z3, or differential oracle proofs).
+- **Bug Bounty MCP Server Tools (`bugbounty_mcp_server.py`)**: Exposes `bb_rank_programs`, `bb_score_fresh_commits`, `bb_cluster_recon_assets`, `bb_analyze_js_bundles`, `bb_classify_http_responses`, `bb_record_hunt_outcome`, and `bb_atlas_llm_eval` alongside `bb_freshness_watch`, `bb_run_fast_ooda`, and `bb_stage_hackerone_draft`.
+
+```powershell
+# 0. ONE-COMMAND TURNKEY PYTHON RUNNER (does everything end-to-end; add --dry-run to preview safely):
+python hunt.py --dry-run
+python hunt.py --sync-public-directory --once
+
+# 1. Rank unlocked public HackerOne programs and compute the daily Lane 1/Lane 2 hunt portfolio:
+python revenue_cli.py rank-programs --min-efficiency 80 --capacity 6 --budget-minutes 120 --json
+
+# 2. Sync public HackerOne directory (newest launches, >=80% eff, zero API token) or offline JSON snapshot:
+python revenue_cli.py sync-directory --public-directory --min-efficiency 80 --limit 25 --json
+python revenue_cli.py sync-directory --snapshot-json directory_snapshot.json --json
+
+# 3. Poll <72h commits/PRs/releases directly from UNLOCKED DB repos with ML commit ranking & invariant ETag 304 caching:
+python revenue_cli.py freshness-watch --from-eligibility-db --ml-rank --hours 72
+
+# 4. Analyze JavaScript bundles & cluster/classify anomalous HTTP recon responses (strictly scope-filtered):
+python revenue_cli.py analyze-js --input ./js_bundles --program common_codes --json
+python revenue_cli.py cluster-recon --input recon_assets.json --program common_codes --json
+
+# 5. Run adversarial LLM prompt-injection / indirect-exfil / guardrail testing ONLY on programs with AI explicitly in scope:
+python revenue_cli.py atlas-llm-eval --llm-target https://ai.example.com --program anthropic --suites low_resource,canary,indirect_exfil,ssrf_tool
+
+# 6. Log real HackerOne report triage outcomes to feed the Cox survival, LTR & bandit models:
+python revenue_cli.py record-outcome --handle henkel_vdp --outcome TRIAGED --lane 1 --signal-delta 7.0 --triage-hours 18.5
+```
+
+---
+
+## Global Windows ConPTY Deadlock Cleaner & Watchdog
+
+During heavy parallel multi-agent builds and tests on Windows, orphaned `conhost.exe` / `OpenConsole.exe` consoles, hung non-interactive child shells, or stale `.git/index.lock` files can wedge ConPTY handles.
+
+- **[scripts/clear_conpty_deadlocks.ps1](scripts/clear_conpty_deadlocks.ps1)**: Inspects physical RAM & virtual commit charge, protects the caller's terminal ancestor chain, reaps only true orphaned consoles (dead parent PIDs) and hung non-interactive child shells (`>= 3 min`), removes stale `.git/index.lock` files across all `D:\harfile\*` repositories, and verifies a fresh `CONPTY_OK` PowerShell spawn.
+- **[scripts/install_global_deadlock_watchdog.ps1](scripts/install_global_deadlock_watchdog.ps1)**: Registers the hidden 5-minute OS-level Windows Scheduled Task `Antigravity-Global-ConPTY-Deadlock-Watchdog` (runs outside IDE ConPTY pools with zero Registry/PATH mutations).
+
+```powershell
+# Preview what would be cleared (read-only):
+powershell -ExecutionPolicy Bypass -File scripts/clear_conpty_deadlocks.ps1 -DryRun
+
+# Install the 5-minute global Windows Scheduled Task and run an immediate sweep:
+powershell -ExecutionPolicy Bypass -File scripts/install_global_deadlock_watchdog.ps1
+
+# Remove the scheduled task cleanly:
+powershell -ExecutionPolicy Bypass -File scripts/install_global_deadlock_watchdog.ps1 -Uninstall
 ```
 
 ---

@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-from typing import Any
+from typing import Any, Iterator
 
 import pytest
 
@@ -30,6 +30,21 @@ from engine.ensemble_whiteboard import (
 from engine.linux_poc_runner import VerifiableTranscript
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ollama_shared_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> Iterator[None]:
+    import engine.ollama_concurrency_guard as ocg
+
+    monkeypatch.setenv("RFCHUNT_OLLAMA_LOCK_PATH", str(tmp_path / "ollama_slot.lock"))
+    ocg._SHARED_GUARD = None
+    try:
+        yield
+    finally:
+        ocg._SHARED_GUARD = None
 
 
 def _disable_docker_and_wsl(

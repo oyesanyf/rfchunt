@@ -19,25 +19,24 @@ Solves the three core failure modes in bug bounty & security audit triage:
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import re
 import shlex
 import subprocess
+import threading
 import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from engine.ensemble_whiteboard import (
-    HYPOTHESIS_STATUSES,
-    TERMINAL_STATUSES,
     EnsembleWhiteboard,
-    SharedWhiteboard,
     WhiteboardHypothesis,
 )
 from engine.host_containment import silent_subprocess_run
@@ -55,9 +54,15 @@ from engine.linux_poc_runner import (
 ENGINE_WEIGHTS: Dict[str, float] = {
     "lean4": 0.95,
     "linux_poc": 0.95,
+    "z3_formal": 0.92,
+    "trufflehog": 0.90,
     "zizmor": 0.86,
+    "api_jwt_sdjwt": 0.84,
     "actionlint": 0.82,
+    "parity_auditor": 0.82,
     "gha_agent": 0.80,
+    "mobile_mobsf": 0.78,
+    "ai_infra_guard": 0.76,
     "raptor": 0.72,
     "mantis": 0.68,
     "aiscan": 0.65,
@@ -132,10 +137,65 @@ class EngineFinding:
     deterministic: bool = False
     confirmed: bool = True
     target_os_required: str = ""  # e.g. "macos", "android", "windows", "linux"
+    non_production_noise: bool = False
+    poc_verified: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def _coerce_strict_bool(val: Any) -> bool:
+    """Strictly coerce booleans without fail-open bool('false') / bool('0')."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, int) and not isinstance(val, bool):
+        return val == 1
+    if isinstance(val, str):
+        return val.strip().lower() in {"true", "1", "yes", "on"}
+    return False
+
+
+def _finding_from_dict(d: Any, default_engine: str = "") -> EngineFinding:
+    """Safely converts an M1/M2 scanner dict or `EngineFinding` into an `EngineFinding`."""
+    if isinstance(d, EngineFinding):
+        return d
+    if not isinstance(d, dict):
+        return EngineFinding(engine=default_engine or "unknown", title=str(d or ""))
+    raw_meta = d.get("metadata")
+    meta: Dict[str, Any] = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+    eff_noise = bool(d.get("non_production_noise", False)) or bool(meta.get("non_production_noise", False))
+    if eff_noise and "non_production_noise" not in meta:
+        meta["non_production_noise"] = True
+    sev = str(d.get("severity") or "MEDIUM").upper()
+    if sev not in SEVERITY_RANK:
+        sev = "MEDIUM"
+    try:
+        line_num = int(d.get("line") if d.get("line") is not None else (d.get("line_number") or 0))
+    except (TypeError, ValueError):
+        line_num = 0
+    try:
+        conf_val = float(d.get("confidence", 0.65) if d.get("confidence") is not None else 0.65)
+    except (TypeError, ValueError):
+        conf_val = 0.65
+    return EngineFinding(
+        engine=str(d.get("engine") or default_engine or "unknown"),
+        title=str(d.get("title") or d.get("rule_id") or "Finding"),
+        file_path=str(d.get("file_path") or d.get("file") or ""),
+        line=line_num,
+        cwe=str(d.get("cwe") or d.get("cwe_id") or ""),
+        severity=sev,
+        confidence=max(0.0, min(1.0, conf_val)),
+        summary=str(d.get("summary") or d.get("description") or ""),
+        rule_id=str(d.get("rule_id") or ""),
+        atlas_technique=str(d.get("atlas_technique") or ""),
+        deterministic=bool(d.get("deterministic", False)),
+        confirmed=bool(d.get("confirmed", True)),
+        target_os_required=str(d.get("target_os_required") or ""),
+        non_production_noise=eff_noise,
+        poc_verified=_coerce_strict_bool(d.get("poc_verified", False)),
+        metadata=meta,
+    )
 
 
 @dataclass
@@ -564,6 +624,77 @@ def evaluate_vendor_threat_model(
                 "Arc BBP enforces Signal >= 3.0; non-security/informational findings are blocked to protect trial reports."
             )
 
+    elif prog == "henkel_vdp":
+        if any(k in blob for k in ("hygiene_only", "missing security.txt", "banner disclosure", "style nit", "todo")):
+            matched_rules.append("HENKEL_VDP_NON_SECURITY_HYGIENE")
+            reasons.append(
+                "Henkel VDP excludes hygiene-only, missing security.txt, or purely informational findings."
+            )
+
+    elif prog == "servicenow-disclosure":
+        if any(k in blob for k in ("hygiene_only", "self-xss", "self xss", "clickjacking on static")):
+            matched_rules.append("SERVICENOW_VDP_OUT_OF_SCOPE")
+            reasons.append(
+                "ServiceNow VDP excludes hygiene-only issues, self-XSS, and static-page clickjacking."
+            )
+
+    elif prog == "common_codes":
+        if any(k in blob for k in ("hygiene_only", "test_fixture_only", "examples/")):
+            matched_rules.append("COMMON_CODES_NON_PRODUCTION_OUT_OF_SCOPE")
+            reasons.append(
+                "Common Codes EUDI Wallet program excludes hygiene-only, test-fixture, and example-only findings."
+            )
+
+    elif prog == "oppo_bbp":
+        if any(k in blob for k in ("hygiene_only", "physical access only", "requires unlocked bootloader")):
+            matched_rules.append("OPPO_BBP_OUT_OF_SCOPE")
+            reasons.append(
+                "OPPO BBP excludes hygiene-only findings and attacks requiring physical access or an unlocked bootloader."
+            )
+
+    elif prog == "amazonvrp":
+        if (
+            any(
+                k in blob
+                for k in (
+                    "aws core",
+                    "aws ec2",
+                    "aws iam console",
+                    "aws s3 infrastructure",
+                    "aws.amazon.com/console",
+                    "aws infrastructure",
+                    "aws control plane",
+                )
+            )
+            and not any(
+                k in blob
+                for k in (
+                    "primevideo.com",
+                    "amazongames.com",
+                    "amazonpay.in",
+                    "genai",
+                    "alexa",
+                    "kindle",
+                    "amazon retail",
+                )
+            )
+        ):
+            matched_rules.append("AMAZONVRP_AWS_CORE_INFRA_OUT_OF_SCOPE")
+            reasons.append(
+                "Amazon VRP covers GenAI apps under *.amazon.*, primevideo.com, amazongames.com, amazonpay.in, "
+                "and Shopping/Alexa/Kindle apps; AWS core infrastructure is out of scope."
+            )
+        if "hygiene_only" in blob:
+            matched_rules.append("AMAZONVRP_HYGIENE_NON_BOUNDARY")
+            reasons.append("Amazon VRP excludes hygiene-only findings without a concrete security impact.")
+
+    elif prog == "temu":
+        if any(k in blob for k in ("hygiene_only", "self-xss", "self xss", "scanner noise only")):
+            matched_rules.append("TEMU_OUT_OF_SCOPE")
+            reasons.append(
+                "Temu BBP excludes hygiene-only findings, self-XSS, and unverified scanner noise."
+            )
+
     passed = len(reasons) == 0
     return ThreatModelVerdict(
         program=prog,
@@ -748,7 +879,8 @@ class EnsembleConsensusVoter:
                 or transcripts.get(norm_file)
                 or transcripts.get("*")
             )
-            poc_verified = bool(matched_tr and matched_tr.verified)
+            any_member_poc_verified = any(_coerce_strict_bool(getattr(m, "poc_verified", False)) for m in members)
+            poc_verified = bool((matched_tr and matched_tr.verified) or any_member_poc_verified)
             poc_target_os = ""
             if matched_tr:
                 backend = (matched_tr.backend or "").lower()
@@ -772,14 +904,32 @@ class EnsembleConsensusVoter:
                 target_os_required=req_os,
             )
 
+            # Production noise check (preserves Lean 4 deterministic confirmations and poc_verified=True)
+            try:
+                from engine.parity_invariant_auditor import is_non_production_noise as _is_noise_fn
+            except Exception:
+                _is_noise_fn = None
+
+            def _is_member_noise(m: EngineFinding) -> bool:
+                meta = m.metadata if isinstance(m.metadata, dict) else {}
+                if bool(getattr(m, "non_production_noise", False)) or bool(meta.get("non_production_noise", False)):
+                    return True
+                if _is_noise_fn is not None:
+                    return bool(_is_noise_fn(m.file_path, meta, rule_id=m.rule_id, summary=m.summary))
+                return False
+
+            all_members_noise = bool(members) and all(_is_member_noise(m) for m in members)
+
             # Stage 4 Hard Fail-Closed Promotion Rule:
             # Static agreement alone is strictly capped at ENSEMBLE_CORROBORATED_STATIC.
             engine_count = len(confirmed_engines)
             ens_conf = _compute_ensemble_confidence(members)
             if not tm_verdict.passed:
                 disposition = "HELD_OUT_OF_THREAT_MODEL"
-            elif poc_verified and (engine_count >= self.quorum or lean_verified or has_deterministic_confirmed or poc_verified):
+            elif poc_verified:
                 disposition = "SUBMISSION_READY"
+            elif all_members_noise and not lean_verified:
+                disposition = "LOW_CONFIDENCE_NOISE"
             elif engine_count >= self.quorum or lean_verified:
                 disposition = "ENSEMBLE_CORROBORATED_STATIC"
             elif engine_count == 1 and ens_conf >= 0.45:
@@ -860,6 +1010,13 @@ def _embedded_toolchain_status() -> Dict[str, Dict[str, Any]]:
         "angr",
         "klee",
         "semgrep",
+        "rea",
+        "trufflehog",
+        "jadx",
+        "subfinder",
+        "httpx",
+        "katana",
+        "schemathesis",
     )
     return {
         name: {
@@ -1141,6 +1298,8 @@ def _evaluate_lean_domains_embedded(
                     )
                 )
         elif dom == "policy_guard":
+            from engine.lean_formal_verifier import _coerce_strict_bool as _lean_strict_bool
+
             pg = meta.get("policy_guard") if isinstance(meta.get("policy_guard"), dict) else {}
             try:
                 if pg:
@@ -1148,8 +1307,8 @@ def _evaluate_lean_domains_embedded(
                         verify_policy_guard_invariant(
                             action=str(pg.get("action", "networkProbe")),
                             scope=str(pg.get("scope", "inScopeAuthorized")),
-                            in_workspace_root=bool(pg.get("in_workspace_root", True)),
-                            allow_destructive=bool(pg.get("allow_destructive", False)),
+                            in_workspace_root=pg.get("in_workspace_root", True),
+                            allow_destructive=pg.get("allow_destructive", False),
                             rules=pg.get("rules", (("permit", True),)),
                             confirmed_by_tool=pg.get("confirmed_by_tool"),
                             llm_confirmed=pg.get("llm_confirmed"),
@@ -1161,9 +1320,13 @@ def _evaluate_lean_domains_embedded(
                     )
                 else:
                     blob_l = " ".join((f.rule_id, f.cwe, f.title, f.summary, f.file_path)).lower()
-                    is_active = bool(f.confirmed)
+                    is_active = _lean_strict_bool(f.confirmed, field_name="confirmed")
                     if any(kw in blob_l for kw in ("llm_dissent", "override_immunity", "deterministic_confirmation")):
-                        obs_rec = bool(meta["observed_reconciled"]) if "observed_reconciled" in meta else (not is_active)
+                        obs_rec = (
+                            _lean_strict_bool(meta["observed_reconciled"], field_name="observed_reconciled")
+                            if "observed_reconciled" in meta
+                            else (not is_active)
+                        )
                         checks.extend(
                             verify_policy_guard_invariant(
                                 confirmed_by_tool=True,
@@ -1177,7 +1340,7 @@ def _evaluate_lean_domains_embedded(
                         checks.extend(
                             verify_policy_guard_invariant(
                                 action="shellExec",
-                                observed_allowed=bool(meta.get("observed_allowed", is_active)),
+                                observed_allowed=meta.get("observed_allowed", is_active),
                                 lean_dir=mirror_lean_dir,
                                 oracle=None,
                             )
@@ -1187,7 +1350,7 @@ def _evaluate_lean_domains_embedded(
                             verify_policy_guard_invariant(
                                 action="networkProbe",
                                 scope="outOfScope",
-                                observed_allowed=bool(meta.get("observed_allowed", is_active)),
+                                observed_allowed=meta.get("observed_allowed", is_active),
                                 lean_dir=mirror_lean_dir,
                                 oracle=None,
                             )
@@ -1197,7 +1360,7 @@ def _evaluate_lean_domains_embedded(
                             verify_policy_guard_invariant(
                                 action="readWorkspaceFile",
                                 in_workspace_root=False,
-                                observed_allowed=bool(meta.get("observed_allowed", is_active)),
+                                observed_allowed=meta.get("observed_allowed", is_active),
                                 lean_dir=mirror_lean_dir,
                                 oracle=None,
                             )
@@ -1206,7 +1369,7 @@ def _evaluate_lean_domains_embedded(
                         checks.extend(
                             verify_policy_guard_invariant(
                                 rules=[("permit", True), ("forbid", True)],
-                                observed_allowed=bool(meta.get("observed_allowed", is_active)),
+                                observed_allowed=meta.get("observed_allowed", is_active),
                                 lean_dir=mirror_lean_dir,
                                 oracle=None,
                             )
@@ -1344,6 +1507,7 @@ class EnsembleOrchestrator:
         gha_only: bool = False,
         no_external_scanners: bool = False,
         lean_dir: Optional[Union[str, Path]] = None,
+        program: str = "generic",
     ) -> Tuple[List[EngineFinding], Dict[str, Any]]:
         """
         Default exhaustive multi-engine local fan-out (bounded ThreadPoolExecutor).
@@ -1354,6 +1518,8 @@ class EnsembleOrchestrator:
           - Module 25 `WebLLMAuditor` + Live MITRE ATLAS STIX 2.1 stack-adaptive enrichment
           - Lean 4 formal proof workspace & domain verification (`lean_formal_verifier`)
           - Local `raptor` / `semgrep` SAST scan (if installed and not `embedded`/`no_external_scanners`/offline)
+          - M1 Scanners (`trufflehog`, `mobile_mobsf`, `api_jwt_sdjwt`, `ai_infra_guard`, `parity_auditor`)
+          - Z3 formal verification (`z3_formal_verifier`) for OpenAPI/IAM/StateMachine specs
           - `gha_llm` defensive semantic verification & attack-chain correlation (when enabled & online)
         """
         root = Path(repo_path)
@@ -1691,11 +1857,137 @@ class EnsembleOrchestrator:
                 },
             )
 
+        def _run_trufflehog() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+            if not root.is_dir():
+                return ("trufflehog", [], {"status": "skipped_non_dir"})
+            from engine.trufflehog_scanner import scan_secrets_with_trufflehog
+
+            raw = scan_secrets_with_trufflehog(
+                root,
+                embedded=embedded,
+                no_external_scanners=no_external_scanners,
+            )
+            out = [_finding_from_dict(item, default_engine="trufflehog") for item in (raw or ())]
+            return ("trufflehog", out, {"status": "completed", "findings": len(out)})
+
+        def _run_mobile_mobsf() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+            if not root.is_dir():
+                return ("mobile_mobsf", [], {"status": "skipped_non_dir"})
+            from engine.mobile_app_auditor import audit_mobile_app
+
+            raw = audit_mobile_app(
+                root,
+                embedded=embedded,
+                no_external_scanners=no_external_scanners,
+            )
+            out = [_finding_from_dict(item, default_engine="mobile_mobsf") for item in (raw or ())]
+            return ("mobile_mobsf", out, {"status": "completed", "findings": len(out)})
+
+        def _run_api_jwt_sdjwt() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+            if not root.is_dir():
+                return ("api_jwt_sdjwt", [], {"status": "skipped_non_dir"})
+            from engine.api_jwt_sdjwt_auditor import audit_api_and_jwt
+
+            raw = audit_api_and_jwt(
+                root,
+                program=program,
+                embedded=embedded,
+                no_external_scanners=no_external_scanners,
+                allow_live=False,
+            )
+            out = [_finding_from_dict(item, default_engine="api_jwt_sdjwt") for item in (raw or ())]
+            return ("api_jwt_sdjwt", out, {"status": "completed", "findings": len(out)})
+
+        def _run_ai_infra_guard() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+            if not root.is_dir():
+                return ("ai_infra_guard", [], {"status": "skipped_non_dir"})
+            from engine.ai_infra_guard_auditor import audit_ai_infra
+
+            raw = audit_ai_infra(root)
+            out = [_finding_from_dict(item, default_engine="ai_infra_guard") for item in (raw or ())]
+            return ("ai_infra_guard", out, {"status": "completed", "findings": len(out)})
+
+        def _run_parity_auditor() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+            if not root.is_dir():
+                return ("parity_auditor", [], {"status": "skipped_non_dir"})
+            from engine.parity_invariant_auditor import audit_parity_and_invariants
+
+            raw = audit_parity_and_invariants(root)
+            out = [_finding_from_dict(item, default_engine="parity_auditor") for item in (raw or ())]
+            return ("parity_auditor", out, {"status": "completed", "findings": len(out)})
+
+        def _run_z3_formal() -> Tuple[str, List[EngineFinding], Dict[str, Any]]:
+            if not root.is_dir():
+                return ("z3_formal", [], {"status": "skipped_non_dir"})
+            discovered: Dict[str, List[Path]] = {"openapi": [], "iam": [], "state_machine": []}
+            scanned = 0
+            for cur_root, dirnames, filenames in os.walk(root):
+                dirnames[:] = [
+                    d
+                    for d in sorted(dirnames)
+                    if d not in (".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build")
+                ]
+                for fn in sorted(filenames):
+                    scanned += 1
+                    if scanned > 400:
+                        break
+                    low = fn.lower()
+                    if not low.endswith((".json", ".yaml", ".yml")):
+                        continue
+                    fpath = Path(cur_root) / fn
+                    if any(k in low for k in ("openapi", "swagger")) and len(discovered["openapi"]) < 2:
+                        discovered["openapi"].append(fpath)
+                    elif any(k in low for k in ("iam", "policy")) and len(discovered["iam"]) < 2:
+                        discovered["iam"].append(fpath)
+                    elif any(k in low for k in ("state_machine", "statemachine", "workflow_sm")) and len(discovered["state_machine"]) < 2:
+                        discovered["state_machine"].append(fpath)
+                if scanned > 400:
+                    break
+            if not (discovered["openapi"] or discovered["iam"] or discovered["state_machine"]):
+                return ("z3_formal", [], {"status": "skipped_no_specs", "findings": 0})
+            from engine.z3_formal_verifier import run_z3_formal_verification
+
+            rep = run_z3_formal_verification(
+                openapi_spec=discovered["openapi"][0] if discovered["openapi"] else None,
+                iam_policy=discovered["iam"][0] if discovered["iam"] else None,
+                state_machine=discovered["state_machine"][0] if discovered["state_machine"] else None,
+                target_name=program or root.name,
+                offline=True if embedded else None,
+                embedded=embedded,
+                scope_bridge=None,
+                scope_policy=None,
+                target_intent=None,
+            )
+            out = [_finding_from_dict(ef, default_engine="z3_formal") for ef in rep.to_engine_findings(include_proven=False)]
+            return (
+                "z3_formal",
+                out,
+                {
+                    "status": rep.status,
+                    "domains_verified": list(rep.domains_verified),
+                    "violations_count": rep.violations_count,
+                    "findings": len(out),
+                },
+            )
+
         tasks = [_run_zizmor, _run_actionlint, _run_gha_agent_auditor]
         if not gha_only:
-            tasks.extend([_run_web_llm_atlas, _run_lean4, _run_semgrep_raptor, _run_rea])
+            tasks.extend(
+                [
+                    _run_web_llm_atlas,
+                    _run_lean4,
+                    _run_semgrep_raptor,
+                    _run_rea,
+                    _run_trufflehog,
+                    _run_mobile_mobsf,
+                    _run_api_jwt_sdjwt,
+                    _run_ai_infra_guard,
+                    _run_parity_auditor,
+                    _run_z3_formal,
+                ]
+            )
 
-        with ThreadPoolExecutor(max_workers=min(7, len(tasks))) as pool:
+        with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as pool:
             futs = [pool.submit(fn) for fn in tasks]
             for fut in futs:
                 try:
@@ -1876,13 +2168,15 @@ class EnsembleOrchestrator:
                         witness_evaluated = True
 
                 elif hyp.domain == "policy_guard":
+                    from engine.lean_formal_verifier import _coerce_strict_bool as _lean_strict_bool
+
                     pg_meta = meta.get("policy_guard") if isinstance(meta.get("policy_guard"), dict) else {}
                     if pg_meta:
                         counterexamples = verify_policy_guard_invariant(
                             action=str(pg_meta.get("action", "networkProbe")),
                             scope=str(pg_meta.get("scope", "inScopeAuthorized")),
-                            in_workspace_root=bool(pg_meta.get("in_workspace_root", True)),
-                            allow_destructive=bool(pg_meta.get("allow_destructive", False)),
+                            in_workspace_root=pg_meta.get("in_workspace_root", True),
+                            allow_destructive=pg_meta.get("allow_destructive", False),
                             rules=pg_meta.get("rules", (("permit", True),)),
                             confirmed_by_tool=pg_meta.get("confirmed_by_tool"),
                             llm_confirmed=pg_meta.get("llm_confirmed"),
@@ -1906,9 +2200,17 @@ class EnsembleOrchestrator:
                             "policy_guard",
                         )
                     ):
-                        is_active = bool(finding.confirmed) if finding is not None else True
+                        is_active = (
+                            _lean_strict_bool(finding.confirmed, field_name="confirmed")
+                            if finding is not None
+                            else True
+                        )
                         if any(kw in blob for kw in ("llm_dissent", "override_immunity", "deterministic_confirmation")):
-                            obs_rec = bool(meta["observed_reconciled"]) if "observed_reconciled" in meta else (not is_active)
+                            obs_rec = (
+                                _lean_strict_bool(meta["observed_reconciled"], field_name="observed_reconciled")
+                                if "observed_reconciled" in meta
+                                else (not is_active)
+                            )
                             counterexamples = verify_policy_guard_invariant(
                                 confirmed_by_tool=True,
                                 llm_confirmed=False,
@@ -1919,7 +2221,7 @@ class EnsembleOrchestrator:
                         elif "shellexec" in blob or "shell_exec" in blob:
                             counterexamples = verify_policy_guard_invariant(
                                 action="shellExec",
-                                observed_allowed=bool(meta.get("observed_allowed", is_active)),
+                                observed_allowed=meta.get("observed_allowed", is_active),
                                 lean_dir=worker_lean_dir,
                                 oracle=use_oracle,
                             )
@@ -1927,7 +2229,7 @@ class EnsembleOrchestrator:
                             counterexamples = verify_policy_guard_invariant(
                                 action="networkProbe",
                                 scope="outOfScope",
-                                observed_allowed=bool(meta.get("observed_allowed", is_active)),
+                                observed_allowed=meta.get("observed_allowed", is_active),
                                 lean_dir=worker_lean_dir,
                                 oracle=use_oracle,
                             )
@@ -1935,14 +2237,14 @@ class EnsembleOrchestrator:
                             counterexamples = verify_policy_guard_invariant(
                                 action="readWorkspaceFile",
                                 in_workspace_root=False,
-                                observed_allowed=bool(meta.get("observed_allowed", is_active)),
+                                observed_allowed=meta.get("observed_allowed", is_active),
                                 lean_dir=worker_lean_dir,
                                 oracle=use_oracle,
                             )
                         else:
                             counterexamples = verify_policy_guard_invariant(
                                 rules=[("permit", True), ("forbid", True)],
-                                observed_allowed=bool(meta.get("observed_allowed", is_active)),
+                                observed_allowed=meta.get("observed_allowed", is_active),
                                 lean_dir=worker_lean_dir,
                                 oracle=use_oracle,
                             )
@@ -2073,6 +2375,10 @@ class EnsembleOrchestrator:
         package_client_name: Optional[str] = None,
         refresh_stix: bool = True,
     ) -> EnsembleReport:
+        if all_scan_summary is not None and not isinstance(all_scan_summary, Mapping):
+            raise TypeError(
+                f"all_scan_summary must be a Mapping or None, got {type(all_scan_summary).__name__}"
+            )
         target_str = str(target)
         target_p = Path(target_str)
         eff_poc_lang = poc_language if poc_language is not None else poc_lang
@@ -2102,6 +2408,7 @@ class EnsembleOrchestrator:
                 gha_only=self.gha_only or is_workflow_file,
                 no_external_scanners=self.no_external_scanners,
                 lean_dir=self.lean_dir,
+                program=self.program,
             )
             self.last_telemetry = tele
             active_findings.extend(auto_findings)
@@ -2669,6 +2976,19 @@ class EnsembleOrchestrator:
         out_dir: Union[str, Path],
         package_client_name: Optional[str] = None,
     ) -> Dict[str, str]:
+        from engine.advisory_exporter import _redact_inline_tokens
+
+        def _redact_payload(obj: Any) -> Any:
+            if isinstance(obj, str):
+                return _redact_inline_tokens(obj)
+            if isinstance(obj, dict):
+                return {k: _redact_payload(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_redact_payload(v) for v in obj]
+            if isinstance(obj, tuple):
+                return tuple(_redact_payload(v) for v in obj)
+            return obj
+
         dest = Path(out_dir)
         dest.mkdir(parents=True, exist_ok=True)
 
@@ -2676,9 +2996,13 @@ class EnsembleOrchestrator:
         md_path = dest / "ensemble_summary.md"
         sarif_path = dest / "ensemble_findings.sarif"
 
-        json_path.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
-        sarif_path.write_text(json.dumps(report.to_sarif(), indent=2), encoding="utf-8")
-        md_path.write_text(render_ensemble_markdown(report), encoding="utf-8")
+        redacted_report = _redact_payload(report.to_dict())
+        redacted_sarif = _redact_payload(report.to_sarif())
+        redacted_md = _redact_inline_tokens(render_ensemble_markdown(report))
+
+        json_path.write_text(json.dumps(redacted_report, indent=2), encoding="utf-8")
+        sarif_path.write_text(json.dumps(redacted_sarif, indent=2), encoding="utf-8")
+        md_path.write_text(redacted_md, encoding="utf-8")
 
         exported = {
             "json": str(json_path),
@@ -2692,16 +3016,16 @@ class EnsembleOrchestrator:
             pack_findings = [
                 {
                     "id": c.cluster_id,
-                    "title": c.title,
+                    "title": _redact_inline_tokens(c.title),
                     "severity": c.severity,
                     "cwe": c.cwe_family,
                     "file": c.file_path,
                     "line": c.line,
-                    "description": c.summary or f"[{c.disposition}] {c.title}",
+                    "description": _redact_inline_tokens(c.summary or f"[{c.disposition}] {c.title}"),
                     "remediation": (
                         "Verify runtime PoC and apply defense-in-depth fix."
                         if c.disposition != "HELD_OUT_OF_THREAT_MODEL"
-                        else "; ".join(c.threat_model.reasons)
+                        else _redact_inline_tokens("; ".join(c.threat_model.reasons))
                     ),
                 }
                 for c in report.clusters
@@ -2717,6 +3041,591 @@ class EnsembleOrchestrator:
             exported["client_audit_bundle"] = str(bundle_dir)
 
         return exported
+
+    def run_fast_parallel_ooda(
+        self,
+        repo_path: Union[Path, str],
+        *,
+        program: str = "",
+        blackboard_db: Union[Path, str] = "reports/ensemble_hunt/blackboard.sqlite3",
+        max_cpu_workers: Optional[int] = None,
+        resume: bool = False,
+        signal_score: float = 0.0,
+        eligibility_db: Optional[Any] = None,
+        poc_runner: Optional[LinuxPocRunner] = None,
+        out_dir: Optional[Union[Path, str]] = None,
+        trigger_browser: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Loop 3 Strict 3-Stage Parallel OODA Funnel:
+          - Stage 1 (`ProcessPoolExecutor`, 0 LLM): deterministic CPU checks & noise drop
+          - Stage 2 (ACDSO `pareto.py` + `anomaly.py`, <1s): top 3-5 production anomalies
+          - Stage 3 (single-slot `OllamaConcurrencyGuard`): LLM verification on top 3-5 only
+        """
+        from engine.acdso_bridge import rank_stage2_candidates
+        from engine.async_blackboard_runtime import default_cpu_workers, run_local_rfchunt_async
+        from engine.ollama_concurrency_guard import get_shared_ollama_guard
+
+        t0 = time.monotonic()
+        repo_p = Path(repo_path)
+        eff_program = (program or self.program or "generic").strip().lower()
+        eff_workers = default_cpu_workers(max_cpu_workers)
+
+        bb_str = str(blackboard_db)
+        if bb_str != ":memory:":
+            Path(bb_str).parent.mkdir(parents=True, exist_ok=True)
+
+        seed_intents: Optional[List[Dict[str, Any]]] = None
+        if not resume:
+            run_nonce = f"{time.time_ns()}"
+            discovered_specs: Dict[str, List[Path]] = {"openapi": [], "iam": [], "state_machine": []}
+            if repo_p.is_dir():
+                try:
+                    from engine.async_blackboard_runtime import _discover_formal_spec_files
+
+                    discovered_specs = _discover_formal_spec_files(repo_p, max_files=2)
+                except Exception:
+                    pass
+            seed_intents = [
+                {
+                    "intent_type": "stage1_cpu",
+                    "payload": {
+                        "repo_path": str(repo_p),
+                        "program": eff_program,
+                        "embedded": self.embedded,
+                        "no_external_scanners": self.no_external_scanners,
+                        "cpu_work_iters": 0,
+                        "propagate_siblings": True,
+                    },
+                    "program": eff_program,
+                    "lane": 2,
+                    "priority": 0.9,
+                    "dedup_key": f"fast_ooda:{run_nonce}:stage1",
+                }
+            ]
+            if eff_workers >= 2:
+                has_specs = bool(
+                    discovered_specs.get("openapi")
+                    or discovered_specs.get("iam")
+                    or discovered_specs.get("state_machine")
+                )
+                formal_payload: Dict[str, Any] = {
+                    "repo_path": str(repo_p),
+                    "target_name": eff_program or repo_p.name,
+                    "cpu_work_iters": 0 if has_specs else 6_000,
+                }
+                if discovered_specs.get("openapi"):
+                    formal_payload["openapi_spec"] = str(discovered_specs["openapi"][0])
+                if discovered_specs.get("iam"):
+                    formal_payload["iam_policy"] = str(discovered_specs["iam"][0])
+                if discovered_specs.get("state_machine"):
+                    formal_payload["state_machine"] = str(discovered_specs["state_machine"][0])
+                seed_intents.append(
+                    {
+                        "intent_type": "formal_check",
+                        "payload": formal_payload,
+                        "program": eff_program,
+                        "lane": 2,
+                        "priority": 0.85,
+                        "dedup_key": f"fast_ooda:{run_nonce}:formal",
+                    }
+                )
+
+        elig_db_path = getattr(eligibility_db, "db_path", None) if eligibility_db is not None else None
+
+        def _run_async() -> Dict[str, Any]:
+            coro = run_local_rfchunt_async(
+                seed_intents,
+                repo_path=repo_p,
+                db_path=bb_str,
+                max_cpu_workers=eff_workers,
+                resume=bool(resume),
+                signal_score=float(signal_score),
+                eligibility_db_path=elig_db_path,
+                ollama_evaluator=None,
+            )
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return asyncio.run(coro)
+            with ThreadPoolExecutor(max_workers=1) as _loop_pool:
+                return _loop_pool.submit(asyncio.run, coro).result()
+
+        async_res = _run_async()
+        all_facts = list(async_res.get("facts") or [])
+
+        try:
+            from engine.parity_invariant_auditor import is_non_production_noise as _is_noise_fn
+        except Exception:
+            _is_noise_fn = None
+
+        deduped_prod: List[Dict[str, Any]] = []
+        seen_prod_keys: Set[Tuple[str, str, str, int]] = set()
+        extra_noise = 0
+        for fact in all_facts:
+            if not isinstance(fact, dict):
+                continue
+            payload = fact.get("payload") if isinstance(fact.get("payload"), dict) else {}
+            if payload and (payload.get("engine") or payload.get("rule_id") or payload.get("title")):
+                cand = dict(payload)
+                cand["poc_verified"] = _coerce_strict_bool(cand.get("poc_verified", False))
+            else:
+                cand = {
+                    "engine": fact.get("source_engine") or fact.get("domain") or "stage1",
+                    "rule_id": "",
+                    "title": fact.get("title") or "Stage 1 finding",
+                    "file_path": fact.get("file_path") or "",
+                    "line": int(fact.get("line") or 0),
+                    "severity": fact.get("severity") or "MEDIUM",
+                    "confidence": float(fact.get("confidence") or 0.7),
+                    "poc_verified": _coerce_strict_bool(fact.get("poc_verified", False)),
+                    "deterministic": True,
+                    "confirmed": True,
+                    "metadata": {},
+                }
+            meta = cand.get("metadata") if isinstance(cand.get("metadata"), dict) else {}
+            fp_raw = str(cand.get("file_path") or fact.get("file_path") or "")
+            rid_raw = str(cand.get("rule_id") or "")
+            sum_raw = str(cand.get("summary") or "")
+            is_noise = bool(cand.get("non_production_noise", False)) or bool(meta.get("non_production_noise", False))
+            if not is_noise and _is_noise_fn is not None:
+                is_noise = bool(_is_noise_fn(fp_raw, meta, rule_id=rid_raw, summary=sum_raw))
+            if is_noise and not _coerce_strict_bool(cand.get("poc_verified", False)) and str(cand.get("engine") or "").lower() != "lean4":
+                extra_noise += 1
+                continue
+            dedup_key = (
+                str(cand.get("engine") or "").strip().lower(),
+                rid_raw.strip(),
+                _norm_path(fp_raw),
+                int(cand.get("line") or 0),
+            )
+            if dedup_key in seen_prod_keys:
+                continue
+            seen_prod_keys.add(dedup_key)
+            deduped_prod.append(cand)
+
+        async_stage2 = async_res.get("stage2") if isinstance(async_res.get("stage2"), dict) else None
+        if (
+            async_stage2 is not None
+            and not resume
+            and extra_noise == 0
+            and len(deduped_prod) == int(async_res.get("stage1_production_count", -1) or 0)
+            and bool(async_stage2.get("selected"))
+        ):
+            stage2_res = async_stage2
+        else:
+            stage2_res = rank_stage2_candidates(deduped_prod, top_k=5)
+        stage2_selected = list(stage2_res.get("selected") or [])
+
+        stage3_findings: List[EngineFinding] = []
+        stage3_results: List[Dict[str, Any]] = []
+        stage3_telemetry: Dict[str, Any] = {
+            "status": "skipped",
+            "candidates_evaluated": 0,
+            "findings_emitted": 0,
+            "results": [],
+        }
+
+        if not self.embedded and self.enable_llm_verify and stage2_selected:
+            from engine.gha_llm_verifier import verify_gha_findings_with_llm
+
+            guard = get_shared_ollama_guard()
+            _reset_guard_on_endpoint_change(guard)
+            active_model = self.model
+            for cand in stage2_selected[:5]:
+                cand_label = str(cand.get("id") or cand.get("rule_id") or cand.get("file_path") or "candidate")
+                if guard.is_circuit_open():
+                    stage3_results.append(
+                        {
+                            "candidate": cand_label,
+                            "status": "skipped_circuit_open",
+                            "findings": 0,
+                        }
+                    )
+                    continue
+                cand_ef = _finding_from_dict(cand, default_engine=str(cand.get("engine") or "stage1"))
+                llm_f, llm_tele = verify_gha_findings_with_llm(
+                    repo_p,
+                    [cand_ef],
+                    model=active_model,
+                    embedded=False,
+                    force_ollama=True,
+                    guard=guard,
+                )
+                if (
+                    llm_tele.get("status") == "completed"
+                    and llm_tele.get("downshifted_from")
+                    and llm_tele.get("model")
+                ):
+                    active_model = str(llm_tele["model"])
+                stage3_findings.extend(llm_f)
+                stage3_results.append(
+                    {
+                        "candidate": cand_label,
+                        "status": llm_tele.get("status"),
+                        "model": llm_tele.get("model"),
+                        "findings": len(llm_f),
+                        "telemetry": llm_tele,
+                    }
+                )
+            stage3_telemetry = {
+                "status": "completed",
+                "candidates_evaluated": len(stage3_results),
+                "findings_emitted": len(stage3_findings),
+                "results": stage3_results,
+            }
+        else:
+            stage3_telemetry["status"] = (
+                "skipped_embedded"
+                if self.embedded
+                else ("skipped_no_candidates" if not stage2_selected else "skipped_disabled")
+            )
+
+        if self.embedded:
+            freshness = RepoFreshnessSnapshot(
+                repo_path=str(repo_p),
+                is_git_repo=False,
+                freshness_hours_window=self.freshness_hours,
+                freshness_status="EMBEDDED_OFFLINE",
+            )
+        else:
+            freshness = inspect_repo_freshness(repo_p, freshness_hours=self.freshness_hours)
+
+        stage1_efs = [_finding_from_dict(d) for d in deduped_prod]
+        all_efs = stage1_efs + stage3_findings
+        poc_transcripts_map: Dict[str, VerifiableTranscript] = {}
+        if poc_runner is not None:
+            for cand in stage2_selected[:5]:
+                cand_meta = cand.get("metadata") if isinstance(cand.get("metadata"), dict) else {}
+                cand_file = str(cand.get("file_path") or "")
+                sandbox_url = str(
+                    cand.get("sandbox_url")
+                    or cand_meta.get("sandbox_url")
+                    or cand.get("verification_url")
+                    or cand_meta.get("verification_url")
+                    or ""
+                ).strip()
+                raw_cmd = cand.get("poc_cmd") or cand_meta.get("poc_cmd")
+                raw_lang = str(cand.get("poc_lang") or cand_meta.get("poc_lang") or "python").strip()
+                # Fail-closed: only run poc_runner when an explicit sandbox HTTP URL or PoC command is present.
+                if sandbox_url:
+                    probe_res = poc_runner.verify_sandbox_http_probe(
+                        sandbox_url,
+                        program=eff_program,
+                        eligibility_db=eligibility_db,
+                    )
+                    probe_ok = bool(probe_res.get("verified", False))
+                    tr = VerifiableTranscript(
+                        language="http",
+                        backend="sandbox_http",
+                        status="passed" if probe_ok else str(probe_res.get("status") or "failed"),
+                        exit_code=0 if probe_ok else 1,
+                        command=["GET", sandbox_url],
+                        image="sandbox_http",
+                        repo_path=str(repo_p),
+                        started_at_utc=datetime.now(timezone.utc).isoformat(),
+                        elapsed_ms=float(probe_res.get("elapsed_ms") or 0.0),
+                        stdout=json.dumps(probe_res, sort_keys=True),
+                        stderr="" if probe_ok else str(probe_res.get("reason") or "; ".join(probe_res.get("reasons") or [])),
+                    )
+                    if cand_file:
+                        poc_transcripts_map[cand_file] = tr
+                        poc_transcripts_map[_norm_path(cand_file)] = tr
+                    if probe_ok and cand_file:
+                        norm_cf = _norm_path(cand_file)
+                        for ef in all_efs:
+                            if _norm_path(ef.file_path) == norm_cf:
+                                ef.poc_verified = True
+                elif isinstance(raw_cmd, (list, tuple)) and raw_cmd:
+                    tr = poc_runner.run_poc(
+                        language=raw_lang or "python",
+                        repo_path=repo_p,
+                        cmd=[str(part) for part in raw_cmd],
+                    )
+                    if cand_file:
+                        poc_transcripts_map[cand_file] = tr
+                        poc_transcripts_map[_norm_path(cand_file)] = tr
+                    if tr.verified and cand_file:
+                        norm_cf = _norm_path(cand_file)
+                        for ef in all_efs:
+                            if _norm_path(ef.file_path) == norm_cf:
+                                ef.poc_verified = True
+
+        clusters = EnsembleConsensusVoter(program=eff_program, quorum=self.quorum).fuse(
+            all_efs,
+            freshness=freshness,
+            poc_transcripts=poc_transcripts_map or None,
+        )
+        counts_by_disp: Dict[str, int] = {}
+        for c in clusters:
+            counts_by_disp[c.disposition] = counts_by_disp.get(c.disposition, 0) + 1
+
+        s1_noise = int(async_res.get("stage1_dropped_noise_count", 0) or 0) + extra_noise
+        s1_prod_count = len(deduped_prod)
+        elapsed_ms = round((time.monotonic() - t0) * 1000.0, 3)
+
+        out: Dict[str, Any] = {
+            "status": "completed",
+            "program": eff_program,
+            "repo_path": str(repo_p),
+            "db_path": str(async_res.get("db_path") or bb_str),
+            "recovery": async_res.get("recovery") or {},
+            "worker_pids": list(async_res.get("worker_pids") or []),
+            "intents_completed": int(async_res.get("intents_completed", 0) or 0),
+            "intents_failed": int(async_res.get("intents_failed", 0) or 0),
+            "loop2_emitted_intents": list(async_res.get("loop2_emitted_intents") or []),
+            "stage1": {
+                "production_count": s1_prod_count,
+                "noise_dropped": s1_noise,
+                "findings": deduped_prod,
+            },
+            "stage1_production_count": s1_prod_count,
+            "stage1_dropped_noise_count": s1_noise,
+            "stage2": stage2_res,
+            "stage3": stage3_telemetry,
+            "stage3_results": stage3_results,
+            "facts": all_facts,
+            "clusters": [c.to_dict() for c in clusters],
+            "counts_by_disposition": counts_by_disp,
+            "lane_allocation": async_res.get("lane_allocation") or {},
+            "eligibility_sync": async_res.get("eligibility_sync"),
+            "elapsed_ms": elapsed_ms,
+        }
+
+        ready_clusters = [c for c in clusters if c.disposition == "SUBMISSION_READY"]
+        if ready_clusters and (out_dir is not None or trigger_browser):
+            top_c = ready_clusters[0]
+            loop4_res = evaluate_and_stage_submission(
+                program=eff_program,
+                asset=top_c.file_path,
+                title=top_c.title,
+                summary=top_c.summary or top_c.title,
+                impact=f"Verified security issue in {top_c.file_path}:{top_c.line} ({top_c.cwe_family}).",
+                weakness_cwe=top_c.cwe_family or "CWE-200",
+                severity=top_c.severity,
+                poc_verified=_coerce_strict_bool(top_c.poc_verified),
+                poc_transcript=json.dumps(top_c.poc_transcript or {}),
+                eligibility_db=eligibility_db,
+                output_dir=out_dir,
+                trigger_browser=bool(trigger_browser),
+                poc_runner=poc_runner,
+                poc_target_os=top_c.poc_target_os or None,
+                finding_id=top_c.cluster_id,
+            )
+            out["loop4"] = loop4_res
+            if loop4_res.get("ready_to_submit_path"):
+                out["ready_to_submit_path"] = loop4_res["ready_to_submit_path"]
+            if loop4_res.get("report_url"):
+                out["report_url"] = loop4_res["report_url"]
+
+        return out
+
+
+_STAGE3_ENDPOINT_LOCK = threading.Lock()
+_LAST_STAGE3_OLLAMA_ENDPOINT: Optional[str] = None
+
+
+def _reset_guard_on_endpoint_change(guard: Any) -> None:
+    """Resets circuit-breaker state when switching to a different `OLLAMA_HOST` endpoint."""
+    global _LAST_STAGE3_OLLAMA_ENDPOINT
+    cur_ep = os.environ.get("OLLAMA_HOST", "").strip()
+    with _STAGE3_ENDPOINT_LOCK:
+        if _LAST_STAGE3_OLLAMA_ENDPOINT is not None and cur_ep != _LAST_STAGE3_OLLAMA_ENDPOINT:
+            if hasattr(guard, "reset"):
+                guard.reset()
+        _LAST_STAGE3_OLLAMA_ENDPOINT = cur_ep
+
+
+def evaluate_and_stage_submission(
+    program: str,
+    asset: str = "",
+    title: str = "",
+    summary: str = "",
+    impact: str = "",
+    weakness_cwe: str = "CWE-200",
+    severity: str = "HIGH",
+    poc_verified: Any = False,
+    poc_transcript: str = "",
+    eligibility_db: Optional[Any] = None,
+    eligibility_db_path: Optional[Union[str, Path]] = None,
+    output_dir: Optional[Union[str, Path]] = None,
+    trigger_browser: bool = True,
+    poc_runner: Optional[LinuxPocRunner] = None,
+    sandbox_url: Optional[str] = None,
+    researcher_handle: str = "oyesanyf",
+    poc_lang: Optional[str] = None,
+    poc_cmd: Optional[Sequence[str]] = None,
+    poc_target_os: Optional[str] = None,
+    target_os_required: Optional[str] = None,
+    report_id: Optional[str] = None,
+    finding_id: str = "",
+) -> Dict[str, Any]:
+    """
+    Loop 4 Fail-Closed Submission Gate:
+      1. `ProgramEligibilityDB.is_eligible(program)` must be True (UNLOCKED)
+      2. `evaluate_vendor_threat_model(...).passed` must be True
+      3. `poc_verified` must be True (supplied or confirmed via `LinuxPocRunner`)
+    Emits `<output_dir>/READY_TO_SUBMIT.json`, builds `/browser` HITL handoff spec,
+    and returns clickable `https://hackerone.com/reports/<id>` URL only when all 3 pass.
+    """
+    from engine.hackerone_porter import HACKERONE_BASE_URL, _scrub_secrets_and_phi
+    from engine.program_eligibility_db import ProgramEligibilityDB
+
+    eff_program = str(program or "").strip().lower()
+    if eligibility_db is not None:
+        eff_elig_db = eligibility_db
+    elif eligibility_db_path is not None:
+        eff_elig_db = ProgramEligibilityDB(eligibility_db_path)
+    else:
+        eff_elig_db = ProgramEligibilityDB()
+
+    if (
+        not eff_program
+        or "\x00" in eff_program
+        or ".." in eff_program
+        or "/" in eff_program
+        or "\\" in eff_program
+        or not eff_elig_db.is_eligible(eff_program)
+    ):
+        return {
+            "eligible": False,
+            "status": "blocked_ineligible",
+            "program": eff_program,
+            "reasons": [f"Program {eff_program!r} is not UNLOCKED in ProgramEligibilityDB."],
+            "report_url": None,
+            "submit_url": None,
+            "ready_to_submit_path": None,
+        }
+
+    eff_poc_verified = _coerce_strict_bool(poc_verified)
+    eff_poc_transcript = str(poc_transcript or "")
+    eff_poc_target_os = str(poc_target_os or "")
+    runner = poc_runner or LinuxPocRunner()
+
+    if not eff_poc_verified and sandbox_url:
+        probe_res = runner.verify_sandbox_http_probe(
+            sandbox_url,
+            program=eff_program,
+            eligibility_db=eff_elig_db,
+            researcher_handle=researcher_handle,
+        )
+        eff_poc_verified = bool(probe_res.get("verified", False))
+        eff_poc_transcript = json.dumps(probe_res)
+    elif not eff_poc_verified and poc_lang and poc_cmd:
+        repo_hint = str(Path(asset).parent) if asset and Path(asset).exists() else "."
+        tr = runner.run_poc(
+            language=poc_lang,
+            repo_path=repo_hint,
+            cmd=list(poc_cmd),
+        )
+        eff_poc_verified = bool(tr.verified)
+        eff_poc_transcript = json.dumps(tr.to_dict())
+        if not eff_poc_target_os and tr.backend:
+            eff_poc_target_os = "linux"
+
+    tm_verdict = evaluate_vendor_threat_model(
+        title=title,
+        summary=summary,
+        file_path=asset,
+        program=eff_program,
+        poc_verified=eff_poc_verified,
+        poc_target_os=eff_poc_target_os,
+        target_os_required=str(target_os_required or ""),
+    )
+    if not tm_verdict.passed:
+        return {
+            "eligible": False,
+            "status": "blocked_threat_model",
+            "program": eff_program,
+            "reasons": list(tm_verdict.reasons),
+            "matched_rules": list(tm_verdict.matched_rules),
+            "threat_model": tm_verdict.to_dict(),
+            "report_url": None,
+            "submit_url": None,
+            "ready_to_submit_path": None,
+        }
+
+    if not eff_poc_verified:
+        return {
+            "eligible": False,
+            "status": "blocked_unverified_poc",
+            "program": eff_program,
+            "reasons": ["poc_verified is False; static-only findings cannot be staged for submission."],
+            "threat_model": tm_verdict.to_dict(),
+            "report_url": None,
+            "submit_url": None,
+            "ready_to_submit_path": None,
+        }
+
+    clean_title = _scrub_secrets_and_phi(title)[:140]
+    clean_asset = _scrub_secrets_and_phi(asset)
+    clean_summary = _scrub_secrets_and_phi(summary)
+    clean_impact = _scrub_secrets_and_phi(impact)
+    clean_transcript = _scrub_secrets_and_phi(eff_poc_transcript)
+
+    if report_id and str(report_id).strip():
+        eff_report_id = str(report_id).strip()
+    else:
+        digest = hashlib.sha256(
+            f"{eff_program}|{clean_asset}|{clean_title}|{finding_id}".encode("utf-8")
+        ).hexdigest()
+        eff_report_id = str(int(digest[:10], 16) % 9_000_000 + 1_000_000)
+
+    report_url = f"{HACKERONE_BASE_URL}/reports/{eff_report_id}"
+    program_new_url = f"{HACKERONE_BASE_URL}/{eff_program}/reports/new"
+
+    browser_handoff_spec: Optional[Dict[str, Any]] = None
+    if trigger_browser:
+        browser_handoff_spec = {
+            "action": "stage_draft",
+            "target_url": report_url,
+            "program_new_url": program_new_url,
+            "program": eff_program,
+            "report_id": eff_report_id,
+            "final_submit_blocked_for_hitl": True,
+            "hitl_invariants": [
+                "Human researcher must complete login, 2FA/MFA, and any CAPTCHA or Turnstile challenge manually.",
+                "Never click final Submit report button automatically; require explicit human review.",
+            ],
+            "prefill_fields": {
+                "title": clean_title,
+                "asset": clean_asset,
+                "weakness_cwe": str(weakness_cwe or "CWE-200").upper(),
+                "severity": str(severity or "HIGH").upper(),
+                "vulnerability_information": clean_summary,
+                "impact": clean_impact,
+            },
+        }
+
+    dest_dir = Path(output_dir) if output_dir is not None else Path("reports/ensemble_hunt")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    ready_path = dest_dir / "READY_TO_SUBMIT.json"
+
+    staged_payload: Dict[str, Any] = {
+        "eligible": True,
+        "status": "ready_to_submit",
+        "program": eff_program,
+        "asset": clean_asset,
+        "title": clean_title,
+        "summary": clean_summary,
+        "impact": clean_impact,
+        "weakness_cwe": str(weakness_cwe or "CWE-200").upper(),
+        "severity": str(severity or "HIGH").upper(),
+        "poc_verified": True,
+        "poc_transcript": clean_transcript,
+        "report_id": eff_report_id,
+        "report_url": report_url,
+        "submit_url": report_url,
+        "program_new_url": program_new_url,
+        "threat_model": tm_verdict.to_dict(),
+        "browser_handoff_spec": browser_handoff_spec,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    ready_path.write_text(json.dumps(staged_payload, indent=2), encoding="utf-8")
+    return {
+        **staged_payload,
+        "ready_to_submit_path": str(ready_path),
+    }
 
 
 def render_ensemble_markdown(report: EnsembleReport) -> str:

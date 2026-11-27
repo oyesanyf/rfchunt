@@ -36,7 +36,7 @@ from engine.paid_model_provider import (
     is_ollama_model_tag,
     load_paid_model_config,
 )
-from model_adapter import ModelFusionAdapter, validate_abliterated_output
+from model_adapter import validate_abliterated_output
 from ollama_manager import (
     HEALTH_PROBE_MAX_TIMEOUT_SEC,
     OllamaLifecycleManager,

@@ -148,10 +148,14 @@ function Test-ConPtySpawn {
     $proc.StartInfo = $psi
     try {
         [void]$proc.Start()
-        $finished = $proc.WaitForExit(6000)
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+        $finished = $proc.WaitForExit(15000)
         $sw.Stop()
         if ($finished) {
-            $out = ($proc.StandardOutput.ReadToEnd()).Trim()
+            [void]$stdoutTask.Wait(2000)
+            [void]$stderrTask.Wait(2000)
+            $out = ("" + $stdoutTask.Result).Trim()
             if ($out -eq "CONPTY_OK") {
                 Write-WatchdogLog ("  [PASS] Fresh PowerShell probe returned CONPTY_OK in {0} ms." -f $sw.ElapsedMilliseconds) -Color Green
                 return $true
@@ -160,7 +164,7 @@ function Test-ConPtySpawn {
             return $false
         } else {
             try { $proc.Kill() } catch {}
-            Write-WatchdogLog "  [FAIL] Fresh PowerShell probe timed out (>6s); ConPTY subsystem saturated." -Color Red -Important
+            Write-WatchdogLog "  [FAIL] Fresh PowerShell probe timed out (>15s); ConPTY subsystem saturated." -Color Red -Important
             return $false
         }
     } catch {
@@ -172,6 +176,30 @@ function Test-ConPtySpawn {
 }
 
 function Invoke-DeadlockSweep {
+    $mutex = $null
+    $lockAcquired = $false
+    try {
+        $mutex = New-Object System.Threading.Mutex($false, "Local\AntigravityConPtyDeadlockSweep")
+        try {
+            $lockAcquired = $mutex.WaitOne(0)
+        } catch [System.Threading.AbandonedMutexException] {
+            $lockAcquired = $true
+        }
+        if (-not $lockAcquired) {
+            return $true
+        }
+        return Invoke-DeadlockSweepCore
+    } finally {
+        if ($lockAcquired -and $mutex) {
+            try { $mutex.ReleaseMutex() } catch {}
+        }
+        if ($mutex) {
+            try { $mutex.Dispose() } catch {}
+        }
+    }
+}
+
+function Invoke-DeadlockSweepCore {
     $now = Get-Date
     Write-WatchdogLog ("Starting Global Windows ConPTY & Shell Deadlock Sweep (DryRun={0})" -f [bool]$DryRun) -Color White
 

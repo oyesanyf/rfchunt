@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Iterator, List, Optional, Sequence
 
 import pytest
 
@@ -79,7 +79,12 @@ def _create_git_repo(root: Path, files: Dict[str, str]) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def _force_offline_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _force_offline_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> Iterator[None]:
+    import engine.ollama_concurrency_guard as ocg
+
     for k, v in (
         ("CI", "true"),
         ("RFCHUNT_OFFLINE", "1"),
@@ -89,6 +94,12 @@ def _force_offline_env(monkeypatch: pytest.MonkeyPatch) -> None:
         ("SEMGREP_SEND_METRICS", "off"),
     ):
         monkeypatch.setenv(k, v)
+    monkeypatch.setenv("RFCHUNT_OLLAMA_LOCK_PATH", str(tmp_path / "ollama_slot.lock"))
+    ocg._SHARED_GUARD = None
+    try:
+        yield
+    finally:
+        ocg._SHARED_GUARD = None
 
 
 @pytest.fixture

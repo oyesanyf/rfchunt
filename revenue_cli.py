@@ -40,6 +40,11 @@ REVENUE_SUBCOMMANDS = {
     "atlas-llm-eval",
     "check-drafts",
     "qa-drafts",
+    "rank-programs",
+    "sync-directory",
+    "cluster-recon",
+    "analyze-js",
+    "record-outcome",
 }
 
 
@@ -61,6 +66,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_fresh.add_argument("--min-score", type=int, default=20, help="Minimum attack-surface risk score (0-100).")
     p_fresh.add_argument("--out", default="out/fresh_hunt_queue", help="Output path stem (writes .json and .md).")
     p_fresh.add_argument("--mark-seen", action="store_true", help="Record returned SHAs as seen in SQLite.")
+    p_fresh.add_argument(
+        "--from-eligibility-db",
+        action="store_true",
+        help="Build watchlist dynamically from UNLOCKED in_scope_repos in ProgramEligibilityDB.",
+    )
+    p_fresh.add_argument("--eligibility-db", default=None, help="Optional ProgramEligibilityDB SQLite path.")
+    p_fresh.add_argument("--min-efficiency", type=float, default=80.0, help="Min response efficiency %% when using --from-eligibility-db.")
+    p_fresh.add_argument("--ml-rank", action="store_true", help="Rank candidates via ACDSO-adapted CommitDiffRanker.")
+    p_fresh.add_argument("--json", dest="json_out", action="store_true", help="Print JSON report to stdout.")
 
     p_poc = sub.add_parser("linux-poc", help="Run a PoC command inside a hardened Linux Docker container or WSL2.")
     p_poc.add_argument("--lang", required=True, choices=["rust", "node", "python", "ruby", "go"])
@@ -123,7 +137,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_atlas.add_argument("--llm-target", default="ollama", help="Target LLM: 'ollama', 'paid' (.env.local), or OpenAI-compatible HTTP(S) URL.")
     p_atlas.add_argument("--model", default=None, help="Optional model name override.")
     p_atlas.add_argument("--repo", default=None, help="Optional repository path for stack-adaptive ATLAS skill synthesis.")
-    p_atlas.add_argument("--suites", default="low_resource,canary,ssrf_tool,atlas_dynamic", help="Comma-separated suites (all, multilingual, low_resource, canary, ssrf_tool, atlas_dynamic).")
+    p_atlas.add_argument("--suites", default="low_resource,canary,indirect_exfil,ssrf_tool,atlas_dynamic", help="Comma-separated suites (all, multilingual, low_resource, canary, indirect_exfil, ssrf_tool, atlas_dynamic).")
+    p_atlas.add_argument("--program", default=None, help="Optional HackerOne program handle (fails closed unless AI/LLM assets are explicitly in scope).")
+    p_atlas.add_argument("--eligibility-db", default=None, help="Optional ProgramEligibilityDB SQLite path for program RoE & AI-in-scope gating.")
+    p_atlas.add_argument("--researcher-handle", default=None, help="Optional HackerOne researcher attribution handle for required policy headers/User-Agent.")
     p_atlas.add_argument("--offline-stix", action="store_true", help="Skip live STIX download and use bundled golden snapshot.")
     p_atlas.add_argument("--concurrency", type=int, default=8, help="Max concurrent LLM requests.")
     p_atlas.add_argument("--out", default="out/atlas_llm_eval", help="Output directory for JSON + SARIF 2.1.0 report.")
@@ -165,6 +182,78 @@ def build_parser() -> argparse.ArgumentParser:
     p_qa.add_argument("--write-repaired", default=None, help="When using --markdown-file, write the auto-repaired markdown body to this path.")
     p_qa.add_argument("--strict", action="store_true", help="Return non-zero exit code if any audited draft is not PASS.")
     p_qa.add_argument("--json", dest="json_out", action="store_true", help="Print structured JSON output.")
+
+    p_rank = sub.add_parser(
+        "rank-programs",
+        help="Rank UNLOCKED public HackerOne programs using ACDSO-adapted survival, LTR, Pareto knee, bandit & Two-Phase knapsack.",
+    )
+    p_rank.add_argument("--db", default=None, help="Optional ProgramEligibilityDB SQLite path.")
+    p_rank.add_argument("--min-efficiency", type=float, default=80.0, help="Minimum response efficiency %% (default: 80).")
+    p_rank.add_argument("--preset", default=None, choices=["signal_fast", "balanced", "max_ev"], help="Optional preference preset.")
+    p_rank.add_argument("--capacity", type=int, default=6, help="Daily portfolio program slot capacity (default: 6).")
+    p_rank.add_argument("--budget-minutes", type=float, default=120.0, help="Daily compute budget in minutes (default: 120).")
+    p_rank.add_argument("--include-deferred", action="store_true", help="Include <min-efficiency unlocked programs in ranking.")
+    p_rank.add_argument("--use-boost", action="store_true", help="Apply ModelFusion /boost tie-breaker when top scores are within 0.02.")
+    p_rank.add_argument("--json", dest="json_out", action="store_true", help="Print structured JSON output.")
+
+    p_sync = sub.add_parser(
+        "sync-directory",
+        help="Sync HackerOne directory metadata & structured scopes (offline JSON snapshot, Public Directory newest-first, or HackerOne API v1) into ProgramEligibilityDB v2.",
+    )
+    p_sync.add_argument("--db", default=None, help="Optional ProgramEligibilityDB SQLite path.")
+    p_sync.add_argument("--snapshot-json", default=None, help="Offline JSON file containing HackerOne program records to upsert.")
+    p_sync.add_argument("--public-directory", action="store_true", help="Fetch public HackerOne Directory sorted by newest launch date (no API token required).")
+    p_sync.add_argument("--public-endpoint", default=None, help="Optional public directory GraphQL URL override (default: https://hackerone.com/graphql).")
+    p_sync.add_argument("--min-efficiency", type=float, default=80.0, help="Minimum response efficiency %% for public directory filtering (default: 80).")
+    p_sync.add_argument("--query", default="", help="Optional HackerOne directory search query.")
+    p_sync.add_argument("--limit", type=int, default=25, help="Max programs to fetch (default: 25).")
+    p_sync.add_argument("--bounties-only", action="store_true", help="Filter directory sync to bounty-paying programs only.")
+    p_sync.add_argument("--vdp-only", action="store_true", help="Filter directory sync to non-monetary VDPs only (fast Signal building).")
+    p_sync.add_argument("--json", dest="json_out", action="store_true", help="Print structured JSON output.")
+
+    p_recon = sub.add_parser(
+        "cluster-recon",
+        help="Cluster HTTP recon endpoints & JS bundles via K-Means++ + inductive p95 noise threshold and classify anomalous HTTP responses.",
+    )
+    p_recon.add_argument("--input", required=True, help="JSON file (list or {'assets': [...]}) or JSONL of recon assets/endpoints.")
+    p_recon.add_argument("--program", default=None, help="Optional HackerOne program handle to filter strictly by in-scope allowlist.")
+    p_recon.add_argument("--db", default=None, help="Optional ProgramEligibilityDB SQLite path.")
+    p_recon.add_argument("--max-clusters", type=int, default=8, help="Maximum clusters (default: 8).")
+    p_recon.add_argument("--out", default=None, help="Optional output JSON file path.")
+    p_recon.add_argument("--json", dest="json_out", action="store_true", help="Print structured JSON output.")
+
+    p_js = sub.add_parser(
+        "analyze-js",
+        help="Analyze JavaScript bundles (.js/.mjs/.js.map or JSON bundle list) for hidden API/GraphQL endpoints, DOM sinks, source maps & recon clustering.",
+    )
+    p_js.add_argument("--input", required=True, help="Directory of .js/.mjs files, single .js file, or JSON bundle list.")
+    p_js.add_argument("--program", default=None, help="Optional HackerOne program handle to enforce strict DNS-boundary scope allowlist.")
+    p_js.add_argument("--db", default=None, help="Optional ProgramEligibilityDB SQLite path.")
+    p_js.add_argument("--out", default=None, help="Optional output JSON file path.")
+    p_js.add_argument("--json", dest="json_out", action="store_true", help="Print structured JSON output.")
+
+    p_outc = sub.add_parser(
+        "record-outcome",
+        help="Record a real HackerOne submission triage outcome into ProgramEligibilityDB to train survival, LTR & bandit models.",
+    )
+    p_outc.add_argument("--db", default=None, help="Optional ProgramEligibilityDB SQLite path.")
+    p_outc.add_argument("--handle", required=True, help="HackerOne program handle (e.g., henkel_vdp, common_codes).")
+    p_outc.add_argument(
+        "--outcome",
+        required=True,
+        choices=["BOUNTY", "RESOLVED", "TRIAGED", "DUPLICATE", "INFORMATIVE", "NA", "NO_FINDING"],
+        help="Observed report outcome.",
+    )
+    p_outc.add_argument("--repo", default="", help="Optional GitHub repo slug.")
+    p_outc.add_argument("--sha", default="", help="Optional commit SHA.")
+    p_outc.add_argument("--lane", type=int, default=1, choices=[1, 2], help="Hunt lane (1=VDP Signal, 2=Paid BBP).")
+    p_outc.add_argument("--age-hours", type=float, default=0.0, help="Target commit/PR age in hours at discovery.")
+    p_outc.add_argument("--signal-delta", type=float, default=0.0, help="Observed Signal point delta (e.g., +7.0).")
+    p_outc.add_argument("--bounty-usd", type=float, default=0.0, help="Awarded bounty in USD (default: 0).")
+    p_outc.add_argument("--triage-hours", type=float, default=None, help="Observed hours to triage.")
+    p_outc.add_argument("--cycle-id", default="", help="Optional hunt cycle ID.")
+    p_outc.add_argument("--update-signal", type=float, default=None, help="Optional updated account Signal score.")
+    p_outc.add_argument("--json", dest="json_out", action="store_true", help="Print structured JSON output.")
     return parser
 
 
@@ -312,10 +401,27 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.command == "freshness-watch":
+        from engine.program_eligibility_db import ProgramEligibilityDB
+
+        elig_db = None
+        elig_path = getattr(args, "eligibility_db", None) or os.environ.get("RFCHUNT_ELIGIBILITY_DB")
+        if bool(getattr(args, "from_eligibility_db", False)) or (elig_path and str(elig_path).strip()):
+            elig_db = ProgramEligibilityDB(str(elig_path).strip() if elig_path else None)
+
         targets: List[WatchTarget] = []
-        wl = Path(args.watchlist)
-        if wl.is_file():
-            targets.extend(load_watchlist(wl))
+        if bool(getattr(args, "from_eligibility_db", False)):
+            from engine.ml_diff_and_recon_ranker import build_unlocked_watchlist_from_db
+
+            raw_targets = build_unlocked_watchlist_from_db(
+                eligibility_db=elig_db,
+                min_efficiency_pct=float(getattr(args, "min_efficiency", 80.0)),
+            )
+            for row in raw_targets:
+                targets.append(WatchTarget.from_dict(row))
+        else:
+            wl = Path(args.watchlist)
+            if wl.is_file():
+                targets.extend(load_watchlist(wl))
         for slug in args.repo:
             targets.append(WatchTarget(program="adhoc", repo=slug))
         watcher = FreshnessWatcher()
@@ -325,6 +431,8 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
                 freshness_hours=args.hours,
                 min_score=args.min_score,
                 mark_returned_seen=args.mark_seen,
+                eligibility_db=elig_db if bool(getattr(args, "from_eligibility_db", False)) else None,
+                ml_rank=bool(getattr(args, "ml_rank", False)),
             )
         finally:
             watcher.close()
@@ -334,7 +442,10 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
         md_path = out_stem.with_suffix(".md")
         json_path.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
         md_path.write_text(render_fresh_hunt_queue_markdown(report), encoding="utf-8")
-        print(f"[+] Freshness Watch complete: {len(report.candidates)} candidates -> {md_path}")
+        if bool(getattr(args, "json_out", False)):
+            print(json.dumps(report.to_dict(), indent=2))
+        else:
+            print(f"[+] Freshness Watch complete: {len(report.candidates)} candidates -> {md_path}")
         return 0
 
     if args.command == "linux-poc":
@@ -357,7 +468,22 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.command == "package-audit":
         raw = json.loads(Path(args.findings_json).read_text(encoding="utf-8"))
-        findings = raw.get("findings", raw) if isinstance(raw, dict) else raw
+        if not isinstance(raw, (list, dict)):
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error": (
+                            f"Invalid --findings-json top-level type {type(raw).__name__}: "
+                            "expected JSON array (list) or object (dict)."
+                        ),
+                    }
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        findings_raw = raw.get("findings", []) if isinstance(raw, dict) else raw
+        findings = findings_raw if isinstance(findings_raw, list) else []
         packager = ClientAuditPackager()
         bundle = packager.package(
             client_name=args.client,
@@ -391,7 +517,21 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
         )
         if args.findings_json:
             raw = json.loads(Path(args.findings_json).read_text(encoding="utf-8"))
-            items = raw.get("findings", raw) if isinstance(raw, dict) else raw
+            if not isinstance(raw, (list, dict)):
+                err_payload = {
+                    "status": "error",
+                    "error": (
+                        f"Invalid --findings-json top-level type {type(raw).__name__}: "
+                        "expected JSON array (list) or object (dict)."
+                    ),
+                }
+                if args.json_out:
+                    print(json.dumps(err_payload, indent=2))
+                else:
+                    print(json.dumps(err_payload), file=sys.stderr)
+                return 2
+            items_raw = raw.get("findings", []) if isinstance(raw, dict) else raw
+            items = items_raw if isinstance(items_raw, list) else []
             findings = [_finding_from_dict(item) for item in items if isinstance(item, dict)]
 
         cpu_workers_arg = getattr(args, "cpu_workers", None)
@@ -606,6 +746,11 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "atlas-llm-eval":
         from engine.atlas_llm_evaluator import AtlasLLMEvaluator, LLMTargetAdapter
 
+        elig_db = None
+        if args.program:
+            from engine.program_eligibility_db import ProgramEligibilityDB
+
+            elig_db = ProgramEligibilityDB(db_path=args.eligibility_db)
         adapter = LLMTargetAdapter(target=args.llm_target, model=args.model)
         evaluator = AtlasLLMEvaluator(adapter=adapter, concurrency=args.concurrency)
         suites = [s.strip() for s in str(args.suites).split(",") if s.strip()]
@@ -613,11 +758,17 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
             suites=suites,
             repo_path=args.repo,
             refresh_stix=not args.offline_stix,
+            program_handle=args.program,
+            eligibility_db=elig_db,
+            researcher_handle=args.researcher_handle,
         )
         out_dir = Path(args.out)
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "atlas_llm_report.json").write_text(json.dumps(rep.to_dict(), indent=2), encoding="utf-8")
         (out_dir / "atlas_llm_findings.sarif").write_text(json.dumps(rep.to_sarif(), indent=2), encoding="utf-8")
+        if rep.stix_metadata.get("compliance_blocked"):
+            print(f"[!] ATLAS LLM Eval blocked by ProgramComplianceContext: {rep.stix_metadata.get('reason')}")
+            return 1
         print(
             f"[+] ATLAS LLM Eval complete: {rep.passed_tests}/{rep.total_tests} passed "
             f"(parity={rep.cross_lingual_parity:.2f}, canary_leaks={rep.canary_leaks}) -> {out_dir}"
@@ -785,6 +936,270 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
 
         if args.strict and summary.passed_count != summary.total_audited:
             return 1
+        return 0
+
+    if args.command == "rank-programs":
+        from engine.ml_program_selector import rank_hackerone_programs
+
+        res = rank_hackerone_programs(
+            db_path=args.db,
+            min_efficiency_pct=float(args.min_efficiency),
+            preset=args.preset,
+            capacity=int(args.capacity),
+            budget_minutes=float(args.budget_minutes),
+            include_deferred=bool(args.include_deferred),
+        )
+        if bool(args.use_boost) and res.get("tie_break_needed") and res.get("ranked_programs"):
+            from engine.boost_decision_adapter import BoostDecisionAdapter
+
+            tb = BoostDecisionAdapter().tie_break_pareto_knee(res["ranked_programs"])
+            res["boost_tie_break"] = {k: v for k, v in tb.items() if k != "ordered"}
+            if tb.get("tie_broken") and tb.get("ordered"):
+                res["ranked_programs"] = tb["ordered"]
+                for idx, row in enumerate(res["ranked_programs"], start=1):
+                    row["rank"] = idx
+        if args.json_out:
+            print(json.dumps(res, indent=2, default=str))
+        else:
+            port = res.get("daily_hunt_portfolio") or {}
+            print(
+                f"[+] ML Program Ranking (preset={res['preset']}, LTR tier={res['ltr_curriculum_tier']}, "
+                f"Pareto winner={res['pareto_knee_winner']}): "
+                f"ranked={len(res['ranked_programs'])}, portfolio={len(port.get('selected') or [])} "
+                f"(Lane1={port.get('lane1_count', 0)}, Lane2={port.get('lane2_count', 0)})"
+            )
+            for row in (res.get("ranked_programs") or [])[:10]:
+                print(
+                    f"  #{row['rank']:2d} {row['handle']:<28} [{row['lane']}] "
+                    f"score={row['combined_rank_score']:.4f} eff={row.get('response_efficiency_pct')}% "
+                    f"max=${row.get('bounty_max_usd', 0)}"
+                )
+        return 0
+
+    if args.command == "sync-directory":
+        from engine.program_eligibility_db import ProgramEligibilityDB
+
+        db = ProgramEligibilityDB(db_path=args.db)
+        upserted: List[str] = []
+        errors_list: List[str] = []
+        if args.snapshot_json:
+            raw_data = json.loads(Path(args.snapshot_json).read_text(encoding="utf-8"))
+            items = raw_data.get("programs", raw_data) if isinstance(raw_data, dict) else raw_data
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    handle = str(item.get("handle") or "").strip().lower()
+                    if not handle:
+                        continue
+                    status = str(item.get("status") or "UNLOCKED").strip().upper()
+                    db.upsert(
+                        handle,
+                        status,
+                        signal_required=item.get("signal_required"),
+                        bounty_min_usd=item.get("bounty_min_usd"),
+                        bounty_max_usd=item.get("bounty_max_usd"),
+                        submit_url=str(item.get("submit_url") or ""),
+                        scope_summary=str(item.get("scope_summary") or ""),
+                        notes=str(item.get("notes") or ""),
+                        launched_at_utc=str(item.get("launched_at_utc") or ""),
+                        response_efficiency_pct=item.get("response_efficiency_pct"),
+                        first_response_hours=item.get("first_response_hours"),
+                        triage_hours=item.get("triage_hours"),
+                        bounty_hours=item.get("bounty_hours"),
+                        resolved_count=int(item.get("resolved_count") or 0),
+                        offers_bounties=item.get("offers_bounties"),
+                        is_vdp=item.get("is_vdp"),
+                        gold_standard=bool(item.get("gold_standard", False)),
+                        fast_payments=bool(item.get("fast_payments", False)),
+                        submission_state=str(item.get("submission_state") or "open"),
+                        in_scope_assets=item.get("in_scope_assets") or (),
+                        in_scope_repos=item.get("in_scope_repos") or (),
+                        out_of_scope_assets=item.get("out_of_scope_assets") or (),
+                        roe_automated_prohibited=item.get("roe_automated_prohibited"),
+                        roe_max_rps=item.get("roe_max_rps"),
+                    )
+                    upserted.append(handle)
+        elif bool(getattr(args, "public_directory", False)):
+            from engine.hackerone_porter import HackerOnePublicDirectoryClient
+
+            pub_client = HackerOnePublicDirectoryClient(endpoint_url=getattr(args, "public_endpoint", None))
+            pub_res = pub_client.fetch_and_sync_directory(
+                eligibility_db=db,
+                query=str(args.query or ""),
+                limit=max(1, int(args.limit)),
+                min_efficiency_pct=float(getattr(args, "min_efficiency", 80.0)),
+                bounties_only=bool(args.bounties_only),
+                vdp_only=bool(getattr(args, "vdp_only", False)),
+            )
+            upserted.extend(pub_res.get("upserted") or [])
+        else:
+            from engine.hackerone_porter import HackerOneApiClient
+
+            client = HackerOneApiClient()
+            if not client.has_credentials:
+                payload = {
+                    "status": "auth_required",
+                    "upserted": [],
+                    "message": "Set HACKERONE_API_USERNAME & HACKERONE_API_TOKEN, pass --public-directory, or pass --snapshot-json.",
+                }
+                if args.json_out:
+                    print(json.dumps(payload, indent=2))
+                else:
+                    print(f"[!] {payload['message']}")
+                return 1
+            campaigns = client.list_campaigns(
+                query=str(args.query or ""),
+                bounties_only=bool(args.bounties_only),
+                limit=max(1, int(args.limit)),
+            )
+            for camp in campaigns:
+                try:
+                    client.fetch_campaign_scope(camp.handle, eligibility_db=db)
+                    upserted.append(camp.handle)
+                except Exception as exc:
+                    errors_list.append(f"{camp.handle}: {exc}")
+
+        out_payload = {
+            "status": "completed",
+            "upserted_count": len(upserted),
+            "upserted": upserted,
+            "summary_counts": db.summary_counts(),
+            "errors": errors_list,
+        }
+        if args.json_out:
+            print(json.dumps(out_payload, indent=2))
+        else:
+            print(f"[+] Synced {len(upserted)} program(s) into {db.db_path} ({out_payload['summary_counts']})")
+        return 0
+
+    if args.command == "cluster-recon":
+        from engine.ml_diff_and_recon_ranker import ReconAssetClusterer
+
+        raw_txt = Path(args.input).read_text(encoding="utf-8").strip()
+        assets_in: List[Dict[str, Any]] = []
+        if raw_txt.startswith("[") or raw_txt.startswith("{"):
+            parsed = json.loads(raw_txt)
+            if isinstance(parsed, dict):
+                parsed = parsed.get("assets") or parsed.get("endpoints") or parsed.get("items") or []
+            if isinstance(parsed, list):
+                assets_in = [x for x in parsed if isinstance(x, dict)]
+        else:
+            for line in raw_txt.splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    assets_in.append(obj)
+
+        compliance_ctx = None
+        if args.program:
+            from engine.program_eligibility_db import ProgramEligibilityDB
+            from engine.request_hygiene import build_program_compliance_context
+
+            db = ProgramEligibilityDB(db_path=args.db)
+            compliance_ctx = build_program_compliance_context(args.program, eligibility_db=db)
+
+        clusterer = ReconAssetClusterer(max_clusters=int(args.max_clusters))
+        result = clusterer.cluster_and_prioritize(assets_in, compliance_ctx=compliance_ctx)
+        if args.out:
+            out_p = Path(args.out)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            out_p.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        if args.json_out:
+            print(json.dumps(result, indent=2))
+        else:
+            print(
+                f"[+] Recon Clustering complete: total={result['total_assets']}, "
+                f"clusters={result['clusters_count']}, outliers={result['outliers_count']}, "
+                f"suppressed_bulk={result['suppressed_homogeneous_count']}, "
+                f"skipped_oos={result['skipped_out_of_scope']}"
+            )
+            for row in (result.get("prioritized_assets") or [])[:10]:
+                print(
+                    f"  - [{row['priority_score']:.3f} | {row.get('anomaly_class', 'NORMAL')}] {row['url']} "
+                    f"(cluster={row['cluster_id']}, outlier={row['is_outlier_noise']}, tokens={row['matched_high_value_tokens']})"
+                )
+        return 0
+
+    if args.command == "analyze-js":
+        from engine.ml_diff_and_recon_ranker import JavaScriptBundleAnalyzer
+
+        in_path = Path(args.input)
+        bundles_in: List[Dict[str, Any]] = []
+        if in_path.is_dir():
+            for p_js in sorted(in_path.rglob("*")):
+                if p_js.is_file() and (
+                    p_js.suffix.lower() in (".js", ".mjs", ".cjs") or p_js.name.lower().endswith(".js.map")
+                ):
+                    bundles_in.append({"path": str(p_js), "url": p_js.relative_to(in_path).as_posix()})
+        elif in_path.is_file() and in_path.suffix.lower() == ".json":
+            parsed = json.loads(in_path.read_text(encoding="utf-8"))
+            items = parsed.get("bundles", parsed) if isinstance(parsed, dict) else parsed
+            if isinstance(items, list):
+                bundles_in = [x for x in items if isinstance(x, dict)]
+        elif in_path.is_file():
+            bundles_in.append({"path": str(in_path), "url": in_path.name})
+
+        compliance_ctx = None
+        if args.program:
+            from engine.program_eligibility_db import ProgramEligibilityDB
+            from engine.request_hygiene import build_program_compliance_context
+
+            db = ProgramEligibilityDB(db_path=args.db)
+            compliance_ctx = build_program_compliance_context(args.program, eligibility_db=db)
+
+        result = JavaScriptBundleAnalyzer().analyze_bundles(bundles_in, compliance_ctx=compliance_ctx)
+        if args.out:
+            out_p = Path(args.out)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            out_p.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        if args.json_out:
+            print(json.dumps(result, indent=2))
+        else:
+            print(
+                f"[+] JS Bundle Analysis complete: bundles={result['total_bundles']}, "
+                f"endpoints={result['total_endpoints_discovered']}, dom_sinks={result['total_dom_sinks']}, "
+                f"sourcemaps={result['total_sourcemap_leaks']}"
+            )
+            for b in (result.get("bundles") or [])[:10]:
+                print(
+                    f"  - [{b['js_risk_score']:.3f}] {b['source']} "
+                    f"(endpoints={len(b['discovered_endpoints'])}, sinks={b['dom_sinks']}, maps={len(b['sourcemap_urls'])})"
+                )
+        return 0
+
+    if args.command == "record-outcome":
+        from engine.program_eligibility_db import ProgramEligibilityDB
+
+        db = ProgramEligibilityDB(db_path=args.db)
+        rec = db.record_hunt_outcome(
+            handle=args.handle,
+            outcome=args.outcome,
+            repo=args.repo,
+            commit_sha=args.sha,
+            lane=int(args.lane),
+            target_age_hours=float(args.age_hours),
+            signal_delta=float(args.signal_delta),
+            bounty_usd=float(args.bounty_usd),
+            triage_hours_observed=args.triage_hours,
+            cycle_id=args.cycle_id,
+        )
+        acct = None
+        if args.update_signal is not None:
+            acct = db.update_account_state(
+                signal_established=True,
+                signal_score=float(args.update_signal),
+            ).to_dict()
+        payload = {"status": "recorded", "outcome": rec.to_dict(), "account_state": acct}
+        if args.json_out:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(
+                f"[+] Recorded outcome {rec.outcome} for {rec.handle} (lane={rec.lane}, "
+                f"signal_delta={rec.signal_delta:+.2f}, bounty=${rec.bounty_usd:.2f})"
+            )
         return 0
 
     return 2

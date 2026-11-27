@@ -11,9 +11,42 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import math
 import threading
 from typing import Any, Dict, List, Optional, Sequence
 import uuid
+
+try:
+    from engine.advisory_exporter import _redact_inline_tokens
+except Exception:  # pragma: no cover - defensive fallback
+    def _redact_inline_tokens(text: str) -> str:
+        return str(text or "")
+
+
+def _redact_recursive(value: Any) -> Any:
+    """Recursively scrubs inline secret tokens from nested whiteboard structures."""
+    if isinstance(value, str):
+        return _redact_inline_tokens(value)
+    if isinstance(value, dict):
+        return {k: _redact_recursive(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_recursive(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_recursive(v) for v in value)
+    return value
+
+
+def _validate_confidence(val: Any) -> float:
+    if isinstance(val, bool):
+        raise ValueError(f"Confidence cannot be a bool: {val!r}")
+    c = float(val)
+    if not math.isfinite(c) or c < 0.0 or c > 1.0:
+        raise ValueError(f"Confidence must be finite and in [0.0, 1.0], got {val!r}")
+    return c
+
+
+_ACTIVE_STATUSES = frozenset({"OPEN", "DISPATCHED", "TESTING"})
+_FINAL_TERMINAL_STATUSES = frozenset({"VERIFIED", "COUNTEREXAMPLE_FOUND", "REFUTED"})
 
 HYPOTHESIS_STATUSES = frozenset(
     {
@@ -64,7 +97,7 @@ class WhiteboardHypothesis:
     )
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return _redact_recursive(asdict(self))
 
 
 class EnsembleWhiteboard:
@@ -117,6 +150,15 @@ class EnsembleWhiteboard:
             if hid in self._hypotheses and not overwrite:
                 raise ValueError(f"Duplicate hypothesis_id: {hid!r}")
 
+            hypothesis.confidence = _validate_confidence(hypothesis.confidence)
+            hypothesis.title = _redact_inline_tokens(str(hypothesis.title or ""))
+            hypothesis.notes = _redact_inline_tokens(str(hypothesis.notes or ""))
+            hypothesis.evidence = _redact_recursive(dict(hypothesis.evidence or {}))
+            hypothesis.counterexamples = _redact_recursive(list(hypothesis.counterexamples or []))
+            hypothesis.verifier_outputs = _redact_recursive(list(hypothesis.verifier_outputs or []))
+            hypothesis.worker_traces = _redact_recursive(list(hypothesis.worker_traces or []))
+            hypothesis.metadata = _redact_recursive(dict(hypothesis.metadata or {}))
+
             if hid not in self._hypotheses:
                 self._order.append(hid)
             hypothesis.updated_at_utc = datetime.now(timezone.utc).isoformat()
@@ -155,25 +197,34 @@ class EnsembleWhiteboard:
 
             hyp = self._hypotheses[hypothesis_id]
             prev_status = hyp.status
+            if prev_status in _FINAL_TERMINAL_STATUSES and status in _ACTIVE_STATUSES:
+                raise ValueError(
+                    f"Illegal terminal-to-active rollback for {hypothesis_id!r}: "
+                    f"{prev_status!r} -> {status!r}"
+                )
+            validated_conf: Optional[float] = (
+                _validate_confidence(confidence) if confidence is not None else None
+            )
+
             hyp.status = status
             if worker_id is not None:
                 hyp.assigned_worker = str(worker_id)
             if round_idx is not None:
                 hyp.round_idx = int(round_idx)
-            if confidence is not None:
-                hyp.confidence = float(confidence)
+            if validated_conf is not None:
+                hyp.confidence = validated_conf
             if severity is not None:
                 hyp.severity = str(severity)
             if notes is not None:
-                hyp.notes = str(notes)
+                hyp.notes = _redact_inline_tokens(str(notes))
             if evidence:
-                hyp.evidence.update(dict(evidence))
+                hyp.evidence.update(_redact_recursive(dict(evidence)))
             if counterexamples:
-                hyp.counterexamples.extend(dict(c) for c in counterexamples)
+                hyp.counterexamples.extend(_redact_recursive(dict(c)) for c in counterexamples)
             if verifier_output:
-                hyp.verifier_outputs.append(dict(verifier_output))
+                hyp.verifier_outputs.append(_redact_recursive(dict(verifier_output)))
             if worker_trace:
-                hyp.worker_traces.append(dict(worker_trace))
+                hyp.worker_traces.append(_redact_recursive(dict(worker_trace)))
 
             ts = datetime.now(timezone.utc).isoformat()
             hyp.updated_at_utc = ts
@@ -229,10 +280,10 @@ class EnsembleWhiteboard:
         with self._lock:
             entry = {
                 "fact_type": str(fact_type),
-                "summary": str(summary),
+                "summary": _redact_inline_tokens(str(summary)),
                 "domain": str(domain),
                 "source": str(source),
-                "payload": dict(payload) if payload else {},
+                "payload": _redact_recursive(dict(payload)) if payload else {},
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             }
             self._facts.append(entry)
@@ -347,19 +398,21 @@ class EnsembleWhiteboard:
             for h in hyps:
                 st = str(h.get("status") or "OPEN")
                 counts_by_status[st] = counts_by_status.get(st, 0) + 1
-            return {
-                "task_id": self.task_id,
-                "enabled": self.enabled,
-                "proxy": self.proxy,
-                "hypotheses": hyps,
-                "counts_by_status": counts_by_status,
-                "facts": list(self._facts),
-                "transitions": list(self._transitions),
-                "rounds": list(self._rounds),
-                "backend_status": dict(self._backend_status),
-                "db_synced": self._db_synced,
-                "sync_errors": list(self._sync_errors),
-            }
+            return _redact_recursive(
+                {
+                    "task_id": self.task_id,
+                    "enabled": self.enabled,
+                    "proxy": self.proxy,
+                    "hypotheses": hyps,
+                    "counts_by_status": counts_by_status,
+                    "facts": list(self._facts),
+                    "transitions": list(self._transitions),
+                    "rounds": list(self._rounds),
+                    "backend_status": dict(self._backend_status),
+                    "db_synced": self._db_synced,
+                    "sync_errors": list(self._sync_errors),
+                }
+            )
 
     snapshot = to_dict
 

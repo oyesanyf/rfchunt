@@ -72,7 +72,7 @@ def _start_github_loopback_server(now_utc: datetime):
                 {"filename": "src/proxy/header_parser.rs"},
             ],
         ),
-        f"/repos/acme/wasm-runner/commits?since={(now_utc - timedelta(hours=72)).strftime('%Y-%m-%dT%H:%M:%SZ').replace(':', '%3A')}&per_page=10": (
+        "/repos/acme/wasm-runner/commits?per_page=10": (
             '"etag-commits-1"',
             [
                 {

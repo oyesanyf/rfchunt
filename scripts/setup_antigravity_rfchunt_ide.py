@@ -21,11 +21,14 @@ What it configures (strictly zero Windows Registry and zero system PATH mutation
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -192,9 +195,156 @@ def seed_eligibility_db() -> None:
         sys.path.insert(0, str(REPO_ROOT))
     from engine.program_eligibility_db import ProgramEligibilityDB
 
-    db = ProgramEligibilityDB()
+    env_db = os.environ.get("RFCHUNT_ELIGIBILITY_DB", "").strip()
+    db = ProgramEligibilityDB(env_db) if env_db else ProgramEligibilityDB()
     counts = db.seed_observed_hackerone_baseline()
     print(f"[+] Seeded SQLite Program Eligibility DB ({db.db_path}): {counts}")
+
+
+EXTERNAL_CLI_TOOLS: Sequence[str] = (
+    "trufflehog",
+    "subfinder",
+    "httpx",
+    "katana",
+    "jadx",
+    "schemathesis",
+)
+
+GO_INSTALL_PACKAGES: Sequence[tuple[str, str]] = (
+    ("subfinder", "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"),
+    ("httpx", "github.com/projectdiscovery/httpx/cmd/httpx@latest"),
+    ("katana", "github.com/projectdiscovery/katana/cmd/katana@latest"),
+)
+
+
+def _process_tool_search_dirs() -> List[Path]:
+    """Build process-local candidate binary directories (Go bin + repo bin) without mutating PATH."""
+    candidates: List[Path] = [Path.home() / "go" / "bin"]
+    for env_key in ("HOME", "USERPROFILE"):
+        raw = os.environ.get(env_key, "").strip()
+        if raw:
+            candidates.append(Path(raw) / "go" / "bin")
+    gopath = os.environ.get("GOPATH", "").strip()
+    if gopath:
+        candidates.append(Path(gopath) / "bin")
+    candidates.append(Path(r"C:\Program Files\Go\bin"))
+    candidates.append(REPO_ROOT / "bin")
+
+    deduped: List[Path] = []
+    seen: set[str] = set()
+    for d in candidates:
+        key = str(d)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(d)
+    return deduped
+
+
+def _is_python_httpx_binary(candidate: str) -> bool:
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    try:
+        from engine.external_scanners import _is_python_httpx_cli_binary
+
+        return bool(_is_python_httpx_cli_binary(candidate))
+    except Exception:
+        low = str(candidate).replace("\\", "/").lower()
+        return "/scripts/httpx" in low or "python" in low
+
+
+def probe_external_cli_tools() -> Dict[str, Optional[str]]:
+    """Probe the 6 external CLI tools using PATH plus in-memory ~/go/bin and Go program dirs."""
+    search_dirs = _process_tool_search_dirs()
+    suffixes = (".exe", "") if os.name == "nt" else ("",)
+    found: Dict[str, Optional[str]] = {}
+
+    for tool in EXTERNAL_CLI_TOOLS:
+        aliases = ("jadx", "jadx-gui") if tool == "jadx" else (tool,)
+        resolved: Optional[str] = None
+
+        for alias in aliases:
+            cand = shutil.which(alias)
+            if cand:
+                if tool == "httpx" and _is_python_httpx_binary(cand):
+                    try:
+                        from engine.external_scanners import _find_non_python_httpx_on_path
+
+                        alt = _find_non_python_httpx_on_path(cand)
+                        if alt:
+                            resolved = alt
+                            break
+                    except Exception:
+                        pass
+                    continue
+                resolved = cand
+                break
+
+        if resolved is None:
+            for base_dir in search_dirs:
+                if not base_dir.is_dir():
+                    continue
+                for alias in aliases:
+                    for suf in suffixes:
+                        cand_path = base_dir / f"{alias}{suf}"
+                        if cand_path.is_file():
+                            cand_str = str(cand_path)
+                            if tool == "httpx" and _is_python_httpx_binary(cand_str):
+                                continue
+                            resolved = cand_str
+                            break
+                    if resolved is not None:
+                        break
+                if resolved is not None:
+                    break
+
+        if resolved is None and tool == "schemathesis":
+            spec = importlib.util.find_spec("schemathesis")
+            if spec is not None:
+                resolved = getattr(spec, "origin", None) or "python-module:schemathesis"
+
+        found[tool] = resolved
+        if resolved:
+            print(f"[+] CLI tool probe: {tool} -> available ({resolved})")
+        else:
+            print(f"[-] CLI tool probe: {tool} -> unavailable (optional)")
+
+    return found
+
+
+def install_go_tools() -> Dict[str, Any]:
+    """Install ProjectDiscovery Go tools into ~/go/bin when `go` is on PATH (process-scoped env only)."""
+    go_bin = shutil.which("go")
+    if not go_bin:
+        print("[!] 'go' binary not found on PATH; skipping --install-go-tools cleanly.")
+        return {"status": "skipped_go_absent", "installed": [], "failed": []}
+
+    proc_env = os.environ.copy()
+    proc_env.setdefault("GOPATH", str(Path.home() / "go"))
+    installed: List[str] = []
+    failed: List[str] = []
+
+    for tool_name, pkg in GO_INSTALL_PACKAGES:
+        print(f"[*] Installing {tool_name} via `{go_bin} install {pkg}`...")
+        proc = subprocess.run(
+            [go_bin, "install", pkg],
+            env=proc_env,
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if proc.returncode == 0:
+            installed.append(tool_name)
+            print(f"[+] Installed Go tool: {tool_name}")
+        else:
+            failed.append(tool_name)
+            err_tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            msg = err_tail[-1] if err_tail else f"exit code {proc.returncode}"
+            print(f"[!] Optional Go tool install did not succeed for {tool_name}: {msg}")
+
+    return {"status": "completed", "installed": installed, "failed": failed}
 
 
 def main() -> int:
@@ -211,6 +361,11 @@ def main() -> int:
         default=sys.executable,
         help="Python executable path to register in Antigravity MCP config (default: current interpreter).",
     )
+    parser.add_argument(
+        "--install-go-tools",
+        action="store_true",
+        help="Attempt `go install` for subfinder, httpx, and katana into ~/go/bin without modifying PATH or Registry.",
+    )
     args = parser.parse_args()
 
     print(f"[*] Bootstrapping RFCHunt Antigravity IDE integration from: {REPO_ROOT}")
@@ -220,6 +375,9 @@ def main() -> int:
     write_local_models_config()
     register_mcp_server(args.python)
     seed_eligibility_db()
+    if args.install_go_tools:
+        install_go_tools()
+    probe_external_cli_tools()
     print("[+] Done! Restart Antigravity IDE to load the global rule, local_models.json, and rfchunt-bugbounty MCP server.")
     return 0
 

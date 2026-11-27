@@ -40,7 +40,6 @@ import time
 import tokenize
 import unicodedata
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
-import uuid
 
 try:
     from database import Database
@@ -1964,7 +1963,6 @@ class MantisZeroDaySynthesizer:
         findings: Optional[List[MantisFinding]] = None,
         code_snippets: Optional[Dict[str, str]] = None,
     ) -> List[MantisHypothesis]:
-        tm_dict = (threat_model.to_dict() if hasattr(threat_model, "to_dict") else dict(threat_model or {})) if threat_model else {}
         if (
             os.environ.get("RFCHUNT_OFFLINE") != "1"
             and self.fusion_arbiter is not None
@@ -4690,7 +4688,7 @@ def run_unified_all_scans(
                     last30days_topic = str(pf_plan["tailored_last30days_topic"])
                 if nuclei_tags is None and pf_plan.get("recommended_nuclei_tags"):
                     nuclei_tags = list(pf_plan["recommended_nuclei_tags"])
-                effective_trace(
+                _log(
                     f"[preflight] Fresh pass run_id={preflight_res.get('run_id', '')[:8]} "
                     f"domains={len(preflight_res.get('active_category_ids') or [])} "
                     f"langs={len(preflight_res.get('detected_languages') or [])} "
@@ -5500,7 +5498,6 @@ def run_unified_all_scans(
                 import_har_file,
                 import_openapi_spec,
                 load_auth_profiles,
-                load_scope_file,
             )
 
             approval_gate = (

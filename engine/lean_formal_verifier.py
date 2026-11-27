@@ -30,10 +30,13 @@ import unicodedata
 from engine.host_containment import silent_subprocess_run
 
 
-_THEOREM_RE = re.compile(r"^\s*theorem\s+(«[^»\n]+»'*|[A-Za-z0-9_']+)", re.MULTILINE)
+_THEOREM_RE = re.compile(
+    r"^\s*(?:(?:private|protected|unsafe|noncomputable|partial)\s+)*theorem\s+(«[^»\n]+»'*|[A-Za-z0-9_']+)",
+    re.MULTILINE,
+)
 _SORRY_RE = re.compile(r"\bsorry\b")
 _AXIOM_RE = re.compile(
-    r"^\s*axiom(?:[ \t]+(«[^»\n]+»'*|[A-Za-z0-9_']+)|(?=\s|$))",
+    r"^\s*(?:(?:private|protected|unsafe|noncomputable|partial)\s+)*axiom(?:[ \t]+(«[^»\n]+»'*|[A-Za-z0-9_']+)|(?=\s|$))",
     re.MULTILINE,
 )
 _HEX_CHARS = frozenset("0123456789abcdefABCDEF")
@@ -1129,6 +1132,24 @@ def _format_framing_verdict(verdict: Tuple[str, Optional[int]]) -> str:
     return tag
 
 
+def _coerce_strict_bool(val: Any, *, field_name: str = "value") -> bool:
+    """Strictly parse boolean flags without fail-open bool('false') coercion."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, int):
+        if val in (0, 1):
+            return val == 1
+        raise ValueError(f"Invalid integer boolean for {field_name}: {val!r}")
+    if isinstance(val, str):
+        norm = val.strip().lower()
+        if norm in ("true", "1", "yes", "on"):
+            return True
+        if norm in ("false", "0", "no", "off"):
+            return False
+        raise ValueError(f"Invalid boolean string for {field_name}: {val!r}")
+    raise TypeError(f"Invalid boolean value for {field_name}: {val!r}")
+
+
 def verify_http_framing_invariant(
     *,
     content_lengths: Sequence[int] = (),
@@ -1139,12 +1160,23 @@ def verify_http_framing_invariant(
     oracle: Optional[LeanCompiledOracle] = None,
 ) -> List[LeanCounterexample]:
     """Evaluates RFC 9112 framing invariants against `RFCHunt.HttpFramingOracle`."""
-    cls_list = [int(x) for x in content_lengths]
+    if isinstance(content_lengths, (str, bytes, bytearray, dict)):
+        raise TypeError(
+            f"content_lengths must be a sequence of integers, not {type(content_lengths).__name__}"
+        )
+    cls_list: List[int] = []
+    for x in content_lengths:
+        if isinstance(x, bool):
+            raise TypeError(f"Content-Length elements must be integers, not bool: {x!r}")
+        cls_list.append(int(x))
     if any(x < 0 for x in cls_list):
         raise ValueError(f"Content-Length values must be non-negative: {cls_list!r}")
 
-    has_te = bool(has_transfer_encoding_chunked)
-    bare_lf = bool(has_bare_lf)
+    has_te = _coerce_strict_bool(
+        has_transfer_encoding_chunked,
+        field_name="has_transfer_encoding_chunked",
+    )
+    bare_lf = _coerce_strict_bool(has_bare_lf, field_name="has_bare_lf")
     active_oracle, backend = _resolve_oracle(lean_dir, oracle)
 
     strict_v = (
@@ -1285,22 +1317,27 @@ def verify_policy_guard_invariant(
 ) -> List[LeanCounterexample]:
     """Evaluates Cedar-style containment & override immunity against `RFCHunt.PolicyGuard`."""
     active_oracle, backend = _resolve_oracle(lean_dir, oracle)
-    rules_list = [(str(eff), bool(m)) for eff, m in rules]
+    in_workspace_root_b = _coerce_strict_bool(in_workspace_root, field_name="in_workspace_root")
+    allow_destructive_b = _coerce_strict_bool(allow_destructive, field_name="allow_destructive")
+    rules_list = [
+        (str(eff), _coerce_strict_bool(m, field_name="rule_matched"))
+        for eff, m in rules
+    ]
 
     oracle_allowed = (
         active_oracle.evaluate_policy(
             action=action,
             scope=scope,
-            in_workspace_root=in_workspace_root,
-            allow_destructive=allow_destructive,
+            in_workspace_root=in_workspace_root_b,
+            allow_destructive=allow_destructive_b,
             rules=rules_list,
         )
         if active_oracle is not None
         else evaluate_policy_mirror(
             action=action,
             scope=scope,
-            in_workspace_root=in_workspace_root,
-            allow_destructive=allow_destructive,
+            in_workspace_root=in_workspace_root_b,
+            allow_destructive=allow_destructive_b,
             rules=rules_list,
         )
     )
@@ -1313,7 +1350,7 @@ def verify_policy_guard_invariant(
         theorem = "out_of_scope_probe_always_denied"
         invariant = "Out-of-scope or private/loopback network probes are unconditionally denied"
         expected_allowed = False
-    elif action == "readWorkspaceFile" and not in_workspace_root:
+    elif action == "readWorkspaceFile" and not in_workspace_root_b:
         theorem = "outside_workspace_read_denied"
         invariant = "Workspace file reads outside workspace root are unconditionally denied"
         expected_allowed = False
@@ -1326,14 +1363,18 @@ def verify_policy_guard_invariant(
         invariant = "Policy decision matches formal evaluatePolicies specification"
         expected_allowed = oracle_allowed
 
-    actual_allowed = oracle_allowed if observed_allowed is None else bool(observed_allowed)
+    actual_allowed = (
+        oracle_allowed
+        if observed_allowed is None
+        else _coerce_strict_bool(observed_allowed, field_name="observed_allowed")
+    )
     policy_violated = actual_allowed != expected_allowed
 
     witness = {
         "action": action,
         "scope": scope,
-        "in_workspace_root": bool(in_workspace_root),
-        "allow_destructive": bool(allow_destructive),
+        "in_workspace_root": in_workspace_root_b,
+        "allow_destructive": allow_destructive_b,
         "rules": [[eff, m] for eff, m in rules_list],
     }
 
@@ -1356,14 +1397,26 @@ def verify_policy_guard_invariant(
     ]
 
     if confirmed_by_tool is not None or llm_confirmed is not None:
-        tool_b = bool(confirmed_by_tool)
-        llm_b = bool(llm_confirmed)
+        tool_b = (
+            False
+            if confirmed_by_tool is None
+            else _coerce_strict_bool(confirmed_by_tool, field_name="confirmed_by_tool")
+        )
+        llm_b = (
+            False
+            if llm_confirmed is None
+            else _coerce_strict_bool(llm_confirmed, field_name="llm_confirmed")
+        )
         oracle_rec = (
             active_oracle.reconcile_verdict(tool_b, llm_b)
             if active_oracle is not None
             else reconcile_verdict_mirror(tool_b, llm_b)
         )
-        actual_rec = oracle_rec if observed_reconciled is None else bool(observed_reconciled)
+        actual_rec = (
+            oracle_rec
+            if observed_reconciled is None
+            else _coerce_strict_bool(observed_reconciled, field_name="observed_reconciled")
+        )
         if tool_b:
             rec_theorem = "deterministic_confirmation_immutable"
             rec_invariant = "Deterministic tool confirmation cannot be vetoed by LLM narrative"
@@ -1757,8 +1810,8 @@ def evaluate_lean_domains(
                 hf_meta = meta.get("http_framing") if isinstance(meta.get("http_framing"), dict) else {}
                 if hf_meta:
                     cls_val = hf_meta.get("content_lengths", [])
-                    te_val = bool(hf_meta.get("has_transfer_encoding_chunked", False))
-                    lf_val = bool(hf_meta.get("has_bare_lf", False))
+                    te_val = hf_meta.get("has_transfer_encoding_chunked", False)
+                    lf_val = hf_meta.get("has_bare_lf", False)
                     pv_raw = hf_meta.get("proxy_verdict")
                     pv_val = tuple(pv_raw) if isinstance(pv_raw, (list, tuple)) and len(pv_raw) == 2 else None
                 elif "dual content-length" in blob:
@@ -1804,8 +1857,8 @@ def evaluate_lean_domains(
                         verify_policy_guard_invariant(
                             action=str(pg_meta.get("action", "networkProbe")),
                             scope=str(pg_meta.get("scope", "inScopeAuthorized")),
-                            in_workspace_root=bool(pg_meta.get("in_workspace_root", True)),
-                            allow_destructive=bool(pg_meta.get("allow_destructive", False)),
+                            in_workspace_root=pg_meta.get("in_workspace_root", True),
+                            allow_destructive=pg_meta.get("allow_destructive", False),
                             rules=pg_meta.get("rules", (("permit", True),)),
                             confirmed_by_tool=pg_meta.get("confirmed_by_tool"),
                             llm_confirmed=pg_meta.get("llm_confirmed"),
@@ -1817,7 +1870,10 @@ def evaluate_lean_domains(
                     )
                 elif any(kw in blob for kw in ("llm_dissent", "override_immunity", "deterministic_confirmation")):
                     if "observed_reconciled" in meta:
-                        obs_rec = bool(meta["observed_reconciled"])
+                        obs_rec = _coerce_strict_bool(
+                            meta["observed_reconciled"],
+                            field_name="observed_reconciled",
+                        )
                     else:
                         obs_rec = not _heuristic_active_policy_failure(f)
                     checks.extend(
@@ -1831,7 +1887,7 @@ def evaluate_lean_domains(
                     )
                 else:
                     obs_allowed = (
-                        bool(meta["observed_allowed"])
+                        _coerce_strict_bool(meta["observed_allowed"], field_name="observed_allowed")
                         if "observed_allowed" in meta
                         else _heuristic_active_policy_failure(f)
                     )

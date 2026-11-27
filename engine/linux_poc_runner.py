@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -30,7 +31,8 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from engine.docker_wsl_doctor import diagnose_docker_wsl, find_docker_binary, probe_docker_daemon
 from engine.host_containment import silent_subprocess_run
@@ -155,12 +157,19 @@ def validate_mount_path(repo_path: Union[str, Path]) -> Tuple[bool, str]:
     raw = str(repo_path).strip()
     if not raw:
         return False, "Repository mount path is empty."
+    if raw in ("/", "\\"):
+        return False, f"Filesystem root cannot be mounted: {raw!r}"
     if "\x00" in raw or raw.startswith("\\\\") or raw.startswith("//"):
         return False, f"Unsafe or UNC mount path rejected: {raw!r}"
     raw_norm = raw.replace("\\", "/").lower()
     if _WINDOWS_CRITICAL_RE.match(raw_norm):
         return False, f"Critical Windows host directory cannot be mounted: {raw}"
-    resolved = Path(raw).resolve()
+    try:
+        resolved = Path(raw).resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return False, f"Invalid mount path {raw!r}: {exc}"
+    if resolved == resolved.parent or len(resolved.parts) <= 1:
+        return False, f"Filesystem or drive root cannot be mounted: {resolved}"
     resolved_str = str(resolved)
     if resolved_str.startswith("\\\\") or resolved.as_posix().startswith("//"):
         return False, f"Unsafe or UNC mount path rejected: {resolved_str!r}"
@@ -170,13 +179,21 @@ def validate_mount_path(repo_path: Union[str, Path]) -> Tuple[bool, str]:
     for prefix in _FORBIDDEN_MOUNT_PREFIXES:
         if norm == prefix or norm.startswith(prefix + "/"):
             return False, f"Critical POSIX host directory cannot be mounted: {resolved}"
-    if not resolved.exists() or not resolved.is_dir():
-        return False, f"Repository directory does not exist: {resolved}"
+    try:
+        if not resolved.exists() or not resolved.is_dir():
+            return False, f"Repository directory does not exist: {resolved}"
+    except OSError as exc:
+        return False, f"Invalid repository directory {resolved}: {exc}"
     return True, resolved_str
 
 
 def validate_command_tokens(cmd: Sequence[str]) -> Tuple[bool, str]:
     """Validates argv tokens have no shell injection metacharacters."""
+    if isinstance(cmd, (str, bytes, bytearray, dict)) or not isinstance(cmd, Sequence):
+        return (
+            False,
+            "Command must be a non-string Sequence of string tokens (e.g. list or tuple), not str/bytes/dict.",
+        )
     if not cmd:
         return False, "Command argv cannot be empty."
     for tok in cmd:
@@ -249,6 +266,83 @@ def windows_to_wsl_path(path: Union[str, Path]) -> str:
     return s
 
 
+_SENSITIVE_QUERY_KEYS = frozenset(
+    {
+        "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "auth",
+        "auth_token",
+        "api_key",
+        "apikey",
+        "key",
+        "secret",
+        "client_secret",
+        "password",
+        "passwd",
+        "pwd",
+        "jwt",
+        "session",
+        "session_id",
+        "sig",
+        "signature",
+        "credential",
+        "bearer",
+        "pat",
+        "code",
+    }
+)
+
+
+def _sanitize_probe_url(raw_url: str, redact_fn: Callable[[str], str]) -> str:
+    """Strips URL userinfo (`user:pass@`) and redacts sensitive query params and inline secrets."""
+    cleaned = str(raw_url or "").strip()
+    if not cleaned:
+        return ""
+    try:
+        parsed = urlparse(cleaned)
+    except ValueError:
+        stripped = re.sub(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@\s]+@", r"\1", cleaned)
+        return redact_fn(stripped)
+
+    netloc = parsed.netloc
+    if "@" in netloc:
+        netloc = netloc.rsplit("@", 1)[1]
+    netloc = redact_fn(netloc)
+
+    query = parsed.query
+    if query:
+        redacted_pairs: List[Tuple[str, str]] = []
+        for k, v in parse_qsl(query, keep_blank_values=True):
+            k_low = k.strip().lower()
+            is_sensitive_key = (
+                k_low in _SENSITIVE_QUERY_KEYS
+                or any(
+                    tok in k_low
+                    for tok in ("token", "secret", "password", "passwd", "apikey", "api_key", "credential", "bearer")
+                )
+            )
+            redacted_v = redact_fn(v)
+            if is_sensitive_key or redacted_v != v:
+                redacted_pairs.append((k, "<REDACTED>"))
+            else:
+                redacted_pairs.append((k, v))
+        query = urlencode(redacted_pairs, safe="<>")
+
+    sanitized = urlunparse(
+        (
+            parsed.scheme,
+            netloc,
+            redact_fn(parsed.path),
+            redact_fn(parsed.params),
+            query,
+            redact_fn(parsed.fragment),
+        )
+    )
+    return redact_fn(sanitized)
+
+
 class LinuxPocRunner:
     """
     Runs polyglot PoC verification commands inside hardened Linux Docker containers
@@ -257,6 +351,8 @@ class LinuxPocRunner:
 
     def __init__(self, timeout_sec: float = 120.0):
         self.timeout_sec = timeout_sec
+        self._probe_lock = threading.Lock()
+        self._probe_limiters: Dict[Tuple[str, float], Any] = {}
 
     def _detect_backend(self) -> Tuple[str, Optional[str]]:
         diag = diagnose_docker_wsl()
@@ -410,6 +506,178 @@ class LinuxPocRunner:
                 docker_argv=exec_argv if backend == "docker" else [],
             )
 
+    def verify_sandbox_http_probe(
+        self,
+        url: str,
+        *,
+        program: str,
+        eligibility_db: Any = None,
+        max_rps: float = 2.0,
+        researcher_handle: Optional[str] = None,
+        allow_private: Optional[bool] = None,
+        timeout_sec: float = 3.0,
+    ) -> Dict[str, Any]:
+        """
+        Fail-closed, strictly non-destructive HTTP GET probe enforcing:
+          1. `ProgramComplianceContext` (`UNLOCKED` + `open` + Tier 1 RoE check)
+          2. `validate_target_host` SSRF guard + strict DNS label-boundary scope allowlist
+          3. Dynamic program-mandated attribution headers (`User-Agent`, `X-HackerOne`, etc.)
+          4. Fractional `TokenBucketRateLimiter` pacing `<= min(max_rps, roe_max_rps)` & `follow_redirects=False`
+        """
+        from engine.advisory_exporter import _redact_inline_tokens
+        from engine.program_eligibility_db import ProgramEligibilityDB
+        from engine.request_hygiene import TokenBucketRateLimiter, build_program_compliance_context
+        from engine.safe_network_validator import is_explicit_loopback_host, validate_target_host
+        import httpx
+
+        t0 = time.monotonic()
+        clean_url = str(url or "").strip()
+        display_url = _sanitize_probe_url(clean_url, _redact_inline_tokens)
+        prog = str(program or "").strip()
+        db = eligibility_db if eligibility_db is not None else ProgramEligibilityDB()
+
+        if researcher_handle is not None:
+            raw_h = str(researcher_handle).strip()
+            if not raw_h or any(ch in raw_h for ch in ("\r", "\n", "\x00")):
+                return {
+                    "verified": False,
+                    "status": "rejected_unsafe_headers",
+                    "program": prog,
+                    "url": display_url,
+                    "status_code": None,
+                    "headers_sent": {},
+                    "response_preview": "",
+                    "elapsed_ms": round((time.monotonic() - t0) * 1000.0, 2),
+                    "reason": "Invalid researcher_handle for HackerOne attribution headers.",
+                }
+
+        ctx = build_program_compliance_context(
+            prog,
+            eligibility_db=db,
+            researcher_handle=researcher_handle,
+            max_rps_cap=max(0.01, min(float(max_rps), 100.0)),
+        )
+        if not ctx.eligible:
+            return {
+                "verified": False,
+                "status": "blocked_ineligible",
+                "program": prog,
+                "url": display_url,
+                "status_code": None,
+                "headers_sent": {},
+                "response_preview": "",
+                "elapsed_ms": round((time.monotonic() - t0) * 1000.0, 2),
+                "reason": f"Program {prog!r} is not UNLOCKED in ProgramEligibilityDB ({ctx.reason}).",
+            }
+        if not ctx.live_allowed or ctx.automated_prohibited:
+            return {
+                "verified": False,
+                "status": "blocked_by_roe",
+                "program": prog,
+                "url": display_url,
+                "status_code": None,
+                "headers_sent": {},
+                "response_preview": "",
+                "elapsed_ms": round((time.monotonic() - t0) * 1000.0, 2),
+                "reason": ctx.reason,
+            }
+
+        parsed = urlparse(clean_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username is not None or parsed.password is not None:
+            return {
+                "verified": False,
+                "status": "rejected_unsafe_url",
+                "program": prog,
+                "url": display_url,
+                "status_code": None,
+                "headers_sent": {},
+                "response_preview": "",
+                "elapsed_ms": round((time.monotonic() - t0) * 1000.0, 2),
+                "reason": "URL must be http(s) with a valid hostname and no embedded credentials.",
+            }
+
+        host = parsed.hostname
+        eff_private = is_explicit_loopback_host(host) if allow_private is None else bool(allow_private)
+        ok_host, host_reason = validate_target_host(host, allow_private=eff_private)
+        if not ok_host:
+            return {
+                "verified": False,
+                "status": "rejected_ssrf",
+                "program": prog,
+                "url": display_url,
+                "status_code": None,
+                "headers_sent": {},
+                "response_preview": "",
+                "elapsed_ms": round((time.monotonic() - t0) * 1000.0, 2),
+                "reason": _redact_inline_tokens(host_reason),
+            }
+        if not is_explicit_loopback_host(host):
+            ok_scope, scope_reason = ctx.authorize_live_host(host, allow_loopback=eff_private)
+            if not ok_scope:
+                return {
+                    "verified": False,
+                    "status": "rejected_out_of_scope",
+                    "program": prog,
+                    "url": display_url,
+                    "status_code": None,
+                    "headers_sent": {},
+                    "response_preview": "",
+                    "elapsed_ms": round((time.monotonic() - t0) * 1000.0, 2),
+                    "reason": _redact_inline_tokens(scope_reason),
+                }
+
+        headers = ctx.to_headers_dict()
+
+        eff_rps = ctx.effective_max_rps
+        lim_key = (prog.lower(), eff_rps)
+        with self._probe_lock:
+            limiter = self._probe_limiters.get(lim_key)
+            if limiter is None:
+                limiter = TokenBucketRateLimiter(eff_rps)
+                self._probe_limiters[lim_key] = limiter
+        limiter.acquire()
+
+        eff_timeout = min(max(0.2, float(timeout_sec)), 10.0)
+        try:
+            with httpx.Client(timeout=eff_timeout, follow_redirects=False, trust_env=False) as client:
+                resp = client.get(clean_url, headers=headers)
+            passed = 200 <= resp.status_code < 400
+            return {
+                "verified": passed,
+                "status": "passed" if passed else "failed",
+                "program": prog,
+                "url": display_url,
+                "status_code": resp.status_code,
+                "headers_sent": headers,
+                "response_preview": _redact_inline_tokens(resp.text[:512]),
+                "elapsed_ms": round((time.monotonic() - t0) * 1000.0, 2),
+                "reason": f"HTTP {resp.status_code}",
+            }
+        except httpx.TimeoutException:
+            return {
+                "verified": False,
+                "status": "timeout",
+                "program": prog,
+                "url": display_url,
+                "status_code": None,
+                "headers_sent": headers,
+                "response_preview": "",
+                "elapsed_ms": round((time.monotonic() - t0) * 1000.0, 2),
+                "reason": f"Sandbox HTTP probe timed out after {eff_timeout:.1f}s.",
+            }
+        except Exception as exc:
+            return {
+                "verified": False,
+                "status": "error",
+                "program": prog,
+                "url": display_url,
+                "status_code": None,
+                "headers_sent": headers,
+                "response_preview": "",
+                "elapsed_ms": round((time.monotonic() - t0) * 1000.0, 2),
+                "reason": _redact_inline_tokens(str(exc)[:200]),
+            }
+
 
 def save_transcript_bundle(
     transcript: VerifiableTranscript, out_dir: Union[str, Path], stem: str = "poc_transcript"
@@ -482,7 +750,8 @@ def probe_optional_backends(
     """
     Non-destructively probes optional local verification toolchains concurrently with
     strictly bounded wall-clock timeouts (<= 3.0s). Returns availability dictionaries
-    for `docker`, `wsl2`, `lean4`, `rfchunt_lean_oracle`, `angr`, `klee`, and `semgrep`.
+    for `docker`, `wsl2`, `lean4`, `rfchunt_lean_oracle`, `angr`, `klee`, `semgrep`,
+    `rea`, `trufflehog`, `jadx`, `subfinder`, `httpx`, `katana`, and `schemathesis`.
     """
     t0 = time.monotonic()
     bounded_timeout = max(0.2, min(float(timeout_sec), 3.0))
@@ -767,6 +1036,115 @@ def probe_optional_backends(
             None,
         )
 
+    def _which_is_unmocked() -> bool:
+        return (
+            getattr(shutil.which, "__module__", None) == "shutil"
+            and getattr(shutil.which, "__qualname__", None) == "which"
+        )
+
+    def _find_optional_binary(names: Sequence[str], *, reject_py_httpx: bool = False) -> Optional[str]:
+        from engine.external_scanners import (
+            _find_non_python_httpx_on_path,
+            _is_python_httpx_cli_binary,
+        )
+
+        rejected_py_httpx_paths: List[str] = []
+        for name in names:
+            cand = shutil.which(name)
+            if cand:
+                if reject_py_httpx and _is_python_httpx_cli_binary(cand):
+                    rejected_py_httpx_paths.append(cand)
+                    continue
+                return cand
+
+        if not _which_is_unmocked():
+            return None
+
+        if reject_py_httpx:
+            for skip_p in rejected_py_httpx_paths:
+                alt = _find_non_python_httpx_on_path(skip_p)
+                if alt:
+                    return alt
+
+        repo_bin = Path(__file__).resolve().parent.parent / "bin"
+        extra_dirs = (
+            Path.home() / "go" / "bin",
+            Path(r"C:\Program Files\Go\bin"),
+            repo_bin,
+        )
+        suffixes = (".exe", "") if os.name == "nt" else ("",)
+        for base in extra_dirs:
+            if not base.is_dir():
+                continue
+            for name in names:
+                for suf in suffixes:
+                    cand_p = base / f"{name}{suf}"
+                    if cand_p.is_file():
+                        cand_s = str(cand_p)
+                        if reject_py_httpx and _is_python_httpx_cli_binary(cand_s):
+                            continue
+                        return cand_s
+        return None
+
+    def _probe_trufflehog() -> Dict[str, Any]:
+        bin_path = _find_optional_binary(("trufflehog",))
+        if bin_path:
+            return _entry(True, "available", "TruffleHog CLI binary found on host.", bin_path)
+        return _entry(
+            False,
+            "unavailable",
+            "TruffleHog CLI not found (pure-Python offline fallback remains active).",
+            None,
+        )
+
+    def _probe_jadx() -> Dict[str, Any]:
+        bin_path = _find_optional_binary(("jadx", "jadx-gui"))
+        if bin_path:
+            return _entry(True, "available", "jadx decompiler CLI found on host.", bin_path)
+        return _entry(
+            False,
+            "unavailable",
+            "jadx CLI not found (pure-Python mobile static auditor remains active).",
+            None,
+        )
+
+    def _probe_subfinder() -> Dict[str, Any]:
+        bin_path = _find_optional_binary(("subfinder",))
+        if bin_path:
+            return _entry(True, "available", "ProjectDiscovery subfinder binary found on host.", bin_path)
+        return _entry(False, "unavailable", "Optional `subfinder` binary is not installed.", None)
+
+    def _probe_httpx() -> Dict[str, Any]:
+        bin_path = _find_optional_binary(("httpx",), reject_py_httpx=True)
+        if bin_path:
+            return _entry(True, "available", "ProjectDiscovery httpx binary found on host.", bin_path)
+        return _entry(
+            False,
+            "unavailable",
+            "Optional ProjectDiscovery `httpx` binary is not installed.",
+            None,
+        )
+
+    def _probe_katana() -> Dict[str, Any]:
+        bin_path = _find_optional_binary(("katana",))
+        if bin_path:
+            return _entry(True, "available", "ProjectDiscovery katana binary found on host.", bin_path)
+        return _entry(False, "unavailable", "Optional `katana` binary is not installed.", None)
+
+    def _probe_schemathesis() -> Dict[str, Any]:
+        bin_path = _find_optional_binary(("schemathesis",))
+        if bin_path:
+            return _entry(True, "available", "Schemathesis CLI binary found on host.", bin_path)
+        spec = _safe_find_spec("schemathesis")
+        if spec is not None:
+            return _entry(
+                True,
+                "available",
+                "Python package `schemathesis` is importable.",
+                getattr(spec, "origin", None) or "schemathesis",
+            )
+        return _entry(False, "unavailable", "Optional `schemathesis` tool/package is not installed.", None)
+
     docker_thread = threading.Thread(
         target=_probe_docker, name="rfchunt-probe-docker", daemon=True
     )
@@ -777,19 +1155,32 @@ def probe_optional_backends(
     wsl_thread.start()
 
     results: Dict[str, Dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=12) as pool:
         f_lean = pool.submit(_probe_lean4)
         f_oracle = pool.submit(_probe_lean_oracle)
         f_angr = pool.submit(_probe_angr)
         f_klee = pool.submit(_probe_klee)
         f_semgrep = pool.submit(_probe_semgrep)
         f_rea = pool.submit(_probe_rea)
+        f_trufflehog = pool.submit(_probe_trufflehog)
+        f_jadx = pool.submit(_probe_jadx)
+        f_subfinder = pool.submit(_probe_subfinder)
+        f_httpx = pool.submit(_probe_httpx)
+        f_katana = pool.submit(_probe_katana)
+        f_schemathesis = pool.submit(_probe_schemathesis)
+
         results["lean4"] = f_lean.result()
         results["rfchunt_lean_oracle"] = f_oracle.result()
         results["angr"] = f_angr.result()
         results["klee"] = f_klee.result()
         results["semgrep"] = f_semgrep.result()
         results["rea"] = f_rea.result()
+        results["trufflehog"] = f_trufflehog.result()
+        results["jadx"] = f_jadx.result()
+        results["subfinder"] = f_subfinder.result()
+        results["httpx"] = f_httpx.result()
+        results["katana"] = f_katana.result()
+        results["schemathesis"] = f_schemathesis.result()
 
     if docker_done.wait(timeout=max(0.0, deadline - time.monotonic())):
         results["docker"] = docker_box.get("value") or _entry(
@@ -824,6 +1215,12 @@ def probe_optional_backends(
         "klee": results["klee"],
         "semgrep": results["semgrep"],
         "rea": results["rea"],
+        "trufflehog": results["trufflehog"],
+        "jadx": results["jadx"],
+        "subfinder": results["subfinder"],
+        "httpx": results["httpx"],
+        "katana": results["katana"],
+        "schemathesis": results["schemathesis"],
     }
 
 

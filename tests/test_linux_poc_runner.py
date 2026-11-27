@@ -130,6 +130,12 @@ def test_probe_optional_backends_all_unavailable_schema(
         "klee",
         "semgrep",
         "rea",
+        "trufflehog",
+        "jadx",
+        "subfinder",
+        "httpx",
+        "katana",
+        "schemathesis",
     }
     assert set(res.keys()) == expected_keys
     for key in expected_keys:
@@ -161,7 +167,24 @@ def test_probe_optional_backends_available_tools_and_oracle(
     monkeypatch.setattr(
         lpr.shutil,
         "which",
-        lambda name: f"/usr/bin/{name}" if name in ("wsl.exe", "lean", "lake", "klee", "semgrep") else None,
+        lambda name: (
+            f"/usr/bin/{name}"
+            if name
+            in (
+                "wsl.exe",
+                "lean",
+                "lake",
+                "klee",
+                "semgrep",
+                "trufflehog",
+                "jadx",
+                "subfinder",
+                "httpx",
+                "katana",
+                "schemathesis",
+            )
+            else None
+        ),
     )
     monkeypatch.setattr(
         lpr,
@@ -273,6 +296,12 @@ def test_probe_optional_backends_live_unmocked_bounded_latency():
         "klee",
         "semgrep",
         "rea",
+        "trufflehog",
+        "jadx",
+        "subfinder",
+        "httpx",
+        "katana",
+        "schemathesis",
     }
 
 
@@ -452,3 +481,156 @@ def test_run_symbolic_hook_bounded_execution_and_no_fabricated_verified(
     assert res_to["status"] == "timeout"
     assert res_to["verified"] is False
     assert res_to["findings"] == []
+
+
+def test_verify_sandbox_http_probe_fail_closed_and_rate_limited(tmp_path: Path):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    import time as _time
+    from engine.program_eligibility_db import ProgramEligibilityDB
+
+    recorded_requests = []
+
+    class _ProbeHandler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            recorded_requests.append(
+                {
+                    "path": self.path,
+                    "user_agent": self.headers.get("User-Agent"),
+                    "x_hackerone": self.headers.get("X-HackerOne"),
+                }
+            )
+            body = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+    db = ProgramEligibilityDB(tmp_path / "elig.sqlite3")
+    db.seed_observed_hackerone_baseline()
+    runner = LinuxPocRunner()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _ProbeHandler)
+    port = srv.server_address[1]
+    srv_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    srv_thread.start()
+    try:
+        target_url = f"http://127.0.0.1:{port}/health"
+
+        # 1. Blocked/ineligible program must fail closed with zero HTTP traffic
+        blocked = runner.verify_sandbox_http_probe(
+            target_url,
+            program="shopify",
+            eligibility_db=db,
+        )
+        assert blocked["verified"] is False
+        assert blocked["status"] == "blocked_ineligible"
+        assert len(recorded_requests) == 0
+
+        # 2. Cloud metadata SSRF target must fail closed even for UNLOCKED program
+        ssrf_res = runner.verify_sandbox_http_probe(
+            "http://169.254.169.254/latest/meta-data",
+            program="common_codes",
+            eligibility_db=db,
+        )
+        assert ssrf_res["verified"] is False
+        assert ssrf_res["status"] == "rejected_ssrf"
+        assert len(recorded_requests) == 0
+
+        # 3. Explicit allow_private=False blocks loopback
+        no_priv = runner.verify_sandbox_http_probe(
+            target_url,
+            program="common_codes",
+            eligibility_db=db,
+            allow_private=False,
+        )
+        assert no_priv["verified"] is False
+        assert no_priv["status"] == "rejected_ssrf"
+        assert len(recorded_requests) == 0
+
+        # 3b. Empty userinfo (`http://@127.0.0.1/`) must be rejected fail-closed
+        empty_userinfo = runner.verify_sandbox_http_probe(
+            f"http://@127.0.0.1:{port}/health",
+            program="common_codes",
+            eligibility_db=db,
+        )
+        assert empty_userinfo["verified"] is False
+        assert empty_userinfo["status"] == "rejected_unsafe_url"
+        assert len(recorded_requests) == 0
+
+        # 4. UNLOCKED program succeeds with required H1 headers and rate-limit pacing
+        t0 = _time.monotonic()
+        ok1 = runner.verify_sandbox_http_probe(
+            target_url,
+            program="common_codes",
+            eligibility_db=db,
+            max_rps=5.0,
+            researcher_handle="oyesanyf",
+        )
+        ok2 = runner.verify_sandbox_http_probe(
+            target_url,
+            program="common_codes",
+            eligibility_db=db,
+            max_rps=5.0,
+            researcher_handle="oyesanyf",
+        )
+        dt = _time.monotonic() - t0
+
+        assert ok1["verified"] is True
+        assert ok1["status"] == "passed"
+        assert ok1["status_code"] == 200
+        assert ok2["verified"] is True
+        assert dt >= 0.16
+        assert len(recorded_requests) == 2
+        for req in recorded_requests:
+            assert req["user_agent"] == "HackerOne/oyesanyf"
+            assert req["x_hackerone"] == "oyesanyf"
+
+        # 5. Low max_rps (0.05) must NOT be clamped upward to 0.1
+        low_rps = runner.verify_sandbox_http_probe(
+            target_url,
+            program="common_codes",
+            eligibility_db=db,
+            max_rps=0.05,
+            researcher_handle="oyesanyf",
+        )
+        assert low_rps["verified"] is True
+        assert ("common_codes", 0.05) in runner._probe_limiters
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_probe_optional_backends_skips_python_httpx_for_later_path_binary(tmp_path: Path):
+    import os
+
+    py_dir = tmp_path / "py_scripts"
+    pd_dir = tmp_path / "pd_bin"
+    py_dir.mkdir()
+    pd_dir.mkdir()
+
+    httpx_name = "httpx.exe" if os.name == "nt" else "httpx"
+    py_httpx = py_dir / httpx_name
+    pd_httpx = pd_dir / httpx_name
+
+    py_httpx.write_bytes(b"#!python\nfrom httpx import main\n")
+    pd_httpx.write_bytes(
+        b"MZ\x90\x00PD_HTTPX_BINARY" if os.name == "nt" else b"\x7fELFPD_HTTPX_BINARY"
+    )
+    if os.name != "nt":
+        os.chmod(py_httpx, 0o755)
+        os.chmod(pd_httpx, 0o755)
+
+    orig_path = os.environ.get("PATH", "")
+    try:
+        os.environ["PATH"] = f"{py_dir}{os.pathsep}{pd_dir}{os.pathsep}{orig_path}"
+        res = probe_optional_backends(lean_dir=tmp_path)
+        assert res["httpx"]["available"] is True
+        assert res["httpx"]["status"] == "available"
+        assert res["httpx"]["path_or_module"] == str(pd_httpx)
+    finally:
+        os.environ["PATH"] = orig_path

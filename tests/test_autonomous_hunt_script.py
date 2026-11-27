@@ -11,12 +11,20 @@ from pathlib import Path
 
 import pytest
 
+from engine.hackerone_porter import (
+    HackerOneCampaign,
+    HackerOneComputerUsePorter,
+    HackerOneReportDraft,
+)
 from engine.program_eligibility_db import ProgramEligibilityDB
+import hunt as root_hunt
 from scripts.autonomous_hunt import (
     build_parser,
     check_program_eligibility,
     execute_hunt_cycle,
+    extract_verified_findings_from_cycle,
     main as hunt_main,
+    open_urls_in_chrome,
     scan_draft_safety_violations,
     validate_repo_slug,
 )
@@ -118,10 +126,114 @@ def test_autonomous_hunt_dry_run_and_embedded_cycle(tmp_path: Path) -> None:
     assert rc == 0
     latest_json = out_dir / "latest_summary.json"
     latest_md = out_dir / "latest_summary.md"
+    ready_md = out_dir / "READY_TO_CLICK_SUBMIT.md"
     assert latest_json.is_file()
     assert latest_md.is_file()
+    assert ready_md.is_file()
     parsed = json.loads(latest_json.read_text(encoding="utf-8"))
     assert parsed["browser_used"] is False
     assert parsed["anti_junk_guard_enabled"] is True
     assert parsed["safety_violations_count"] == 0
     assert len(parsed["targets_audited"]) == 1
+
+
+def test_extract_verified_findings_filters_noise_and_stage_draft_blocks_submit(tmp_path: Path) -> None:
+    report_path = tmp_path / "fast_ooda_report.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "clusters": [
+                    {
+                        "title": "Unverified speculative alert",
+                        "file_path": "src/a.py",
+                        "line": 10,
+                        "disposition": "SPECULATIVE",
+                        "poc_verified": False,
+                    },
+                    {
+                        "title": "Verified symlink escape",
+                        "file_path": "src/store.ts",
+                        "line": 48,
+                        "cwe": "CWE-59",
+                        "severity": "HIGH",
+                        "disposition": "CONFIRMED",
+                        "poc_verified": True,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    verified = extract_verified_findings_from_cycle(tmp_path)
+    assert len(verified) == 1
+    assert verified[0]["file_path"] == "src/store.ts"
+    assert verified[0]["evidence_lane"] == "LANE_1_POC"
+
+    camp = HackerOneCampaign(
+        handle="common_codes",
+        name="Common Codes",
+        url="https://hackerone.com/common_codes",
+        submit_url="https://hackerone.com/common_codes/reports/new",
+    )
+    draft = HackerOneReportDraft(
+        draft_id="H1-COMMON-1234",
+        fingerprint="1234abcd",
+        program_handle="common_codes",
+        submit_url="https://hackerone.com/common_codes/reports/new",
+        title="Verified symlink escape",
+        weakness_cwe="CWE-59",
+        severity_rating="high",
+        asset_identifier="github.com/common-codes/app",
+        evidence_lane="LANE_1_POC",
+        poe_level=3,
+        vulnerability_information="Reproducible PoC",
+        impact="Arbitrary write",
+        source_rule_id="PARITY-SYMLINK",
+        source_scanner="parity_auditor",
+        scope_match_status="in_scope",
+    )
+    res = HackerOneComputerUsePorter().stage_draft_ready_to_submit(camp, draft, dry_run=True)
+    assert res["status"] == "dry_run_draft_stage_planned"
+    assert res["auto_submit_forbidden"] is True
+    assert res["captcha_bypass_forbidden"] is True
+    assert res["final_submit_blocked_for_hitl"] is True
+    assert res["auto_submitted"] is False
+
+    # Chrome launcher validates strictly pinned https://hackerone.com/... URLs and rejects external domains
+    chrome_plan = open_urls_in_chrome(
+        ["https://hackerone.com/reports/4244042", "https://hackerone.com/reports/4244042"],
+        dry_run=True,
+    )
+    assert chrome_plan["status"] == "dry_run_chrome_planned"
+    assert chrome_plan["opened_urls"] == ["https://hackerone.com/reports/4244042"]
+    with pytest.raises((ValueError, PermissionError)):
+        open_urls_in_chrome(["https://evil.example.com/phish"], dry_run=True)
+
+
+def test_python_hunt_entrypoint_builds_full_turnkey_argv(tmp_path: Path) -> None:
+    ns_default = root_hunt.build_parser().parse_args([])
+    argv_default = root_hunt.build_hunt_argv(ns_default)
+    assert "--start-modelfusion" in argv_default
+    assert "--clone-unlocked" in argv_default
+    assert "--from-eligibility-db" in argv_default
+    assert "--stage-drafts" in argv_default
+    assert "--open-chrome" in argv_default
+    assert "--watch" in argv_default
+
+    ns_once = root_hunt.build_parser().parse_args(["--target", "repo_x", "--program", "common_codes", "--once", "--dry-run"])
+    argv_once = root_hunt.build_hunt_argv(ns_once)
+    assert "--target" in argv_once
+    assert "common_codes" in argv_once
+    assert "--watch" not in argv_once
+    assert "--dry-run" in argv_once
+    assert "--open-chrome" in argv_once
+
+    # Bare `python hunt.py --dry-run` MUST NOT enter infinite --watch loop and MUST execute cleanly with 0 side effects
+    ns_dry = root_hunt.build_parser().parse_args(["--dry-run"])
+    argv_dry = root_hunt.build_hunt_argv(ns_dry)
+    assert "--dry-run" in argv_dry
+    assert "--watch" not in argv_dry
+    dry_out = tmp_path / "hunt_dry_test"
+    rc = root_hunt.main(["--dry-run", "--sync-public-directory", "--out", str(dry_out), "--json"])
+    assert rc == 0
+    assert not dry_out.exists()
