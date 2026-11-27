@@ -36,7 +36,10 @@ REVENUE_SUBCOMMANDS = {
     "bugbounty-mcp",
     "lean-verify",
     "ensemble-audit",
+    "fast-ooda",
     "atlas-llm-eval",
+    "check-drafts",
+    "qa-drafts",
 }
 
 
@@ -97,6 +100,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_ens.add_argument("--sarif-out", default=None, help="Optional explicit file path for SARIF 2.1.0 output.")
     p_ens.add_argument("--json", dest="json_out", action="store_true", default=False, help="Print full JSON report summary to stdout.")
     p_ens.add_argument("--package-client", default=None, help="Optional client name to also emit 5-file ClientAuditPackager bundle.")
+    p_ens.add_argument("--cpu-workers", type=int, default=None, help="Bounded ProcessPoolExecutor CPU workers (default: clamped 2..8).")
+    p_ens.add_argument("--blackboard-db", default=None, help="Optional Async SQLite WAL Blackboard database path.")
+    p_ens.add_argument("--resume", action="store_true", default=False, help="Recover stale IN_PROGRESS intents from blackboard DB before running.")
+
+    p_ooda = sub.add_parser("fast-ooda", help="Run Loop 3 3-stage parallel OODA funnel + Loop 4 auto-PoC submission gate.")
+    p_ooda.add_argument("--target", "--repo", dest="target", required=True, help="Target repository directory.")
+    p_ooda.add_argument("--program", default="generic", help="Vendor threat-model / eligibility program handle.")
+    p_ooda.add_argument("--cpu-workers", type=int, default=None, help="Bounded ProcessPoolExecutor CPU workers (default: clamped 2..8).")
+    p_ooda.add_argument("--blackboard-db", default="reports/ensemble_hunt/blackboard.sqlite3", help="Async SQLite WAL Blackboard database path.")
+    p_ooda.add_argument("--resume", action="store_true", default=False, help="Recover stale IN_PROGRESS intents from blackboard DB before running.")
+    p_ooda.add_argument("--signal-score", type=float, default=0.0, help="Current HackerOne Signal score for two-lane scheduling.")
+    p_ooda.add_argument("--eligibility-db", default=None, help="Optional ProgramEligibilityDB SQLite path.")
+    p_ooda.add_argument("--out", default="out/fast_ooda", help="Output directory for fast_ooda_report.json and staged drafts.")
+    p_ooda.add_argument("--embedded", action="store_true", default=False, help="Run purely in-process offline (zero external binaries, zero Ollama calls).")
+    p_ooda.add_argument("--model", default=None, help="Optional Ollama model override for Stage 3 verification.")
+    p_ooda.add_argument("--no-llm", dest="no_llm", action="store_true", default=False, help="Disable Stage 3 LLM verification layer.")
+    p_ooda.add_argument("--trigger-browser", dest="trigger_browser", action="store_true", default=False, help="Emit /browser stage-draft handoff spec for Loop 4 verified findings.")
+    p_ooda.add_argument("--json", dest="json_out", action="store_true", default=False, help="Print full JSON OODA report to stdout.")
 
     p_atlas = sub.add_parser("atlas-llm-eval", help="Sync live MITRE ATLAS STIX 2.1 and evaluate LLM guardrails + 74-language/low-resource parity.")
     p_atlas.add_argument("--llm-target", default="ollama", help="Target LLM: 'ollama', 'paid' (.env.local), or OpenAI-compatible HTTP(S) URL.")
@@ -106,6 +127,44 @@ def build_parser() -> argparse.ArgumentParser:
     p_atlas.add_argument("--offline-stix", action="store_true", help="Skip live STIX download and use bundled golden snapshot.")
     p_atlas.add_argument("--concurrency", type=int, default=8, help="Max concurrent LLM requests.")
     p_atlas.add_argument("--out", default="out/atlas_llm_eval", help="Output directory for JSON + SARIF 2.1.0 report.")
+
+    p_drafts = sub.add_parser(
+        "check-drafts",
+        help="Check HackerOne saved drafts for cooldown clearance (`can_submit_draft? == true`) and print next 1-2 clickable URLs to submit.",
+    )
+    p_drafts.add_argument("--db", default="reports/ensemble_hunt/draft_submit_tracker.sqlite3", help="SQLite WAL tracker database path.")
+    p_drafts.add_argument("--probe-id", type=int, default=4243972, help="Anchor draft report ID to probe first (default: 4243972).")
+    p_drafts.add_argument("--probe-only", action="store_true", help="Only probe the single anchor draft ID (1 HTTP request).")
+    p_drafts.add_argument("--all", dest="check_all", action="store_true", help="Check all tracked drafts even if anchor probe is still locked.")
+    p_drafts.add_argument("--id", dest="report_ids", action="append", type=int, default=[], help="Specific HackerOne report ID(s) to check (repeatable).")
+    p_drafts.add_argument("--max-per-day", type=int, default=2, help="Safe daily submission pacing cap (default: 2).")
+    p_drafts.add_argument("--cookie-env", default="HACKERONE_SESSION_COOKIE", help="Env var holding HackerOne Cookie header.")
+    p_drafts.add_argument("--snapshot-json", default=None, help="Optional JSON file of browser-exported HackerOne report objects to ingest offline.")
+    p_drafts.add_argument("--mark-submitted", type=int, default=None, help="Record a report ID as submitted today (updates daily pacing).")
+    p_drafts.add_argument("--seed-only", action="store_true", help="Seed/list tracked drafts locally without making network requests.")
+    p_drafts.add_argument("--watch", action="store_true", help="Poll periodically until `can_submit_draft?` clears to true.")
+    p_drafts.add_argument("--interval-minutes", type=float, default=30.0, help="Polling interval in minutes when --watch is set (default: 30).")
+    p_drafts.add_argument("--out-md", default="reports/ensemble_hunt/drafts_ready_to_submit.md", help="Clickable Markdown checklist output path.")
+    p_drafts.add_argument("--qa-db", default="reports/ensemble_hunt/draft_qa_tracker.sqlite3", help="Optional QA Phase SQLite DB to sync QA pass/fail gating before recommending drafts.")
+    p_drafts.add_argument("--json", dest="json_out", action="store_true", help="Print structured JSON output.")
+
+    p_qa = sub.add_parser(
+        "qa-drafts",
+        help="Run Quality Assurance (QA Phase) checks, upstream source verification, and auto-repair across HackerOne drafts.",
+    )
+    p_qa.add_argument("--snapshot-json", default=None, help="JSON file containing a HackerOne draft object or list of draft objects.")
+    p_qa.add_argument("--markdown-file", default=None, help="Single local Markdown draft file to QA-check and optionally auto-repair before staging.")
+    p_qa.add_argument("--title", default="", help="Draft title when using --markdown-file.")
+    p_qa.add_argument("--report-id", type=int, default=0, help="HackerOne report ID when using --markdown-file.")
+    p_qa.add_argument("--program", default="", help="Program handle when using --markdown-file.")
+    p_qa.add_argument("--db", default="reports/ensemble_hunt/draft_qa_tracker.sqlite3", help="SQLite WAL QA tracker DB path.")
+    p_qa.add_argument("--submit-db", default="reports/ensemble_hunt/draft_submit_tracker.sqlite3", help="Submit tracker DB to sync QA pass/fail status into.")
+    p_qa.add_argument("--no-verify-sources", dest="no_verify_sources", action="store_true", help="Skip live raw.githubusercontent.com source-line and #define verification.")
+    p_qa.add_argument("--out-md", default="reports/ensemble_hunt/qa_draft_audit.md", help="Clickable Markdown QA report output path.")
+    p_qa.add_argument("--out-edit-queue", default="reports/ensemble_hunt/qa_edit_queue.json", help="Machine-readable edit queue JSON output path.")
+    p_qa.add_argument("--write-repaired", default=None, help="When using --markdown-file, write the auto-repaired markdown body to this path.")
+    p_qa.add_argument("--strict", action="store_true", help="Return non-zero exit code if any audited draft is not PASS.")
+    p_qa.add_argument("--json", dest="json_out", action="store_true", help="Print structured JSON output.")
     return parser
 
 
@@ -321,7 +380,7 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
         return 0 if rep.status in ("machine_checked", "static_audited_lean_not_installed") else 1
 
     if args.command == "ensemble-audit":
-        from engine.ensemble_orchestrator import EngineFinding, EnsembleOrchestrator
+        from engine.ensemble_orchestrator import EnsembleOrchestrator, _finding_from_dict
 
         findings = None
         all_scan_summary: Optional[Dict[str, Any]] = None
@@ -333,7 +392,22 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
         if args.findings_json:
             raw = json.loads(Path(args.findings_json).read_text(encoding="utf-8"))
             items = raw.get("findings", raw) if isinstance(raw, dict) else raw
-            findings = [EngineFinding(**item) for item in items if isinstance(item, dict)]
+            findings = [_finding_from_dict(item) for item in items if isinstance(item, dict)]
+
+        cpu_workers_arg = getattr(args, "cpu_workers", None)
+        bb_db_arg = getattr(args, "blackboard_db", None)
+        resume_flag = bool(getattr(args, "resume", False))
+        bb_recovery: Optional[Dict[str, Any]] = None
+        if bb_db_arg or resume_flag:
+            from engine.async_blackboard_runtime import SqliteBlackboard
+
+            bb_path = str(bb_db_arg or "reports/ensemble_hunt/blackboard.sqlite3")
+            bb = SqliteBlackboard(bb_path)
+            try:
+                if resume_flag:
+                    bb_recovery = bb.recover_stale_intents(force_all_in_progress=True)
+            finally:
+                bb.close()
 
         orch = EnsembleOrchestrator(
             program=args.program,
@@ -346,6 +420,7 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
             gha_only=bool(args.gha_only),
             no_external_scanners=bool(getattr(args, "no_external_scanners", False)),
             proxy=getattr(args, "proxy", None),
+            max_workers=(max(1, int(cpu_workers_arg)) if cpu_workers_arg else 4),
         )
 
         target_path = Path(args.target)
@@ -402,6 +477,7 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
                         gha_only=bool(args.gha_only),
                         no_external_scanners=bool(getattr(args, "no_external_scanners", False)),
                         lean_dir=orch.lean_dir,
+                        program=args.program,
                     )
                     orch.last_telemetry = tele
                     findings = [*converted, *auto_findings]
@@ -426,6 +502,12 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
             package_client_name=args.package_client,
             refresh_stix=not offline_mode,
         )
+        if bb_recovery is not None:
+            orch.last_telemetry["blackboard_recovery"] = bb_recovery
+        if bb_db_arg:
+            orch.last_telemetry["blackboard_db"] = str(bb_db_arg)
+        if cpu_workers_arg is not None:
+            orch.last_telemetry["cpu_workers"] = int(cpu_workers_arg)
         if args.sarif_out:
             sarif_dest = Path(args.sarif_out)
             sarif_dest.parent.mkdir(parents=True, exist_ok=True)
@@ -446,6 +528,79 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
                 f"| lean={lv.get('status', 'unknown')} | available_toolchains={avail_tc or 'none'} "
                 f"| proxy={rep.proxy or 'none'} -> {args.out}"
             )
+        return 0
+
+    if args.command == "fast-ooda":
+        from engine.ensemble_orchestrator import EnsembleOrchestrator
+        from engine.program_eligibility_db import ProgramEligibilityDB
+
+        cpu_workers_arg = getattr(args, "cpu_workers", None)
+        orch = EnsembleOrchestrator(
+            program=args.program,
+            embedded=bool(args.embedded),
+            model=args.model,
+            enable_llm_verify=(not args.no_llm and not args.embedded),
+            max_workers=(max(1, int(cpu_workers_arg)) if cpu_workers_arg else 4),
+        )
+        elig_db_raw = getattr(args, "eligibility_db", None) or os.environ.get("RFCHUNT_ELIGIBILITY_DB")
+        elig_db = (
+            ProgramEligibilityDB(str(elig_db_raw).strip())
+            if elig_db_raw and str(elig_db_raw).strip()
+            else None
+        )
+        res = orch.run_fast_parallel_ooda(
+            args.target,
+            program=args.program,
+            blackboard_db=args.blackboard_db,
+            max_cpu_workers=cpu_workers_arg,
+            resume=bool(args.resume),
+            signal_score=float(args.signal_score),
+            eligibility_db=elig_db,
+            out_dir=args.out,
+            trigger_browser=bool(args.trigger_browser),
+        )
+        if args.out:
+            out_dir = Path(args.out)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "fast_ooda_report.json").write_text(
+                json.dumps(res, indent=2, default=str),
+                encoding="utf-8",
+            )
+        if args.json_out:
+            print(json.dumps(res, indent=2, default=str))
+        else:
+            s1 = res.get("stage1") if isinstance(res.get("stage1"), dict) else {}
+            s2 = res.get("stage2") if isinstance(res.get("stage2"), dict) else {}
+            prod_cnt = s1.get("production_count", res.get("stage1_production_count", 0))
+            noise_cnt = s1.get("noise_dropped", res.get("stage1_dropped_noise_count", 0))
+            sel_cnt = len(s2.get("selected") or [])
+            print(
+                f"[+] Fast OODA ({res.get('status', 'completed')}) complete: "
+                f"prod={prod_cnt}, noise_dropped={noise_cnt}, stage2_selected={sel_cnt}, "
+                f"clusters={len(res.get('clusters') or [])} -> {args.out}"
+            )
+            ready_paths: List[str] = []
+            report_urls: List[str] = []
+            candidates: List[Dict[str, Any]] = [res]
+            if isinstance(res.get("submission"), dict):
+                candidates.append(res["submission"])
+            if isinstance(res.get("loop4"), dict):
+                candidates.append(res["loop4"])
+            for item in res.get("staged_submissions") or []:
+                if isinstance(item, dict):
+                    candidates.append(item)
+            for cand in candidates:
+                rp = cand.get("ready_to_submit_path")
+                if rp and str(rp) not in ready_paths:
+                    ready_paths.append(str(rp))
+                for key in ("report_url", "submit_url"):
+                    u = str(cand.get(key) or "").strip()
+                    if u.startswith("https://hackerone.com/reports/") and u not in report_urls:
+                        report_urls.append(u)
+            for rp in ready_paths:
+                print(f"[+] READY_TO_SUBMIT.json: {rp}")
+            for url in report_urls:
+                print(f"[+] HackerOne Draft URL: {url}")
         return 0
 
     if args.command == "atlas-llm-eval":
@@ -469,6 +624,169 @@ def run_revenue_cli(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 0 if rep.failed_tests == 0 else 1
 
+    if args.command == "check-drafts":
+        import time as _time
+        from engine.draft_qa_checker import DraftQATrackerDB
+        from engine.draft_submit_checker import DraftSubmitChecker, DraftSubmitTrackerDB
+
+        db = DraftSubmitTrackerDB(args.db)
+        db.seed_default_queue()
+        if args.qa_db and Path(args.qa_db).exists():
+            qa_map = DraftQATrackerDB(args.qa_db).get_qa_status_map()
+            if qa_map:
+                db.sync_qa_statuses(qa_map)
+
+        if args.mark_submitted is not None:
+            db.mark_submitted(int(args.mark_submitted))
+            if args.json_out:
+                print(
+                    json.dumps(
+                        {
+                            "status": "marked_submitted",
+                            "report_id": int(args.mark_submitted),
+                            "submitted_today": db.get_submitted_today(),
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                print(
+                    f"[+] Marked report #{args.mark_submitted} as submitted "
+                    f"(submitted today: {db.get_submitted_today()}/{args.max_per_day})."
+                )
+            return 0
+
+        if args.seed_only:
+            drafts = db.list_drafts(only_drafts=True)
+            if args.json_out:
+                print(json.dumps({"total_drafts": len(drafts), "drafts": [d.__dict__ for d in drafts]}, indent=2))
+            else:
+                print(f"[+] Tracked HackerOne Drafts: {len(drafts)} (db={args.db})")
+                for d in drafts[:10]:
+                    print(f"  - [{d.payout_tier} {d.severity}] {d.url} ({d.program}) — {d.title}")
+            return 0
+
+        cookie_val = os.environ.get(str(args.cookie_env), "").strip()
+        checker = DraftSubmitChecker(db=db, session_cookie=cookie_val)
+
+        if args.snapshot_json:
+            raw_snap = json.loads(Path(args.snapshot_json).read_text(encoding="utf-8"))
+            snaps = raw_snap if isinstance(raw_snap, list) else [raw_snap]
+            summary = checker.ingest_snapshots(
+                snaps,
+                probe_report_id=int(args.probe_id),
+                max_per_day=int(args.max_per_day),
+                out_md=args.out_md,
+            )
+        else:
+            while True:
+                summary = checker.check(
+                    report_ids=args.report_ids or None,
+                    probe_report_id=int(args.probe_id),
+                    probe_first=not bool(args.check_all),
+                    probe_only=bool(args.probe_only),
+                    max_per_day=int(args.max_per_day),
+                    out_md=args.out_md,
+                )
+                if not args.watch or summary.account_status in ("CLEARED", "AUTH_REQUIRED"):
+                    break
+                sleep_s = max(60.0, float(args.interval_minutes) * 60.0)
+                print(
+                    f"[~] Status={summary.account_status} (probe #{summary.probe_report_id}) "
+                    f"— sleeping {args.interval_minutes:.1f}m before next polite check..."
+                )
+                _time.sleep(sleep_s)
+
+        if args.json_out:
+            print(json.dumps(summary.to_dict(), indent=2))
+        else:
+            print(
+                f"[+] HackerOne Draft Readiness: {summary.account_status} | "
+                f"ready={summary.ready_to_submit_count}, locked={summary.cooldown_locked_count}, "
+                f"open={summary.already_submitted_count} | "
+                f"daily_quota={summary.submitted_today}/{summary.daily_limit} "
+                f"-> {summary.ready_markdown_path}"
+            )
+            if summary.account_status == "CLEARED":
+                print("[+] SUBMIT READY NOW (Next Safe Batch):")
+                for item in summary.recommended_next_batch:
+                    print(
+                        f"    -> {item['url']}  [{item['program']} | {item['payout_tier']} | {item['severity']}] "
+                        f"{item['title']}"
+                    )
+            elif summary.account_status == "COOLDOWN_ACTIVE":
+                print(
+                    "[!] Cooldown still active (`can_submit_draft? == false`). "
+                    "Do NOT click Delete; re-run later or use --watch."
+                )
+            elif summary.account_status == "AUTH_REQUIRED":
+                print(
+                    f"[!] Auth required: export {args.cookie_env} or pass --snapshot-json from an authenticated browser session."
+                )
+        return 0 if summary.account_status == "CLEARED" else 1
+
+    if args.command == "qa-drafts":
+        from engine.draft_qa_checker import DraftQAChecker, DraftQATrackerDB
+        from engine.draft_submit_checker import DraftSubmitTrackerDB
+
+        qa_db = DraftQATrackerDB(args.db)
+        qa_checker = DraftQAChecker(db=qa_db)
+        snapshots: List[Dict[str, Any]] = []
+
+        if args.snapshot_json:
+            raw_snap = json.loads(Path(args.snapshot_json).read_text(encoding="utf-8"))
+            snapshots = raw_snap if isinstance(raw_snap, list) else [raw_snap]
+        elif args.markdown_file:
+            md_path = Path(args.markdown_file)
+            body = md_path.read_text(encoding="utf-8")
+            snapshots = [
+                {
+                    "id": int(args.report_id or 1),
+                    "title": str(args.title or md_path.stem),
+                    "team_handle": str(args.program or ""),
+                    "state": "Draft",
+                    "vulnerability_information": body,
+                }
+            ]
+        else:
+            print("[!] Provide either --snapshot-json <file> or --markdown-file <file>.", file=sys.stderr)
+            return 2
+
+        summary = qa_checker.audit_snapshots(
+            snapshots,
+            verify_sources=not bool(args.no_verify_sources),
+            out_md=args.out_md,
+            out_edit_queue=args.out_edit_queue,
+        )
+
+        if args.write_repaired and summary.results:
+            Path(args.write_repaired).write_text(summary.results[0].repaired_body, encoding="utf-8")
+
+        if args.submit_db:
+            submit_db = DraftSubmitTrackerDB(args.submit_db)
+            submit_db.seed_default_queue()
+            submit_db.sync_qa_statuses(qa_db.get_qa_status_map())
+
+        if args.json_out:
+            print(json.dumps(summary.to_dict(include_bodies=False), indent=2))
+        else:
+            print(
+                f"[+] QA Phase Complete: audited={summary.total_audited} | "
+                f"pass={summary.passed_count}, auto_fixed={summary.auto_fixed_pending_push_count}, "
+                f"needs_source_edit={summary.needs_source_edit_count}, fail={summary.failed_count} "
+                f"| defects={summary.total_defects}"
+            )
+            print(f"[+] Clickable QA Report: {summary.audit_markdown_path}")
+            print(f"[+] Auto-Edit Queue:    {summary.edit_queue_json_path}")
+            for r in summary.results:
+                if r.qa_status != "PASS":
+                    codes = ", ".join(sorted({d.code for d in r.defects}))
+                    print(f"    -> [{r.qa_status}] {r.url} ({r.program}) :: {codes}")
+
+        if args.strict and summary.passed_count != summary.total_audited:
+            return 1
+        return 0
+
     return 2
 
 
@@ -487,6 +805,9 @@ def _translate_swarm_argv_to_ensemble(argv: Sequence[str]) -> tuple[List[str], b
     model: Optional[str] = None
     findings_json: Optional[str] = None
     package_client: Optional[str] = None
+    cpu_workers: Optional[str] = None
+    blackboard_db: Optional[str] = None
+    resume = False
     proxy: Optional[str] = "auto"
     embedded = False
     no_llm = False
@@ -566,6 +887,21 @@ def _translate_swarm_argv_to_ensemble(argv: Sequence[str]) -> tuple[List[str], b
         elif tok == "--package-client" and i + 1 < len(tokens):
             package_client = tokens[i + 1]
             i += 2
+        elif tok == "--cpu-workers" and i + 1 < len(tokens):
+            cpu_workers = tokens[i + 1]
+            i += 2
+        elif tok.startswith("--cpu-workers="):
+            cpu_workers = tok.split("=", 1)[1] or None
+            i += 1
+        elif tok == "--blackboard-db" and i + 1 < len(tokens):
+            blackboard_db = tokens[i + 1]
+            i += 2
+        elif tok.startswith("--blackboard-db="):
+            blackboard_db = tok.split("=", 1)[1] or None
+            i += 1
+        elif tok == "--resume":
+            resume = True
+            i += 1
         elif tok == "--proxy":
             if i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
                 proxy = tokens[i + 1]
@@ -615,6 +951,12 @@ def _translate_swarm_argv_to_ensemble(argv: Sequence[str]) -> tuple[List[str], b
         mapped.extend(["--findings-json", findings_json])
     if package_client:
         mapped.extend(["--package-client", package_client])
+    if cpu_workers:
+        mapped.extend(["--cpu-workers", cpu_workers])
+    if blackboard_db:
+        mapped.extend(["--blackboard-db", blackboard_db])
+    if resume:
+        mapped.append("--resume")
     if proxy:
         mapped.extend(["--proxy", proxy])
     return mapped, dry_run

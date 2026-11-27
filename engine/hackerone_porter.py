@@ -607,6 +607,16 @@ def build_hackerone_report_draft(
         f"`{cwe}` ({rule_id}) to bypass the enforced security boundary. {description[:280]}"
     )
 
+    raw_body = "\n".join(vuln_info_parts)
+    try:
+        from engine.draft_qa_checker import auto_repair_markdown
+
+        title, raw_body, _ = auto_repair_markdown(title, raw_body)
+        _, impact_text, _ = auto_repair_markdown("", impact_text)
+        title = title[:140]
+    except Exception:
+        pass
+
     return HackerOneReportDraft(
         draft_id=draft_id,
         fingerprint=fp,
@@ -618,7 +628,7 @@ def build_hackerone_report_draft(
         asset_identifier=asset_id,
         evidence_lane=lane,
         poe_level=poe_level,
-        vulnerability_information="\n".join(vuln_info_parts),
+        vulnerability_information=raw_body,
         impact=impact_text,
         source_rule_id=rule_id,
         source_scanner=scanner,
@@ -776,6 +786,7 @@ class HackerOneApiClient:
                 "endpoint": f"{HACKERONE_API_BASE_URL}/hackers/reports",
                 "draft_id": draft.draft_id,
                 "program_handle": draft.program_handle,
+                "report_url": f"{HACKERONE_BASE_URL}/reports/{draft.draft_id}",
             }
         if not hitl_approved:
             raise PermissionError("Refusing HackerOne API submission without explicit human-in-the-loop approval.")
@@ -783,6 +794,21 @@ class HackerOneApiClient:
             raise PermissionError("Refusing to submit speculative Lane-3 hypothesis to HackerOne.")
         if draft.scope_match_status == "out_of_scope":
             raise PermissionError(f"Refusing to submit out-of-scope asset {draft.asset_identifier!r} to {draft.program_handle}.")
+
+        from engine.draft_qa_checker import audit_draft_text
+
+        qa_check = audit_draft_text(
+            report_id=0,
+            title=draft.title,
+            body=draft.vulnerability_information,
+            program=draft.program_handle,
+        )
+        critical_qa = [d for d in qa_check.defects if d.severity == "CRITICAL"]
+        if critical_qa:
+            codes = ", ".join(sorted({d.code for d in critical_qa}))
+            raise ValueError(
+                f"QA Phase gate blocked HackerOne submission for {draft.draft_id}: critical defect(s) [{codes}]"
+            )
 
         payload = {
             "data": {
@@ -796,7 +822,13 @@ class HackerOneApiClient:
                 },
             }
         }
-        return self._request_json("hackers/reports", method="POST", payload=payload)
+        resp = self._request_json("hackers/reports", method="POST", payload=payload)
+        if isinstance(resp, dict):
+            remote_id = str((resp.get("data") or {}).get("id") or "").strip()
+            if remote_id:
+                resp.setdefault("report_id", remote_id)
+                resp.setdefault("report_url", f"{HACKERONE_BASE_URL}/reports/{remote_id}")
+        return resp
 
 
 class HackerOneComputerUsePorter:
@@ -1078,6 +1110,121 @@ class HackerOneComputerUsePorter:
             "drafts_prefilled": len(filled_drafts),
         }
 
+    @staticmethod
+    def build_hugos_browser_cdp_draft_spec(
+        campaign: HackerOneCampaign,
+        draft: HackerOneReportDraft,
+        *,
+        cdp_url: Optional[str] = None,
+        modelfusion_cli: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Builds a deterministic, Draft-only Human-in-the-Loop (HITL) handoff spec for
+        ModelFusion's HugOS Browser (`cli.exe --browser --browser-port 9222`).
+
+        Safety invariants:
+          - Strictly navigates to `https://hackerone.com/<handle>/reports/new`
+          - Prefills Title, Vulnerability Information, and Impact fields only
+          - Stops at **Create Draft** (NEVER clicks final Submit Report)
+          - NEVER solves or bypasses CAPTCHAs, Turnstile, or login/2FA gates.
+        """
+        validated_submit_url = validate_hackerone_url(draft.submit_url or campaign.submit_url)
+        eff_cdp = (cdp_url or os.environ.get("RFCHUNT_HUGOS_CDP_URL") or "http://127.0.0.1:9222").rstrip("/")
+        eff_cli = modelfusion_cli or os.environ.get(
+            "MODELFUSION_CLI_PATH", r"d:\harfile\ModelFusion\target\release\cli.exe"
+        )
+        port_match = re.search(r":(\d+)$", eff_cdp)
+        cdp_port = int(port_match.group(1)) if port_match else 9222
+
+        return {
+            "schema": "rfchunt.hugos_browser_cdp_draft.v1",
+            "cdp_url": eff_cdp,
+            "cdp_port": cdp_port,
+            "modelfusion_cli": eff_cli,
+            "launch_args": [eff_cli, "--browser", "--browser-port", str(cdp_port)],
+            "action_boundary": "create_draft_only",
+            "auto_submit_forbidden": True,
+            "captcha_bypass_forbidden": True,
+            "final_submit_blocked_for_hitl": True,
+            "program_handle": campaign.handle,
+            "draft_id": draft.draft_id,
+            "target_url": validated_submit_url,
+            "fields": {
+                "title": draft.title,
+                "vulnerability_information": draft.vulnerability_information,
+                "impact": draft.impact,
+                "severity_rating": draft.severity_rating,
+                "weakness_cwe": draft.weakness_cwe,
+                "asset_identifier": draft.asset_identifier,
+            },
+            "steps": [
+                {"action": "hitl_login_checkpoint", "url": f"{HACKERONE_BASE_URL}/users/sign_in"},
+                {"action": "navigate", "url": validated_submit_url},
+                {"action": "fill_field", "field": "title"},
+                {"action": "fill_field", "field": "vulnerability_information"},
+                {"action": "fill_field", "field": "impact"},
+                {"action": "click_create_draft_only", "forbidden_buttons": ["Submit report", "Submit"]},
+                {"action": "pause_for_human_review", "expected_url_prefix": f"{HACKERONE_BASE_URL}/reports/"},
+            ],
+        }
+
+    def stage_draft_via_hugos_cdp(
+        self,
+        campaign: HackerOneCampaign,
+        drafts: Sequence[HackerOneReportDraft],
+        *,
+        cdp_url: Optional[str] = None,
+        modelfusion_cli: Optional[str] = None,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Probes HugOS Browser CDP (`<= 400ms` timeout) and emits a Draft-only HITL
+        staging plan ready for ModelFusion's HugOS Browser without ever auto-submitting.
+        """
+        if not drafts:
+            return {
+                "status": "skipped_no_eligible_drafts",
+                "final_submit_blocked_for_hitl": True,
+                "auto_submit_forbidden": True,
+                "captcha_bypass_forbidden": True,
+                "campaign": campaign.to_dict(),
+                "spec": None,
+            }
+
+        spec = self.build_hugos_browser_cdp_draft_spec(
+            campaign,
+            drafts[0],
+            cdp_url=cdp_url,
+            modelfusion_cli=modelfusion_cli,
+        )
+        if dry_run:
+            return {
+                "status": "dry_run_hugos_cdp_draft_planned",
+                "dry_run": True,
+                "cdp_reachable": False,
+                "final_submit_blocked_for_hitl": True,
+                "auto_submit_forbidden": True,
+                "captcha_bypass_forbidden": True,
+                "spec": spec,
+            }
+
+        cdp_reachable = False
+        try:
+            with urllib.request.urlopen(f"{spec['cdp_url']}/json/version", timeout=0.4) as resp:
+                cdp_reachable = int(resp.status) == 200
+        except Exception:
+            cdp_reachable = False
+
+        return {
+            "status": "hugos_cdp_draft_ready" if cdp_reachable else "hugos_cdp_offline_spec_ready",
+            "dry_run": False,
+            "cdp_reachable": cdp_reachable,
+            "final_submit_blocked_for_hitl": True,
+            "auto_submit_forbidden": True,
+            "captcha_bypass_forbidden": True,
+            "spec": spec,
+        }
+
 
 class HackerOnePorter:
     """
@@ -1214,6 +1361,8 @@ class HackerOnePorter:
         policy_text_override: str = "",
         dry_run: bool = False,
         wait_for_human_fn: Optional[Callable[[str], str]] = None,
+        eligibility_db: Optional[Any] = None,
+        enforce_eligibility: bool = False,
     ) -> Dict[str, Any]:
         """Full `--hackerone` porting pipeline with strict Anti-Slop PoC Gate and `--dry-run` safety."""
         campaign, matches = self.resolve_campaign(
@@ -1225,6 +1374,34 @@ class HackerOnePorter:
             policy_text_override=policy_text_override,
             dry_run=dry_run,
         )
+        if eligibility_db is not None or enforce_eligibility:
+            eff_elig_db = eligibility_db
+            if eff_elig_db is None:
+                from engine.program_eligibility_db import ProgramEligibilityDB
+
+                eff_elig_db = ProgramEligibilityDB()
+            if not eff_elig_db.is_eligible(campaign.handle):
+                return {
+                    "status": "blocked_ineligible",
+                    "eligible": False,
+                    "dry_run": bool(dry_run),
+                    "anti_slop_gate_enforced": True,
+                    "final_submit_requires_hitl": True,
+                    "program_handle": campaign.handle,
+                    "campaign": campaign.to_dict(),
+                    "policy_rules": campaign.policy_rules,
+                    "matching_campaigns": [c.to_dict() for c in matches],
+                    "eligible_drafts_count": 0,
+                    "rejected_findings_count": len(findings or ()),
+                    "drafts": [],
+                    "rejected": [{"reason": f"program_ineligible:{campaign.handle}"}],
+                    "browser_session": None,
+                    "api_submissions": [],
+                    "report_url": None,
+                    "report_urls": [],
+                    "bundle_path": "",
+                    "generated_at": _utc_now_iso(),
+                }
         ledger = self._load_ledger()
         eligible, rejected = filter_eligible_findings(
             findings,
@@ -1280,9 +1457,32 @@ class HackerOnePorter:
                 if dry_run:
                     api_submissions.append(resp)
                 else:
-                    remote_id = str((resp.get("data") or {}).get("id") or "")
+                    remote_id = str((resp.get("data") or {}).get("id") or resp.get("report_id") or "")
+                    eff_rid = remote_id or d.draft_id
+                    r_url = f"{HACKERONE_BASE_URL}/reports/{eff_rid}"
                     self._save_ledger_record(d, delivery_mode="hackerone_api_v1", remote_id=remote_id)
-                    api_submissions.append({"draft_id": d.draft_id, "remote_id": remote_id, "status": "submitted"})
+                    api_submissions.append(
+                        {
+                            "draft_id": d.draft_id,
+                            "remote_id": remote_id,
+                            "report_url": r_url,
+                            "status": "submitted",
+                        }
+                    )
+
+        draft_dicts: List[Dict[str, Any]] = []
+        report_urls: List[str] = []
+        sub_url_by_draft = {
+            str(s.get("draft_id") or ""): str(s.get("report_url") or "")
+            for s in api_submissions
+            if isinstance(s, dict) and s.get("report_url")
+        }
+        for d in drafts:
+            d_dict = d.to_dict()
+            r_url = sub_url_by_draft.get(d.draft_id) or f"{HACKERONE_BASE_URL}/reports/{d.draft_id}"
+            d_dict["report_url"] = r_url
+            draft_dicts.append(d_dict)
+            report_urls.append(r_url)
 
         bundle_path = self.output_dir / f"hackerone_port_bundle_{campaign.handle}.json"
         result = {
@@ -1295,10 +1495,12 @@ class HackerOnePorter:
             "matching_campaigns": [c.to_dict() for c in matches],
             "eligible_drafts_count": len(drafts),
             "rejected_findings_count": len(rejected),
-            "drafts": [d.to_dict() for d in drafts],
+            "drafts": draft_dicts,
             "rejected": rejected,
             "browser_session": browser_result,
             "api_submissions": api_submissions,
+            "report_url": report_urls[0] if report_urls else None,
+            "report_urls": report_urls,
             "bundle_path": f"[dry-run] {bundle_path}" if dry_run else str(bundle_path),
             "generated_at": _utc_now_iso(),
         }
@@ -1370,8 +1572,16 @@ class HackerOneAutonomousRunner:
         include_ai_disclosure: bool = False,
         dry_run: bool = False,
         wait_for_human_fn: Optional[Callable[[str], str]] = None,
+        eligibility_db: Optional[Any] = None,
+        enforce_eligibility: bool = False,
     ) -> Dict[str, Any]:
         """Executes the full policy-aware autonomous HackerOne workflow (or safe `--dry-run` plan)."""
+        eff_elig_db = eligibility_db
+        if eff_elig_db is None and enforce_eligibility:
+            from engine.program_eligibility_db import ProgramEligibilityDB
+
+            eff_elig_db = ProgramEligibilityDB()
+
         eff_user = (researcher_username or self.porter.api_client.username or "").strip()
         campaigns: List[HackerOneCampaign] = []
         discovery_meta: Dict[str, Any] = {"source": "direct_or_override"}
@@ -1431,6 +1641,36 @@ class HackerOneAutonomousRunner:
 
         program_results: List[Dict[str, Any]] = []
         for camp in campaigns[: max(1, int(max_programs or 2))]:
+            if eff_elig_db is not None and not eff_elig_db.is_eligible(camp.handle):
+                port_blocked = self.porter.port_findings(
+                    [],
+                    program_handle=camp.handle,
+                    query=query,
+                    dry_run=dry_run,
+                    eligibility_db=eff_elig_db,
+                    enforce_eligibility=True,
+                )
+                program_results.append(
+                    {
+                        "program_handle": camp.handle,
+                        "eligible": False,
+                        "status": "blocked_ineligible",
+                        "campaign": camp.to_dict(),
+                        "roe_compliance": {
+                            "safe_harbor_status": "blocked_by_program_eligibility_db",
+                            "live_scan_policy_decision": "BLOCKED_INELIGIBLE_PROGRAM",
+                        },
+                        "audit_actions": [
+                            {
+                                "action": "blocked_ineligible_program",
+                                "program_handle": camp.handle,
+                            }
+                        ],
+                        "port_result": port_blocked,
+                    }
+                )
+                continue
+
             rules = parse_hackerone_program_policy(
                 camp.handle,
                 camp.policy_text,
@@ -1563,6 +1803,8 @@ class HackerOneAutonomousRunner:
                 policy_text_override=camp.policy_text,
                 dry_run=dry_run,
                 wait_for_human_fn=wait_for_human_fn,
+                eligibility_db=eff_elig_db,
+                enforce_eligibility=enforce_eligibility,
             )
 
             program_results.append(
