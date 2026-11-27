@@ -928,6 +928,9 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "login_timeout": {"type": "number", "default": 300.0},
                 "swarm": {"type": "boolean", "default": False, "description": "Enable parallel multi-agent swarm auditing across targets"},
                 "swarm_workers": {"type": "integer"},
+                "dedup_db": {"type": "string", "description": "SQLite WAL database path for processed target SHAs and drafted findings dedup"},
+                "force_rescan": {"type": "boolean", "default": False},
+                "no_stage_drafts": {"type": "boolean", "default": False},
                 "dry_run": {"type": "boolean", "default": True},
                 "model": {"type": "string"},
             },
@@ -1397,6 +1400,12 @@ class BugBountyMCPServer:
                 swarm_argv.append("--swarm")
             if args.get("swarm_workers") is not None:
                 swarm_argv.extend(["--swarm-workers", str(max(1, int(args["swarm_workers"])))])
+            if args.get("dedup_db"):
+                swarm_argv.extend(["--dedup-db", str(args["dedup_db"]).strip()])
+            if _coerce_strict_bool(args.get("force_rescan", False)):
+                swarm_argv.append("--force-rescan")
+            if _coerce_strict_bool(args.get("no_stage_drafts", False)):
+                swarm_argv.append("--no-stage-drafts")
             for t in args.get("targets") or []:
                 t_s = str(t).strip()
                 if t_s:

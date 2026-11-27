@@ -2241,6 +2241,7 @@ class HackerOneComputerUsePorter:
         probe_report_id: int = 4243972,
         eligibility_db_path: Optional[Union[str, Path]] = None,
         draft_tracker_db_path: Optional[Union[str, Path]] = None,
+        dedup_db_path: Optional[Union[str, Path]] = None,
         dry_run: bool = False,
         wait_for_human_fn: Optional[Callable[[str], str]] = None,
     ) -> Dict[str, Any]:
@@ -2342,6 +2343,7 @@ class HackerOneComputerUsePorter:
         current_user: Dict[str, Any] = {}
         probe_report: Dict[str, Any] = {}
         inbox_counts: Dict[str, Any] = {}
+        live_reports: List[Dict[str, Any]] = []
         program_cards: List[Dict[str, Any]] = []
         page_links: List[str] = []
         logged_in = False
@@ -2501,30 +2503,57 @@ class HackerOneComputerUsePorter:
                     try:
                         bugs_data = page.evaluate(
                             """async () => {
-                                try {
-                                    const r = await fetch('/bugs.json?subject=user&report_id=0&view=all&substates[]=new&substates[]=triaged&substates[]=needs-more-info&substates[]=editing&text_query=&program_states[]=2&program_states[]=3&program_states[]=4&program_states[]=5&sort_type=latest_activity&sort_direction=descending&limit=50&page=1', {credentials: 'same-origin'});
-                                    if (!r.ok) return null;
-                                    return await r.json();
-                                } catch (e) { return null; }
+                                const all = [];
+                                const seen = new Set();
+                                for (const pg of [1, 2]) {
+                                    try {
+                                        const url = `/bugs.json?subject=user&report_id=0&view=all&substates[]=new&substates[]=triaged&substates[]=needs-more-info&substates[]=editing&substates[]=resolved&substates[]=informative&substates[]=duplicate&substates[]=not-applicable&text_query=&program_states[]=2&program_states[]=3&program_states[]=4&program_states[]=5&sort_type=latest_activity&sort_direction=descending&limit=100&page=${pg}`;
+                                        const r = await fetch(url, {credentials: 'same-origin'});
+                                        if (!r.ok) break;
+                                        const d = await r.json();
+                                        const arr = Array.isArray(d?.reports) ? d.reports : [];
+                                        for (const item of arr) {
+                                            if (item && item.id && !seen.has(item.id)) {
+                                                seen.add(item.id);
+                                                all.push({
+                                                    id: item.id,
+                                                    title: item.title || '',
+                                                    state: item.state || '',
+                                                    substate: item.substate || '',
+                                                    severity_rating: item.severity_rating || '',
+                                                    url: item.url || `/reports/${item.id}`,
+                                                    team: item.team ? {handle: item.team.handle || ''} : {},
+                                                });
+                                            }
+                                        }
+                                        if (arr.length < 100) break;
+                                    } catch (e) { break; }
+                                }
+                                return all;
                             }"""
                         )
-                        if isinstance(bugs_data, dict):
-                            reports_arr = bugs_data.get("reports") or []
-                            if isinstance(reports_arr, list):
-                                inbox_counts = {
-                                    "total_visible": len(reports_arr),
-                                    "draft_reports": sum(
-                                        1 for x in reports_arr if isinstance(x, dict) and str(x.get("state", "")).lower() == "draft"
-                                    ),
-                                    "triaged_reports": sum(
-                                        1 for x in reports_arr if isinstance(x, dict) and str(x.get("substate", "")).lower() == "triaged"
-                                    ),
-                                    "open_reports": sum(
-                                        1 for x in reports_arr if isinstance(x, dict) and str(x.get("state", "")).lower() != "draft"
-                                    ),
-                                }
+                        if isinstance(bugs_data, list):
+                            live_reports = [x for x in bugs_data if isinstance(x, dict)]
+                            inbox_counts = {
+                                "total_visible": len(live_reports),
+                                "draft_reports": sum(
+                                    1 for x in live_reports if str(x.get("state", "")).lower() == "draft"
+                                ),
+                                "triaged_reports": sum(
+                                    1 for x in live_reports if str(x.get("substate", "")).lower() == "triaged"
+                                ),
+                                "open_reports": sum(
+                                    1
+                                    for x in live_reports
+                                    if str(x.get("state", "")).lower() not in ("draft", "closed")
+                                ),
+                                "closed_reports": sum(
+                                    1 for x in live_reports if str(x.get("state", "")).lower() == "closed"
+                                ),
+                            }
                     except Exception:
                         inbox_counts = {}
+                        live_reports = []
 
                 # Phase 3: Discover unlocked programs, scopes, and in-scope GitHub repositories
                 if (page.url or "").rstrip("/") != validated_url.rstrip("/"):
@@ -2630,6 +2659,12 @@ class HackerOneComputerUsePorter:
                     except Exception:
                         pass
 
+        synced_live_count = 0
+        if dedup_db_path is not None and live_reports:
+            from engine.hunt_dedup_db import HuntDedupDB
+
+            synced_live_count = HuntDedupDB(dedup_db_path).sync_from_live_hackerone_reports(live_reports)
+
         extracted = extract_unlocked_programs_and_repos_from_page_data(
             hunt_url=validated_url,
             current_user=current_user,
@@ -2644,6 +2679,7 @@ class HackerOneComputerUsePorter:
         return {
             **base_meta,
             **extracted,
+            "synced_existing_reports_count": synced_live_count,
             "status": "browser_hunt_session_completed",
             "dry_run": False,
             "browser_launched": True,
@@ -2669,9 +2705,16 @@ class HackerOnePorter:
         workspace_root: Optional[Path] = None,
         api_client: Optional[HackerOneApiClient] = None,
         browser_porter: Optional[HackerOneComputerUsePorter] = None,
+        ledger_path: Optional[Union[str, Path]] = None,
+        dedup_db: Optional[Any] = None,
     ) -> None:
         self.output_dir = Path(output_dir).resolve(strict=False)
-        self.ledger_path = self.output_dir / "submission_ledger.json"
+        self.ledger_path = (
+            Path(ledger_path).resolve(strict=False)
+            if ledger_path is not None
+            else (self.output_dir / "submission_ledger.json")
+        )
+        self.dedup_db = dedup_db
         self.api_client = api_client or HackerOneApiClient(workspace_root=workspace_root)
         self.browser_porter = browser_porter or HackerOneComputerUsePorter()
 
@@ -2684,7 +2727,7 @@ class HackerOnePorter:
             return {"submitted_fingerprints": [], "records": []}
 
     def _save_ledger_record(self, draft: HackerOneReportDraft, *, delivery_mode: str, remote_id: str = "") -> None:
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
         ledger = self._load_ledger()
         fps = list(ledger.get("submitted_fingerprints") or [])
         if draft.fingerprint not in fps:
@@ -2859,13 +2902,56 @@ class HackerOnePorter:
                     "generated_at": _utc_now_iso(),
                 }
         ledger = self._load_ledger()
+        known_fps = list(ledger.get("submitted_fingerprints") or [])
+        if self.dedup_db is not None:
+            known_fps.extend(self.dedup_db.list_fingerprints(program=campaign.handle))
         eligible, rejected = filter_eligible_findings(
             findings,
             min_severity=min_severity,
             max_reports=max_reports,
-            submitted_fingerprints=ledger.get("submitted_fingerprints") or [],
+            submitted_fingerprints=known_fps,
             program_handle=campaign.handle,
         )
+
+        # 4-layer SQLite duplicate-draft guard (exact fp, file+rule, file+CWE, title/code-anchor vs existing H1 drafts)
+        if self.dedup_db is not None and eligible:
+            deduped_eligible: List[Dict[str, Any]] = []
+            for f_item in eligible:
+                cand_fp = str(f_item.get("_h1_fingerprint") or compute_finding_fingerprint(f_item, campaign.handle))
+                cand_file = str(f_item.get("file_path") or f_item.get("file") or "")
+                cand_rule = str(f_item.get("rule_id") or "")
+                cand_cwe = str(f_item.get("cwe") or f_item.get("cwe_id") or "")
+                cand_title = str(f_item.get("title") or "")
+                cand_asset = str(f_item.get("asset_identifier") or "")
+                dup = self.dedup_db.find_duplicate(
+                    campaign.handle,
+                    fingerprint=cand_fp,
+                    title=cand_title,
+                    file_path=cand_file,
+                    rule_id=cand_rule,
+                    cwe=cand_cwe,
+                    asset_identifier=cand_asset,
+                )
+                if dup is not None:
+                    matched_ref = str(
+                        dup.get("matched_remote_report_id")
+                        or dup.get("matched_draft_id")
+                        or dup.get("matched_fingerprint")
+                        or ""
+                    )
+                    reason = f"duplicate_in_sqlite:{dup['reason']}:{matched_ref}"
+                    rejected.append({"finding": f_item, "reason": reason, "duplicate_match": dup})
+                    if not dry_run:
+                        self.dedup_db.record_dedup_event(
+                            "finding_skipped",
+                            campaign.handle,
+                            cand_title or cand_file or cand_fp,
+                            matched_id=matched_ref,
+                            reason=str(dup.get("reason") or ""),
+                        )
+                    continue
+                deduped_eligible.append(f_item)
+            eligible = deduped_eligible
 
         if not dry_run:
             self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -2892,6 +2978,23 @@ class HackerOnePorter:
                 )
                 md_file.write_text(md_doc, encoding="utf-8")
                 draft.markdown_path = str(md_file)
+                self._save_ledger_record(draft, delivery_mode="local_md")
+                if self.dedup_db is not None:
+                    self.dedup_db.record_drafted_finding(
+                        fingerprint=draft.fingerprint,
+                        program=draft.program_handle,
+                        draft_id=draft.draft_id,
+                        title=draft.title,
+                        asset_identifier=draft.asset_identifier,
+                        file_path=str(f_item.get("file_path") or f_item.get("file") or ""),
+                        line=int(f_item.get("line_number") or f_item.get("line") or 0),
+                        rule_id=draft.source_rule_id,
+                        cwe=draft.weakness_cwe,
+                        severity=draft.severity_rating,
+                        delivery_mode="local_md",
+                        draft_url=draft.submit_url,
+                        markdown_path=draft.markdown_path,
+                    )
             else:
                 draft.markdown_path = f"[dry-run] {md_file}"
             drafts.append(draft)
@@ -2917,6 +3020,21 @@ class HackerOnePorter:
                     eff_rid = remote_id or d.draft_id
                     r_url = f"{HACKERONE_BASE_URL}/reports/{eff_rid}"
                     self._save_ledger_record(d, delivery_mode="hackerone_api_v1", remote_id=remote_id)
+                    if self.dedup_db is not None:
+                        self.dedup_db.record_drafted_finding(
+                            fingerprint=d.fingerprint,
+                            program=d.program_handle,
+                            draft_id=d.draft_id,
+                            title=d.title,
+                            asset_identifier=d.asset_identifier,
+                            rule_id=d.source_rule_id,
+                            cwe=d.weakness_cwe,
+                            severity=d.severity_rating,
+                            delivery_mode="hackerone_api_v1",
+                            remote_report_id=(int(remote_id) if remote_id.isdigit() else None),
+                            draft_url=r_url,
+                            markdown_path=d.markdown_path,
+                        )
                     api_submissions.append(
                         {
                             "draft_id": d.draft_id,

@@ -22,10 +22,12 @@ from engine.hackerone_porter import (
     DEFAULT_BUG_HUNT_URL,
     HackerOneCampaign,
     HackerOneComputerUsePorter,
+    HackerOnePorter,
     HackerOneReportDraft,
     extract_unlocked_programs_and_repos_from_page_data,
     validate_bug_hunt_url,
 )
+from engine.hunt_dedup_db import HuntDedupDB
 from engine.program_eligibility_db import ProgramEligibilityDB
 from mcp_server import TerminatorMCPServer
 from scripts.autonomous_hunt import (
@@ -1105,6 +1107,158 @@ def test_swarm_flag_standalone_combined_and_embedded(tmp_path: Path) -> None:
         check=False,
     )
     assert p3.returncode != 0
+
+
+def test_sqlite_hunt_dedup_eliminates_duplicate_scans_and_drafts(tmp_path: Path) -> None:
+    dedup_db_path = tmp_path / "hunt_state.sqlite3"
+    db = HuntDedupDB(dedup_db_path)
+
+    # 1. Seeded + live HackerOne reports sync into SQLite WAL and block duplicate re-drafting
+    synced_seed = db.sync_from_draft_tracker(seed_defaults=True)
+    assert synced_seed >= 40
+    synced_live = db.sync_from_live_hackerone_reports(
+        [
+            {
+                "id": 9900123,
+                "team": {"handle": "anthropic"},
+                "title": "anthropics/skills (run_eval.py): Path traversal write/delete via SKILL.md frontmatter",
+                "state": "Draft",
+                "substate": "editing",
+                "severity_rating": "medium",
+                "url": "/reports/9900123",
+            },
+            {
+                "id": 4244523,
+                "team": {"handle": "anthropic"},
+                "title": "claude-code-action: Plaintext GitHub token written to .git/config on untrusted PR",
+                "state": "Closed",
+                "substate": "informative",
+                "severity_rating": "high",
+                "url": "https://hackerone.com/reports/4244523",
+            },
+        ]
+    )
+    assert synced_live == 2
+
+    # Existing live HackerOne draft on `run_eval.py` MUST be detected as duplicate!
+    dup_anchor = db.find_duplicate(
+        "anthropic",
+        title="Path traversal write via SKILL.md frontmatter in run_eval.py",
+        file_path="anthropics/skills/run_eval.py",
+        rule_id="PARITY-PATH-TRAVERSAL",
+        cwe="CWE-22",
+        staged_or_remote_only=True,
+    )
+    assert dup_anchor is not None
+    assert dup_anchor["matched_delivery_mode"] == "hackerone_existing_draft"
+
+    # Existing closed Informative Anthropic report MUST be detected as duplicate!
+    dup_closed = db.find_duplicate(
+        "anthropic",
+        title="claude-code-action: Plaintext GitHub token written to .git/config on untrusted PR",
+        file_path=".git/config",
+        staged_or_remote_only=True,
+    )
+    assert dup_closed is not None
+    assert dup_closed["matched_remote_report_id"] == 4244523
+    assert dup_closed["matched_delivery_mode"] == "hackerone_closed"
+
+    # Unrelated brand-new bug on a brand-new file MUST NOT false-positive!
+    no_dup = db.find_duplicate(
+        "anthropic",
+        title="New OAuth PKCE downgrade in verifier_v2.ts",
+        file_path="src/oauth/verifier_v2.ts",
+        rule_id="AUTH-PKCE-001",
+        cwe="CWE-287",
+    )
+    assert no_dup is None
+
+    # 2. HackerOnePorter wired with shared ledger + SQLite dedup blocks repeat porting across separate cycle dirs
+    shared_ledger = tmp_path / "submission_ledger.json"
+    finding = {
+        "title": "New OAuth PKCE downgrade in verifier_v2.ts",
+        "description": "PKCE challenge verifier accepts plain downgrade.",
+        "file_path": "src/oauth/verifier_v2.ts",
+        "line_number": 42,
+        "rule_id": "AUTH-PKCE-001",
+        "scanner": "parity_auditor",
+        "cwe": "CWE-287",
+        "severity": "high",
+        "evidence_lane": "LANE_1_POC",
+        "poe_level": 3,
+        "evidence": "Reproduced PKCE downgrade trace.",
+    }
+    porter_run1 = HackerOnePorter(
+        output_dir=str(tmp_path / "cycle1_drafts"),
+        ledger_path=shared_ledger,
+        dedup_db=db,
+    )
+    res1 = porter_run1.port_findings([finding], program_handle="common_codes", dry_run=False)
+    assert res1["eligible_drafts_count"] == 1
+
+    # Second run in a DIFFERENT cycle dir with line shifted (42 -> 55) MUST still be blocked via SQLite dedup!
+    finding_shifted = {**finding, "line_number": 55}
+    porter_run2 = HackerOnePorter(
+        output_dir=str(tmp_path / "cycle2_drafts"),
+        ledger_path=shared_ledger,
+        dedup_db=db,
+    )
+    res2 = porter_run2.port_findings([finding_shifted], program_handle="common_codes", dry_run=False)
+    assert res2["eligible_drafts_count"] == 0
+    assert any("duplicate" in str(r.get("reason") or "").lower() for r in res2["rejected"])
+
+    # 3. End-to-end back-to-back CLI runs skip unchanged processed target in Run #2 via SQLite `processed_targets`,
+    #    and `--force-rescan` re-runs the scan cleanly when requested!
+    repo_dir = tmp_path / "dedup_local_repo"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    (repo_dir / "calc.py").write_text("def mul(a: int, b: int) -> int:\n    return a * b\n", encoding="utf-8")
+    hunt_out = tmp_path / "dedup_hunt_out"
+    swarm_script = Path(__file__).resolve().parents[1] / "rfc_hunt_swarm.py"
+
+    base_cmd = [
+        sys.executable,
+        str(swarm_script),
+        "--hunt",
+        "--repo",
+        str(repo_dir),
+        "--program",
+        "generic",
+        "--dedup-db",
+        str(dedup_db_path),
+        "--once",
+        "--headless-only",
+        "--no-stage-drafts",
+        "--embedded",
+        "--no-llm",
+        "--out",
+        str(hunt_out),
+        "--json",
+    ]
+    r1 = subprocess.run(base_cmd, capture_output=True, text=True, encoding="utf-8", timeout=120, check=False)
+    assert r1.returncode == 0, f"r1 stderr={r1.stderr}\nstdout={r1.stdout}"
+    d1 = json.loads(r1.stdout)
+    assert d1["targets_audited"][0]["fast_ooda_status"] == "ok"
+    assert d1["dedup_db"]["processed_targets_count"] >= 1
+
+    # Run #2 on the EXACT same unchanged folder -> automatically skipped via SQLite `processed_targets`!
+    r2 = subprocess.run(base_cmd, capture_output=True, text=True, encoding="utf-8", timeout=90, check=False)
+    assert r2.returncode == 0, f"r2 stderr={r2.stderr}\nstdout={r2.stdout}"
+    d2 = json.loads(r2.stdout)
+    assert d2["targets_audited"][0]["status"] == "skipped_already_processed"
+    assert d2["failed_steps"] == []
+
+    # Run #3 with `--force-rescan` -> re-runs the audit cleanly!
+    r3 = subprocess.run(
+        [*base_cmd, "--force-rescan"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+        check=False,
+    )
+    assert r3.returncode == 0, f"r3 stderr={r3.stderr}\nstdout={r3.stdout}"
+    d3 = json.loads(r3.stdout)
+    assert d3["targets_audited"][0]["fast_ooda_status"] == "ok"
 
 
 def test_stage5_excludes_fresh_hunt_queue_and_non_draft_markdown(tmp_path: Path) -> None:

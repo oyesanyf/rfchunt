@@ -131,12 +131,20 @@ def build_hunt_argv(ns: argparse.Namespace) -> list[str]:
         argv.append("--swarm")
     if getattr(ns, "swarm_workers", None) is not None:
         argv.extend(["--swarm-workers", str(max(1, int(ns.swarm_workers)))])
+    if getattr(ns, "dedup_db", None):
+        argv.extend(["--dedup-db", str(ns.dedup_db)])
+    if getattr(ns, "force_rescan", False):
+        argv.append("--force-rescan")
+    if getattr(ns, "no_stage_drafts", False):
+        argv.append("--no-stage-drafts")
     if getattr(ns, "no_browser_hunt", False):
         argv.append("--no-browser-hunt")
     elif getattr(ns, "browser_hunt", False) or (not ns.headless_only and not ns.embedded):
         argv.append("--browser-hunt")
     if not ns.headless_only:
-        argv.extend(["--stage-drafts", "--open-chrome"])
+        if not getattr(ns, "no_stage_drafts", False):
+            argv.append("--stage-drafts")
+        argv.append("--open-chrome")
     if not ns.once and not ns.dry_run:
         argv.extend(["--watch", "--interval-minutes", str(float(ns.interval_minutes))])
     if ns.max_cycles and int(ns.max_cycles) > 0:
@@ -255,6 +263,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--probe-report-id", type=int, default=4243972, help="HackerOne report ID probed read-only for cooldown can_submit_draft? status (default: 4243972).")
     p.add_argument("--swarm", action="store_true", default=False, help="Enable parallel multi-agent swarm auditing across discovered and local targets.")
     p.add_argument("--swarm-workers", type=int, default=None, help="Bounded concurrent swarm target workers (1..8).")
+    p.add_argument("--dedup-db", default=None, help="SQLite WAL ledger storing processed target SHAs and drafted/submitted findings (default: <out>/hunt_state.sqlite3).")
+    p.add_argument("--force-rescan", action="store_true", default=False, help="Re-scan targets even if their current commit SHA / folder digest was already processed in SQLite.")
+    p.add_argument("--no-stage-drafts", action="store_true", default=False, help="Do not stage drafts on HackerOne /reports/new; record local drafts and SQLite dedup state only.")
     p.add_argument("--headless-only", action="store_true", default=False, help="Do not open browser, stage drafts, or launch Chrome; write READY_TO_CLICK_SUBMIT.md only.")
     p.add_argument("--model", default=None, help="Explicit abliterated Ollama model override.")
     p.add_argument("--out", default="out/autonomous_hunt", help="Output directory (default: out/autonomous_hunt).")

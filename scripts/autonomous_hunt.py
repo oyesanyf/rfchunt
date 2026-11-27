@@ -63,6 +63,7 @@ from engine.hackerone_porter import (
     validate_bug_hunt_url,
     validate_hackerone_url,
 )
+from engine.hunt_dedup_db import HuntDedupDB
 from engine.program_eligibility_db import ProgramEligibilityDB
 
 _REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -643,6 +644,25 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
 
     steps: list[dict[str, Any]] = []
     targets_to_audit: list[tuple[str, Path]] = []
+    target_repo_slug_by_path: dict[str, str] = {}
+
+    # Persistent SQLite WAL Deduplication & Processed-State Ledger (`hunt_state.sqlite3`):
+    # Tracks every processed target commit SHA / folder digest AND every drafted/staged/submitted
+    # HackerOne report so repeated `--hunt` / `--swarm` runs never scan unchanged commits or
+    # create duplicate HackerOne drafts.
+    dedup_db_path = (
+        Path(str(args.dedup_db)).resolve()
+        if getattr(args, "dedup_db", None)
+        else (out_root / "hunt_state.sqlite3")
+    )
+    shared_ledger_path = out_root / "submission_ledger.json"
+    dedup_db: HuntDedupDB | None = None
+    if not args.dry_run:
+        dedup_db = HuntDedupDB(dedup_db_path)
+        dedup_db.sync_from_draft_tracker(
+            out_root / "draft_submit_tracker.sqlite3",
+            seed_defaults=True,
+        )
 
     # Stage 0A: Interactive Browser Hunt Session (opens --hunt-url, waits for human login/2FA/CAPTCHA,
     # syncs inbox/cooldown `can_submit_draft?`/Signal, discovers unlocked programs & GitHub repos)
@@ -676,6 +696,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
             probe_report_id=int(getattr(args, "probe_report_id", 4243972) or 4243972),
             eligibility_db_path=args.eligibility_db,
             draft_tracker_db_path=(out_root / "draft_submit_tracker.sqlite3" if not args.dry_run else None),
+            dedup_db_path=(dedup_db_path if not args.dry_run else None),
             dry_run=args.dry_run,
         )
         b_status = str(browser_hunt_session.get("status") or "")
@@ -906,6 +927,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
             steps.append(sync_res)
             if repo_dir is not None and repo_dir.resolve() not in seen_target_paths:
                 seen_target_paths.add(repo_dir.resolve())
+                target_repo_slug_by_path[str(repo_dir.resolve())] = item["repo"]
                 targets_to_audit.append((item["program"], repo_dir))
 
     # Stage 2 & Stage 3: Fast 3-Stage OODA + Exhaustive Multi-Engine Ensemble Audit per eligible target
@@ -933,6 +955,43 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
                 "status": "skipped_ineligible",
                 "reason": elig_reason,
             }
+
+        repo_slug_hint = target_repo_slug_by_path.get(str(target_dir.resolve()), "")
+        cur_sha = ""
+        cur_digest = ""
+        if dedup_db is not None and not bool(getattr(args, "force_rescan", False)):
+            already_done, prev_rec, cur_sha, cur_digest = dedup_db.is_target_processed(
+                prog,
+                target_dir,
+                repo_slug=repo_slug_hint,
+            )
+            if already_done:
+                rev_id = cur_sha or cur_digest
+                dedup_db.record_dedup_event(
+                    "target_skipped",
+                    prog,
+                    repo_slug_hint or str(target_dir),
+                    matched_id=rev_id,
+                    reason="unchanged_revision",
+                )
+                local_steps.append(
+                    {
+                        "label": f"dedup_skip:{prog}:{repo_slug_hint or target_dir.name}",
+                        "status": "skipped_already_processed",
+                        "exit_code": 0,
+                        "revision": rev_id,
+                        "previous_scanned_utc": (prev_rec or {}).get("last_scanned_utc", ""),
+                    }
+                )
+                return local_steps, {
+                    "program": prog,
+                    "target": str(target_dir),
+                    "repo_slug": repo_slug_hint,
+                    "status": "skipped_already_processed",
+                    "revision": rev_id,
+                    "previous_scanned_utc": (prev_rec or {}).get("last_scanned_utc", ""),
+                    "swarm_parallel": swarm_enabled,
+                }
 
         t_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{idx}_{prog}_{target_dir.name}")[:64]
         t_out = cycle_dir / t_slug
@@ -1035,10 +1094,20 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
         }
 
         # Stage 3.5: Auto-Port verified findings into QA-checked, secret/PHI-redacted HackerOne drafts
+        # Uses shared persistent `submission_ledger.json` + SQLite `HuntDedupDB` to prevent duplicate drafts!
+        ported_count = 0
+        verified_count = 0
+        duplicates_skipped_in_port = 0
         if not args.dry_run:
             verified_findings = extract_verified_findings_from_cycle(t_out)
+            verified_count = len(verified_findings)
             if verified_findings:
-                porter = HackerOnePorter(output_dir=str(t_out / "hackerone_drafts"), workspace_root=RFCHUNT_ROOT)
+                porter = HackerOnePorter(
+                    output_dir=str(t_out / "hackerone_drafts"),
+                    workspace_root=RFCHUNT_ROOT,
+                    ledger_path=shared_ledger_path,
+                    dedup_db=dedup_db,
+                )
                 port_res = porter.port_findings(
                     verified_findings,
                     program_handle=prog,
@@ -1048,8 +1117,33 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
                     dry_run=False,
                     enforce_eligibility=(not args.allow_blocked and prog != "generic"),
                 )
-                t_res["ported_drafts_count"] = int(port_res.get("eligible_drafts_count") or 0)
+                ported_count = int(port_res.get("eligible_drafts_count") or 0)
+                duplicates_skipped_in_port = sum(
+                    1
+                    for rj in (port_res.get("rejected") or [])
+                    if isinstance(rj, dict) and "duplicate" in str(rj.get("reason") or "").lower()
+                )
+                t_res["ported_drafts_count"] = ported_count
                 t_res["ported_drafts"] = list(port_res.get("drafts") or [])
+                t_res["duplicates_skipped"] = duplicates_skipped_in_port
+
+            if dedup_db is not None:
+                step_failed = any(
+                    st.get("status") not in ("ok", "dry_run_planned", "skipped_ineligible", "skipped_already_processed")
+                    for st in local_steps
+                )
+                if not step_failed:
+                    dedup_db.record_processed_target(
+                        prog,
+                        target_dir,
+                        repo_slug=repo_slug_hint,
+                        commit_sha=(cur_sha or None),
+                        content_digest=(cur_digest or None),
+                        status="completed",
+                        findings_count=verified_count,
+                        drafts_created=ported_count,
+                        cycle_id=cycle_id,
+                    )
 
         return local_steps, t_res
 
@@ -1193,8 +1287,48 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
                 "qa_status": qa_status_by_path.get(resolved_md, "PASS"),
                 "auto_submitted": False,
             }
-            if args.stage_drafts and prog_handle != "generic":
-                porter = HackerOnePorter(output_dir=str(cycle_dir / "hackerone_drafts"), workspace_root=RFCHUNT_ROOT)
+            effective_stage_drafts = bool(args.stage_drafts) and not bool(getattr(args, "no_stage_drafts", False))
+            if effective_stage_drafts and prog_handle != "generic":
+                dup_remote = (
+                    dedup_db.find_duplicate(
+                        prog_handle,
+                        fingerprint=str(d_item.get("fingerprint") or ""),
+                        title=entry["title"],
+                        file_path=str(d_item.get("file_path") or ""),
+                        rule_id=str(d_item.get("source_rule_id") or ""),
+                        cwe=str(d_item.get("weakness_cwe") or ""),
+                        asset_identifier=str(d_item.get("asset_identifier") or ""),
+                        staged_or_remote_only=True,
+                    )
+                    if dedup_db is not None
+                    else None
+                )
+                if dup_remote is not None:
+                    matched_ref = str(
+                        dup_remote.get("matched_remote_report_id")
+                        or dup_remote.get("matched_draft_id")
+                        or dup_remote.get("matched_fingerprint")
+                        or ""
+                    )
+                    if dedup_db is not None:
+                        dedup_db.record_dedup_event(
+                            "stage_skipped",
+                            prog_handle,
+                            entry["title"],
+                            matched_id=matched_ref,
+                            reason=str(dup_remote.get("reason") or ""),
+                        )
+                    entry["stage_status"] = f"skipped_duplicate:{dup_remote['reason']}:{matched_ref}"
+                    if dup_remote.get("matched_url"):
+                        entry["draft_url"] = str(dup_remote["matched_url"])
+                    continue
+
+                porter = HackerOnePorter(
+                    output_dir=str(cycle_dir / "hackerone_drafts"),
+                    workspace_root=RFCHUNT_ROOT,
+                    ledger_path=shared_ledger_path,
+                    dedup_db=dedup_db,
+                )
                 camp, _ = porter.resolve_campaign(program_handle=prog_handle, dry_run=args.dry_run)
                 from engine.hackerone_porter import HackerOneReportDraft
 
@@ -1226,6 +1360,26 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
                 staged_browser_drafts.append(stage_res)
                 entry["draft_url"] = str(stage_res.get("draft_url") or entry["submit_url"])
                 entry["stage_status"] = str(stage_res.get("status") or "")
+                if not args.dry_run and entry["stage_status"] in (
+                    "draft_saved_ready_for_submit_click",
+                    "form_prefilled_ready_for_submit_click",
+                ):
+                    porter._save_ledger_record(draft_obj, delivery_mode="browser_staged")
+                    if dedup_db is not None:
+                        dedup_db.record_drafted_finding(
+                            fingerprint=draft_obj.fingerprint,
+                            program=prog_handle,
+                            draft_id=draft_obj.draft_id,
+                            title=draft_obj.title,
+                            asset_identifier=draft_obj.asset_identifier,
+                            file_path=str(d_item.get("file_path") or ""),
+                            rule_id=draft_obj.source_rule_id,
+                            cwe=draft_obj.weakness_cwe,
+                            severity=draft_obj.severity_rating,
+                            delivery_mode="browser_staged",
+                            draft_url=entry["draft_url"],
+                            markdown_path=md_p,
+                        )
             ready_to_click_submit.append(entry)
 
     # Stage 5B: Headless Cooldown / Draft Submission Readiness Check (`check-drafts`)
@@ -1263,7 +1417,17 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
     critical_violations = [
         v for item in draft_violations for v in item["violations"] if v.get("severity") == "CRITICAL"
     ]
-    failed_steps = [s["label"] for s in steps if s.get("status") not in ("ok", "dry_run_planned", "skipped_ineligible")]
+    failed_steps = [
+        s["label"]
+        for s in steps
+        if s.get("status") not in ("ok", "dry_run_planned", "skipped_ineligible", "skipped_already_processed")
+    ]
+
+    dedup_summary = (
+        dedup_db.summary_counts()
+        if dedup_db is not None
+        else {"db_path": str(dedup_db_path), "dry_run": True}
+    )
 
     summary: dict[str, Any] = {
         "schema": "rfchunt.autonomous_hunt_cycle.v1",
@@ -1274,6 +1438,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
         "browser_used": bool(staged_browser_drafts) or bool(browser_hunt_session.get("browser_launched")),
         "browser_hunt_enabled": bool(browser_hunt_active),
         "browser_hunt_session": browser_hunt_session,
+        "dedup_db": dedup_summary,
         "swarm_enabled": swarm_enabled,
         "swarm_workers": eff_swarm_workers,
         "auto_submit_forbidden": True,
@@ -1469,6 +1634,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Prefill & save QA-verified drafts in HugOS Browser CDP (:9222) or persistent Chromium profile (NEVER clicks Submit).",
+    )
+    p.add_argument(
+        "--no-stage-drafts",
+        action="store_true",
+        default=False,
+        help="Do not open /reports/new or save drafts on HackerOne; write local Markdown & SQLite dedup records only.",
+    )
+    p.add_argument(
+        "--dedup-db",
+        default=None,
+        help="SQLite WAL database path storing processed target commit SHAs and drafted/submitted findings to prevent duplicates (default: <out>/hunt_state.sqlite3).",
+    )
+    p.add_argument(
+        "--force-rescan",
+        action="store_true",
+        default=False,
+        help="Re-scan targets even if their current git commit SHA / folder digest is already recorded in SQLite (duplicate drafts remain blocked).",
     )
     p.add_argument(
         "--cdp-url",

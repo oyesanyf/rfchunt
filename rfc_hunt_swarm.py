@@ -5507,6 +5507,12 @@ def build_autonomous_hunt_argv(args, raw_argv: Optional[List[str]] = None) -> Li
         hunt_argv.append("--swarm")
     if getattr(args, "swarm_workers", None) is not None:
         hunt_argv.extend(["--swarm-workers", str(max(1, int(args.swarm_workers)))])
+    if getattr(args, "dedup_db", None):
+        hunt_argv.extend(["--dedup-db", str(args.dedup_db)])
+    if getattr(args, "force_rescan", False):
+        hunt_argv.append("--force-rescan")
+    if getattr(args, "no_stage_drafts", False):
+        hunt_argv.append("--no-stage-drafts")
     if getattr(args, "headless_only", False):
         hunt_argv.append("--headless-only")
     if getattr(args, "embedded", False):
@@ -8822,6 +8828,9 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--cdp-url", dest="cdp_url", type=str, default=None, help="Attach --hunt to an already-signed-in Chrome or HugOS Browser CDP endpoint (e.g. http://127.0.0.1:9222)")
     parser.add_argument("--login-timeout", dest="login_timeout", type=float, default=300.0, help="Maximum seconds --hunt waits for you to complete login, 2FA, and any CAPTCHA directly in the browser (default: 300.0)")
     parser.add_argument("--probe-report-id", dest="probe_report_id", type=int, default=4243972, help="HackerOne report ID probed read-only during --hunt to check live account cooldown (`can_submit_draft?`, default: 4243972)")
+    parser.add_argument("--dedup-db", dest="dedup_db", type=str, default=None, help="SQLite WAL database path persisting processed target SHAs and drafted/submitted findings to eliminate duplicates (default: <out>/hunt_state.sqlite3)")
+    parser.add_argument("--force-rescan", dest="force_rescan", action="store_true", default=False, help="Re-scan targets during --hunt even if their current commit SHA or folder digest is already recorded in SQLite (duplicate drafts stay blocked)")
+    parser.add_argument("--no-stage-drafts", dest="no_stage_drafts", action="store_true", default=False, help="During --hunt, skip opening /reports/new or saving drafts on HackerOne while keeping browser discovery, scanning, and SQLite dedup active")
     parser.add_argument("--headless-only", dest="headless_only", action="store_true", default=False, help="During --hunt, skip browser login/discovery, draft staging, and Chrome launch; write READY_TO_CLICK_SUBMIT.md only")
     parser.add_argument("--allow-blocked", dest="allow_blocked", action="store_true", default=False, help="Allow Signal-blocked programs for local offline research during --hunt")
     parser.add_argument("--install-schedule", dest="install_schedule", action="store_true", default=False, help="Install recurring native OS schedule for `rfc_hunt_swarm.py --hunt --once` (zero Registry/PATH mutation)")
@@ -8845,6 +8854,9 @@ _CURATED_FLAG_EXAMPLES: Dict[str, str] = {
     "--cdp-url": "python rfc_hunt_swarm.py --hunt --cdp-url http://127.0.0.1:9222 --dry-run",
     "--login-timeout": "python rfc_hunt_swarm.py --hunt --login-timeout 180 --dry-run",
     "--probe-report-id": "python rfc_hunt_swarm.py --hunt --probe-report-id 4243972 --dry-run",
+    "--dedup-db": "python rfc_hunt_swarm.py --hunt --dedup-db out/autonomous_hunt/hunt_state.sqlite3 --dry-run",
+    "--force-rescan": "python rfc_hunt_swarm.py --hunt --repo ./target_repo --force-rescan --once --dry-run",
+    "--no-stage-drafts": "python rfc_hunt_swarm.py --hunt --hunt-url https://hackerone.com/anthropic --no-stage-drafts --once --dry-run",
     "--hunt-target": "python rfc_hunt_swarm.py --hunt --hunt-target ./target_repo --program common_codes --once --dry-run",
     "--hunt-repo": "python rfc_hunt_swarm.py --hunt --hunt-repo Shopify/shopify-app-js --once --dry-run",
     "--clone-unlocked": "python rfc_hunt_swarm.py --hunt --repo ./my_repo --folder ./my_folder --clone-unlocked --dry-run",

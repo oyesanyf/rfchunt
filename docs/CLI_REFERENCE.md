@@ -17,6 +17,10 @@
 
 ---
 
+## Complete Table of CLI Flags (100% Coverage with Runnable Examples)
+
+> Every flag registered on `rfc_hunt_swarm.py` includes a concrete CLI example both here and in `python rfc_hunt_swarm.py --help`.
+
 | Flag(s) | Type | Default | Description | Example |
 | :--- | :--- | :--- | :--- | :--- |
 | `--rfc` | string | `9112` | Specific RFC ID to analyze (e.g. 9112 or MCP) | `python rfc_hunt_swarm.py --all --repo . --rfc 9112` |
@@ -360,6 +364,9 @@
 | `--cdp-url` | string | `None` | Attach --hunt to an already-signed-in Chrome or HugOS Browser CDP endpoint (e.g. http://127.0.0.1:9222) | `python rfc_hunt_swarm.py --hunt --cdp-url http://127.0.0.1:9222 --dry-run` |
 | `--login-timeout` | float | `300.0` | Maximum seconds --hunt waits for you to complete login, 2FA, and any CAPTCHA directly in the browser (default: 300.0) | `python rfc_hunt_swarm.py --hunt --login-timeout 180 --dry-run` |
 | `--probe-report-id` | int | `4243972` | HackerOne report ID probed read-only during --hunt to check live account cooldown (`can_submit_draft?`, default: 4243972) | `python rfc_hunt_swarm.py --hunt --probe-report-id 4243972 --dry-run` |
+| `--dedup-db` | string | `None` | SQLite WAL database path persisting processed target SHAs and drafted/submitted findings to eliminate duplicates (default: <out>/hunt_state.sqlite3) | `python rfc_hunt_swarm.py --hunt --dedup-db out/autonomous_hunt/hunt_state.sqlite3 --dry-run` |
+| `--force-rescan` | flag | `False` | Re-scan targets during --hunt even if their current commit SHA or folder digest is already recorded in SQLite (duplicate drafts stay blocked) | `python rfc_hunt_swarm.py --hunt --repo ./target_repo --force-rescan --once --dry-run` |
+| `--no-stage-drafts` | flag | `False` | During --hunt, skip opening /reports/new or saving drafts on HackerOne while keeping browser discovery, scanning, and SQLite dedup active | `python rfc_hunt_swarm.py --hunt --hunt-url https://hackerone.com/anthropic --no-stage-drafts --once --dry-run` |
 | `--headless-only` | flag | `False` | During --hunt, skip browser login/discovery, draft staging, and Chrome launch; write READY_TO_CLICK_SUBMIT.md only | `python rfc_hunt_swarm.py --hunt --once --headless-only --embedded` |
 | `--allow-blocked` | flag | `False` | Allow Signal-blocked programs for local offline research during --hunt | `python rfc_hunt_swarm.py --hunt --target ./repo --program shopify --allow-blocked --once --dry-run` |
 | `--install-schedule` | flag | `False` | Install recurring native OS schedule for `rfc_hunt_swarm.py --hunt --once` (zero Registry/PATH mutation) | `python rfc_hunt_swarm.py --hunt --install-schedule --interval-minutes 60 --dry-run` |
