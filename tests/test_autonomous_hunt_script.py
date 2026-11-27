@@ -310,6 +310,60 @@ def test_rfc_hunt_swarm_master_cli_hunt_dry_run_and_embedded_cycle(tmp_path: Pat
     dry_payload = json.loads(proc.stdout)
     assert dry_payload["dry_run"] is True
     assert dry_payload["auto_submit_forbidden"] is True
+    planned_cmds = [s.get("command") or [] for s in (dry_payload.get("steps") or []) if s.get("command")]
+    assert planned_cmds and all("rfc_hunt_swarm.py" in str(cmd[1]) for cmd in planned_cmds if len(cmd) > 1)
+
+    # 2b. Live standalone 3-Stage Parallel OODA Funnel via master CLI (`--fast-ooda`) and `--all --fast-ooda --start-modelfusion --dry-run`
+    ooda_out = tmp_path / "swarm_fast_ooda_out"
+    proc_ooda = subprocess.run(
+        [
+            sys.executable,
+            str(swarm_script),
+            "--fast-ooda",
+            "--repo",
+            str(repo_dir),
+            "--program",
+            "generic",
+            "--embedded",
+            "--no-llm",
+            "--blackboard-db",
+            str(tmp_path / "ooda_bb.sqlite3"),
+            "--out",
+            str(ooda_out),
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+        check=False,
+    )
+    assert proc_ooda.returncode == 0, f"stderr={proc_ooda.stderr}\nstdout={proc_ooda.stdout}"
+    ooda_doc = json.loads(proc_ooda.stdout)
+    assert ooda_doc["status"] == "completed"
+    assert "stage1" in ooda_doc and "stage2" in ooda_doc and "stage3" in ooda_doc
+    assert (ooda_out / "fast_ooda_report.json").is_file()
+
+    proc_combo_dry = subprocess.run(
+        [
+            sys.executable,
+            str(swarm_script),
+            "--all",
+            "--fast-ooda",
+            "--start-modelfusion",
+            "--repo",
+            str(repo_dir),
+            "--dry-run",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=90,
+        check=False,
+    )
+    assert proc_combo_dry.returncode == 0, f"stderr={proc_combo_dry.stderr}\nstdout={proc_combo_dry.stdout}"
+    assert json.loads(proc_combo_dry.stdout).get("dry_run") is True
 
     # 3. Live embedded single cycle via `rfc_hunt_swarm.py --hunt --once --embedded --headless-only`
     emb_out = tmp_path / "swarm_hunt_emb"

@@ -560,7 +560,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
     if getattr(args, "sync_public_directory", False) and not args.embedded:
         sync_cmd = [
             sys.executable,
-            str(RFCHUNT_ROOT / "revenue_cli.py"),
+            str(RFCHUNT_ROOT / "rfc_hunt_swarm.py"),
             "sync-directory",
             "--public-directory",
             "--min-efficiency",
@@ -588,7 +588,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
         if args.dry_run:
             rank_cmd = [
                 sys.executable,
-                str(RFCHUNT_ROOT / "revenue_cli.py"),
+                str(RFCHUNT_ROOT / "rfc_hunt_swarm.py"),
                 "rank-programs",
                 "--min-efficiency",
                 str(getattr(args, "min_efficiency", 80.0)),
@@ -635,7 +635,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
     if not args.skip_freshness and not args.embedded:
         fresh_cmd = [
             sys.executable,
-            str(RFCHUNT_ROOT / "revenue_cli.py"),
+            str(RFCHUNT_ROOT / "rfc_hunt_swarm.py"),
             "freshness-watch",
             "--hours",
             str(args.freshness_hours),
@@ -741,7 +741,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
         # Stage 2: Fast 3-Stage OODA Funnel (Loop 3 + Loop 4 Auto-PoC Gate; zero browser)
         ooda_cmd = [
             sys.executable,
-            str(RFCHUNT_ROOT / "revenue_cli.py"),
+            str(RFCHUNT_ROOT / "rfc_hunt_swarm.py"),
             "fast-ooda",
             "--target",
             str(target_dir),
@@ -783,7 +783,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
             sarif_path = t_out / "ensemble_audit" / "results.sarif"
             ens_cmd = [
                 sys.executable,
-                str(RFCHUNT_ROOT / "revenue_cli.py"),
+                str(RFCHUNT_ROOT / "rfc_hunt_swarm.py"),
                 "ensemble-audit",
                 "--target",
                 str(target_dir),
@@ -855,7 +855,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
 
     # Stage 4: Lean 4 Formal Proof Kernel Verification
     if not args.skip_lean:
-        lean_cmd = [sys.executable, str(RFCHUNT_ROOT / "revenue_cli.py"), "lean-verify"]
+        lean_cmd = [sys.executable, str(RFCHUNT_ROOT / "rfc_hunt_swarm.py"), "lean-verify"]
         steps.append(
             run_step(
                 "stage4_lean_verify",
@@ -912,7 +912,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
             if not args.skip_qa_drafts:
                 qa_cmd = [
                     sys.executable,
-                    str(RFCHUNT_ROOT / "revenue_cli.py"),
+                    str(RFCHUNT_ROOT / "rfc_hunt_swarm.py"),
                     "qa-drafts",
                     "--markdown-file",
                     str(md_path),
@@ -1009,7 +1009,7 @@ def execute_hunt_cycle(args: argparse.Namespace, cycle_num: int) -> dict[str, An
     if not args.skip_check_drafts:
         chk_cmd = [
             sys.executable,
-            str(RFCHUNT_ROOT / "revenue_cli.py"),
+            str(RFCHUNT_ROOT / "rfc_hunt_swarm.py"),
             "check-drafts",
             "--out-md",
             str(out_root / "drafts_ready_to_submit.md"),

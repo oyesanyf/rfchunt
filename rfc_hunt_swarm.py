@@ -5525,6 +5525,76 @@ def cmd_autonomous_hunt(args, raw_argv: Optional[List[str]] = None) -> int:
     return int(_turnkey_hunt.main(hunt_argv))
 
 
+def cmd_fast_ooda(args) -> int:
+    """
+    Runs the 3-Stage Parallel OODA Funnel directly from `rfc_hunt_swarm.py --fast-ooda`:
+      Stage 1 (CPU / ms, zero LLM): deterministic static/formal checks via SQLite WAL Blackboard
+      Stage 2 (ACDSO Pareto AutoML, <1s): multi-objective Pareto + anomaly ranking
+      Stage 3 (Abliterated Consensus + HITL): VRAM-gated specialist panel behind OllamaConcurrencyGuard
+    """
+    import json as _ooda_json
+    from engine.ensemble_orchestrator import EnsembleOrchestrator
+    from engine.program_eligibility_db import ProgramEligibilityDB
+
+    target_str = str(
+        getattr(args, "repo", None)
+        or getattr(args, "path", None)
+        or getattr(args, "target_arg", None)
+        or "."
+    )
+    as_json = bool(getattr(args, "as_json", False))
+    embedded = bool(getattr(args, "embedded", False))
+    no_llm = bool(getattr(args, "no_llm", False))
+    cpu_workers_arg = getattr(args, "cpu_workers", None)
+    bb_db = str(getattr(args, "blackboard_db", None) or "reports/ensemble_hunt/blackboard.sqlite3")
+    raw_out = getattr(args, "out", None)
+    out_dir = str(raw_out if (raw_out and str(raw_out) != "reports") else (getattr(args, "output_dir", None) or "out/fast_ooda"))
+    program = str(getattr(args, "program", "generic") or "generic")
+    raw_model = getattr(args, "model", None)
+    eff_model = None if raw_model == "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M" else raw_model
+
+    orch = EnsembleOrchestrator(
+        program=program,
+        embedded=embedded,
+        model=eff_model,
+        enable_llm_verify=(not no_llm and not embedded),
+        max_workers=(max(1, int(cpu_workers_arg)) if cpu_workers_arg else 4),
+    )
+    elig_db_raw = getattr(args, "eligibility_db", None) or os.environ.get("RFCHUNT_ELIGIBILITY_DB")
+    elig_db = (
+        ProgramEligibilityDB(str(elig_db_raw).strip())
+        if elig_db_raw and str(elig_db_raw).strip()
+        else None
+    )
+    _ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+    with _ctx:
+        res = orch.run_fast_parallel_ooda(
+            target_str,
+            program=program,
+            blackboard_db=bb_db,
+            max_cpu_workers=cpu_workers_arg,
+            resume=bool(getattr(args, "resume", False)),
+            signal_score=float(getattr(args, "signal_score", 0.0) or 0.0),
+            eligibility_db=elig_db,
+            out_dir=out_dir,
+            trigger_browser=False,
+        )
+    out_p = Path(out_dir)
+    out_p.mkdir(parents=True, exist_ok=True)
+    (out_p / "fast_ooda_report.json").write_text(_ooda_json.dumps(res, indent=2, default=str), encoding="utf-8")
+    if as_json:
+        print(_ooda_json.dumps(res, indent=2, default=str))
+    else:
+        s1 = res.get("stage1") if isinstance(res.get("stage1"), dict) else {}
+        s2 = res.get("stage2") if isinstance(res.get("stage2"), dict) else {}
+        print(
+            f"[+] 3-Stage Parallel OODA complete ({res.get('status', 'completed')}): "
+            f"stage1_prod={s1.get('production_count', 0)}, noise_dropped={s1.get('noise_dropped', 0)}, "
+            f"stage2_selected={len(s2.get('selected') or [])}, clusters={len(res.get('clusters') or [])} -> {out_dir}"
+        )
+    return 0
+
+
 def cmd_all(args):
     """
     Unified --all orchestrator running Google Mantis, haasonsaas/aiscan, BaaRai/ARTEX Dual-Graph,
@@ -6105,6 +6175,54 @@ def cmd_all(args):
                         "status": "degraded_error",
                         "error": str(_ext_tools_exc),
                     }
+
+        if getattr(args, "enable_fast_ooda", False) and (repo or path):
+            _ooda_target = str(repo or path)
+            if os.path.isdir(_ooda_target):
+                try:
+                    import json as _ooda_all_json
+                    from engine.ensemble_orchestrator import EnsembleOrchestrator
+                    from engine.program_eligibility_db import ProgramEligibilityDB
+
+                    _ooda_emb = bool(getattr(args, "embedded", False))
+                    _ooda_llm = (not bool(getattr(args, "no_llm", False))) and (not _ooda_emb)
+                    _ooda_cpu = getattr(args, "cpu_workers", None)
+                    _ooda_orch = EnsembleOrchestrator(
+                        program=str(getattr(args, "program", "generic") or "generic"),
+                        embedded=_ooda_emb,
+                        enable_llm_verify=_ooda_llm,
+                        max_workers=(max(1, int(_ooda_cpu)) if _ooda_cpu else 4),
+                    )
+                    _elig_p = getattr(args, "eligibility_db", None) or os.environ.get("RFCHUNT_ELIGIBILITY_DB")
+                    _elig_obj = ProgramEligibilityDB(str(_elig_p).strip()) if _elig_p and str(_elig_p).strip() else None
+                    _ooda_out = Path(str(reports_dir)) / "fast_ooda"
+                    _ooda_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+                    with _ooda_ctx:
+                        _ooda_res = _ooda_orch.run_fast_parallel_ooda(
+                            _ooda_target,
+                            program=str(getattr(args, "program", "generic") or "generic"),
+                            blackboard_db=str(getattr(args, "blackboard_db", None) or (Path(str(reports_dir)) / "blackboard.sqlite3")),
+                            max_cpu_workers=_ooda_cpu,
+                            resume=bool(getattr(args, "resume", False)),
+                            signal_score=float(getattr(args, "signal_score", 0.0) or 0.0),
+                            eligibility_db=_elig_obj,
+                            out_dir=_ooda_out,
+                            trigger_browser=False,
+                        )
+                    _ooda_out.mkdir(parents=True, exist_ok=True)
+                    (_ooda_out / "fast_ooda_report.json").write_text(
+                        _ooda_all_json.dumps(_ooda_res, indent=2, default=str), encoding="utf-8"
+                    )
+                    res["fast_ooda"] = _ooda_res
+                    res.setdefault("engines", {})["fast_ooda"] = {
+                        "status": _ooda_res.get("status", "completed"),
+                        "stage1_production_count": _ooda_res.get("stage1_production_count", 0),
+                        "stage1_dropped_noise_count": _ooda_res.get("stage1_dropped_noise_count", 0),
+                        "stage2_selected_count": len((_ooda_res.get("stage2") or {}).get("selected") or []),
+                        "clusters_count": len(_ooda_res.get("clusters") or []),
+                    }
+                except Exception as _ooda_exc:
+                    res.setdefault("engines", {})["fast_ooda"] = {"status": "error", "error": str(_ooda_exc)}
 
         if hasattr(db, "add_fact"):
             try:
@@ -8159,6 +8277,22 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
    docker-doctor [--fix] [--include-all-wsl]
                             Windows Docker Desktop & WSL2 NTFS-compression VHDX diagnostic and self-healing repair
                             Example: python -u rfc_hunt_swarm.py docker-doctor --fix --include-all-wsl --plain
+
+14. UNIFIED LOCAL-FIRST RFCHUNT + MODELFUSION SINGLE-FILE ARCHITECTURE (--hunt, --all, --ensemble, --fast-ooda):
+   --start-modelfusion      Auto-start local ModelFusion (:5000) with VRAM-gated abliterated open-weight models
+                            (Gemma-4-12B, Foundation-Sec-8B, GLM, DeepSeek-R1-8B) + Anti-Junk & Grounding Guards.
+   --fast-ooda              3-Stage Parallel OODA Funnel: Stage 1 (CPU/ms SQLite WAL Blackboard, Lean 4/Z3, AST) ->
+                            Stage 2 (ACDSO 5/6-Objective Pareto AutoML <1s) -> Stage 3 (Abliterated Consensus + HITL).
+   --all / --ensemble       Regular pentest mode (without --hunt): runs Mantis, aiscan, ARTEX, RAPTOR, REA, PE/.NET,
+                            TruffleHog, Mobile/MobSF, API/JWT/SD-JWT, AI Infra Guard, Parity/Invariants, Zizmor/Actionlint/GHA,
+                            Z3 Formal, JS Bundle Analyzer + Recon Clustering, Lean 4 Formal Proofs, ACDSO Stage-2 Pareto,
+                            Strict 3-Lane Evidence Separation, RFC 6962 Merkle proofs, SARIF 2.1.0 / Nuclei / Snort 3 & --phi.
+   --hunt                   Turnkey autonomous bug bounty pipeline (+ --dry-run, --sync-public-directory, --once,
+                            --headless-only, --embedded, --no-llm, --install-schedule; HITL draft-only, never auto-submits).
+   Subcommands (all runnable directly via `python rfc_hunt_swarm.py <subcommand>`):
+                            freshness-watch, fast-ooda, ensemble-audit, lean-verify, rank-programs, sync-directory,
+                            analyze-js, cluster-recon, qa-drafts, check-drafts, atlas-llm-eval, linux-poc,
+                            package-audit, record-outcome, mcp, bugbounty-mcp.
 ===============================================================================
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -8555,6 +8689,12 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--no-llm", dest="no_llm", action="store_true", default=False, help="Disable optional LLM semantic verification layer in --ensemble")
     parser.add_argument("--gha-only", dest="gha_only", action="store_true", default=False, help="Restrict --ensemble local engine fan-out to GitHub Actions workflow scanners")
     parser.add_argument("--package-client", dest="package_client", type=str, default=None, help="Optional client organization name to emit 5-file ClientAuditPackager bundle in --ensemble")
+    parser.add_argument("--start-modelfusion", dest="start_modelfusion", action="store_true", default=False, help="Auto-start local ModelFusion (:5000) server with VRAM-gated abliterated open-weight models and Anti-Junk & Grounding Guards before scanning")
+    parser.add_argument("--fast-ooda", dest="enable_fast_ooda", action="store_true", default=False, help="Run the 3-Stage Parallel OODA Funnel (Stage 1 CPU SQLite WAL Blackboard -> Stage 2 ACDSO Pareto AutoML -> Stage 3 Abliterated Consensus behind OllamaConcurrencyGuard) standalone or chained into --all")
+    parser.add_argument("--cpu-workers", dest="cpu_workers", type=int, default=None, help="Bounded ProcessPoolExecutor CPU workers for --fast-ooda / --ensemble (default: clamped 2..8)")
+    parser.add_argument("--blackboard-db", dest="blackboard_db", type=str, default=None, help="SQLite WAL Blackboard database path for --fast-ooda / --ensemble")
+    parser.add_argument("--resume", dest="resume", action="store_true", default=False, help="Recover stale IN_PROGRESS intents from SQLite WAL Blackboard before running --fast-ooda / --ensemble")
+    parser.add_argument("--signal-score", dest="signal_score", type=float, default=0.0, help="HackerOne Signal score for two-lane scheduling in --fast-ooda / --hunt (default: 0.0)")
 
     # Turnkey Autonomous Bug Bounty Hunter (--hunt) — unified into rfc_hunt_swarm.py (regular pentests run unchanged without --hunt)
     parser.add_argument("--hunt", dest="enable_autonomous_hunt", action="store_true", default=False, help="Run the turnkey autonomous RFCHunt + ModelFusion bug bounty pipeline (syncs directory, ranks unlocked programs via ACDSO ML, runs freshness-watch, fast-ooda, ensemble-audit, Lean 4, QA-drafts & HITL Chrome handoff; omit for regular pentesting)")
@@ -8977,6 +9117,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "deep_audit", "proxy_target", "live_proxy_fuzz", "trust_boundary_review",
             "coverage_fuzz", "enable_poc", "enable_phi", "enable_hackerone", "hackerone_auto",
             "serve_ui", "network_lifecycle", "dry_run", "enable_pe_audit", "enable_autonomous_hunt",
+            "enable_fast_ooda", "start_modelfusion",
         )
     ) and getattr(args, "hint", None) is None and not getattr(args, "dispatch", None):
         build_swarm_parser().print_help()
@@ -9074,6 +9215,28 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             cmd_phi(args)
             return
         cmd_dry_run_plan(args, active_mode=active_mode, raw_argv=raw_argv)
+        return
+
+    # Optional ModelFusion (:5000) local server bootstrap when --start-modelfusion is requested (zero side effects on --dry-run)
+    if getattr(args, "start_modelfusion", False) and not getattr(args, "embedded", False):
+        try:
+            from scripts.autonomous_hunt import ensure_modelfusion_running
+
+            _mf_info = ensure_modelfusion_running(dry_run=False)
+            if not getattr(args, "as_json", False):
+                print(
+                    f"[*] ModelFusion (:5000): status={_mf_info.get('status')} "
+                    f"endpoint={_mf_info.get('endpoint')}"
+                )
+        except Exception as _mf_exc:
+            if not getattr(args, "as_json", False):
+                print(f"[!] ModelFusion auto-start fallback to Ollama: {_mf_exc}")
+
+    # Standalone 3-Stage Parallel OODA Funnel (--fast-ooda without --all)
+    if getattr(args, "enable_fast_ooda", False) and not getattr(args, "run_all_scans", False):
+        _ooda_rc = cmd_fast_ooda(args)
+        if _ooda_rc != 0:
+            sys.exit(_ooda_rc)
         return
 
     if active_mode == "setup":
@@ -10152,6 +10315,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
 if __name__ == "__main__":
     _cli_argv = sys.argv[1:]
     _has_hunt_flag = any(t == "--hunt" for t in _cli_argv)
+    _has_fast_ooda_flag = any(t == "--fast-ooda" for t in _cli_argv)
     _has_embedded = any(t in ("--embedded", "--embeded") for t in _cli_argv)
     _has_all_flag = (
         any(t in ("--all", "--run-all", "--all-scans", "all", "all_scans") for t in _cli_argv)
@@ -10163,7 +10327,7 @@ if __name__ == "__main__":
             for idx in range(len(_cli_argv))
         )
     )
-    if not _has_hunt_flag:
+    if not _has_hunt_flag and not _has_fast_ooda_flag:
         from revenue_cli import REVENUE_SUBCOMMANDS, maybe_dispatch_revenue_cli
 
         _is_rev_subcmd = bool(_cli_argv) and (_cli_argv[0] in REVENUE_SUBCOMMANDS)

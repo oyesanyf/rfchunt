@@ -854,10 +854,11 @@ python rfc_hunt_swarm.py --hunt --sync-public-directory --dry-run
 python rfc_hunt_swarm.py --hunt --sync-public-directory --once
 python rfc_hunt_swarm.py --hunt --target D:\path\to\repo --program common_codes --once --headless-only
 
-# Regular Pentest (without --hunt) — --all and --all --ensemble automatically invoke ALL local tools + JS Bundle + ACDSO:
+# Regular Pentest (without --hunt) — --all, --ensemble & --fast-ooda run ALL tools + ModelFusion + ACDSO + Lean 4/Z3:
 python rfc_hunt_swarm.py --all --repo D:\path\to\repo --dry-run
-python rfc_hunt_swarm.py --all --repo D:\path\to\repo
-python rfc_hunt_swarm.py --all --ensemble --repo D:\path\to\repo --program generic
+python rfc_hunt_swarm.py --all --repo D:\path\to\repo --start-modelfusion
+python rfc_hunt_swarm.py --all --ensemble --fast-ooda --repo D:\path\to\repo --program generic
+python rfc_hunt_swarm.py --fast-ooda --repo D:\path\to\repo --embedded --json
 
 # 1. Rank unlocked public HackerOne programs and compute the daily Lane 1/Lane 2 hunt portfolio:
 python rfc_hunt_swarm.py rank-programs --min-efficiency 80 --capacity 6 --budget-minutes 120 --json
