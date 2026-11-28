@@ -3995,6 +3995,17 @@ def cmd_dry_run_plan(
             if getattr(args, "hackerone_auto", False)
             else "HackerOnePorter(HITL)"
         )
+    if getattr(args, "enable_strix", False):
+        try:
+            from engine.ensemble_orchestrator import RuntimeCapabilityProbe, StrixAdapter
+
+            _strix_caps = RuntimeCapabilityProbe.probe(allow_daemon_probes=False)
+            _strix_eval = StrixAdapter.evaluate_resources(capabilities=_strix_caps)
+            planned_modules.append(
+                f"StrixAgent(mode={getattr(args, 'strix_mode', 'quick')}|eligible={_strix_eval['eligible']}|reasons={','.join(_strix_eval['reasons']) or 'ok'})"
+            )
+        except Exception:
+            planned_modules.append("StrixAgent(resource_gated)")
     if getattr(args, "serve_ui", False):
         planned_modules.append(f"MissionControlServer({getattr(args, 'ui_host', '127.0.0.1')}:{getattr(args, 'ui_port', 8789)})")
     if not planned_modules:
@@ -5059,6 +5070,10 @@ def cmd_ensemble(args: Any) -> Dict[str, Any]:
         enable_pyrit_eval=bool(getattr(args, "enable_pyrit_eval", False)),
         enable_codex_review=bool(getattr(args, "enable_codex_review", False)),
         enable_codeql=not bool(getattr(args, "no_codeql", False)),
+        enable_strix=bool(getattr(args, "enable_strix", False)),
+        strix_mode=str(getattr(args, "strix_mode", "quick") or "quick"),
+        strix_instruction=getattr(args, "strix_instruction", None),
+        authorized=bool(getattr(args, "authorized", False)),
         enable_cloudflare_audit=not bool(getattr(args, "no_cloudflare_audit", False)),
         enable_compliance_map=not bool(getattr(args, "no_compliance_map", False)),
         hybrid_panel=bool(getattr(args, "hybrid_panel", False)),
@@ -7876,6 +7891,9 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--diff-review", dest="enable_diff_review", action="store_true", default=False, help="Opt-in git diff security review (Claude CLI / local Ollama MIT rubric)")
     parser.add_argument("--codex-review", dest="enable_codex_review", action="store_true", default=False, help="Opt-in OpenAI Codex / OpenAI-compatible security review adapter")
     parser.add_argument("--pyrit-eval", dest="enable_pyrit_eval", action="store_true", default=False, help="Opt-in defensive loopback/local LLM prompt-safety evaluation hook (MIT PyRIT)")
+    parser.add_argument("--strix", "--enable-strix", dest="enable_strix", action="store_true", default=False, help="Opt-in resource-gated Strix autonomous security agent (usestrix/strix); runs ONLY when host has Docker + >=12GB total RAM + >=4GB free RAM + >=4 CPUs + >=10GB free disk (and --authorized for remote targets)")
+    parser.add_argument("--strix-mode", dest="strix_mode", choices=["quick", "standard", "deep"], default="quick", help="Strix scan mode when --strix is enabled and host resources qualify (default: quick)")
+    parser.add_argument("--strix-instruction", dest="strix_instruction", type=str, default=None, help="Optional scope/focus instruction forwarded to Strix CLI")
     parser.add_argument("--panel-models", dest="panel_models", type=str, default=None, help="Comma-separated arbitrary N-model panel for ModelFusion voting (supports ollama/<tag> mixed with cloud providers)")
     parser.add_argument("--fusion-quorum", dest="fusion_quorum", type=float, default=0.5, help="Quorum threshold (0.34..1.0) for N-model majority consensus in ModelFusion (default: 0.5)")
     parser.add_argument("--hybrid-panel", dest="hybrid_panel", action="store_true", default=False, help="Enable hybrid local Ollama + .env.local cloud ModelFusion panel routing")

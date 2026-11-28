@@ -56,6 +56,88 @@ def is_embedding_model(tag: str) -> bool:
     return any(marker in low for marker in EMBEDDING_MODEL_MARKERS)
 
 
+def get_total_memory_gb() -> float:
+    """Evaluates total physical system RAM in GB across Windows, Linux, and macOS."""
+    try:
+        if os.name == "nt":
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return float(stat.ullTotalPhys) / (1024 ** 3)
+        elif os.path.isfile("/proc/meminfo"):
+            with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        kb = int(line.split()[1])
+                        return float(kb) / (1024 ** 2)
+    except Exception:
+        pass
+    try:
+        import psutil  # type: ignore[import-untyped]
+
+        return float(psutil.virtual_memory().total) / (1024 ** 3)
+    except Exception:
+        pass
+    if sys.platform == "darwin":
+        try:
+            proc = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"],
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=HEALTH_PROBE_MAX_TIMEOUT_SEC,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip().isdigit():
+                return float(int(proc.stdout.strip())) / (1024 ** 3)
+        except Exception:
+            pass
+    return 8.0
+
+
+def get_runtime_system_resources(
+    path: str = ".",
+    *,
+    allow_in_tests: bool = False,
+) -> Dict[str, float]:
+    """
+    Calculates live available host resources (mirroring ModelFusion's memory sizing):
+    `total_ram_gb`, `free_ram_gb`, `free_vram_mb`, `cpu_count`, and `free_disk_gb`.
+    Used by resource-gated integrations (such as Docker-backed Strix) so any user
+    cloning RFCHunt from GitHub automatically enables or skips heavy engines safely.
+    """
+    free_ram, free_vram = get_runtime_free_memory(allow_in_tests=allow_in_tests)
+    total_ram = get_total_memory_gb()
+    cpus = int(os.cpu_count() or 1)
+    free_disk_gb = 0.0
+    try:
+        usage = shutil.disk_usage(path if os.path.exists(path) else ".")
+        free_disk_gb = float(usage.free) / (1024 ** 3)
+    except OSError:
+        free_disk_gb = 0.0
+    return {
+        "total_ram_gb": round(float(total_ram), 2),
+        "free_ram_gb": round(float(free_ram), 2),
+        "free_vram_mb": round(float(free_vram), 1),
+        "cpu_count": cpus,
+        "free_disk_gb": round(float(free_disk_gb), 2),
+    }
+
+
 def get_free_memory_gb() -> float:
     """
     Evaluates runtime FREE/AVAILABLE system RAM in GB (NEVER total physical RAM)

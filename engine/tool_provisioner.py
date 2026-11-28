@@ -324,6 +324,14 @@ TOOL_CATALOG: Tuple[ToolSpec, ...] = (
         required_for_core=False,
         default_in_setup=False,
     ),
+    ToolSpec(
+        "strix",
+        "Strix Autonomous Security Agent (Resource-Gated Docker Opt-In)",
+        "docker",
+        "usestrix/strix Docker-sandboxed security agent; conditionally enabled only when host has Docker + >=12GB RAM (>=4GB free) + >=4 CPUs + >=10GB free disk",
+        required_for_core=False,
+        default_in_setup=False,
+    ),
 )
 
 ALL_TOOL_IDS: Tuple[str, ...] = tuple(spec.tool_id for spec in TOOL_CATALOG)
@@ -957,6 +965,31 @@ class ToolProvisioner:
                 ),
             )
 
+        if tool_id == "strix":
+            from engine.ensemble_orchestrator import StrixAdapter
+
+            strix_bin = self.find_binary("strix")
+            docker_ok = bool(shutil.which("docker") and allow_probes and self._docker_daemon_responsive())
+            res_eval = StrixAdapter.evaluate_resources(
+                docker_daemon=docker_ok,
+                strix_binary=str(strix_bin) if strix_bin else None,
+            )
+            eligible = bool(res_eval["eligible"])
+            reasons_s = ", ".join(res_eval["reasons"]) if res_eval["reasons"] else "all host resource thresholds met"
+            return ToolStatus(
+                tool_id="strix",
+                display_name=spec.display_name,
+                category=spec.category,
+                installed=bool(strix_bin and eligible),
+                path_or_source=str(strix_bin) if strix_bin else None,
+                method="binary+docker" if (strix_bin and eligible) else ("resource_gated" if not eligible else "missing"),
+                detail=(
+                    f"Strix CLI ready at {strix_bin} (Docker + resources verified: {res_eval['resources']})"
+                    if (strix_bin and eligible)
+                    else f"Conditional resource gate ({reasons_s}; cli_installed={bool(strix_bin)})"
+                ),
+            )
+
         if tool_id == "raptor":
             raptor_py = self.raptor_root / "raptor.py"
             installed = raptor_py.is_file()
@@ -1518,16 +1551,185 @@ class ToolProvisioner:
             error=(proc.stderr or proc.stdout or f"docker pull exited {proc.returncode}")[-240:],
         )
 
-    def _install_docker_scanners(self) -> ToolStatus:
+    def ensure_docker_if_resources_available(
+        self,
+        *,
+        auto_install: bool = True,
+        auto_start: bool = True,
+        resources_override: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Resource-conditional Docker auto-provisioning & self-healing startup.
+        Mirrors ModelFusion's runtime memory check:
+          - Computes live available RAM, CPU cores, and free disk via `evaluate_resource_budget("docker_runtime")`.
+          - If host resources are insufficient (e.g. <=8 GB laptop with <3 GB free RAM or <12 GB free disk),
+            skips cleanly (`status="resource_gated"`) without mutating or crashing the host.
+          - If resources ARE sufficient:
+              * If Docker daemon is already running -> returns `already_ready`.
+              * If Docker CLI is installed but stopped -> attempts safe non-destructive start
+                (`DockerWSLDoctor` on Windows, `open -a Docker` on macOS, `systemctl start docker` on Linux).
+              * If Docker CLI is absent and `auto_install=True` (online, non-test) -> attempts
+                OS-native silent install (`winget install Docker.DockerDesktop`, `brew install --cask docker`,
+                or `apt-get`/`dnf` when running as root on Linux), strictly `shell=False`.
+        """
+        from engine.ensemble_orchestrator import evaluate_resource_budget
+
         docker_bin = self._docker_available()
-        if not docker_bin or not self._docker_daemon_responsive():
+        daemon_ok = bool(docker_bin and self._docker_daemon_responsive())
+        if daemon_ok:
+            return {
+                "status": "already_ready",
+                "docker_ready": True,
+                "docker_binary": docker_bin,
+                "actions": [],
+            }
+
+        budget = evaluate_resource_budget(
+            "docker_runtime",
+            resources=resources_override,
+            docker_daemon=False,
+            target_path=str(self.repo_root),
+        )
+        if not budget["eligible"]:
+            return {
+                "status": "resource_gated",
+                "docker_ready": False,
+                "docker_binary": docker_bin,
+                "reasons": list(budget["reasons"]),
+                "resources": dict(budget["resources"]),
+                "thresholds": dict(budget["thresholds"]),
+                "actions": [],
+            }
+
+        actions: List[str] = []
+        is_test_or_offline = bool(
+            os.environ.get("RFCHUNT_OFFLINE") == "1"
+            or "PYTEST_CURRENT_TEST" in os.environ
+            or os.environ.get("CI")
+            or os.environ.get("GITHUB_ACTIONS")
+        )
+
+        # 1. Docker CLI already installed -> attempt safe startup / WSL2 doctor repair
+        if docker_bin and auto_start and not is_test_or_offline:
+            if os.name == "nt":
+                try:
+                    from engine.docker_wsl_doctor import DockerWSLDoctor
+
+                    doc = DockerWSLDoctor()
+                    rep = doc.repair_and_start(approval_mode="auto")
+                    actions.extend(rep.actions_taken)
+                except Exception as exc:
+                    actions.append(f"docker_wsl_doctor_warn:{exc}")
+            elif sys.platform == "darwin":
+                try:
+                    _run_quiet_subprocess(["open", "-a", "Docker"], timeout=15)
+                    actions.append("launched_docker_desktop_macos")
+                except Exception as exc:
+                    actions.append(f"macos_docker_start_warn:{exc}")
+            else:
+                if shutil.which("systemctl") and hasattr(os, "geteuid") and os.geteuid() == 0:
+                    proc = _run_quiet_subprocess(["systemctl", "start", "docker"], timeout=30)
+                    actions.append(f"systemctl_start_docker_rc={proc.returncode}")
+
+            if self._docker_daemon_responsive():
+                return {
+                    "status": "started",
+                    "docker_ready": True,
+                    "docker_binary": self._docker_available(),
+                    "resources": dict(budget["resources"]),
+                    "actions": actions,
+                }
+
+        # 2. Docker CLI missing -> attempt OS-native silent install when resources qualify
+        if not docker_bin and auto_install and not is_test_or_offline:
+            if os.name == "nt":
+                winget = shutil.which("winget")
+                if winget:
+                    self._trace("[*] Host resources qualify for Docker -> provisioning Docker Desktop via winget...")
+                    proc = _run_quiet_subprocess(
+                        [
+                            winget,
+                            "install",
+                            "--id",
+                            "Docker.DockerDesktop",
+                            "-e",
+                            "--silent",
+                            "--accept-package-agreements",
+                            "--accept-source-agreements",
+                        ],
+                        timeout=600,
+                    )
+                    actions.append(f"winget_install_docker_rc={proc.returncode}")
+            elif sys.platform == "darwin":
+                brew = shutil.which("brew")
+                if brew:
+                    self._trace("[*] Host resources qualify for Docker -> provisioning Docker Desktop via Homebrew...")
+                    proc = _run_quiet_subprocess([brew, "install", "--cask", "docker"], timeout=600)
+                    actions.append(f"brew_install_docker_rc={proc.returncode}")
+            else:
+                if hasattr(os, "geteuid") and os.geteuid() == 0:
+                    if shutil.which("apt-get"):
+                        proc = _run_quiet_subprocess(["apt-get", "install", "-y", "docker.io"], timeout=600)
+                        actions.append(f"apt_install_docker_rc={proc.returncode}")
+                    elif shutil.which("dnf"):
+                        proc = _run_quiet_subprocess(["dnf", "install", "-y", "docker"], timeout=600)
+                        actions.append(f"dnf_install_docker_rc={proc.returncode}")
+                else:
+                    actions.append("linux_non_root_install_hint:sudo apt-get install -y docker.io")
+
+        docker_bin_after = self._docker_available()
+        daemon_after = bool(docker_bin_after and self._docker_daemon_responsive())
+        return {
+            "status": "provisioned_ready" if daemon_after else ("installed_restart_required" if docker_bin_after else "install_unavailable"),
+            "docker_ready": daemon_after,
+            "docker_binary": docker_bin_after,
+            "resources": dict(budget["resources"]),
+            "actions": actions,
+        }
+
+    def _install_strix(self) -> ToolStatus:
+        """Auto-provisions Docker (if host resources qualify) and installs `strix-agent`."""
+        from engine.ensemble_orchestrator import StrixAdapter
+
+        spec_name = "Strix Autonomous Security Agent (Resource-Gated Docker Opt-In)"
+        docker_prov = self.ensure_docker_if_resources_available(auto_install=True, auto_start=True)
+        docker_ok = bool(docker_prov.get("docker_ready"))
+        res_eval = StrixAdapter.evaluate_resources(docker_daemon=docker_ok)
+        if not res_eval["eligible"]:
+            return ToolStatus(
+                tool_id="strix",
+                display_name=spec_name,
+                category="docker",
+                installed=False,
+                method="resource_gated",
+                detail=f"Skipped Strix install: host does not meet resource/Docker thresholds ({', '.join(res_eval['reasons'])}; docker_provision={docker_prov.get('status')})",
+            )
+        install_res = self._install_python_packages([("strix", "strix-agent")], "strix", spec_name)
+        strix_bin = self.find_binary("strix")
+        if strix_bin or install_res.installed:
+            return ToolStatus(
+                tool_id="strix",
+                display_name=spec_name,
+                category="docker",
+                installed=True,
+                newly_installed=install_res.newly_installed,
+                path_or_source=str(strix_bin) if strix_bin else install_res.path_or_source,
+                method="pip+docker",
+                detail=f"Installed strix-agent (Docker + resources verified: {res_eval['resources']})",
+            )
+        return install_res
+
+    def _install_docker_scanners(self) -> ToolStatus:
+        docker_prov = self.ensure_docker_if_resources_available(auto_install=True, auto_start=True)
+        docker_bin = docker_prov.get("docker_binary") or self._docker_available()
+        if not docker_bin or not docker_prov.get("docker_ready"):
             return ToolStatus(
                 tool_id="docker_scanners",
                 display_name="ProjectDiscovery Docker Images",
                 category="docker",
                 installed=False,
-                method="daemon_stopped" if docker_bin else "docker_missing",
-                detail="Docker daemon unavailable",
+                method=str(docker_prov.get("status") or ("daemon_stopped" if docker_bin else "docker_missing")),
+                detail=f"Docker unavailable ({docker_prov.get('status')}: {', '.join(docker_prov.get('reasons') or []) or 'daemon not responsive'})",
             )
         ok_imgs = []
         fail_imgs = []
@@ -2096,6 +2298,8 @@ class ToolProvisioner:
             res = self._install_rfc_cache()
         elif tool_id == "docker_scanners":
             res = self._install_docker_scanners()
+        elif tool_id == "strix":
+            res = self._install_strix()
         else:
             res = current
 

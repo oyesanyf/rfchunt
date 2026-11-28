@@ -627,6 +627,9 @@ class TerminatorMCPServer:
                         "path": {"type": "string", "description": "Specific file or folder path to audit"},
                         "ensemble_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional subset of free ensemble tools"},
                         "enable_diff_review": {"type": "boolean", "default": False},
+                        "enable_strix": {"type": "boolean", "default": False, "description": "Opt-in resource-gated Strix agent (requires Docker + >=12GB RAM + >=4GB free RAM + >=4 CPUs + >=10GB free disk)"},
+                        "strix_mode": {"type": "string", "enum": ["quick", "standard", "deep"], "default": "quick"},
+                        "authorized": {"type": "boolean", "default": False},
                         "enable_compliance_map": {"type": "boolean", "default": True},
                         "output_dir": {"type": "string", "default": "reports"},
                     },
@@ -1846,6 +1849,9 @@ class TerminatorMCPServer:
             reports_dir = self._parse_strict_str(args, "output_dir", "reports") or "reports"
             ensemble_tools = self._parse_str_list(args, "ensemble_tools", None)
             enable_diff_review = bool(self._parse_strict_bool(args, "enable_diff_review", False))
+            enable_strix = bool(self._parse_strict_bool(args, "enable_strix", False))
+            strix_mode = self._parse_strict_str(args, "strix_mode", "quick") or "quick"
+            authorized = bool(self._parse_strict_bool(args, "authorized", False))
             enable_compliance_map = bool(self._parse_strict_bool(args, "enable_compliance_map", True))
             with _suppress_stdout_to_stderr():
                 orch = EnsembleOrchestrator(reports_dir=reports_dir)
@@ -1853,6 +1859,9 @@ class TerminatorMCPServer:
                     resolved,
                     requested_tools=ensemble_tools,
                     enable_diff_review=enable_diff_review,
+                    enable_strix=enable_strix,
+                    strix_mode=strix_mode,
+                    authorized=authorized,
                     enable_compliance_map=enable_compliance_map,
                     auto_install=False,
                 )

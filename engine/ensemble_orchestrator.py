@@ -77,9 +77,128 @@ DEFAULT_SKIP_DIRS: Tuple[str, ...] = (
     ".pytest_tmp_e2e",
 )
 
-EXCLUDED_PAID_OR_HEAVY_TOOLS: Dict[str, str] = {
-    "strix": "Not wrapped: autonomous Kali Linux exploitation container requires Docker + offensive exploitation scope (RFCHunt guardrailed bin/artex.exe + DualGraphAttackEngine covers safe attack-path modeling).",
+EXCLUDED_PAID_OR_HEAVY_TOOLS: Dict[str, str] = {}
+
+RESOURCE_BUDGET_PROFILES: Dict[str, Dict[str, Any]] = {
+    "docker_runtime": {
+        "min_total_ram_gb": 8.0,
+        "min_free_ram_gb": 3.0,
+        "min_cpu_cores": 2,
+        "min_free_disk_gb": 12.0,
+        "docker_required": False,
+        "description": "Docker Desktop / Docker Engine auto-provisioning & container execution",
+    },
+    "strix": {
+        "min_total_ram_gb": 12.0,
+        "min_free_ram_gb": 4.0,
+        "min_cpu_cores": 4,
+        "min_free_disk_gb": 10.0,
+        "docker_required": True,
+        "description": "Strix autonomous security agent (usestrix/strix)",
+    },
+    "codeql": {
+        "min_total_ram_gb": 8.0,
+        "min_free_ram_gb": 2.5,
+        "min_cpu_cores": 2,
+        "min_free_disk_gb": 5.0,
+        "docker_required": False,
+        "description": "GitHub CodeQL CLI database creation & taint query execution",
+    },
+    "raptor_docker": {
+        "min_total_ram_gb": 8.0,
+        "min_free_ram_gb": 3.0,
+        "min_cpu_cores": 2,
+        "min_free_disk_gb": 8.0,
+        "docker_required": True,
+        "description": "RAPTOR Docker container mode (falls back to native Python/Semgrep on non-Docker hosts)",
+    },
+    "poe_container": {
+        "min_total_ram_gb": 8.0,
+        "min_free_ram_gb": 2.5,
+        "min_cpu_cores": 2,
+        "min_free_disk_gb": 5.0,
+        "docker_required": True,
+        "description": "Isolated --network=none ContainerPOEVerifier (POE==3 runtime verification)",
+    },
+    "docker_parser_matrix": {
+        "min_total_ram_gb": 8.0,
+        "min_free_ram_gb": 3.0,
+        "min_cpu_cores": 2,
+        "min_free_disk_gb": 6.0,
+        "docker_required": True,
+        "description": "6-parser Docker differential HTTP framing matrix",
+    },
 }
+
+CONDITIONAL_RESOURCE_GATED_TOOLS: Dict[str, str] = {
+    k: (
+        f"Conditionally enabled based on live host resources: "
+        f"total_ram>={v['min_total_ram_gb']}GB, free_ram>={v['min_free_ram_gb']}GB, "
+        f"cpus>={v['min_cpu_cores']}, free_disk>={v['min_free_disk_gb']}GB"
+        + (", Docker required" if v["docker_required"] else "")
+        + f" — {v['description']}"
+    )
+    for k, v in RESOURCE_BUDGET_PROFILES.items()
+}
+
+
+def evaluate_resource_budget(
+    profile_name: str,
+    *,
+    resources: Optional[Dict[str, Any]] = None,
+    docker_daemon: Optional[bool] = None,
+    target_path: str = ".",
+) -> Dict[str, Any]:
+    """
+    Evaluates whether live available host resources meet a named tool/runtime profile
+    (mirroring ModelFusion's runtime memory sizing). Nothing is excluded statically;
+    higher-spec machines automatically unlock heavier engines and Docker provisioning.
+    """
+    prof = RESOURCE_BUDGET_PROFILES.get(profile_name) or RESOURCE_BUDGET_PROFILES["docker_runtime"]
+    if resources is None:
+        from ollama_manager import get_runtime_system_resources
+
+        res = get_runtime_system_resources(path=target_path, allow_in_tests=False)
+    else:
+        res = dict(resources)
+
+    total_ram = float(res.get("total_ram_gb", 0.0))
+    free_ram = float(res.get("free_ram_gb", 0.0))
+    cpu_count = int(res.get("cpu_count", 1))
+    free_disk = float(res.get("free_disk_gb", 0.0))
+    docker_ok = bool(docker_daemon) if docker_daemon is not None else bool(res.get("docker_daemon", False))
+
+    reasons: List[str] = []
+    if total_ram < float(prof["min_total_ram_gb"]):
+        reasons.append(f"insufficient_total_ram ({total_ram:.1f}GB < {prof['min_total_ram_gb']:.1f}GB)")
+    if free_ram < float(prof["min_free_ram_gb"]):
+        reasons.append(f"insufficient_free_ram ({free_ram:.1f}GB < {prof['min_free_ram_gb']:.1f}GB)")
+    if cpu_count < int(prof["min_cpu_cores"]):
+        reasons.append(f"insufficient_cpu_cores ({cpu_count} < {prof['min_cpu_cores']})")
+    if free_disk < float(prof["min_free_disk_gb"]):
+        reasons.append(f"insufficient_free_disk ({free_disk:.1f}GB < {prof['min_free_disk_gb']:.1f}GB)")
+    if bool(prof["docker_required"]) and not docker_ok:
+        reasons.append("docker_daemon_unavailable")
+
+    return {
+        "profile": profile_name,
+        "eligible": len(reasons) == 0,
+        "reasons": reasons,
+        "resources": {
+            "total_ram_gb": round(total_ram, 2),
+            "free_ram_gb": round(free_ram, 2),
+            "cpu_count": cpu_count,
+            "free_disk_gb": round(free_disk, 2),
+            "docker_daemon": docker_ok,
+        },
+        "thresholds": {
+            "min_total_ram_gb": float(prof["min_total_ram_gb"]),
+            "min_free_ram_gb": float(prof["min_free_ram_gb"]),
+            "min_cpu_cores": int(prof["min_cpu_cores"]),
+            "min_free_disk_gb": float(prof["min_free_disk_gb"]),
+            "docker_required": bool(prof["docker_required"]),
+        },
+    }
 
 _SEVERITY_WEIGHT: Dict[str, int] = {
     "CRITICAL": 90,
@@ -327,6 +446,13 @@ class RuntimeCapabilities:
     skillspector_pkg: bool
     cloudflare_skill_repo: bool
     pyrit_installed: bool
+    total_ram_gb: float = 8.0
+    cpu_count: int = 2
+    free_disk_gb: float = 0.0
+    strix_installed: bool = False
+    strix_resource_eligible: bool = False
+    strix_resource_reasons: List[str] = field(default_factory=list)
+    resource_budgets: Dict[str, Any] = field(default_factory=dict)
     trivy_vuln_db_cached: bool = False
     bumblebee_catalogs_count: int = 0
     nuclei_templates_count: int = 0
@@ -348,15 +474,20 @@ class RuntimeCapabilityProbe:
     @classmethod
     def probe(cls, *, allow_daemon_probes: bool = False) -> RuntimeCapabilities:
         from engine.tool_provisioner import ToolProvisioner
-        from ollama_manager import OllamaLifecycleManager, get_runtime_free_memory
+        from ollama_manager import OllamaLifecycleManager, get_runtime_system_resources
 
-        free_ram, free_vram = get_runtime_free_memory(allow_in_tests=False)
+        sys_res = get_runtime_system_resources(allow_in_tests=False)
+        free_ram = float(sys_res["free_ram_gb"])
+        free_vram = float(sys_res["free_vram_mb"])
+        total_ram = float(sys_res["total_ram_gb"])
+        cpu_count = int(sys_res["cpu_count"])
+        free_disk_gb = float(sys_res["free_disk_gb"])
         max_workers = 2 if (free_ram < 4.0 and free_vram < 2048.0) else 4
 
         prov = ToolProvisioner()
         bin_names = (
             "trivy", "trufflehog", "infisical", "aiscan", "httpx", "katana",
-            "nuclei", "artex", "bumblebee", "codeql", "codex", "claude",
+            "nuclei", "artex", "bumblebee", "codeql", "codex", "claude", "strix",
         )
         binaries: Dict[str, Optional[str]] = {}
         for bname in bin_names:
@@ -408,6 +539,27 @@ class RuntimeCapabilityProbe:
         else:
             ollama_ready = bool(OllamaLifecycleManager.find_ollama_binary())
 
+        strix_installed = bool(binaries.get("strix") or shutil.which("strix"))
+        res_snapshot = {
+            "total_ram_gb": total_ram,
+            "free_ram_gb": free_ram,
+            "cpu_count": cpu_count,
+            "free_disk_gb": free_disk_gb,
+            "docker_daemon": docker_daemon,
+        }
+        resource_budgets = {
+            pname: evaluate_resource_budget(pname, resources=res_snapshot, docker_daemon=docker_daemon)
+            for pname in RESOURCE_BUDGET_PROFILES
+        }
+        strix_budget = resource_budgets["strix"]
+        strix_reasons = list(strix_budget["reasons"])
+        if not docker_daemon and not docker_cli:
+            strix_reasons = [
+                ("docker_not_installed" if r == "docker_daemon_unavailable" else r)
+                for r in strix_reasons
+            ]
+        strix_eligible = bool(strix_budget["eligible"])
+
         backend_matrix = {
             "aiscan": "native_rust_binary" if binaries["aiscan"] else "python_fallback",
             "trivy": (
@@ -446,6 +598,11 @@ class RuntimeCapabilityProbe:
             "local_diff_review": "claude_cli_or_local_ollama" if binaries["claude"] else "local_ollama",
             "docker_engines": "available" if docker_daemon else "skipped_no_docker",
             "pyrit_eval": "native_python_opt_in" if pyrit_installed else "opt_in_not_installed",
+            "strix": (
+                "docker_native_ready"
+                if (strix_eligible and strix_installed)
+                else ("resource_eligible_install_required" if strix_eligible else "skipped_insufficient_resources_or_docker")
+            ),
         }
 
         return RuntimeCapabilities(
@@ -462,6 +619,13 @@ class RuntimeCapabilityProbe:
             skillspector_pkg=skillspector_pkg,
             cloudflare_skill_repo=cf_repo,
             pyrit_installed=pyrit_installed,
+            total_ram_gb=round(float(total_ram), 2),
+            cpu_count=cpu_count,
+            free_disk_gb=round(float(free_disk_gb), 2),
+            strix_installed=strix_installed,
+            strix_resource_eligible=strix_eligible,
+            strix_resource_reasons=strix_reasons,
+            resource_budgets=resource_budgets,
             trivy_vuln_db_cached=trivy_db_ok,
             bumblebee_catalogs_count=bb_catalogs,
             nuclei_templates_count=nuc_tpl_count,
@@ -525,6 +689,7 @@ class IntelligentEnsemblePlanner:
         enable_pyrit_eval: bool = False,
         enable_codex_review: bool = False,
         enable_codeql: bool = True,
+        enable_strix: bool = False,
     ) -> Dict[str, Any]:
         root = Path(target_path).resolve()
         files = _walk_target_files(root) if root.exists() else []
@@ -672,10 +837,25 @@ class IntelligentEnsemblePlanner:
                 bool(enable_pyrit_eval),
                 f"PyRIT installed={capabilities.pyrit_installed}; opt-in defensive prompt-safety evaluation for loopback/local LLM endpoints.",
             ),
+            (
+                "strix",
+                bool(enable_strix and capabilities.strix_resource_eligible),
+                (
+                    f"Strix (usestrix/strix) resource-eligible={capabilities.strix_resource_eligible}, "
+                    f"docker={capabilities.docker_daemon}, total_ram={capabilities.total_ram_gb}GB, "
+                    f"free_ram={capabilities.free_ram_gb}GB, cpus={capabilities.cpu_count}, "
+                    f"free_disk={capabilities.free_disk_gb}GB, installed={capabilities.strix_installed}"
+                    + (f" (gated: {', '.join(capabilities.strix_resource_reasons)})" if capabilities.strix_resource_reasons else "")
+                ),
+            ),
         ]
 
         for tid, default_on, rationale in tool_specs:
             enabled, reason = _should_enable(tid, default_on=default_on)
+            strix_requested = bool(enable_strix or (allow_subset is not None and "strix" in allow_subset))
+            if tid == "strix" and strix_requested and not capabilities.strix_resource_eligible:
+                enabled = False
+                reason = "gated_insufficient_resources:" + ",".join(capabilities.strix_resource_reasons or ["docker_or_ram"])
             scheduled.append({
                 "tool_id": tid,
                 "enabled": enabled,
@@ -694,6 +874,7 @@ class IntelligentEnsemblePlanner:
             "skill_files_count": len(skill_files),
             "has_git": has_git,
             "scheduled_scanners": scheduled,
+            "conditional_resource_gated": dict(CONDITIONAL_RESOURCE_GATED_TOOLS),
             "excluded_paid_or_heavy": dict(EXCLUDED_PAID_OR_HEAVY_TOOLS),
         }
 
@@ -2876,6 +3057,308 @@ class ProjectDiscoveryHostNativeAdapter:
             }
 
 
+class StrixAdapter:
+    """
+    Resource-Conditional & Authorization-Gated Native Wrapper for Strix (`usestrix/strix`).
+
+    Computes live host resources identically to ModelFusion (`ollama_manager.get_runtime_system_resources`):
+      - Requires active Docker daemon (`docker_daemon == True`)
+      - Requires `total_ram_gb >= 12.0` AND `free_ram_gb >= 4.0`
+      - Requires `cpu_count >= 4` logical cores AND `free_disk_gb >= 10.0`
+      - Requires explicit `--strix` opt-in (and `--authorized` + SSRF checks for remote URLs/hosts)
+      - Executes `strix -n --target <target> --scan-mode <quick|standard|deep>` strictly via
+        `shell=False`, `CREATE_NO_WINDOW`, and routes parsed findings through RFCHunt's
+        deterministic `ClaimPreconditionVerifier` & `epistemic_state` (never auto-promoting
+        unverified agent prose without independent proof).
+    """
+
+    SCANNER_NAME = "Strix-Agent"
+    MIN_TOTAL_RAM_GB = 12.0
+    MIN_FREE_RAM_GB = 4.0
+    MIN_CPU_CORES = 4
+    MIN_FREE_DISK_GB = 10.0
+    ALLOWED_SCAN_MODES = frozenset({"quick", "standard", "deep"})
+
+    @classmethod
+    def evaluate_resources(
+        cls,
+        capabilities: Optional[RuntimeCapabilities] = None,
+        *,
+        target_path: str = ".",
+        min_total_ram_gb: float = MIN_TOTAL_RAM_GB,
+        min_free_ram_gb: float = MIN_FREE_RAM_GB,
+        min_cpu_cores: int = MIN_CPU_CORES,
+        min_free_disk_gb: float = MIN_FREE_DISK_GB,
+        docker_daemon: Optional[bool] = None,
+        strix_binary: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Evaluates whether the current host has sufficient RAM/CPU/disk/Docker to run Strix safely."""
+        if capabilities is not None:
+            total_ram = float(capabilities.total_ram_gb)
+            free_ram = float(capabilities.free_ram_gb)
+            cpu_count = int(capabilities.cpu_count)
+            free_disk = float(capabilities.free_disk_gb)
+            docker_ok = bool(capabilities.docker_daemon) if docker_daemon is None else bool(docker_daemon)
+            strix_bin = strix_binary or (capabilities.binaries.get("strix") if isinstance(capabilities.binaries, dict) else None)
+        else:
+            from ollama_manager import get_runtime_system_resources
+            from engine.tool_provisioner import ToolProvisioner
+
+            res = get_runtime_system_resources(path=target_path, allow_in_tests=False)
+            total_ram = float(res["total_ram_gb"])
+            free_ram = float(res["free_ram_gb"])
+            cpu_count = int(res["cpu_count"])
+            free_disk = float(res["free_disk_gb"])
+            prov = ToolProvisioner()
+            if docker_daemon is None:
+                docker_ok = bool(shutil.which("docker") and not _is_offline_or_test_env() and prov._docker_daemon_responsive())
+            else:
+                docker_ok = bool(docker_daemon)
+            found_bin = prov.find_binary("strix")
+            strix_bin = strix_binary or (str(found_bin) if found_bin else shutil.which("strix"))
+
+        reasons: List[str] = []
+        if total_ram < float(min_total_ram_gb):
+            reasons.append(f"insufficient_total_ram ({total_ram:.1f}GB < {min_total_ram_gb:.1f}GB)")
+        if free_ram < float(min_free_ram_gb):
+            reasons.append(f"insufficient_free_ram ({free_ram:.1f}GB < {min_free_ram_gb:.1f}GB)")
+        if cpu_count < int(min_cpu_cores):
+            reasons.append(f"insufficient_cpu_cores ({cpu_count} < {min_cpu_cores})")
+        if free_disk < float(min_free_disk_gb):
+            reasons.append(f"insufficient_free_disk ({free_disk:.1f}GB < {min_free_disk_gb:.1f}GB)")
+        if not docker_ok:
+            reasons.append("docker_daemon_unavailable")
+
+        return {
+            "eligible": len(reasons) == 0,
+            "binary_installed": bool(strix_bin),
+            "strix_binary": strix_bin,
+            "reasons": reasons,
+            "resources": {
+                "total_ram_gb": round(total_ram, 2),
+                "free_ram_gb": round(free_ram, 2),
+                "cpu_count": cpu_count,
+                "free_disk_gb": round(free_disk, 2),
+                "docker_daemon": docker_ok,
+            },
+            "thresholds": {
+                "min_total_ram_gb": float(min_total_ram_gb),
+                "min_free_ram_gb": float(min_free_ram_gb),
+                "min_cpu_cores": int(min_cpu_cores),
+                "min_free_disk_gb": float(min_free_disk_gb),
+                "docker_required": True,
+            },
+        }
+
+    @classmethod
+    def _parse_strix_outputs(cls, stdout_text: str, run_dir: Path, target_path: str) -> List[Dict[str, Any]]:
+        """Parses Strix JSON report files or JSON stdout lines into normalized RFCHunt findings."""
+        findings: List[Dict[str, Any]] = []
+        raw_items: List[Dict[str, Any]] = []
+
+        # 1. Inspect JSON files emitted under strix_runs/
+        if run_dir.is_dir():
+            for jf in sorted(run_dir.rglob("*.json"))[:50]:
+                try:
+                    data = json.loads(jf.read_text(encoding="utf-8", errors="replace"))
+                except Exception:
+                    continue
+                if isinstance(data, list):
+                    raw_items.extend(x for x in data if isinstance(x, dict))
+                elif isinstance(data, dict):
+                    for key in ("vulnerabilities", "findings", "issues", "results"):
+                        if isinstance(data.get(key), list):
+                            raw_items.extend(x for x in data[key] if isinstance(x, dict))
+                    if data.get("title") and (data.get("severity") or data.get("cwe")):
+                        raw_items.append(data)
+
+        # 2. Fallback: JSON object/array on stdout
+        if not raw_items and (stdout_text or "").strip():
+            s = stdout_text.strip()
+            for marker in ("{", "["):
+                idx = s.find(marker)
+                if idx >= 0:
+                    try:
+                        parsed = json.loads(s[idx:])
+                        if isinstance(parsed, list):
+                            raw_items.extend(x for x in parsed if isinstance(x, dict))
+                        elif isinstance(parsed, dict):
+                            for key in ("vulnerabilities", "findings", "issues", "results"):
+                                if isinstance(parsed.get(key), list):
+                                    raw_items.extend(x for x in parsed[key] if isinstance(x, dict))
+                        if raw_items:
+                            break
+                    except Exception:
+                        continue
+
+        for idx, item in enumerate(raw_items, start=1):
+            rid = str(item.get("id") or item.get("rule_id") or f"STRIX-FINDING-{idx:03d}")
+            title = str(item.get("title") or item.get("name") or rid)
+            sev = _normalize_severity(item.get("severity"), "MEDIUM")
+            cwe = str(item.get("cwe") or item.get("cwe_id") or "CWE-20").strip().upper()
+            fpath = str(item.get("file_path") or item.get("file") or item.get("location") or target_path)
+            try:
+                line_no = max(1, int(item.get("line_number") or item.get("line") or 1))
+            except (TypeError, ValueError):
+                line_no = 1
+            verified_poc = bool(item.get("verified") or item.get("poc_verified"))
+            findings.append({
+                "rule_id": rid,
+                "title": f"Strix Agent: {title}",
+                "severity": sev,
+                "cwe": cwe,
+                "file_path": fpath,
+                "line_number": line_no,
+                "description": str(item.get("description") or item.get("impact") or title)[:600],
+                "remediation": str(item.get("remediation") or item.get("fix") or "Review Strix PoC trace and apply defense-in-depth fix.")[:400],
+                "scanner": cls.SCANNER_NAME,
+                "evidence_lane": "VERIFIED_EXPLOIT" if verified_poc else "SPECULATIVE_HYPOTHESIS",
+                "poe_level": 3 if verified_poc else 1,
+                "runtime_poe_verified": verified_poc,
+                "independent_oracles": ["runtime_poe_container"] if verified_poc else [],
+                "correlated_oracles": ["llm_strix_agent"],
+            })
+
+        return findings
+
+    @classmethod
+    def run(
+        cls,
+        target_path: str,
+        *,
+        capabilities: Optional[RuntimeCapabilities] = None,
+        binary_path: Optional[str] = None,
+        scan_mode: str = "quick",
+        instruction: Optional[str] = None,
+        authorized: bool = False,
+        reports_dir: Optional[Path] = None,
+        timeout: int = 600,
+        use_native_binary: Optional[bool] = None,
+        min_total_ram_gb: float = MIN_TOTAL_RAM_GB,
+        min_free_ram_gb: float = MIN_FREE_RAM_GB,
+        min_cpu_cores: int = MIN_CPU_CORES,
+        min_free_disk_gb: float = MIN_FREE_DISK_GB,
+    ) -> Dict[str, Any]:
+        t0 = time.monotonic()
+        mode_clean = str(scan_mode or "quick").strip().lower()
+        if mode_clean not in cls.ALLOWED_SCAN_MODES:
+            mode_clean = "quick"
+
+        # 1. Fail-closed target scope & authorization check for remote URLs/hosts
+        is_remote = str(target_path).strip().lower().startswith(("http://", "https://"))
+        if is_remote:
+            from urllib.parse import urlparse
+            from engine.safe_network_validator import validate_and_authorize_target
+
+            host = urlparse(str(target_path)).hostname or ""
+            ok_auth, auth_reason = validate_and_authorize_target(host, authorized=authorized)
+            if not ok_auth:
+                return {
+                    "tool_id": "strix",
+                    "scanner": cls.SCANNER_NAME,
+                    "status": f"blocked:authorization_required:{auth_reason}",
+                    "mode": "authorization_gated",
+                    "total_findings": 0,
+                    "findings": [],
+                    "elapsed_sec": round(time.monotonic() - t0, 3),
+                }
+        elif not os.path.exists(str(target_path)):
+            return {
+                "tool_id": "strix",
+                "scanner": cls.SCANNER_NAME,
+                "status": "skipped:target_not_found",
+                "mode": "invalid_target",
+                "total_findings": 0,
+                "findings": [],
+                "elapsed_sec": round(time.monotonic() - t0, 3),
+            }
+
+        # 2. Resource & Docker gate (mirrors ModelFusion's runtime memory sizing)
+        res_eval = cls.evaluate_resources(
+            capabilities=capabilities,
+            target_path=str(target_path) if not is_remote else ".",
+            min_total_ram_gb=min_total_ram_gb,
+            min_free_ram_gb=min_free_ram_gb,
+            min_cpu_cores=min_cpu_cores,
+            min_free_disk_gb=min_free_disk_gb,
+            strix_binary=binary_path,
+        )
+        if not res_eval["eligible"]:
+            return {
+                "tool_id": "strix",
+                "scanner": cls.SCANNER_NAME,
+                "status": "skipped:insufficient_resources:" + ";".join(res_eval["reasons"]),
+                "mode": "resource_gated",
+                "resource_check": res_eval,
+                "total_findings": 0,
+                "findings": [],
+                "elapsed_sec": round(time.monotonic() - t0, 3),
+            }
+
+        resolved_bin = binary_path or res_eval.get("strix_binary")
+        allow_native = True if use_native_binary is None else bool(use_native_binary)
+        if not allow_native or not resolved_bin or not Path(resolved_bin).is_file():
+            return {
+                "tool_id": "strix",
+                "scanner": cls.SCANNER_NAME,
+                "status": "skipped:strix_cli_not_installed",
+                "mode": "resource_eligible_install_required",
+                "install_hint": "Install Docker + `pip install strix-agent` (or `python rfc_hunt_swarm.py --install-tools --tools strix`)",
+                "resource_check": res_eval,
+                "total_findings": 0,
+                "findings": [],
+                "elapsed_sec": round(time.monotonic() - t0, 3),
+            }
+
+        # 3. Execute native Strix CLI non-interactively (`shell=False`, `CREATE_NO_WINDOW`)
+        out_root = (reports_dir or Path("reports")) / "strix_runs"
+        out_root.mkdir(parents=True, exist_ok=True)
+        argv = [str(resolved_bin), "-n", "--target", str(target_path), "--scan-mode", mode_clean]
+        if instruction and str(instruction).strip():
+            argv.extend(["--instruction", str(instruction).strip()[:500]])
+
+        try:
+            proc = _run_safe_subprocess(argv, cwd=str(out_root), timeout=timeout)
+            raw_findings = cls._parse_strix_outputs(proc.stdout or "", out_root, str(target_path))
+            # Ground Strix findings through RFCHunt's deterministic AST claim verifier & epistemic state machine
+            try:
+                from engine.claim_verifier import ClaimPreconditionVerifier
+
+                if not is_remote and os.path.isdir(str(target_path)):
+                    findings = ClaimPreconditionVerifier.apply_to_findings(raw_findings, repo_root=target_path)
+                else:
+                    from engine.epistemic_state import attach_epistemic_metadata
+
+                    findings = [attach_epistemic_metadata(dict(f)) for f in raw_findings]
+            except Exception:
+                findings = raw_findings
+
+            return {
+                "tool_id": "strix",
+                "scanner": cls.SCANNER_NAME,
+                "status": "executed_native" if proc.returncode == 0 else f"executed_native_exit_{proc.returncode}",
+                "mode": f"docker_strix_{mode_clean}",
+                "binary": str(resolved_bin),
+                "output_dir": str(out_root),
+                "resource_check": res_eval,
+                "total_findings": len(findings),
+                "findings": findings,
+                "elapsed_sec": round(time.monotonic() - t0, 3),
+            }
+        except Exception as exc:
+            return {
+                "tool_id": "strix",
+                "scanner": cls.SCANNER_NAME,
+                "status": "error",
+                "mode": f"docker_strix_{mode_clean}",
+                "error": str(exc)[:240],
+                "resource_check": res_eval,
+                "total_findings": 0,
+                "findings": [],
+                "elapsed_sec": round(time.monotonic() - t0, 3),
+            }
+
+
 class ScannerRegistry:
     """Declarative registry of ALL RFCHunt & OSS native scanners composable in `--all` and `--ensemble` (no tool left behind)."""
 
@@ -2902,6 +3385,7 @@ class ScannerRegistry:
         RegisteredScanner("local_diff_review", "Claude CLI / Local-Ollama Diff Security Reviewer (MIT rubric)", "MIT", "diff_review", False),
         RegisteredScanner("codex_security", "OpenAI Codex Security Reviewer (Opt-In CLI)", "Apache-2.0", "ai_code_review", False),
         RegisteredScanner("pyrit_eval", "Microsoft PyRIT Defensive Eval (Loopback Opt-In)", "MIT", "llm_safety_eval", False),
+        RegisteredScanner("strix", "Strix Autonomous Security Agent (Docker + Resource-Gated Opt-In)", "Apache-2.0", "autonomous_agent_dast", False),
     )
 
     def __init__(self) -> None:
@@ -3113,6 +3597,10 @@ class EnsembleOrchestrator:
         enable_pyrit_eval: bool = False,
         enable_codex_review: bool = False,
         enable_codeql: bool = True,
+        enable_strix: bool = False,
+        strix_mode: str = "quick",
+        strix_instruction: Optional[str] = None,
+        authorized: bool = False,
         hybrid_panel: bool = False,
         auto_install: bool = True,
         offline: Optional[bool] = None,
@@ -3130,9 +3618,14 @@ class EnsembleOrchestrator:
 
                 prov = ToolProvisioner(on_trace=self.on_trace)
                 prov_ids = ["aiscan", "trivy", "trufflehog", "infisical", "semgrep", "bumblebee", "cloudflare_audit_skill"]
+                # Resource-conditional Docker & Strix auto-provisioning on hosts with sufficient RAM/CPU/disk
+                docker_budget = evaluate_resource_budget("docker_runtime", target_path=target_path)
+                if docker_budget["eligible"] and enable_strix:
+                    prov.ensure_docker_if_resources_available(auto_install=True, auto_start=True)
+                    prov_ids.append("strix")
                 provision_summary = prov.ensure_all(
                     tool_ids=prov_ids,
-                    include_docker=False,
+                    include_docker=bool(docker_budget["eligible"]),
                     include_models=False,
                 )
             except Exception as exc:
@@ -3148,6 +3641,7 @@ class EnsembleOrchestrator:
             enable_pyrit_eval=enable_pyrit_eval,
             enable_codex_review=enable_codex_review,
             enable_codeql=enable_codeql,
+            enable_strix=enable_strix,
         )
 
         enabled_ids = {s["tool_id"] for s in plan["scheduled_scanners"] if s["enabled"]}
@@ -3203,6 +3697,17 @@ class EnsembleOrchestrator:
             )
         if "pyrit_eval" in enabled_ids:
             tasks["pyrit_eval"] = lambda: PyritDefensiveEvalAdapter.run()
+        if "strix" in enabled_ids:
+            tasks["strix"] = lambda: StrixAdapter.run(
+                target_path,
+                capabilities=caps,
+                binary_path=caps.binaries.get("strix"),
+                scan_mode=strix_mode,
+                instruction=strix_instruction,
+                authorized=authorized,
+                reports_dir=self.reports_dir,
+                use_native_binary=allow_native,
+            )
 
         for s_entry in plan["scheduled_scanners"]:
             tid = s_entry["tool_id"]
@@ -3452,6 +3957,10 @@ class EnsembleOrchestrator:
         enable_pyrit_eval: bool = False,
         enable_codex_review: bool = False,
         enable_codeql: bool = True,
+        enable_strix: bool = False,
+        strix_mode: str = "quick",
+        strix_instruction: Optional[str] = None,
+        authorized: bool = False,
         enable_cloudflare_audit: bool = True,
         enable_compliance_map: bool = True,
         hybrid_panel: bool = False,
@@ -3468,6 +3977,10 @@ class EnsembleOrchestrator:
             enable_pyrit_eval=enable_pyrit_eval,
             enable_codex_review=enable_codex_review,
             enable_codeql=enable_codeql,
+            enable_strix=enable_strix,
+            strix_mode=strix_mode,
+            strix_instruction=strix_instruction,
+            authorized=authorized,
             hybrid_panel=hybrid_panel,
             auto_install=auto_install,
             offline=offline,
@@ -3490,6 +4003,7 @@ __all__ = [
     "AiscanNativeAdapter",
     "ArtexNativeAdapter",
     "BumblebeeAdapter",
+    "CONDITIONAL_RESOURCE_GATED_TOOLS",
     "CloudflareAuditLedgerValidator",
     "CodeQLNativeAdapter",
     "CodexSecurityAdapter",
@@ -3505,6 +4019,7 @@ __all__ = [
     "PhiNativeAdapter",
     "ProjectDiscoveryHostNativeAdapter",
     "PyritDefensiveEvalAdapter",
+    "RESOURCE_BUDGET_PROFILES",
     "RaptorNativeAdapter",
     "ReaNativeAdapter",
     "RegisteredScanner",
@@ -3514,9 +4029,11 @@ __all__ = [
     "SemgrepNativeAdapter",
     "SkillSpectorAdapter",
     "StrideThreatModelAdapter",
+    "StrixAdapter",
     "TrivyAdapter",
     "TruffleHogAdapter",
     "Z3FormalVerifierAdapter",
+    "evaluate_resource_budget",
     "find_semgrep_executable",
     "redact_secret_value",
 ]
