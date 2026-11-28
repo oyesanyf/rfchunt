@@ -1,0 +1,19 @@
+# Exclude large local tool runtimes, binaries, caches, and ephemeral test dirs from Language Server indexing
+bin/
+tools/
+.pytest_temp/
+.pytest_tmp_e2e/
+.pytest_cache/
+__pycache__/
+reports/
+runs/
+rfcs/
+caldera_export/
+caldera_plugin/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.exe
+*.dll
+*.olean

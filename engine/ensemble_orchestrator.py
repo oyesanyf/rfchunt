@@ -776,7 +776,7 @@ class TrivyAdapter:
     ) -> Dict[str, Any]:
         t0 = time.monotonic()
         findings: List[Dict[str, Any]] = []
-        allow_native = (not _is_pytest_env()) if use_native_binary is None else bool(use_native_binary)
+        allow_native = True if use_native_binary is None else bool(use_native_binary)
         native_error: Optional[str] = None
 
         if allow_native and binary_path and Path(binary_path).is_file():
@@ -910,7 +910,7 @@ class TruffleHogAdapter:
     ) -> Dict[str, Any]:
         t0 = time.monotonic()
         findings: List[Dict[str, Any]] = []
-        allow_native = (not _is_pytest_env()) if use_native_binary is None else bool(use_native_binary)
+        allow_native = True if use_native_binary is None else bool(use_native_binary)
         if allow_native and binary_path and Path(binary_path).is_file():
             excl_file: Optional[str] = None
             try:
@@ -1048,7 +1048,7 @@ class InfisicalScanAdapter:
     ) -> Dict[str, Any]:
         t0 = time.monotonic()
         findings: List[Dict[str, Any]] = []
-        allow_native = (not _is_pytest_env()) if use_native_binary is None else bool(use_native_binary)
+        allow_native = True if use_native_binary is None else bool(use_native_binary)
         native_error: Optional[str] = None
         if allow_native and binary_path and Path(binary_path).is_file():
             report_path: Optional[str] = None
@@ -1667,7 +1667,7 @@ class BumblebeeAdapter:
         use_native_binary: Optional[bool] = None,
     ) -> Dict[str, Any]:
         t0 = time.monotonic()
-        allow_native = (not _is_pytest_env()) if use_native_binary is None else bool(use_native_binary)
+        allow_native = True if use_native_binary is None else bool(use_native_binary)
         repo_root = Path(__file__).resolve().parent.parent
         bb_root = bumblebee_root or (repo_root / "tools" / "bumblebee")
         ti_index, catalog_files = cls._load_threat_intel_catalogs(bb_root)
@@ -3319,6 +3319,21 @@ class EnsembleOrchestrator:
         self.reports_dir.mkdir(parents=True, exist_ok=True)
         consensus = EnsembleConsensusEngine.correlate_lossless(all_raw_findings, target_root=target_root)
         preserved = consensus["all_findings"]
+        try:
+            from engine.claim_verifier import ClaimPreconditionVerifier
+
+            preserved = ClaimPreconditionVerifier.apply_to_findings(
+                preserved,
+                repo_root=target_root if os.path.isdir(str(target_root)) else None,
+            )
+        except Exception:
+            pass
+        epistemic_summary = {
+            "PROVEN_RUNTIME": sum(1 for d in preserved if d.get("epistemic_status") == "PROVEN_RUNTIME"),
+            "PROVEN_STATIC_INVARIANT": sum(1 for d in preserved if d.get("epistemic_status") == "PROVEN_STATIC_INVARIANT"),
+            "UNRESOLVED": sum(1 for d in preserved if d.get("epistemic_status") == "UNRESOLVED"),
+            "REFUTED": sum(1 for d in preserved if d.get("epistemic_status") == "REFUTED"),
+        }
 
         merged_statuses: Dict[str, Dict[str, Any]] = dict(ensemble_run.get("scanners") or {})
         if extra_scanner_statuses:
@@ -3354,6 +3369,7 @@ class EnsembleOrchestrator:
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "zero_findings_dropped": True,
             "accounting_proof": consensus["accounting_proof"],
+            "epistemic_summary": epistemic_summary,
             "native_binary_summary": ensemble_run.get("native_binary_summary") or {},
             "runtime_capabilities": ensemble_run.get("runtime_capabilities") or {},
             "planner": ensemble_run.get("planner") or {},

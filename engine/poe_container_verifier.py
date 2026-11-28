@@ -115,12 +115,15 @@ class POEVerificationResult:
     elapsed_ms: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        from engine.epistemic_state import attach_epistemic_metadata
+
+        out = {
             "finding_id": self.finding_id,
             "title": self.title,
             "original_severity": self.original_severity,
             "calibrated_severity": self.calibrated_severity,
             "status": self.status,
+            "poe_verification_status": self.status,
             "poe_level": int(self.poe_level),
             "verified": self.verified,
             "false_positive": self.false_positive,
@@ -132,6 +135,12 @@ class POEVerificationResult:
             "provenance": dict(self.provenance),
             "elapsed_ms": self.elapsed_ms,
         }
+        attach_epistemic_metadata(
+            out,
+            runtime_poe_verified=bool(self.verified and int(self.poe_level) >= 3),
+            refuted=bool(self.false_positive or self.status == "downgraded_false_positive"),
+        )
+        return out
 
 
 @dataclass
@@ -1205,12 +1214,16 @@ class ContainerPOEVerifier:
             )
             res = by_id.get(fid) if fid in by_id else (results[idx] if idx < len(results) else None)
             if res is not None:
+                from engine.epistemic_state import attach_epistemic_metadata
+
                 if res.verified:
                     copy["poe_level"] = int(POELevel.VERIFIED_EXPLOIT)
                     copy["verification_status"] = "VERIFIED"
                     copy["poe_verification_status"] = res.status
                     copy["poe_evidence"] = res.evidence
                     copy["false_positive"] = False
+                    copy["runtime_poe_verified"] = True
+                    attach_epistemic_metadata(copy, runtime_poe_verified=True)
                 elif res.false_positive:
                     copy["poe_level"] = int(POELevel.NONE)
                     copy["verification_status"] = "DOWNGRADED_FALSE_POSITIVE"
@@ -1219,9 +1232,11 @@ class ContainerPOEVerifier:
                     copy["severity"] = res.calibrated_severity
                     copy["poe_evidence"] = res.evidence
                     copy["false_positive"] = True
+                    attach_epistemic_metadata(copy, refuted=True)
                     if drop_false_positives:
                         continue
                 else:
                     copy["poe_verification_status"] = res.status
+                    attach_epistemic_metadata(copy)
             updated.append(copy)
         return updated

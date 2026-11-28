@@ -134,7 +134,9 @@ class PoCTriageRecord:
     verification_status: str = "triaged"
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        from engine.epistemic_state import attach_epistemic_metadata
+
+        out = {
             "finding_id": self.finding_id,
             "rule_id": self.rule_id,
             "title": self.title,
@@ -152,6 +154,16 @@ class PoCTriageRecord:
             "generated_files": list(self.generated_files),
             "verification_status": self.verification_status,
         }
+        is_rt = self.verdict == VERDICT_VERIFIED_REPRODUCIBLE and int(self.poe_level) >= 3 and self.category != "secret"
+        is_stat = self.verdict == VERDICT_VERIFIED_REPRODUCIBLE and self.category == "secret"
+        is_ref = self.verdict in (VERDICT_FALSE_POSITIVE, VERDICT_TEST_FIXTURE, VERDICT_HARDENING_NOTE)
+        attach_epistemic_metadata(
+            out,
+            runtime_poe_verified=is_rt,
+            static_invariant_verified=is_stat,
+            refuted=is_ref,
+        )
+        return out
 
 
 @dataclass

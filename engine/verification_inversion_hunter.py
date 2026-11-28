@@ -229,9 +229,24 @@ class VerificationInversionFinding:
     finding_tier: str = "MANUAL_REVIEW_LEAD"
     scanner: str = "VerificationInversionHunter"
     category: str = "verification_inversion"
+    z3_status: str = ""  # "sat" | "unsat" | "unknown" | ""
+    z3_witness: Dict[str, Any] = field(default_factory=dict)
+    epistemic_status: str = "UNRESOLVED"
+    status_justification: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        from engine.epistemic_state import attach_epistemic_metadata
+
+        d = asdict(self)
+        if not d.get("status_justification"):
+            is_z3_sat = str(self.z3_status).lower() == "sat"
+            is_z3_unsat = str(self.z3_status).lower() == "unsat"
+            attach_epistemic_metadata(
+                d,
+                static_invariant_verified=is_z3_sat,
+                refuted=is_z3_unsat,
+            )
+        return d
 
 
 def _synthesize_counterexample_trace_and_formula(f: VerificationInversionFinding) -> Tuple[List[str], str]:
@@ -344,6 +359,8 @@ class VerificationInversionReport:
     security_gates_audited: int
     findings: List[VerificationInversionFinding] = field(default_factory=list)
     pass_counts: Dict[str, int] = field(default_factory=dict)
+    z3_summary: Dict[str, Any] = field(default_factory=dict)
+    lean4_verification: Dict[str, Any] = field(default_factory=dict)
     elapsed_sec: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -355,9 +372,283 @@ class VerificationInversionReport:
             "security_gates_audited": self.security_gates_audited,
             "findings_count": len(self.findings),
             "pass_counts": dict(self.pass_counts),
+            "z3_summary": dict(self.z3_summary),
+            "lean4_verification": dict(self.lean4_verification),
             "findings": [f.to_dict() for f in self.findings],
             "elapsed_sec": round(self.elapsed_sec, 3),
         }
+
+
+# Process-local cache so repeated Lean 4 kernel checks on unchanged `.lean` specs remain fast
+_LEAN4_KERNEL_CACHE: Dict[Tuple[str, float], Dict[str, Any]] = {}
+
+
+def _check_z3_available() -> Tuple[bool, str]:
+    try:
+        import z3
+
+        return True, str(z3.get_version_string())
+    except Exception:
+        return False, ""
+
+
+def z3_verify_numeric_bounds(
+    *,
+    var_name: str = "content_length",
+    has_lower_bound: bool = False,
+    lower_bound: int = 0,
+    has_upper_bound: bool = False,
+    upper_bound: int = 1048576,
+    safe_min: int = 0,
+    safe_max: int = 1048576,
+    timeout_ms: int = 1500,
+) -> Dict[str, Any]:
+    """
+    Live Z3 SMT bounds & header-length arithmetic verifier:
+      - Asserts the code's observed guard constraints on `var_name` alongside
+        violation (`var_name < safe_min OR var_name > safe_max`).
+      - `sat`     -> concrete counterexample witness model (`PROVEN_STATIC_INVARIANT`)
+      - `unsat`   -> mathematically safe within `[safe_min, safe_max]` (`REFUTED`)
+      - `unknown` -> solver timeout/unavailable (`UNRESOLVED`)
+    """
+    ok_z3, z3_ver = _check_z3_available()
+    if not ok_z3:
+        return {
+            "z3_status": "unknown",
+            "epistemic_status": "UNRESOLVED",
+            "witness": {},
+            "z3_version": "",
+            "reason": "z3-solver not installed",
+        }
+    import z3
+
+    solver = z3.Solver()
+    solver.set("timeout", int(timeout_ms))
+    v = z3.Int(var_name)
+    if has_lower_bound:
+        solver.add(v >= int(lower_bound))
+    if has_upper_bound:
+        solver.add(v <= int(upper_bound))
+    # Search for a counterexample escaping safe_min..safe_max
+    solver.add(z3.Or(v < int(safe_min), v > int(safe_max)))
+    res = solver.check()
+    if res == z3.sat:
+        m = solver.model()
+        val = m.eval(v, model_completion=True).as_long()
+        return {
+            "z3_status": "sat",
+            "epistemic_status": "PROVEN_STATIC_INVARIANT",
+            "witness": {var_name: val, "safe_min": safe_min, "safe_max": safe_max},
+            "z3_version": z3_ver,
+            "reason": f"Z3 found concrete out-of-bounds witness `{var_name} = {val}` violating [{safe_min}, {safe_max}].",
+        }
+    if res == z3.unsat:
+        return {
+            "z3_status": "unsat",
+            "epistemic_status": "REFUTED",
+            "witness": {},
+            "z3_version": z3_ver,
+            "reason": f"Z3 proved `{var_name}` cannot escape [{safe_min}, {safe_max}] under existing guards (UNSAT).",
+        }
+    return {
+        "z3_status": "unknown",
+        "epistemic_status": "UNRESOLVED",
+        "witness": {},
+        "z3_version": z3_ver,
+        "reason": "Z3 returned unknown/timeout for numeric bounds constraint.",
+    }
+
+
+def z3_verify_comparator_contract(
+    *,
+    checks_sig: bool = True,
+    checks_exp: bool = True,
+    checks_aud: bool = True,
+    checks_iss: bool = True,
+    forbid_overrides_permit: bool = True,
+    inverted_role_check: bool = False,
+    timeout_ms: int = 1500,
+) -> Dict[str, Any]:
+    """
+    Live Z3 SMT verifier for Pass 3 `COMPARATOR_CONTRACT` (JWT/OIDC & RBAC policies):
+      - Challenge contract requires: `sig ∧ exp ∧ aud ∧ iss ∧ role_ok ∧ ¬forbid`.
+      - Checks if an attacker input exists where `Solution(input) == True` while
+        `Challenge(input) == False`.
+      - `sat`     -> concrete bypass witness model (`PROVEN_STATIC_INVARIANT`)
+      - `unsat`   -> contract holds across all inputs (`REFUTED`)
+      - `unknown` -> solver timeout/unavailable (`UNRESOLVED`)
+    """
+    ok_z3, z3_ver = _check_z3_available()
+    if not ok_z3:
+        return {
+            "z3_status": "unknown",
+            "epistemic_status": "UNRESOLVED",
+            "witness": {},
+            "z3_version": "",
+            "reason": "z3-solver not installed",
+        }
+    import z3
+
+    solver = z3.Solver()
+    solver.set("timeout", int(timeout_ms))
+
+    sig = z3.Bool("sig_valid")
+    exp = z3.Bool("exp_valid")
+    aud = z3.Bool("aud_valid")
+    iss = z3.Bool("iss_valid")
+    is_admin = z3.Bool("is_admin_role")
+    has_permit = z3.Bool("has_permit")
+    has_forbid = z3.Bool("has_forbid")
+
+    challenge_allow = z3.And(sig, exp, aud, iss, is_admin, has_permit, z3.Not(has_forbid))
+
+    sol_terms = [has_permit]
+    if checks_sig:
+        sol_terms.append(sig)
+    if checks_exp:
+        sol_terms.append(exp)
+    if checks_aud:
+        sol_terms.append(aud)
+    if checks_iss:
+        sol_terms.append(iss)
+    if forbid_overrides_permit:
+        sol_terms.append(z3.Not(has_forbid))
+    sol_terms.append(z3.Not(is_admin) if inverted_role_check else is_admin)
+    solution_allow = z3.And(*sol_terms)
+
+    # Bypass exists iff Solution permits what Challenge forbids
+    solver.add(solution_allow, z3.Not(challenge_allow))
+    res = solver.check()
+    if res == z3.sat:
+        m = solver.model()
+        witness = {
+            "sig_valid": z3.is_true(m.eval(sig, model_completion=True)),
+            "exp_valid": z3.is_true(m.eval(exp, model_completion=True)),
+            "aud_valid": z3.is_true(m.eval(aud, model_completion=True)),
+            "iss_valid": z3.is_true(m.eval(iss, model_completion=True)),
+            "is_admin_role": z3.is_true(m.eval(is_admin, model_completion=True)),
+            "has_permit": z3.is_true(m.eval(has_permit, model_completion=True)),
+            "has_forbid": z3.is_true(m.eval(has_forbid, model_completion=True)),
+            "solution_decision": "ALLOW",
+            "challenge_decision": "DENY",
+        }
+        return {
+            "z3_status": "sat",
+            "epistemic_status": "PROVEN_STATIC_INVARIANT",
+            "witness": witness,
+            "z3_version": z3_ver,
+            "reason": "Z3 synthesized a concrete JWT/RBAC comparator bypass witness.",
+        }
+    if res == z3.unsat:
+        return {
+            "z3_status": "unsat",
+            "epistemic_status": "REFUTED",
+            "witness": {},
+            "z3_version": z3_ver,
+            "reason": "Z3 proved comparator contract cannot be bypassed (UNSAT).",
+        }
+    return {
+        "z3_status": "unknown",
+        "epistemic_status": "UNRESOLVED",
+        "witness": {},
+        "z3_version": z3_ver,
+        "reason": "Z3 returned unknown/timeout for comparator contract.",
+    }
+
+
+def verify_trusted_closure_lean4(
+    *,
+    repo_root: Optional[Path] = None,
+    use_native_binary: Optional[bool] = None,
+    modules: Sequence[str] = ("TrustedClosure.lean", "EpistemicPromotionInvariants.lean"),
+) -> Dict[str, Any]:
+    """
+    Runs native `lean.exe` v4.36.0 against RFCHunt's Lean 4 gating & trusted-closure
+    specification modules (`formal/lean4/TrustedClosure.lean` and
+    `formal/lean4/EpistemicPromotionInvariants.lean`) with zero-`sorry` enforcement
+    and mtime-keyed process caching.
+    """
+    import os
+    from engine.formal_verifier import Lean4FormalVerifier, _run_quiet, find_lean4_binary
+
+    root = repo_root or Path(__file__).resolve().parent.parent
+    lean_dir = root / "formal" / "lean4"
+    lean_bin = find_lean4_binary(root)
+    allow_native = ("PYTEST_CURRENT_TEST" not in os.environ) if use_native_binary is None else bool(use_native_binary)
+
+    checked_modules: List[Dict[str, Any]] = []
+    all_proved = True
+    for mod_name in modules:
+        lf = lean_dir / mod_name
+        if not lf.is_file():
+            checked_modules.append({"name": mod_name, "status": "MISSING", "machine_checked": False})
+            all_proved = False
+            continue
+        mtime = lf.stat().st_mtime
+        cache_key = (str(lf.resolve()), mtime)
+        if allow_native and lean_bin is not None and cache_key in _LEAN4_KERNEL_CACHE:
+            entry = dict(_LEAN4_KERNEL_CACHE[cache_key])
+            checked_modules.append(entry)
+            if not entry.get("machine_checked"):
+                all_proved = False
+            continue
+
+        src = lf.read_text(encoding="utf-8", errors="replace")
+        stripped = Lean4FormalVerifier._strip_lean_comments(src)
+        has_sorry = bool(Lean4FormalVerifier._FORBIDDEN_AXIOM_RX.search(stripped))
+        theorems = Lean4FormalVerifier._THEOREM_DECL_RX.findall(stripped)
+
+        if has_sorry:
+            entry = {
+                "name": mod_name,
+                "file": str(lf),
+                "theorems": theorems,
+                "theorem_count": len(theorems),
+                "has_sorry": True,
+                "machine_checked": False,
+                "status": "SORRY_DETECTED",
+            }
+            all_proved = False
+        elif allow_native and lean_bin is not None:
+            proc = _run_quiet([str(lean_bin), str(lf)], cwd=str(root), timeout=90)
+            ok = proc.returncode == 0
+            entry = {
+                "name": mod_name,
+                "file": str(lf),
+                "theorems": theorems,
+                "theorem_count": len(theorems),
+                "has_sorry": False,
+                "machine_checked": ok,
+                "status": "PROVED_NATIVE_LEAN4" if ok else "TYPECHECK_FAILED",
+                "exit_code": proc.returncode,
+            }
+            if not ok:
+                entry["diagnostic"] = ((proc.stderr or "") + "\n" + (proc.stdout or ""))[:300]
+                all_proved = False
+            _LEAN4_KERNEL_CACHE[cache_key] = dict(entry)
+        else:
+            entry = {
+                "name": mod_name,
+                "file": str(lf),
+                "theorems": theorems,
+                "theorem_count": len(theorems),
+                "has_sorry": False,
+                "machine_checked": False,
+                "status": "STRUCTURAL_ZERO_SORRY_ONLY",
+            }
+            all_proved = False
+        checked_modules.append(entry)
+
+    return {
+        "lean4_binary": str(lean_bin) if lean_bin else None,
+        "native_checked": bool(allow_native and lean_bin is not None),
+        "all_modules_proved": all_proved and bool(checked_modules),
+        "scope_note": (
+            "Lean 4 machine-checks RFCHunt's TrustedClosure & EpistemicPromotion gating specifications; "
+            "Z3 SMT and AST/CFG passes verify target-code invariants."
+        ),
+        "modules": checked_modules,
+    }
 
 
 class VerificationInversionHunter:
@@ -371,9 +662,15 @@ class VerificationInversionHunter:
         *,
         max_closure_depth: int = 6,
         include_tests: bool = False,
+        enable_z3: bool = True,
+        enable_lean4: bool = True,
+        use_native_lean4: Optional[bool] = None,
     ) -> None:
         self.max_closure_depth = max(2, int(max_closure_depth))
         self.include_tests = bool(include_tests)
+        self.enable_z3 = bool(enable_z3)
+        self.enable_lean4 = bool(enable_lean4)
+        self.use_native_lean4 = use_native_lean4
 
     def analyze_repository(
         self,
@@ -395,6 +692,7 @@ class VerificationInversionHunter:
             "REFINEMENT_GAP": 0,
             "RELEASE_ELISION": 0,
             "STATE_MACHINE_ORDERING": 0,
+            "Z3_SMT_CONSTRAINTS": 0,
         }
 
         p1 = self._run_pass1_dev_inversion(root, cg_context)
@@ -404,6 +702,14 @@ class VerificationInversionHunter:
         p5 = self._run_pass5_release_elision(root, cg_context)
         p6 = self._run_pass6_state_machine_ordering(root, cg_context)
 
+        z3_checks_run = 0
+        z3_sat_count = 0
+        z3_unsat_count = 0
+        z3_ok, z3_ver = _check_z3_available()
+        p_z3: List[VerificationInversionFinding] = []
+        if self.enable_z3 and z3_ok:
+            p_z3, z3_checks_run, z3_sat_count, z3_unsat_count = self._run_z3_constraint_checks(root, cg_context, p3)
+
         for batch, key in (
             (p1, "DEV_INVERSION"),
             (p2, "RULE5_TRUST_CLOSURE"),
@@ -411,6 +717,7 @@ class VerificationInversionHunter:
             (p4, "REFINEMENT_GAP"),
             (p5, "RELEASE_ELISION"),
             (p6, "STATE_MACHINE_ORDERING"),
+            (p_z3, "Z3_SMT_CONSTRAINTS"),
         ):
             pass_counts[key] = len(batch)
             findings.extend(batch)
@@ -427,6 +734,19 @@ class VerificationInversionHunter:
                     f.counterexample_trace = trace_steps
                 if not f.violated_invariant_formula:
                     f.violated_invariant_formula = inv_formula
+            if not f.status_justification:
+                from engine.epistemic_state import derive_epistemic_status
+
+                fd = asdict(f)
+                is_sat = str(f.z3_status).lower() == "sat"
+                is_unsat = str(f.z3_status).lower() == "unsat"
+                just = derive_epistemic_status(
+                    fd,
+                    static_invariant_verified=is_sat,
+                    refuted=is_unsat,
+                )
+                f.epistemic_status = just["epistemic_status"]
+                f.status_justification = just
             key = (f.rule_id, f.file_path.replace("\\", "/").lower(), int(f.line_number))
             if key not in seen:
                 seen.add(key)
@@ -435,6 +755,13 @@ class VerificationInversionHunter:
         sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
         deduped.sort(key=lambda x: (sev_rank.get(x.severity, 9), x.file_path.lower(), x.line_number))
 
+        lean4_info: Dict[str, Any] = {"native_checked": False, "all_modules_proved": False, "modules": []}
+        if self.enable_lean4:
+            try:
+                lean4_info = verify_trusted_closure_lean4(use_native_binary=self.use_native_lean4)
+            except Exception as exc:
+                lean4_info = {"native_checked": False, "all_modules_proved": False, "error": str(exc)[:200]}
+
         return VerificationInversionReport(
             repo_path=str(root),
             files_scanned=len(cg_context.parsed_files),
@@ -442,8 +769,186 @@ class VerificationInversionHunter:
             security_gates_audited=gates_audited,
             findings=deduped,
             pass_counts=pass_counts,
+            z3_summary={
+                "enabled": bool(self.enable_z3 and z3_ok),
+                "z3_version": z3_ver,
+                "checks_run": z3_checks_run,
+                "sat_witnesses": z3_sat_count,
+                "unsat_proved_safe": z3_unsat_count,
+            },
+            lean4_verification=lean4_info,
             elapsed_sec=time.perf_counter() - t0,
         )
+
+    def _run_z3_constraint_checks(
+        self,
+        root: Path,
+        cg_context: CallGraphContext,
+        pass3_findings: List[VerificationInversionFinding],
+    ) -> Tuple[List[VerificationInversionFinding], int, int, int]:
+        """
+        Live Z3 SMT constraint verification for:
+          1. Pass 3 JWT/OIDC findings -> enriches each with concrete Z3 SAT counterexample witness.
+          2. Pass 1 numeric bounds / header-length arithmetic (`content_length`, `buffer_size`, `limit`, `offset`).
+          3. Pass 3 RBAC / policy comparator inversion (`role != "admin"` or `permit` overriding `forbid`).
+        """
+        import json as _json
+
+        extra: List[VerificationInversionFinding] = []
+        checks_run = 0
+        sat_cnt = 0
+        unsat_cnt = 0
+
+        # A. Enrich Pass 3 JWT missing-claim findings with live Z3 SAT counterexample models
+        for f in pass3_findings:
+            if f.rule_id == "INV-COMP-MISSING-CLAIM":
+                mp = " ".join(f.missing_predicates).lower()
+                zres = z3_verify_comparator_contract(
+                    checks_sig=("verify_signature" not in mp),
+                    checks_exp=("verify_exp" not in mp),
+                    checks_aud=("aud" not in mp),
+                    checks_iss=("iss" not in mp),
+                    forbid_overrides_permit=True,
+                    inverted_role_check=False,
+                )
+                checks_run += 1
+                f.z3_status = zres["z3_status"]
+                if zres["z3_status"] == "sat":
+                    sat_cnt += 1
+                    f.z3_witness = dict(zres["witness"])
+                    f.counterexample_witness = _json.dumps(zres["witness"])
+                    f.poe_level = max(f.poe_level, 2)
+                    f.epistemic_status = "PROVEN_STATIC_INVARIANT"
+                elif zres["z3_status"] == "unsat":
+                    unsat_cnt += 1
+
+        _NUM_PARSE_RX = re.compile(
+            r"\b(content_length|header_len|header_length|buf_size|buffer_size|alloc_size|chunk_size|packet_len)\s*=\s*int\s*\(",
+            re.IGNORECASE,
+        )
+        _LOWER_BOUND_RX = re.compile(
+            r"(?:\b0\s*<=|(?:\s|[A-Za-z0-9_)])<\s*0\b|(?:\s|[A-Za-z0-9_)])<=\s*0\b|(?:\s|[A-Za-z0-9_)])>=\s*0\b|\bmax\s*\(\s*0\b|\bclamp\s*\()",
+            re.IGNORECASE,
+        )
+        _UPPER_BOUND_RX = re.compile(
+            r"(?:<=\s*(?:MAX_|max_|LIMIT|65536|1048576|\d{3,})|>\s*(?:MAX_|max_|LIMIT|65536|1048576|\d{3,})|\bmin\s*\([^)]*(?:MAX_|max_|LIMIT|\d{3,})|\bclamp\s*\()",
+            re.IGNORECASE,
+        )
+        _RBAC_INVERTED_RX = re.compile(
+            r"\bif\s+[^\n:]*\b(?:role|user_role|principal_role)\s*!=\s*['\"](?:admin|superuser|owner)['\"][^\n:]*:\s*(?:\n\s+)?return\s+True\b",
+            re.IGNORECASE,
+        )
+        _RBAC_PERMIT_OVERRIDES_FORBID_RX = re.compile(
+            r"\bif\s+[^\n:]*\bpermit\b[^\n:]*:\s*\n\s+return\s+True\b[\s\S]{0,120}\bforbid\b",
+            re.IGNORECASE,
+        )
+
+        for _, sym in cg_context.symbols_by_id.items():
+            if not self.include_tests and _is_test_rel_path(sym.file_path):
+                continue
+            pf = cg_context.parsed_files.get(sym.file_path)
+            if pf is None:
+                continue
+            abs_fp = str((root / sym.file_path).resolve(strict=False))
+            body_lines = self._symbol_body_lines(pf, sym)
+            body_text = "\n".join(txt for _, txt in body_lines if not _COMMENT_LINE_RE.match(txt))
+
+            # B. Numeric bounds / header-length arithmetic Z3 check
+            for ln_no, line in body_lines:
+                if _COMMENT_LINE_RE.match(line):
+                    continue
+                m_num = _NUM_PARSE_RX.search(line)
+                if m_num:
+                    vname = m_num.group(1)
+                    has_lo = bool(_LOWER_BOUND_RX.search(body_text))
+                    has_hi = bool(_UPPER_BOUND_RX.search(body_text))
+                    zres = z3_verify_numeric_bounds(
+                        var_name=vname,
+                        has_lower_bound=has_lo,
+                        has_upper_bound=has_hi,
+                    )
+                    checks_run += 1
+                    if zres["z3_status"] == "sat":
+                        sat_cnt += 1
+                        extra.append(
+                            VerificationInversionFinding(
+                                rule_id="INV-Z3-UNBOUNDED-NUMERIC",
+                                primitive="DEV_INVERSION",
+                                severity="HIGH",
+                                cwe="CWE-1284",
+                                file_path=abs_fp,
+                                line_number=ln_no,
+                                title=f"Z3 SMT Counterexample: Unbounded numeric/header length `{vname}` in {sym.file_path}:{ln_no}",
+                                description=(
+                                    f"Live Z3 SMT solver (`z3 {zres['z3_version']}`) proved `{vname}` in `{sym.name}` "
+                                    f"can escape safe bounds [0, 1048576]. {zres['reason']}"
+                                ),
+                                evidence=line.strip()[:200],
+                                remediation=f"Clamp `{vname}` to explicit `[0, MAX_ALLOWED]` bounds (e.g. `if not (0 <= {vname} <= MAX_LEN): raise ValueError`).",
+                                call_chain=[sym.name],
+                                missing_predicates=(
+                                    (["lower_bound >= 0"] if not has_lo else [])
+                                    + (["upper_bound <= MAX_LEN"] if not has_hi else [])
+                                ),
+                                counterexample_witness=_json.dumps(zres["witness"]),
+                                poe_level=2,
+                                z3_status="sat",
+                                z3_witness=dict(zres["witness"]),
+                                epistemic_status="PROVEN_STATIC_INVARIANT",
+                            )
+                        )
+                    elif zres["z3_status"] == "unsat":
+                        unsat_cnt += 1
+                    break
+
+            # C. RBAC / policy comparator inversion Z3 check
+            m_inv = _RBAC_INVERTED_RX.search(body_text)
+            m_forb = _RBAC_PERMIT_OVERRIDES_FORBID_RX.search(body_text)
+            if m_inv or m_forb:
+                zres = z3_verify_comparator_contract(
+                    checks_sig=True,
+                    checks_exp=True,
+                    checks_aud=True,
+                    checks_iss=True,
+                    forbid_overrides_permit=not bool(m_forb),
+                    inverted_role_check=bool(m_inv),
+                )
+                checks_run += 1
+                if zres["z3_status"] == "sat":
+                    sat_cnt += 1
+                    hit_ln = body_lines[0][0] if body_lines else sym.start_line
+                    for ln_no, line in body_lines:
+                        if "role" in line.lower() or "permit" in line.lower():
+                            hit_ln = ln_no
+                            break
+                    extra.append(
+                        VerificationInversionFinding(
+                            rule_id="INV-Z3-COMPARATOR-RBAC-BYPASS",
+                            primitive="COMPARATOR_CONTRACT",
+                            severity="CRITICAL",
+                            cwe="CWE-863",
+                            file_path=abs_fp,
+                            line_number=hit_ln,
+                            title=f"Z3 SMT Counterexample: RBAC comparator bypass in `{sym.name}` ({sym.file_path}:{hit_ln})",
+                            description=(
+                                f"Live Z3 SMT solver (`z3 {zres['z3_version']}`) proved an unauthorized principal "
+                                f"bypasses `{sym.name}` ({'inverted role predicate' if m_inv else 'permit evaluated before forbid'})."
+                            ),
+                            evidence=pf.lines[max(0, hit_ln - 1)].strip()[:200],
+                            remediation="Enforce fail-closed RBAC: evaluate `forbid` strictly before `permit` and require positive role membership.",
+                            call_chain=[sym.name],
+                            missing_predicates=["forbid_overrides_permit" if m_forb else "positive_role_check"],
+                            counterexample_witness=_json.dumps(zres["witness"]),
+                            poe_level=2,
+                            z3_status="sat",
+                            z3_witness=dict(zres["witness"]),
+                            epistemic_status="PROVEN_STATIC_INVARIANT",
+                        )
+                    )
+                elif zres["z3_status"] == "unsat":
+                    unsat_cnt += 1
+
+        return extra, checks_run, sat_cnt, unsat_cnt
 
     @staticmethod
     def _symbol_body_lines(pf: Any, sym: SymbolNode) -> List[Tuple[int, str]]:

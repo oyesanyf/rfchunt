@@ -923,15 +923,38 @@ class FusionArbiter:
             )
 
         # Gate 2: Unanimous Identical Implementations Bypass
+        # NOTE: Multi-LLM agreement is strictly labeled as `correlated_oracles` and NEVER
+        # promotes a finding out of UNRESOLVED / Lane 3 without an independent oracle.
         first_sig = self._normalize_probe_signature(proposals[0].raw_request)
         if all(self._normalize_probe_signature(p.raw_request) == first_sig for p in proposals):
-            res_probes = [proposals[0].to_dict()]
+            corr_oracles = [
+                (m if str(m).lower().startswith("llm_") else f"llm_{m}")
+                for m in participating_models
+            ]
+            winner_probe = proposals[0].to_dict()
+            winner_probe["correlated_oracles"] = list(corr_oracles)
+            winner_probe["independent_oracles"] = []
+            winner_probe["epistemic_status"] = "UNRESOLVED"
+            winner_probe["status_justification"] = {
+                "epistemic_status": "UNRESOLVED",
+                "satisfied_checks": ["llm_unanimous_template_agreement"],
+                "failed_checks": [],
+                "missing_evidence": ["independent_oracle_missing", "runtime_poe_not_executed"],
+                "independent_oracles": [],
+                "correlated_oracles": list(corr_oracles),
+            }
+            res_probes = [winner_probe]
             self._save_probes_to_db(res_probes, fragment_id, "Unanimous")
             return FusionArbitrationResult(
                 consensus_type="Unanimous",
                 fused_probes=res_probes,
-                reasoning="All specialists produced identical request templates.",
+                reasoning="All specialists produced identical request templates (correlated LLM agreement; requires independent oracle before promotion).",
                 participating_models=participating_models,
+                metadata={
+                    "epistemic_status": "UNRESOLVED",
+                    "correlated_oracles": list(corr_oracles),
+                    "independent_oracles": [],
+                },
             )
 
         # Gate 3: Arbitrary N-Model Quorum Majority Consensus (for N >= 3 distinct specialists)
@@ -949,10 +972,25 @@ class FusionArbiter:
             top_group = ranked_clusters[0]
             top_voters = list(dict.fromkeys(g.model for g in top_group))
             if len(top_voters) >= quorum_needed:
+                corr_oracles = [
+                    (m if str(m).lower().startswith("llm_") else f"llm_{m}")
+                    for m in top_voters
+                ]
                 winner = top_group[0].to_dict()
                 winner["corroborated_by_models"] = top_voters
+                winner["correlated_oracles"] = list(corr_oracles)
+                winner["independent_oracles"] = []
                 winner["vote_count"] = len(top_voters)
                 winner["panel_size"] = len(unique_specialists)
+                winner["epistemic_status"] = "UNRESOLVED"
+                winner["status_justification"] = {
+                    "epistemic_status": "UNRESOLVED",
+                    "satisfied_checks": ["llm_quorum_agreement"],
+                    "failed_checks": [],
+                    "missing_evidence": ["independent_oracle_missing", "runtime_poe_not_executed"],
+                    "independent_oracles": [],
+                    "correlated_oracles": list(corr_oracles),
+                }
                 res_probes = [winner]
                 self._save_probes_to_db(res_probes, fragment_id, "QuorumConsensus")
                 return FusionArbitrationResult(
@@ -960,13 +998,16 @@ class FusionArbiter:
                     fused_probes=res_probes,
                     reasoning=(
                         f"N-model quorum reached ({len(top_voters)}/{len(unique_specialists)} distinct models agreed; "
-                        f"threshold={quorum_needed})."
+                        f"threshold={quorum_needed}; correlated LLM agreement only — requires independent oracle)."
                     ),
                     participating_models=participating_models,
                     metadata={
                         "vote_tally": {k[:40]: len({g.model for g in v}) for k, v in clusters.items()},
                         "quorum_needed": quorum_needed,
                         "voters": top_voters,
+                        "epistemic_status": "UNRESOLVED",
+                        "correlated_oracles": list(corr_oracles),
+                        "independent_oracles": [],
                     },
                 )
 
@@ -1738,12 +1779,404 @@ Output strict JSON matching:
             if single_model_collapsed
             else ("AbliteratedConsensus" if has_abl else "ArbiterSynthesized")
         )
+        corr_oracles = [
+            (m if str(m).lower().startswith("llm_") else f"llm_{m}")
+            for m in [p["model"] for p in proposals]
+        ]
         return {
             "task": task_name,
             "status": "fused",
             "consensus_type": consensus_label,
             "participating_models": [p["model"] for p in proposals],
+            "correlated_oracles": corr_oracles,
+            "independent_oracles": [],
+            "epistemic_status": "UNRESOLVED",
+            "status_justification": {
+                "epistemic_status": "UNRESOLVED",
+                "satisfied_checks": ["llm_structured_consensus"],
+                "failed_checks": [],
+                "missing_evidence": ["independent_oracle_missing", "runtime_poe_not_executed"],
+                "independent_oracles": [],
+                "correlated_oracles": corr_oracles,
+            },
             "abliterated_active": has_abl,
             "backend_mode": getattr(self, "backend_mode", "ollama"),
             "data": synthesized_data,
         }
+
+    # =========================================================================
+    # Epistemic Oracle Separation + Devil's-Advocate / Refutation Pass
+    # =========================================================================
+    @staticmethod
+    def extract_function_and_callees_context(
+        file_path: str,
+        line_number: int,
+        *,
+        max_callees: int = 4,
+    ) -> Dict[str, Any]:
+        """
+        Extracts the enclosing function and same-file helper callees around
+        `(file_path, line_number)` using Python `ast` (with bounded line-window
+        fallback for non-Python files) to feed the Devil's-Advocate refutation pass.
+        """
+        from pathlib import Path
+
+        path = Path(file_path)
+        if not path.is_file():
+            return {"exists": False, "enclosing_function": "", "snippet": "", "callees": [], "line_range": (0, 0)}
+
+        try:
+            lines = path.read_bytes()[:256 * 1024].decode("utf-8", errors="replace").splitlines()
+        except OSError:
+            return {"exists": False, "enclosing_function": "", "snippet": "", "callees": [], "line_range": (0, 0)}
+
+        ln = max(1, min(int(line_number or 1), max(1, len(lines))))
+
+        def _fmt(start: int, end: int) -> str:
+            s = max(1, start)
+            e = min(len(lines), end)
+            return "\n".join(f"{i:4d}: {lines[i - 1]}" for i in range(s, e + 1))
+
+        if path.suffix.lower() != ".py":
+            start = max(1, ln - 20)
+            end = min(len(lines), ln + 20)
+            return {
+                "exists": True,
+                "enclosing_function": "<block>",
+                "snippet": _fmt(start, end),
+                "callees": [],
+                "line_range": (start, end),
+            }
+
+        try:
+            tree = ast.parse("\n".join(lines))
+        except SyntaxError:
+            start = max(1, ln - 20)
+            end = min(len(lines), ln + 20)
+            return {
+                "exists": True,
+                "enclosing_function": "<unparsed>",
+                "snippet": _fmt(start, end),
+                "callees": [],
+                "line_range": (start, end),
+            }
+
+        fn_defs: Dict[str, ast.AST] = {}
+        enclosing: Optional[ast.AST] = None
+        best_span = 10**9
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                fn_defs[node.name] = node
+                s = getattr(node, "lineno", 1)
+                e = getattr(node, "end_lineno", s)
+                if s <= ln <= e and (e - s) < best_span:
+                    enclosing = node
+                    best_span = e - s
+
+        if enclosing is None:
+            start = max(1, ln - 15)
+            end = min(len(lines), ln + 15)
+            return {
+                "exists": True,
+                "enclosing_function": "<module>",
+                "snippet": _fmt(start, end),
+                "callees": [],
+                "line_range": (start, end),
+            }
+
+        start = int(getattr(enclosing, "lineno", ln))
+        decs = getattr(enclosing, "decorator_list", None) or []
+        if decs:
+            start = min(start, min(int(getattr(d, "lineno", start)) for d in decs))
+        end = int(getattr(enclosing, "end_lineno", ln))
+        blocks = [f"### Enclosing function `{enclosing.name}` (L{start}-L{end})\n{_fmt(start, end)}"]
+
+        # Collect same-file callees invoked inside the enclosing function
+        called_names: List[str] = []
+        for sub in ast.walk(enclosing):
+            if isinstance(sub, ast.Call):
+                cname = sub.func.id if isinstance(sub.func, ast.Name) else (
+                    sub.func.attr if isinstance(sub.func, ast.Attribute) else ""
+                )
+                if cname and cname != enclosing.name and cname in fn_defs and cname not in called_names:
+                    called_names.append(cname)
+
+        callee_names: List[str] = []
+        for cname in called_names[:max_callees]:
+            cnode = fn_defs[cname]
+            cs = int(getattr(cnode, "lineno", 1))
+            ce = int(getattr(cnode, "end_lineno", cs))
+            blocks.append(f"### Callee `{cname}` (L{cs}-L{ce})\n{_fmt(cs, ce)}")
+            callee_names.append(cname)
+
+        return {
+            "exists": True,
+            "enclosing_function": enclosing.name,
+            "snippet": "\n\n".join(blocks),
+            "callees": callee_names,
+            "line_range": (start, end),
+        }
+
+    def run_refutation_pass(
+        self,
+        candidate: Dict[str, Any],
+        *,
+        repo_root: Optional[str] = None,
+        use_llm: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Devil's-Advocate / Refutation Pass executed before accepting a candidate finding.
+        Inspects the full surrounding function and callees to strictly DISPROVE the claim
+        (auth middleware, sanitizers, bounds checks, parameterization, or dead code).
+        Every cited counter-evidence line is deterministically verified against the AST;
+        unverified/hallucinated LLM line citations are rejected.
+        """
+        from pathlib import Path
+        from engine.claim_verifier import ClaimPreconditionVerifier
+
+        raw_fp = str(candidate.get("file_path") or candidate.get("file") or "").strip()
+        line_no = int(candidate.get("line_number") or candidate.get("line") or 1)
+        cwe = str(candidate.get("cwe") or "")
+
+        resolved_path: Optional[Path] = None
+        if raw_fp:
+            p = Path(raw_fp)
+            if p.is_file():
+                resolved_path = p
+            elif repo_root:
+                cand_p = Path(repo_root) / p
+                if cand_p.is_file():
+                    resolved_path = cand_p
+
+        # 1. Always run deterministic AST claim precondition check first
+        claim_res = ClaimPreconditionVerifier.verify_claim(candidate, repo_root=repo_root)
+        context_info = (
+            self.extract_function_and_callees_context(str(resolved_path), line_no)
+            if resolved_path is not None
+            else {"exists": False, "enclosing_function": "", "snippet": "", "callees": [], "line_range": (0, 0)}
+        )
+
+        # If deterministic AST verifier already refuted the claim (dominating sanitizer / missing file / static literal)
+        if claim_res.epistemic_status == "REFUTED":
+            cited = [claim_res.counter_evidence_line] if claim_res.counter_evidence_line else []
+            return {
+                "refuted": True,
+                "source": "deterministic_ast_precondition",
+                "reason": claim_res.reason,
+                "cited_lines": cited,
+                "verified_lines": cited,
+                "rejected_lines": [],
+                "callees_inspected": context_info.get("callees") or [],
+                "enclosing_function": context_info.get("enclosing_function") or "",
+                "claim_verification": claim_res.to_dict(),
+                "independent_oracles": ["ast_refutation_verifier", ClaimPreconditionVerifier.ORACLE_NAME],
+            }
+
+        # Check callee bodies deterministically for sanitizers/auth guards/bounds checks
+        if resolved_path is not None and context_info.get("callees"):
+            callee_candidate_lines: List[int] = []
+            in_callee_section = False
+            for raw_ln_txt in context_info.get("snippet", "").splitlines():
+                if raw_ln_txt.startswith("### Callee "):
+                    in_callee_section = True
+                    continue
+                if raw_ln_txt.startswith("### "):
+                    in_callee_section = False
+                    continue
+                if in_callee_section:
+                    m_ln = re.match(r"^\s*(\d+):", raw_ln_txt)
+                    if m_ln:
+                        callee_candidate_lines.append(int(m_ln.group(1)))
+            if callee_candidate_lines:
+                callee_check = ClaimPreconditionVerifier.verify_refutation_citations(
+                    resolved_path, callee_candidate_lines, cwe=cwe
+                )
+                if callee_check["verified"]:
+                    return {
+                        "refuted": True,
+                        "source": "deterministic_callee_ast_guard",
+                        "reason": f"Callee AST contains verified counter-evidence guard(s): {callee_check['evidence'][:3]}",
+                        "cited_lines": callee_check["verified_lines"],
+                        "verified_lines": callee_check["verified_lines"],
+                        "rejected_lines": [],
+                        "callees_inspected": context_info.get("callees") or [],
+                        "enclosing_function": context_info.get("enclosing_function") or "",
+                        "claim_verification": claim_res.to_dict(),
+                        "independent_oracles": ["ast_refutation_verifier"],
+                    }
+
+        # 2. Optional LLM Devil's-Advocate counter-hypothesis pass (when online and enabled)
+        llm_cited_lines: List[int] = []
+        llm_reason = ""
+        llm_attempted = False
+        is_offline = os.environ.get("RFCHUNT_OFFLINE") == "1"
+        if use_llm and not is_offline and resolved_path is not None and context_info.get("snippet"):
+            llm_attempted = True
+            sys_prompt = (
+                "You are a skeptical Devil's-Advocate Security Reviewer. "
+                "Your ONLY job is to DISPROVE the candidate vulnerability claim by finding "
+                "auth middleware, sanitizers, bounds checks, parameterized queries, safe loaders, "
+                "or dead code in the provided function and its callees. "
+                "Output strictly valid JSON with keys: 'refuted' (bool), 'cited_lines' (list of ints), 'reason' (str). "
+                "Every refutation MUST cite exact line numbers from the numbered snippet."
+            )
+            user_prompt = (
+                f"Candidate Claim:\n"
+                f"- Title: {candidate.get('title', '')}\n"
+                f"- CWE: {cwe}\n"
+                f"- File: {resolved_path.name}:{line_no}\n"
+                f"- Description: {str(candidate.get('description') or '')[:400]}\n\n"
+                f"Numbered Source (Enclosing Function + Callees):\n{context_info['snippet'][:3500]}\n\n"
+                "Return strict JSON only."
+            )
+            try:
+                raw_resp = self._query_model(self.arbiter_model, user_prompt, sys_prompt, num_predict=256)
+                parsed = self._parse_json(raw_resp, unwrap_lists=False)
+                if parsed and isinstance(parsed[0], dict):
+                    obj = parsed[0]
+                    llm_reason = str(obj.get("reason") or "")
+                    if obj.get("refuted") and isinstance(obj.get("cited_lines"), list):
+                        llm_cited_lines = [int(x) for x in obj["cited_lines"] if str(x).isdigit()]
+            except Exception:
+                llm_cited_lines = []
+
+        # 3. Deterministically verify ANY cited lines returned by the Devil's-Advocate LLM!
+        if llm_cited_lines and resolved_path is not None:
+            ver = ClaimPreconditionVerifier.verify_refutation_citations(resolved_path, llm_cited_lines, cwe=cwe)
+            if ver["verified"]:
+                return {
+                    "refuted": True,
+                    "source": "llm_devils_advocate_ast_verified",
+                    "reason": llm_reason or f"Verified AST counter-evidence at lines {ver['verified_lines']}",
+                    "cited_lines": llm_cited_lines,
+                    "verified_lines": ver["verified_lines"],
+                    "rejected_lines": ver["rejected_lines"],
+                    "callees_inspected": context_info.get("callees") or [],
+                    "enclosing_function": context_info.get("enclosing_function") or "",
+                    "claim_verification": claim_res.to_dict(),
+                    "independent_oracles": ["ast_refutation_verifier"],
+                }
+            # Hallucinated/invalid line citations from the LLM -> reject the refutation!
+            return {
+                "refuted": False,
+                "source": "llm_refutation_citations_rejected_by_ast",
+                "reason": "Devil's-advocate LLM cited lines that failed deterministic AST guard verification.",
+                "cited_lines": llm_cited_lines,
+                "verified_lines": [],
+                "rejected_lines": ver["rejected_lines"],
+                "callees_inspected": context_info.get("callees") or [],
+                "enclosing_function": context_info.get("enclosing_function") or "",
+                "claim_verification": claim_res.to_dict(),
+                "independent_oracles": [],
+            }
+
+        return {
+            "refuted": False,
+            "source": "not_refuted" + ("_llm_checked" if llm_attempted else "_offline_ast"),
+            "reason": claim_res.reason or "No deterministic refutation guard discovered.",
+            "cited_lines": [],
+            "verified_lines": [],
+            "rejected_lines": [],
+            "callees_inspected": context_info.get("callees") or [],
+            "enclosing_function": context_info.get("enclosing_function") or "",
+            "claim_verification": claim_res.to_dict(),
+            "independent_oracles": list(claim_res.independent_oracles),
+        }
+
+    def arbitrate_finding_epistemic(
+        self,
+        candidate: Dict[str, Any],
+        *,
+        llm_votes: Optional[Sequence[str]] = None,
+        independent_oracles: Optional[Sequence[str]] = None,
+        repo_root: Optional[str] = None,
+        run_refutation: bool = True,
+        use_llm_refutation: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Arbitrates a candidate vulnerability finding with strict epistemic rigor:
+          1. Separates multi-LLM agreement (`llm_votes`) into `correlated_oracles`.
+          2. Runs the Devil's-Advocate / Refutation Pass before acceptance.
+          3. Enforces the hard cap: LLM-only consensus (even 3/3 unanimous) NEVER
+             promotes past `UNRESOLVED` / Lane 3 unless corroborated by an orthogonal
+             independent oracle (AST/static invariant, Z3 SMT, Lean 4, or runtime PoE).
+        """
+        from engine.epistemic_state import (
+            EpistemicStatus,
+            attach_epistemic_metadata,
+            derive_epistemic_status,
+            is_correlated_oracle_name,
+        )
+
+        item = dict(candidate)
+        corr_list = list(item.get("correlated_oracles") or [])
+        for v in llm_votes or []:
+            vs = str(v or "").strip()
+            if vs:
+                corr_list.append(vs if vs.lower().startswith("llm_") else f"llm_{vs}")
+        item["correlated_oracles"] = list(dict.fromkeys(corr_list))
+
+        indep_list = [
+            str(o).strip()
+            for o in (list(item.get("independent_oracles") or []) + list(independent_oracles or []))
+            if str(o or "").strip() and not is_correlated_oracle_name(str(o))
+        ]
+        item["independent_oracles"] = list(dict.fromkeys(indep_list))
+
+        refutation_report: Optional[Dict[str, Any]] = None
+        claim_res_dict: Optional[Dict[str, Any]] = None
+        if run_refutation:
+            refutation_report = self.run_refutation_pass(
+                item,
+                repo_root=repo_root,
+                use_llm=use_llm_refutation,
+            )
+            item["refutation_pass"] = refutation_report
+            claim_res_dict = refutation_report.get("claim_verification")
+            if refutation_report.get("refuted"):
+                item["independent_oracles"] = list(
+                    dict.fromkeys(item["independent_oracles"] + list(refutation_report.get("independent_oracles") or []))
+                )
+                just = derive_epistemic_status(item, claim_result=claim_res_dict, refuted=True)
+                just["failed_checks"] = list(dict.fromkeys(just.get("failed_checks", []) + ["devils_advocate_refutation"]))
+                attach_epistemic_metadata(item, justification=just)
+                return item
+
+        # If no independent oracle exists (pure LLM unanimous consensus), enforce UNRESOLVED + Lane 3 hard cap!
+        if not item["independent_oracles"]:
+            # If claim_verifier ran without refuting and didn't prove static invariant, do NOT let empty/weak check promote
+            claim_proved = (
+                isinstance(claim_res_dict, dict)
+                and claim_res_dict.get("epistemic_status") == EpistemicStatus.PROVEN_STATIC_INVARIANT.value
+            )
+            if not claim_proved:
+                item["evidence_lane"] = "LLM_HEURISTIC"
+                just = derive_epistemic_status(item, claim_result=claim_res_dict)
+                just["independent_oracles"] = []
+                just["epistemic_status"] = EpistemicStatus.UNRESOLVED.value
+                if "independent_oracle_missing" not in just["missing_evidence"]:
+                    just["missing_evidence"].append("independent_oracle_missing")
+                if item["correlated_oracles"] and "correlated_llm_agreement_cannot_promote" not in just["missing_evidence"]:
+                    just["missing_evidence"].append("correlated_llm_agreement_cannot_promote")
+                attach_epistemic_metadata(item, justification=just)
+                return item
+
+        # Orthogonal independent oracle exists -> derive exact epistemic status
+        rt_verified = bool(
+            item.get("runtime_poe_verified") is True
+            or (int(item.get("poe_level") or 0) >= 3 and any("runtime" in o for o in item["independent_oracles"]))
+        )
+        stat_verified = bool(
+            (isinstance(claim_res_dict, dict) and claim_res_dict.get("epistemic_status") == EpistemicStatus.PROVEN_STATIC_INVARIANT.value)
+            or str(item.get("z3_status") or "").lower() == "sat"
+            or any(o in ("z3_smt", "ast_invariant", "claim_precondition_ast") for o in item["independent_oracles"])
+            and not (isinstance(claim_res_dict, dict) and claim_res_dict.get("epistemic_status") == EpistemicStatus.UNRESOLVED.value)
+        )
+        just = derive_epistemic_status(
+            item,
+            claim_result=claim_res_dict,
+            runtime_poe_verified=rt_verified,
+            static_invariant_verified=stat_verified,
+        )
+        attach_epistemic_metadata(item, justification=just)
+        return item

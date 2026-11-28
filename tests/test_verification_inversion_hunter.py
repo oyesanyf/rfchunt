@@ -361,3 +361,86 @@ def verify_auth_token(token: str, expected_secret: str) -> bool:
     sarif_doc = json.loads(Path(all_res["report_files"]["combined_sarif"]).read_text(encoding="utf-8"))
     sarif_rules = {r["ruleId"] for r in sarif_doc["runs"][0]["results"]}
     assert "INV-RULE5-FAIL-OPEN" in sarif_rules or "INV-ELISION-NON-CT-SECRET" in sarif_rules
+
+
+def test_live_z3_and_lean4_trusted_closure_in_verification_inversion_hunter(tmp_path: Path) -> None:
+    """
+    Reproducible verification that `VerificationInversionHunter` executes live Z3 SMT
+    constraint checks (Pass 1 numeric bounds + Pass 3 JWT/RBAC comparator contracts)
+    and live Lean 4 machine-checking of `TrustedClosure.lean` + `EpistemicPromotionInvariants.lean`,
+    with 0 false positives on compliant/patched implementations.
+    """
+    from engine.formal_verifier import find_lean4_binary
+    from engine.verification_inversion_hunter import verify_trusted_closure_lean4
+
+    vuln_dir = tmp_path / "vuln_formal"
+    vuln_dir.mkdir(parents=True)
+    (vuln_dir / "header_bounds.py").write_text(
+        "def alloc_header(raw_len: str) -> bytes:\n"
+        "    content_length = int(raw_len)\n"
+        "    return b'x' * content_length\n",
+        encoding="utf-8",
+    )
+    (vuln_dir / "rbac_bad.py").write_text(
+        "def check_admin(user_role: str) -> bool:\n"
+        "    if user_role != 'admin':\n"
+        "        return True\n"
+        "    return False\n",
+        encoding="utf-8",
+    )
+    (vuln_dir / "jwt_bad.py").write_text(
+        "import jwt\n"
+        "def verify_token(token: str, secret: str):\n"
+        "    return jwt.decode(token, secret, algorithms=['HS256'])\n",
+        encoding="utf-8",
+    )
+
+    rep_vuln = VerificationInversionHunter(enable_z3=True, enable_lean4=True).analyze_repository(vuln_dir)
+    assert rep_vuln.z3_summary["enabled"] is True
+    assert rep_vuln.z3_summary["sat_witnesses"] >= 3
+    rule_ids = {f.rule_id for f in rep_vuln.findings}
+    assert "INV-Z3-UNBOUNDED-NUMERIC" in rule_ids
+    assert "INV-Z3-COMPARATOR-RBAC-BYPASS" in rule_ids
+    assert "INV-COMP-MISSING-CLAIM" in rule_ids
+    for f in rep_vuln.findings:
+        if f.z3_status == "sat":
+            assert f.epistemic_status == "PROVEN_STATIC_INVARIANT"
+            assert "z3_smt" in f.status_justification["independent_oracles"]
+
+    # Compliant / patched negative cases -> 0 Z3 SAT findings (0 FP)
+    safe_dir = tmp_path / "safe_formal"
+    safe_dir.mkdir(parents=True)
+    (safe_dir / "header_bounds.py").write_text(
+        "MAX_FRAME = 65536\n"
+        "def alloc_header(raw_len: str) -> bytes:\n"
+        "    content_length = int(raw_len)\n"
+        "    if not (0 <= content_length <= MAX_FRAME):\n"
+        "        raise ValueError('out of bounds')\n"
+        "    return b'x' * content_length\n",
+        encoding="utf-8",
+    )
+    (safe_dir / "rbac_good.py").write_text(
+        "def check_admin(user_role: str, forbid: bool = False) -> bool:\n"
+        "    if forbid:\n"
+        "        return False\n"
+        "    return user_role == 'admin'\n",
+        encoding="utf-8",
+    )
+    (safe_dir / "jwt_good.py").write_text(
+        "import jwt\n"
+        "def verify_token(token: str, secret: str):\n"
+        "    return jwt.decode(token, secret, algorithms=['HS256'], audience='api', issuer='idp')\n",
+        encoding="utf-8",
+    )
+
+    rep_safe = VerificationInversionHunter(enable_z3=True, enable_lean4=False).analyze_repository(safe_dir)
+    assert rep_safe.z3_summary["sat_witnesses"] == 0
+    assert [f for f in rep_safe.findings if f.rule_id in ("INV-Z3-UNBOUNDED-NUMERIC", "INV-Z3-COMPARATOR-RBAC-BYPASS", "INV-COMP-MISSING-CLAIM")] == []
+
+    # Verify live Lean 4 kernel checking of TrustedClosure.lean & EpistemicPromotionInvariants.lean
+    if find_lean4_binary(Path(__file__).resolve().parent.parent) is not None:
+        lean_res = verify_trusted_closure_lean4(use_native_binary=True)
+        assert lean_res["native_checked"] is True
+        assert lean_res["all_modules_proved"] is True
+        assert all(m["status"] == "PROVED_NATIVE_LEAN4" and not m["has_sorry"] for m in lean_res["modules"])
+

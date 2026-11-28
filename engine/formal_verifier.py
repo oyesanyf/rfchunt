@@ -126,7 +126,21 @@ class FormalCheckResult:
     elapsed_ms: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        from engine.epistemic_state import attach_epistemic_metadata
+
+        d = asdict(self)
+        oracle = "z3_smt" if self.engine == "z3_smt" else ("lean4_kernel" if self.engine == "lean4" else "ast_invariant")
+        d["independent_oracles"] = [oracle]
+        if self.status == "COUNTEREXAMPLE_FOUND":
+            d["z3_status"] = "sat" if self.engine == "z3_smt" else ""
+            d["z3_witness"] = dict(self.counterexample or {})
+            attach_epistemic_metadata(d, static_invariant_verified=True)
+        elif self.status == "PROVED":
+            d["z3_status"] = "unsat" if self.engine == "z3_smt" else ""
+            attach_epistemic_metadata(d, refuted=True)
+        else:
+            attach_epistemic_metadata(d)
+        return d
 
 
 class Z3FormalVerifier:
@@ -648,7 +662,8 @@ class Lean4FormalVerifier:
                 continue
 
             if allow_native and lean_bin is not None:
-                proc = _run_quiet([str(lean_bin), str(lf)], cwd=str(lf.parent), timeout=90)
+                lf_abs = lf.resolve()
+                proc = _run_quiet([str(lean_bin), str(lf_abs)], cwd=str(lf_abs.parent), timeout=90)
                 ok = proc.returncode == 0
                 if ok:
                     machine_checked_count += 1

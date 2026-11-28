@@ -8241,7 +8241,34 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         if (getattr(args, "enable_phi", False) or active_mode == "phi") and not getattr(args, "run_all_scans", False):
             cmd_phi(args)
             return
-        cmd_dry_run_plan(args, active_mode=active_mode, raw_argv=raw_argv)
+        _has_host_for_dry = "host" in explicit_dests or any(
+            a in ("--host", "--target") or a.startswith(("--host=", "--target=")) for a in raw_argv
+        )
+        _has_port_for_dry = "port" in explicit_dests or any(
+            a == "--port" or a.startswith("--port=") for a in raw_argv
+        )
+        _effective_dry_mode = active_mode
+        if (
+            not explicit_mode_given
+            and not _has_host_for_dry
+            and not getattr(args, "targets", None)
+            and (getattr(args, "folder", None) or getattr(args, "repo", None))
+            and not any(
+                getattr(args, fl, False)
+                for fl in (
+                    "enable_mantis", "mantis_report", "enable_aiscan", "aiscan_report",
+                    "enable_artex", "enable_prompt_smuggle", "enable_raptor",
+                    "raptor_status", "raptor_findings", "raptor_setup",
+                    "harness2_report", "dream_benchmark", "enable_rea_only",
+                    "enable_ensemble_flag", "enable_formal_flag", "enable_stride_flag",
+                )
+            )
+        ):
+            _effective_dry_mode = "all"
+            args.host = None
+            if not _has_port_for_dry and getattr(args, "port", 5006) in (443, 5006):
+                args.port = None
+        cmd_dry_run_plan(args, active_mode=_effective_dry_mode, raw_argv=raw_argv)
         return
 
     if active_mode == "setup":

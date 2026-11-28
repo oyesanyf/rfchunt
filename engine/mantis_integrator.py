@@ -3067,11 +3067,22 @@ class MantisIntegrator:
         summary_json_path = self.reports_dir / "mantis_summary.json"
         summary_txt_path = self.reports_dir / "mantis_summary.txt"
 
+        findings_dicts = [f.to_dict() for f in findings]
+        try:
+            from engine.claim_verifier import ClaimPreconditionVerifier
+
+            findings_dicts = ClaimPreconditionVerifier.apply_to_findings(
+                findings_dicts,
+                repo_root=target_path if os.path.isdir(str(target_path)) else None,
+            )
+        except Exception:
+            pass
+
         sarif_doc = build_sarif_document(
             tool_name="RFCHunt-Google-Mantis",
             tool_uri=MANTIS_REPO_URL,
             target_root=target_path,
-            findings=[f.to_dict() for f in findings],
+            findings=findings_dicts,
         )
         with open(sarif_path, "w", encoding="utf-8") as f:
             json.dump(sarif_doc, f, indent=2)
@@ -3085,8 +3096,14 @@ class MantisIntegrator:
             "abliterated_model": self.preferred_model,
             "fusion_models": list(self.fusion_models),
             "threat_model": threat_model.to_dict(),
-            "total_findings": len(findings),
-            "findings": [item.to_dict() for item in findings],
+            "total_findings": len(findings_dicts),
+            "epistemic_summary": {
+                "PROVEN_RUNTIME": sum(1 for d in findings_dicts if d.get("epistemic_status") == "PROVEN_RUNTIME"),
+                "PROVEN_STATIC_INVARIANT": sum(1 for d in findings_dicts if d.get("epistemic_status") == "PROVEN_STATIC_INVARIANT"),
+                "UNRESOLVED": sum(1 for d in findings_dicts if d.get("epistemic_status") == "UNRESOLVED"),
+                "REFUTED": sum(1 for d in findings_dicts if d.get("epistemic_status") == "REFUTED"),
+            },
+            "findings": findings_dicts,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
         with open(json_path, "w", encoding="utf-8") as f:
@@ -3265,45 +3282,47 @@ def build_sarif_document(
         if item.get("evidence"):
             msg += f" | Sink: {item.get('sink', '')}"
 
+        from engine.epistemic_state import enrich_sarif_result_epistemic
+
         sarif_lvl = "note" if evidence_lane == "SPECULATIVE_HYPOTHESIS" else _sarif_level(sev)
 
-        results.append(
-            {
-                "ruleId": rid,
-                "level": sarif_lvl,
-                "message": {"text": msg},
-                "locations": [
-                    {
-                        "physicalLocation": {
-                            "artifactLocation": {"uri": rel_uri},
-                            "region": {"startLine": line_num},
-                        }
+        sarif_entry = {
+            "ruleId": rid,
+            "level": sarif_lvl,
+            "message": {"text": msg},
+            "locations": [
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": rel_uri},
+                        "region": {"startLine": line_num},
                     }
-                ],
-                "properties": {
-                    "severity": sev,
-                    "potential_impact": potential_impact,
-                    "evidence_lane": evidence_lane,
-                    "cvss_score": item.get("cvss_score"),
-                    "cvss_vector": item.get("cvss_vector"),
-                    "reproduced": bool(item.get("reproduced", False) or poe_val >= 3),
-                    "patch_verified": item.get("patch_verified", False),
-                    "scanner": scanner_lbl,
-                    "corroborating_scanners": list(
-                        item.get("corroborating_scanners") or [scanner_lbl]
-                    ),
-                    "is_zero_day": item.get("is_zero_day", False),
-                    "poe_level": poe_val,
-                    "verification_status": ver_status,
-                    "finding_tier": tier_label,
-                    **({
-                        "hop_count": item.get("hop_count"),
-                        "source_scanners": item.get("source_scanners"),
-                        "chain_steps": item.get("chain_steps"),
-                    } if item.get("chain_steps") or item.get("hop_count") else {}),
-                },
-            }
-        )
+                }
+            ],
+            "properties": {
+                "severity": sev,
+                "potential_impact": potential_impact,
+                "evidence_lane": evidence_lane,
+                "cvss_score": item.get("cvss_score"),
+                "cvss_vector": item.get("cvss_vector"),
+                "reproduced": bool(item.get("reproduced", False) or poe_val >= 3),
+                "patch_verified": item.get("patch_verified", False),
+                "scanner": scanner_lbl,
+                "corroborating_scanners": list(
+                    item.get("corroborating_scanners") or [scanner_lbl]
+                ),
+                "is_zero_day": item.get("is_zero_day", False),
+                "poe_level": poe_val,
+                "verification_status": ver_status,
+                "finding_tier": tier_label,
+                **({
+                    "hop_count": item.get("hop_count"),
+                    "source_scanners": item.get("source_scanners"),
+                    "chain_steps": item.get("chain_steps"),
+                } if item.get("chain_steps") or item.get("hop_count") else {}),
+            },
+        }
+        enrich_sarif_result_epistemic(sarif_entry, item)
+        results.append(sarif_entry)
 
     return {
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
