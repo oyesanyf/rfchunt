@@ -347,6 +347,7 @@ class EnsembleReport:
     whiteboard: dict[str, Any] = field(default_factory=dict)
     lean_verification: dict[str, Any] = field(default_factory=dict)
     toolchain_status: dict[str, Any] = field(default_factory=dict)
+    stride_threat_model: dict[str, Any] = field(default_factory=dict)
     proxy: str | None = None
     all_scan_summary: dict[str, Any] | None = None
     generated_at_utc: str = field(
@@ -374,6 +375,7 @@ class EnsembleReport:
                 "whiteboard": dict(self.whiteboard),
                 "lean_verification": dict(self.lean_verification),
                 "toolchain_status": dict(self.toolchain_status),
+                "stride_threat_model": dict(self.stride_threat_model),
                 "all_scan_summary": self.all_scan_summary,
             }
         )
@@ -1576,6 +1578,10 @@ class EnsembleOrchestrator:
         db: Any | None = None,
         lean_dir: str | Path | None = None,
         max_workers: int = 4,
+        enable_stride: bool | None = None,
+        stride_diagrams: Sequence[str | Path] = (),
+        stride_out: str | Path | None = None,
+        stride_write_repo: bool = False,
     ) -> None:
         self.program = (program or "generic").strip().lower()
         self.freshness_hours = int(freshness_hours)
@@ -1605,6 +1611,10 @@ class EnsembleOrchestrator:
             else (Path(__file__).resolve().parent.parent / "formal" / "lean4")
         )
         self.max_workers = max(1, int(max_workers))
+        self.enable_stride = enable_stride
+        self.stride_diagrams = tuple(str(p) for p in (stride_diagrams or ()) if str(p or "").strip())
+        self.stride_out = str(stride_out).strip() if stride_out else None
+        self.stride_write_repo = bool(stride_write_repo)
         self.last_telemetry: dict[str, Any] = {}
 
     @staticmethod
@@ -3249,6 +3259,54 @@ class EnsembleOrchestrator:
         except Exception:  # noqa: BLE001, S110
             pass
 
+        stride_tm: dict[str, Any] = {"status": "disabled"}
+        if self.enable_stride is not False and target_p.is_dir():
+            try:
+                from engine.stride_threat_modeler import StrideThreatModeler
+
+                stride_out = (
+                    Path(self.stride_out)
+                    if self.stride_out
+                    else (
+                        Path(out_dir) / "stride_threat_model"
+                        if out_dir is not None
+                        else Path("reports/stride_threat_model")
+                    )
+                )
+                modeler = StrideThreatModeler(
+                    use_fusion=(not self.embedded and self.enable_llm_verify),
+                    embedded=self.embedded,
+                    model=self.model,
+                )
+                stride_tm = modeler.analyze_codebase(
+                    target_p,
+                    out_dir=stride_out,
+                    diagram_paths=self.stride_diagrams,
+                    existing_findings=[c.to_dict() for c in clusters],
+                    force_generate=(self.enable_stride is True) or bool(self.stride_diagrams),
+                    write_to_repo=self.stride_write_repo,
+                    dry_run=False,
+                )
+                whiteboard.add_fact(
+                    "stride_threat_model",
+                    (
+                        f"STRIDE Threat Model ({stride_tm.get('status')}): "
+                        f"components={stride_tm.get('components_count', 0)}, "
+                        f"threats={stride_tm.get('threat_scenarios_count', 0)}, "
+                        f"requirements={stride_tm.get('security_requirements_count', 0)}, "
+                        f"attack_trees={stride_tm.get('attack_trees_count', 0)}"
+                    ),
+                    payload={
+                        "status": stride_tm.get("status"),
+                        "missing_threat_model": stride_tm.get("missing_threat_model", False),
+                        "auto_generated": stride_tm.get("auto_generated", False),
+                        "report_files": stride_tm.get("report_files") or {},
+                    },
+                    source="stride_threat_modeler",
+                )
+            except Exception as stride_exc:  # noqa: BLE001
+                stride_tm = {"status": "error", "error": str(stride_exc)}
+
         wb_snapshot = whiteboard.to_dict()
         self.last_telemetry = _redact_payload(
             {
@@ -3259,6 +3317,15 @@ class EnsembleOrchestrator:
                 "lean_verification": lean_dict,
                 "toolchain_status": toolchain_status,
                 "acdso_stage2": acdso_stage2,
+                "stride_threat_model": {
+                    "status": stride_tm.get("status"),
+                    "missing_threat_model": stride_tm.get("missing_threat_model", False),
+                    "auto_generated": stride_tm.get("auto_generated", False),
+                    "threat_scenarios_count": stride_tm.get("threat_scenarios_count", 0),
+                    "security_requirements_count": stride_tm.get("security_requirements_count", 0),
+                    "attack_trees_count": stride_tm.get("attack_trees_count", 0),
+                    "report_files": stride_tm.get("report_files") or {},
+                },
             }
         )
 
@@ -3272,6 +3339,7 @@ class EnsembleOrchestrator:
             whiteboard=wb_snapshot,
             lean_verification=lean_dict,
             toolchain_status=toolchain_status,
+            stride_threat_model=stride_tm,
             proxy=self.proxy,
             all_scan_summary=all_scan_summary,
         )
@@ -4000,5 +4068,37 @@ def render_ensemble_markdown(report: EnsembleReport) -> str:
                 f"- **Backends:** `{json.dumps(tc_summary)}`",
             ]
         )
+
+    if report.stride_threat_model and isinstance(report.stride_threat_model, dict):
+        stm = report.stride_threat_model
+        stm_rf = stm.get("report_files") if isinstance(stm.get("report_files"), dict) else {}
+        lines.extend(
+            [
+                "",
+                "## STRIDE Threat Model & Attack Trees",
+                (
+                    f"- **Status:** `{stm.get('status', 'unknown')}` | "
+                    f"**Missing Threat Model:** `{stm.get('missing_threat_model', False)}` | "
+                    f"**Auto-Generated:** `{stm.get('auto_generated', False)}`"
+                ),
+                (
+                    f"- **Coverage:** components=`{stm.get('components_count', 0)}`, "
+                    f"boundaries=`{stm.get('trust_boundaries_count', 0)}`, "
+                    f"scenarios=`{stm.get('threat_scenarios_count', 0)}`, "
+                    f"requirements=`{stm.get('security_requirements_count', 0)}`, "
+                    f"attack_trees=`{stm.get('attack_trees_count', 0)}`"
+                ),
+            ]
+        )
+        if stm_rf.get("markdown"):
+            lines.append(f"- **Report Markdown:** `{stm_rf['markdown']}`")
+        if stm_rf.get("architecture_svg"):
+            lines.append(f"- **Architecture Diagram (SVG):** `{stm_rf['architecture_svg']}`")
+        if stm_rf.get("architecture_png"):
+            lines.append(f"- **Architecture Diagram (PNG):** `{stm_rf['architecture_png']}`")
+        if stm_rf.get("attack_tree_svgs"):
+            lines.append(f"- **Attack Tree Diagrams (SVG):** `{', '.join(str(p) for p in stm_rf['attack_tree_svgs'][:5])}`")
+        if stm_rf.get("attack_tree_pngs"):
+            lines.append(f"- **Attack Tree Diagrams (PNG):** `{', '.join(str(p) for p in stm_rf['attack_tree_pngs'][:5])}`")
 
     return _redact_inline_tokens("\n".join(lines) + "\n")

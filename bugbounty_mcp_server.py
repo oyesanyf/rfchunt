@@ -993,6 +993,24 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "bb_generate_stride_threat_model",
+        "description": "Generate an advanced Fusion-powered STRIDE, MITRE ATT&CK, Zero Trust, Trust Boundary, Security Requirements & downloadable Attack Tree SVG threat model for a codebase (auto-detects missing threat models and parses uploaded architecture diagrams).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "description": "Local repository or directory path"},
+                "out_dir": {"type": "string", "default": "reports/stride_threat_model"},
+                "diagram_paths": {"type": "array", "items": {"type": "string"}},
+                "force_generate": {"type": "boolean", "default": True},
+                "write_to_repo": {"type": "boolean", "default": False},
+                "embedded": {"type": "boolean", "default": False},
+                "use_fusion": {"type": "boolean", "default": True},
+                "dry_run": {"type": "boolean", "default": False},
+                "query": {"type": "string", "description": "Optional scoping question"},
+            },
+        },
+    },
 ]
 
 
@@ -1645,6 +1663,30 @@ class BugBountyMCPServer:
                 out_md=args.get("out_md"),
             )
             return {**summary.to_dict(), "auto_submit_forbidden": True, "auto_delete_forbidden": True}
+
+        if name == "bb_generate_stride_threat_model":
+            from engine.stride_threat_modeler import (
+                StrideThreatModeler,
+                guard_prompt_disclosure_probe,
+            )
+
+            refusal = guard_prompt_disclosure_probe(str(args.get("query") or ""))
+            if refusal is not None:
+                return {"status": "refused", "message": refusal}
+
+            target_str = str(args.get("target") or ".").strip() or "."
+            out_dir = str(args.get("out_dir") or "reports/stride_threat_model")
+            embedded_flag = _coerce_strict_bool(args.get("embedded", False))
+            use_fusion_flag = _coerce_strict_bool(args.get("use_fusion", True)) and not embedded_flag
+            modeler = StrideThreatModeler(use_fusion=use_fusion_flag, embedded=embedded_flag)
+            return modeler.analyze_codebase(
+                target_str,
+                out_dir=out_dir,
+                diagram_paths=list(args.get("diagram_paths") or []),
+                force_generate=_coerce_strict_bool(args.get("force_generate", True)),
+                write_to_repo=_coerce_strict_bool(args.get("write_to_repo", False)),
+                dry_run=_coerce_strict_bool(args.get("dry_run", False)),
+            )
 
         raise ValueError(f"Unknown tool: {name}")
 

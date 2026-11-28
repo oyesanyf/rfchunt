@@ -1724,6 +1724,29 @@ class TerminatorMCPServer:
                 },
             },
             {
+                "name": "generate_stride_threat_model",
+                "description": (
+                    "[Module 26 STRIDE + MITRE ATT&CK + Zero Trust + Attack Trees] Detects whether a codebase "
+                    "has a threat model and generates an advanced Fusion-powered STRIDE threat model with "
+                    "Trust Boundaries, Security Requirements, and downloadable SVG Attack Tree diagrams."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "target": {"type": "string", "default": "."},
+                        "out_dir": {"type": "string", "default": "reports/stride_threat_model"},
+                        "diagram_paths": {"type": "array", "items": {"type": "string"}},
+                        "force_generate": {"type": "boolean", "default": True},
+                        "write_to_repo": {"type": "boolean", "default": False},
+                        "embedded": {"type": "boolean", "default": False},
+                        "use_fusion": {"type": "boolean", "default": True},
+                        "dry_run": {"type": "boolean", "default": False},
+                        "query": {"type": "string"},
+                        "workspace_root": {"type": "string"},
+                    },
+                },
+            },
+            {
                 "name": "run_fast_ooda",
                 "description": (
                     "[3-Stage Parallel OODA Triage Funnel] Runs Stage 1 parallel deterministic CPU checks, "
@@ -3729,6 +3752,7 @@ class TerminatorMCPServer:
             "classify_http_responses",
             "qa_bounty_drafts",
             "check_bounty_drafts",
+            "generate_stride_threat_model",
         ):
             self._reject_shell_execution(args)
             from bugbounty_mcp_server import BugBountyMCPServer
@@ -3744,9 +3768,27 @@ class TerminatorMCPServer:
                 "classify_http_responses": "bb_classify_http_responses",
                 "qa_bounty_drafts": "bb_qa_drafts",
                 "check_bounty_drafts": "bb_check_drafts",
+                "generate_stride_threat_model": "bb_generate_stride_threat_model",
             }
             forwarded_args = dict(args)
             explicit_ws_root = self._resolve_mcp_workspace_root(args)
+            if name == "generate_stride_threat_model":
+                forwarded_args["target"] = self._validate_mcp_scan_path(
+                    str(forwarded_args.get("target") or "."),
+                    workspace_root=explicit_ws_root,
+                    allow_directory=True,
+                )
+                if forwarded_args.get("out_dir"):
+                    forwarded_args["out_dir"] = self._validate_mcp_output_dir(
+                        str(forwarded_args["out_dir"]),
+                        workspace_root=explicit_ws_root,
+                        enforce_explicit_ws=(explicit_ws_root is not None),
+                    )
+                if forwarded_args.get("diagram_paths"):
+                    forwarded_args["diagram_paths"] = [
+                        self._validate_mcp_scan_path(str(dp), workspace_root=explicit_ws_root, allow_directory=False)
+                        for dp in forwarded_args["diagram_paths"]
+                    ]
             if name == "run_autonomous_hunt" and forwarded_args.get("targets"):
                 validated_targets: List[str] = []
                 for raw_t in forwarded_args["targets"]:

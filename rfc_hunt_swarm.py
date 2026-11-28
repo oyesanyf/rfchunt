@@ -2738,6 +2738,30 @@ def cmd_aiscan(args):
 
     db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
     try:
+        if getattr(args, "aiscan_report", False):
+            target_filter = getattr(args, "aiscan_target", None) or getattr(args, "repo", None) or getattr(args, "path", None)
+            stored = db.get_ai_findings(target_path=target_filter, limit=50)
+            if getattr(args, "as_json", False):
+                from engine.cli_render import render_json
+
+                render_json({"status": "ok", "total_findings": len(stored), "findings": stored})
+                return
+            print(f"\n{'='*75}")
+            print(f"[*] HAASONSAAS/AISCAN STORED AI SECURITY FINDINGS ({len(stored)} rows)")
+            print(f"{'='*75}")
+            if not stored:
+                print("  [+] No stored AI security audit findings in database.")
+            else:
+                for row in stored[:25]:
+                    loc = f"{Path(str(row.get('file_path', ''))).name}:{row.get('line_number', 0)}"
+                    print(
+                        f"  [{str(row.get('severity', 'INFO')):<8}] "
+                        f"{str(row.get('finding_type', '')):<26} {loc:<28} "
+                        f"{str(row.get('description', ''))[:60]}"
+                    )
+            print(f"{'='*75}\n")
+            return
+
         scanner = AiscanIntegrator(db=db)
 
         print("\n" + "=" * 75)
@@ -3924,6 +3948,95 @@ def _run_all_aixcc_extensions(
             engines["hackerone_porter"] = {"status": "error", "error": str(exc)}
 
 
+def cmd_stride(
+    args: Any,
+    *,
+    return_dict_only: bool = False,
+    existing_findings: Sequence[Dict[str, Any]] = (),
+) -> Dict[str, Any]:
+    """
+    Executes `--stride`: Fusion-powered STRIDE + MITRE ATT&CK + Zero Trust Threat Modeling,
+    Trust Boundaries, Security Requirements, and Downloadable Attack Tree SVG Diagram Engine.
+    Automatically triggers during `--all` / `--ensemble` when a codebase has no threat model.
+    """
+    from engine.stride_threat_modeler import StrideThreatModeler
+
+    hunt_t = list(getattr(args, "hunt_targets", None) or [])
+    target_path = (
+        getattr(args, "repo", None)
+        or getattr(args, "path", None)
+        or getattr(args, "raptor_target", None)
+        or (hunt_t[0] if hunt_t else None)
+        or getattr(args, "target_arg", None)
+        or "."
+    )
+    out_dir = str(
+        getattr(args, "stride_out", None)
+        or (Path(str(getattr(args, "output_dir", "reports") or "reports")) / "stride_threat_model")
+    )
+    dry_run = bool(getattr(args, "dry_run", False))
+    embedded = bool(getattr(args, "embedded", False))
+    no_llm = bool(getattr(args, "no_llm", False))
+    no_models = not bool(getattr(args, "include_models", True))
+    use_fusion = bool(getattr(args, "fusion", True)) and not embedded and not no_llm and not no_models
+    diagrams = list(getattr(args, "stride_diagrams", None) or [])
+    write_repo = bool(getattr(args, "stride_write_repo", False))
+    force_gen = bool(getattr(args, "enable_stride", False)) or bool(diagrams)
+
+    modeler = StrideThreatModeler(
+        use_fusion=use_fusion,
+        embedded=embedded,
+        model=getattr(args, "model", None),
+        sec_model=getattr(args, "sec_model", None),
+    )
+    result = modeler.analyze_codebase(
+        str(target_path),
+        out_dir=out_dir,
+        diagram_paths=diagrams,
+        existing_findings=existing_findings,
+        force_generate=force_gen,
+        write_to_repo=write_repo,
+        dry_run=dry_run,
+    )
+
+    if return_dict_only:
+        return result
+
+    if getattr(args, "as_json", False):
+        from engine.cli_render import render_json
+
+        render_json(result)
+        return result
+
+    rf = result.get("report_files") or {}
+    print("\n" + "=" * 78)
+    print("  RFCHUNT + MODELFUSION: STRIDE / MITRE ATT&CK / ZERO TRUST THREAT MODEL (--stride)")
+    print("=" * 78)
+    print(f"  Status                : {result.get('status')}")
+    print(f"  Target Path           : {result.get('target_path')}")
+    print(f"  Missing Threat Model  : {result.get('missing_threat_model')} (auto_generated={result.get('auto_generated')})")
+    print(f"  Components Discovered : {result.get('components_count', 0)}")
+    print(f"  Trust Boundaries      : {result.get('trust_boundaries_count', 0)}")
+    print(f"  STRIDE Threat Matrix  : {result.get('threat_scenarios_count', 0)} scenarios {result.get('severity_counts', {})}")
+    print(f"  Security Requirements : {result.get('security_requirements_count', 0)}")
+    print(f"  Attack Trees (SVG)    : {result.get('attack_trees_count', result.get('attack_trees_planned', 0))}")
+    if not dry_run:
+        print(f"  Report Markdown       : {rf.get('markdown', '-')}")
+        print(f"  Architecture Diagram  : {rf.get('architecture_svg', '-')}")
+        if rf.get("architecture_png"):
+            print(f"  Architecture PNG      : {rf.get('architecture_png')}")
+        if rf.get("attack_tree_svgs"):
+            print(f"  Attack Tree Diagrams  : {', '.join(rf['attack_tree_svgs'][:5])}")
+        if rf.get("attack_tree_pngs"):
+            print(f"  Attack Tree PNGs      : {', '.join(rf['attack_tree_pngs'][:5])}")
+        if rf.get("repo_threat_model_md"):
+            print(f"  Repo THREAT_MODEL.md  : {rf.get('repo_threat_model_md')}")
+    else:
+        print("  Dry-Run Mode          : ACTIVE (0 files written, 0 network requests)")
+    print("=" * 78 + "\n")
+    return result
+
+
 def cmd_phi(
     args: Any,
     *,
@@ -4352,6 +4465,15 @@ def cmd_dry_run_plan(
         planned_modules.append("Module-PE-DotNet-Auditor(UMCI/SEC_COMMIT/YARA/HostPatch)")
     if getattr(args, "enable_phi", False) or active_mode == "phi":
         planned_modules.append("Module-22-PhiScanner(Presidio+GLiNER+RedactX-v3)")
+    if (
+        getattr(args, "enable_stride", False)
+        or active_mode in ("stride", "threat-model", "threat_model")
+        or (
+            not getattr(args, "no_stride", False)
+            and (getattr(args, "run_all_scans", False) or getattr(args, "ensemble", False) or active_mode in ("all", "all_scans"))
+        )
+    ):
+        planned_modules.append("StrideThreatModeler(STRIDE+MITRE-ATT&CK+ZeroTrust+AttackTrees+SVG)")
     if getattr(args, "deep_audit", False) or active_mode in ("deep-audit", "deep_audit") or getattr(args, "proxy_target", None):
         planned_modules.append("DeepRepoAudit(TrustBoundary+LoopbackProxy+CoverageFuzz)")
     if getattr(args, "enable_poc", False):
@@ -4379,6 +4501,15 @@ def cmd_dry_run_plan(
         sub_plans["preflight"] = cmd_preflight(args, return_dict_only=True)
     if getattr(args, "enable_phi", False):
         sub_plans["phi"] = cmd_phi(args, return_dict_only=True)
+    if (
+        getattr(args, "enable_stride", False)
+        or active_mode in ("stride", "threat-model", "threat_model")
+        or (
+            not getattr(args, "no_stride", False)
+            and (getattr(args, "run_all_scans", False) or getattr(args, "ensemble", False) or active_mode in ("all", "all_scans"))
+        )
+    ):
+        sub_plans["stride"] = cmd_stride(args, return_dict_only=True)
     if getattr(args, "enable_hackerone", False):
         sub_plans["hackerone"] = cmd_hackerone(args, findings_override=[], return_dict_only=True)
 
@@ -6080,6 +6211,14 @@ def cmd_all(args):
                 no_external_scanners=bool(getattr(args, "no_external_scanners", False)),
                 proxy=getattr(args, "proxy_target", None),
                 db=db,
+                enable_stride=(
+                    False
+                    if bool(getattr(args, "no_stride", False))
+                    else (True if bool(getattr(args, "enable_stride", False)) else None)
+                ),
+                stride_diagrams=list(getattr(args, "stride_diagrams", None) or []),
+                stride_out=getattr(args, "stride_out", None),
+                stride_write_repo=bool(getattr(args, "stride_write_repo", False)),
             )
 
             converted_findings = unified_findings_to_engine_findings(
@@ -6147,6 +6286,30 @@ def cmd_all(args):
             rf["ensemble_json"] = str(ens_out_dir / "ensemble_report.json")
             rf["ensemble_md"] = str(ens_out_dir / "ensemble_summary.md")
             rf["ensemble_sarif"] = str(ens_out_dir / "ensemble_findings.sarif")
+            if isinstance(ens_dict.get("stride_threat_model"), dict) and ens_dict["stride_threat_model"]:
+                _stm = ens_dict["stride_threat_model"]
+                res["stride_threat_model"] = _stm
+                res.setdefault("engines", {})["stride_threat_model"] = {
+                    "status": _stm.get("status"),
+                    "missing_threat_model": _stm.get("missing_threat_model", False),
+                    "auto_generated": _stm.get("auto_generated", False),
+                    "components_count": _stm.get("components_count", 0),
+                    "threat_scenarios_count": _stm.get("threat_scenarios_count", 0),
+                    "security_requirements_count": _stm.get("security_requirements_count", 0),
+                    "attack_trees_count": _stm.get("attack_trees_count", 0),
+                    "report_files": _stm.get("report_files") or {},
+                }
+                _stm_rf = _stm.get("report_files") or {}
+                if _stm_rf.get("markdown"):
+                    rf["stride_threat_model_md"] = str(_stm_rf["markdown"])
+                if _stm_rf.get("architecture_svg"):
+                    rf["stride_architecture_svg"] = str(_stm_rf["architecture_svg"])
+                if _stm_rf.get("architecture_png"):
+                    rf["stride_architecture_png"] = str(_stm_rf["architecture_png"])
+                if _stm_rf.get("attack_tree_svgs"):
+                    rf["stride_attack_tree_svgs"] = list(_stm_rf["attack_tree_svgs"])
+                if _stm_rf.get("attack_tree_pngs"):
+                    rf["stride_attack_tree_pngs"] = list(_stm_rf["attack_tree_pngs"])
             if combined_json_str and Path(combined_json_str).parent.exists():
                 Path(combined_json_str).write_text(_ens_json.dumps(res, indent=2), encoding="utf-8")
         else:
@@ -6210,6 +6373,75 @@ def cmd_all(args):
                     res.setdefault("engines", {})["exhaustive_local_tools"] = {
                         "status": "degraded_error",
                         "error": str(_ext_tools_exc),
+                    }
+
+            # Auto-generate Fusion-powered STRIDE Threat Model during standalone `--all`
+            # whenever `--stride` is passed OR the codebase has no existing threat model (unless `--no-stride`).
+            if not bool(getattr(args, "no_stride", False)) and _local_target_p is not None and _local_target_p.is_dir():
+                try:
+                    import json as _stride_all_json
+                    from engine.stride_threat_modeler import StrideThreatModeler
+
+                    _stride_offline = (
+                        os.environ.get("RFCHUNT_OFFLINE") == "1"
+                        or bool(os.environ.get("CI"))
+                        or bool(getattr(args, "embedded", False))
+                        or bool(getattr(args, "no_llm", False))
+                        or (not bool(getattr(args, "preflight_live", True)))
+                        or (not bool(getattr(args, "include_models", True)))
+                    )
+                    _stride_out = str(
+                        getattr(args, "stride_out", None)
+                        or (Path(str(reports_dir)) / "stride_threat_model")
+                    )
+                    _stride_modeler = StrideThreatModeler(
+                        use_fusion=(bool(getattr(args, "fusion", True)) and not _stride_offline),
+                        embedded=bool(getattr(args, "embedded", False)),
+                        model=getattr(args, "model", None),
+                        sec_model=getattr(args, "sec_model", None),
+                    )
+                    _stride_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+                    with _stride_ctx:
+                        _stm_all = _stride_modeler.analyze_codebase(
+                            _local_target_p,
+                            out_dir=_stride_out,
+                            diagram_paths=list(getattr(args, "stride_diagrams", None) or []),
+                            existing_findings=list(res.get("findings") or []) + list(res.get("exhaustive_local_findings") or []),
+                            force_generate=bool(getattr(args, "enable_stride", False))
+                            or bool(getattr(args, "stride_diagrams", None)),
+                            write_to_repo=bool(getattr(args, "stride_write_repo", False)),
+                            dry_run=False,
+                        )
+                    res["stride_threat_model"] = _stm_all
+                    res.setdefault("engines", {})["stride_threat_model"] = {
+                        "status": _stm_all.get("status"),
+                        "missing_threat_model": _stm_all.get("missing_threat_model", False),
+                        "auto_generated": _stm_all.get("auto_generated", False),
+                        "components_count": _stm_all.get("components_count", 0),
+                        "threat_scenarios_count": _stm_all.get("threat_scenarios_count", 0),
+                        "security_requirements_count": _stm_all.get("security_requirements_count", 0),
+                        "attack_trees_count": _stm_all.get("attack_trees_count", 0),
+                        "report_files": _stm_all.get("report_files") or {},
+                    }
+                    _stm_rf2 = _stm_all.get("report_files") or {}
+                    _rf_all = res.setdefault("report_files", {})
+                    if _stm_rf2.get("markdown"):
+                        _rf_all["stride_threat_model_md"] = str(_stm_rf2["markdown"])
+                    if _stm_rf2.get("architecture_svg"):
+                        _rf_all["stride_architecture_svg"] = str(_stm_rf2["architecture_svg"])
+                    if _stm_rf2.get("architecture_png"):
+                        _rf_all["stride_architecture_png"] = str(_stm_rf2["architecture_png"])
+                    if _stm_rf2.get("attack_tree_svgs"):
+                        _rf_all["stride_attack_tree_svgs"] = list(_stm_rf2["attack_tree_svgs"])
+                    if _stm_rf2.get("attack_tree_pngs"):
+                        _rf_all["stride_attack_tree_pngs"] = list(_stm_rf2["attack_tree_pngs"])
+                    _cj_p = str(_rf_all.get("combined_json") or "").strip()
+                    if _cj_p and Path(_cj_p).parent.exists():
+                        Path(_cj_p).write_text(_stride_all_json.dumps(res, indent=2, default=str), encoding="utf-8")
+                except Exception as _stride_exc:
+                    res.setdefault("engines", {})["stride_threat_model"] = {
+                        "status": "error",
+                        "error": str(_stride_exc),
                     }
 
         if getattr(args, "enable_fast_ooda", False) and (repo or path):
@@ -6485,6 +6717,14 @@ def cmd_all(args):
                 f"    Exhaustive Tools    : {elt.get('status', 'completed')} "
                 f"(engines={len(elt_exec)} [{','.join(elt_exec[:8])}], "
                 f"findings={elt.get('total_findings', 0)}, prod={elt.get('production_findings', 0)})"
+            )
+        if "stride_threat_model" in eng:
+            stm_i = eng.get("stride_threat_model") or {}
+            print(
+                f"    STRIDE Threat Model : {stm_i.get('status', 'completed')} "
+                f"(auto={stm_i.get('auto_generated', False)}, components={stm_i.get('components_count', 0)}, "
+                f"threats={stm_i.get('threat_scenarios_count', 0)}, reqs={stm_i.get('security_requirements_count', 0)}, "
+                f"attack_trees={stm_i.get('attack_trees_count', 0)})"
             )
         print(f"    Combined SARIF      : {res['report_files'].get('combined_sarif')}")
         if res["report_files"].get("exported_sarif"):
@@ -8076,7 +8316,7 @@ ALL_MODES = [
     "poc", "poc-verify", "poc_verify", "docker-doctor", "docker_doctor", "doctor-docker",
     "deep-audit", "deep_audit",
     "novelty", "novelty-refresh", "novelty_refresh", "swarm", "swarm-board", "swarm_board", "board",
-    "phi", "preflight", "hackerone", "hackone",
+    "phi", "preflight", "hackerone", "hackone", "stride", "threat-model", "threat_model",
     "pe-audit", "pe_audit", "pe-dotnet", "pe_dotnet",
 ]
 
@@ -8760,6 +9000,13 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--phi-model", dest="phi_model", type=str, default="urchade/gliner_multi_pii-v1", help="GLiNER Span NER model identifier for --phi (default: urchade/gliner_multi_pii-v1)")
     parser.add_argument("--no-phi-ml", dest="no_phi_ml", action="store_true", default=False, help="Force deterministic offline RedactX-v3 + GLiNER fallback without loading HuggingFace GLiNER or Presidio ML weights")
 
+    # Module 26: Fusion-Powered STRIDE, MITRE ATT&CK, Zero Trust & Attack Tree Threat Modeler (--stride)
+    parser.add_argument("--stride", dest="enable_stride", action="store_true", default=False, help="Generate an advanced Fusion-powered STRIDE, MITRE ATT&CK, Zero Trust, Trust Boundary, Security Requirements & Attack Tree SVG Threat Model (standalone or chained into --all / --ensemble; auto-runs when a codebase lacks a threat model)")
+    parser.add_argument("--no-stride", dest="no_stride", action="store_true", default=False, help="Disable automatic STRIDE threat model generation during --all / --ensemble when a repository lacks a threat model")
+    parser.add_argument("--stride-diagram", dest="stride_diagrams", action="append", default=[], help="Optional uploaded system architecture diagram (.mmd, .svg, .drawio, .puml, .json, .yaml, .png, .jpg) to include in STRIDE & Trust Boundary analysis (repeatable)")
+    parser.add_argument("--stride-out", dest="stride_out", type=str, default=None, help="Output directory for THREAT_MODEL_STRIDE.md, JSON/SARIF, and downloadable SVG architecture/attack-tree diagrams")
+    parser.add_argument("--stride-write-repo", dest="stride_write_repo", action="store_true", default=False, help="Also write THREAT_MODEL.md directly into the target repository root when generating a STRIDE threat model")
+
     # HackerOne Campaign Finder, RoE Policy Engine & Autonomous HITL Computer-Use Report Porter
     parser.add_argument("--hackerone", "--hackone", dest="enable_hackerone", action="store_true", default=False, help="Discover a HackerOne campaign, parse its 3-tier RoE policy, and port verified/deterministic RFCHunt findings into redacted HackerOne report drafts with HITL review")
     parser.add_argument("--hackerone-auto", "--hackone-auto", dest="hackerone_auto", action="store_true", default=False, help="Policy-aware autonomous HackerOne workflow: after human login, discovers open campaigns, enforces RoE rules/Safe Harbor, audits in-scope repos (--all + --phi), and pre-fills drafts up to final human Submit")
@@ -8908,6 +9155,11 @@ _CURATED_FLAG_EXAMPLES: Dict[str, str] = {
     "--phi-redact": "python rfc_hunt_swarm.py --phi --repo . --phi-redact",
     "--phi-model": "python rfc_hunt_swarm.py --phi --repo . --phi-model urchade/gliner_multi_pii-v1",
     "--no-phi-ml": "python rfc_hunt_swarm.py --phi --repo . --no-phi-ml",
+    "--stride": "python rfc_hunt_swarm.py --stride --repo . --dry-run",
+    "--no-stride": "python rfc_hunt_swarm.py --all --repo . --no-stride --dry-run",
+    "--stride-diagram": "python rfc_hunt_swarm.py --stride --repo . --stride-diagram docs/architecture.mmd --dry-run",
+    "--stride-out": "python rfc_hunt_swarm.py --stride --repo . --stride-out reports/stride_threat_model",
+    "--stride-write-repo": "python rfc_hunt_swarm.py --stride --repo ./target_repo --stride-write-repo --dry-run",
     "--hackerone": "python rfc_hunt_swarm.py --hackerone --hackerone-program anthropic --dry-run",
     "--hackerone-auto": "python rfc_hunt_swarm.py --hackerone-auto --hackerone-max-programs 2 --dry-run",
     "--crlf-desync": "python rfc_hunt_swarm.py --crlf-desync --repo . --json",
@@ -9402,7 +9654,7 @@ def _normalize_all_positional_target(
             break
         if tok.startswith("-"):
             opt_key = tok.split("=", 1)[0]
-            if opt_key in ("--all", "--run-all", "--all-scans", "--hunt", "--fast-ooda", "--ensemble", "--essemble", "--essample", "--swarm"):
+            if opt_key in ("--all", "--run-all", "--all-scans", "--hunt", "--fast-ooda", "--ensemble", "--essemble", "--essample", "--swarm", "--stride"):
                 has_all_flag = True
             elif opt_key == "--mode":
                 if "=" in tok:
@@ -9542,7 +9794,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "deep_audit", "proxy_target", "live_proxy_fuzz", "trust_boundary_review",
             "coverage_fuzz", "enable_poc", "enable_phi", "enable_hackerone", "hackerone_auto",
             "serve_ui", "network_lifecycle", "dry_run", "enable_pe_audit", "enable_autonomous_hunt",
-            "enable_fast_ooda", "start_modelfusion", "enable_swarm",
+            "enable_fast_ooda", "start_modelfusion", "enable_swarm", "enable_stride",
         )
     ) and getattr(args, "hint", None) is None and not getattr(args, "dispatch", None):
         build_swarm_parser().print_help()
@@ -9724,6 +9976,9 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         if (getattr(args, "enable_phi", False) or active_mode == "phi") and not getattr(args, "run_all_scans", False):
             cmd_phi(args)
             return
+        if (getattr(args, "enable_stride", False) or active_mode in ("stride", "threat-model", "threat_model")) and not getattr(args, "run_all_scans", False):
+            cmd_stride(args)
+            return
         cmd_dry_run_plan(args, active_mode=active_mode, raw_argv=raw_argv)
         return
 
@@ -9880,6 +10135,16 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         cmd_phi(args)
         return
 
+    # Standalone Module 26 STRIDE + MITRE ATT&CK + Zero Trust Threat Modeler (--stride without --all/--ensemble)
+    if getattr(args, "ensemble", False) and not getattr(args, "run_all_scans", False):
+        args.run_all_scans = True
+    if (
+        getattr(args, "enable_stride", False)
+        or active_mode in ("stride", "threat-model", "threat_model")
+    ) and not getattr(args, "run_all_scans", False) and not getattr(args, "ensemble", False):
+        cmd_stride(args)
+        return
+
     # Standalone CLI-only blackboard hint injection (zero GUI / HTTP server calls)
     has_non_hint_action = explicit_mode_given and active_mode != "hint"
     has_shortcut_action = any(
@@ -9891,7 +10156,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "enable_rea_only", "install_tools", "tool_status",
             "raptor_status", "raptor_findings", "raptor_setup",
             "harness2_report", "mantis_report", "aiscan_report",
-            "preflight_only", "enable_pe_audit", "enable_autonomous_hunt", "enable_swarm",
+            "preflight_only", "enable_pe_audit", "enable_autonomous_hunt", "enable_swarm", "enable_stride",
         )
     )
     if active_mode == "hint" or (
@@ -10160,7 +10425,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         _dispatch_cmd("cmd_mantis", args, check_main_shim=(caller_profile == "main"))
         return
 
-    if active_mode in ("aiscan", "ai") or getattr(args, "enable_aiscan", False) and not explicit_mode_given:
+    if active_mode in ("aiscan", "ai") or getattr(args, "aiscan_report", False) or (getattr(args, "enable_aiscan", False) and not explicit_mode_given):
         _dispatch_cmd("cmd_aiscan", args, check_main_shim=(caller_profile == "main"))
         return
 
@@ -10827,6 +11092,10 @@ if __name__ == "__main__":
     _has_hunt_flag = any(t == "--hunt" for t in _cli_argv)
     _has_fast_ooda_flag = any(t == "--fast-ooda" for t in _cli_argv)
     _has_swarm_flag = any(t == "--swarm" for t in _cli_argv)
+    _has_stride_flag = any(t == "--stride" for t in _cli_argv)
+    _has_ensemble_trigger = any(
+        t in ("--ensemble", "--essemble", "--essample", "--embedded", "--embeded") for t in _cli_argv
+    )
     _has_embedded = any(t in ("--embedded", "--embeded") for t in _cli_argv)
     _has_all_flag = (
         any(t in ("--all", "--run-all", "--all-scans", "all", "all_scans") for t in _cli_argv)
@@ -10838,7 +11107,7 @@ if __name__ == "__main__":
             for idx in range(len(_cli_argv))
         )
     )
-    if not _has_hunt_flag and not _has_fast_ooda_flag and not _has_swarm_flag:
+    if not _has_hunt_flag and not _has_fast_ooda_flag and not _has_swarm_flag and (not _has_stride_flag or _has_ensemble_trigger):
         from revenue_cli import REVENUE_SUBCOMMANDS, maybe_dispatch_revenue_cli
 
         _is_rev_subcmd = bool(_cli_argv) and (_cli_argv[0] in REVENUE_SUBCOMMANDS)

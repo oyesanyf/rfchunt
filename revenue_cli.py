@@ -117,6 +117,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_ens.add_argument("--cpu-workers", type=int, default=None, help="Bounded ProcessPoolExecutor CPU workers (default: clamped 2..8).")
     p_ens.add_argument("--blackboard-db", default=None, help="Optional Async SQLite WAL Blackboard database path.")
     p_ens.add_argument("--resume", action="store_true", default=False, help="Recover stale IN_PROGRESS intents from blackboard DB before running.")
+    p_ens.add_argument("--stride", dest="enable_stride", action="store_true", default=False, help="Force generation of an advanced Fusion-powered STRIDE + MITRE ATT&CK + Zero Trust threat model and attack-tree diagrams (auto-runs when codebase lacks a threat model).")
+    p_ens.add_argument("--no-stride", dest="no_stride", action="store_true", default=False, help="Disable automatic STRIDE threat model generation during ensemble-audit.")
+    p_ens.add_argument("--stride-diagram", dest="stride_diagrams", action="append", default=[], help="Architecture diagram file to ingest into STRIDE analysis (repeatable).")
+    p_ens.add_argument("--stride-out", dest="stride_out", default=None, help="Custom output directory for STRIDE report and downloadable SVG/PNG diagrams.")
+    p_ens.add_argument("--stride-write-repo", dest="stride_write_repo", action="store_true", default=False, help="Also write generated THREAT_MODEL.md into the target repository root.")
 
     p_ooda = sub.add_parser("fast-ooda", help="Run Loop 3 3-stage parallel OODA funnel + Loop 4 auto-PoC submission gate.")
     p_ooda.add_argument("--target", "--repo", dest="target", required=True, help="Target repository directory.")
@@ -556,7 +561,7 @@ def run_revenue_cli(argv: Sequence[str] | None = None) -> int:
             program=args.program,
             freshness_hours=args.freshness_hours,
             quorum=args.quorum,
-            exhaustive_default=True,
+            exhaustive_default=bool(getattr(args, "ensemble", True)),
             embedded=bool(args.embedded),
             model=args.model,
             enable_llm_verify=(not args.no_llm and not args.embedded),
@@ -564,6 +569,14 @@ def run_revenue_cli(argv: Sequence[str] | None = None) -> int:
             no_external_scanners=bool(getattr(args, "no_external_scanners", False)),
             proxy=getattr(args, "proxy", None),
             max_workers=(max(1, int(cpu_workers_arg)) if cpu_workers_arg else 4),
+            enable_stride=(
+                False
+                if bool(getattr(args, "no_stride", False))
+                else (True if bool(getattr(args, "enable_stride", False)) else None)
+            ),
+            stride_diagrams=list(getattr(args, "stride_diagrams", None) or []),
+            stride_out=getattr(args, "stride_out", None),
+            stride_write_repo=bool(getattr(args, "stride_write_repo", False)),
         )
 
         target_path = Path(args.target)
@@ -667,11 +680,17 @@ def run_revenue_cli(argv: Sequence[str] | None = None) -> int:
             lv = rep.lean_verification or {}
             tc = rep.toolchain_status or {}
             avail_tc = [k for k, v in tc.items() if isinstance(v, dict) and v.get("available")]
+            stm = rep.stride_threat_model if isinstance(rep.stride_threat_model, dict) else {}
+            stride_tag = (
+                f" | stride={stm.get('status', 'disabled')}({stm.get('threat_scenarios_count', 0)} threats, {stm.get('attack_trees_count', 0)} trees)"
+                if stm
+                else ""
+            )
             print(
                 f"[+] Exhaustive Ensemble Audit ({mode_tag}) complete: {len(rep.clusters)} clusters "
                 f"({rep.counts_by_disposition}) | whiteboard_hyps={wb.get('total_hypotheses', len(wb.get('hypotheses') or []))} "
-                f"| lean={lv.get('status', 'unknown')} | available_toolchains={avail_tc or 'none'} "
-                f"| proxy={rep.proxy or 'none'} -> {args.out}"
+                f"| lean={lv.get('status', 'unknown')} | available_toolchains={avail_tc or 'none'}"
+                f"{stride_tag} | proxy={rep.proxy or 'none'} -> {args.out}"
             )
         return 0
 
@@ -1236,6 +1255,11 @@ def _translate_swarm_argv_to_ensemble(argv: Sequence[str]) -> tuple[list[str], b
     no_external_scanners = False
     json_out = False
     dry_run = False
+    enable_stride = False
+    no_stride = False
+    stride_diagrams: list[str] = []
+    stride_out: str | None = None
+    stride_write_repo = False
 
     i = 0
     while i < len(tokens):
@@ -1244,6 +1268,29 @@ def _translate_swarm_argv_to_ensemble(argv: Sequence[str]) -> tuple[list[str], b
             i += 1
         elif tok in ("--embedded", "--embeded"):
             embedded = True
+            i += 1
+        elif tok == "--stride":
+            enable_stride = True
+            i += 1
+        elif tok == "--no-stride":
+            no_stride = True
+            i += 1
+        elif tok == "--stride-write-repo":
+            stride_write_repo = True
+            i += 1
+        elif tok == "--stride-diagram" and i + 1 < len(tokens):
+            stride_diagrams.append(tokens[i + 1])
+            i += 2
+        elif tok.startswith("--stride-diagram="):
+            val_sd = tok.split("=", 1)[1].strip()
+            if val_sd:
+                stride_diagrams.append(val_sd)
+            i += 1
+        elif tok == "--stride-out" and i + 1 < len(tokens):
+            stride_out = tokens[i + 1]
+            i += 2
+        elif tok.startswith("--stride-out="):
+            stride_out = tok.split("=", 1)[1].strip() or None
             i += 1
         elif tok == "--no-llm":
             no_llm = True
@@ -1380,6 +1427,16 @@ def _translate_swarm_argv_to_ensemble(argv: Sequence[str]) -> tuple[list[str], b
         mapped.append("--resume")
     if proxy:
         mapped.extend(["--proxy", proxy])
+    if enable_stride:
+        mapped.append("--stride")
+    if no_stride:
+        mapped.append("--no-stride")
+    for dpath in stride_diagrams:
+        mapped.extend(["--stride-diagram", dpath])
+    if stride_out:
+        mapped.extend(["--stride-out", stride_out])
+    if stride_write_repo:
+        mapped.append("--stride-write-repo")
     return mapped, dry_run
 
 
