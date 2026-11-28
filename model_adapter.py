@@ -5,20 +5,23 @@ Enables 24/7 zero-cost local LLM inference using Google Gemma, Qwen, Foundation-
 and GLM / DeepSeek-R1 via local Ollama with multi-model panel fusion.
 """
 
+import ast
 import json
 import logging
 import os
 import re
 import subprocess
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 import httpx
 
 from engine.paid_model_provider import (
     PaidModelClient,
     PaidModelConfig,
+    is_explicit_ollama_spec,
     is_ollama_model_tag,
     load_paid_model_config,
+    strip_ollama_prefix,
 )
 from ollama_manager import OllamaLifecycleManager, is_embedding_model
 
@@ -44,11 +47,14 @@ class ModelFusionAdapter:
         sec_model: Optional[str] = None,
         env_local_path: Optional[str] = None,
         force_ollama: bool = False,
+        panel_models: Optional[Sequence[str]] = None,
+        hybrid_mode: Optional[bool] = None,
     ):
         self.endpoint = ollama_endpoint or os.environ.get("OLLAMA_ENDPOINT", self.DEFAULT_OLLAMA_ENDPOINT)
         self.use_fusion = use_fusion if os.environ.get("USE_MODEL_FUSION") is None else (os.environ.get("USE_MODEL_FUSION") == "1")
         self.free_ram_gb = self._get_free_memory_gb()
         self.sized_qwen = self._size_qwen_for_free_memory(self.free_ram_gb)
+        self.custom_panel_models: List[str] = [str(m).strip() for m in (panel_models or []) if str(m).strip()]
 
         timeout_env = os.environ.get("OLLAMA_TIMEOUT", "120.0")
         self.timeout = float(timeout_env) if float(timeout_env) > 0 else None
@@ -58,8 +64,32 @@ class ModelFusionAdapter:
             force_ollama=force_ollama,
         )
         self.paid_client: Optional[PaidModelClient] = None
+        self.ollama_client: Optional[httpx.Client] = None
 
-        if self.paid_config.enabled:
+        is_hybrid = bool(
+            self.paid_config.enabled
+            and (
+                self.paid_config.hybrid_mode
+                or bool(hybrid_mode)
+                or any(is_explicit_ollama_spec(m) for m in self.custom_panel_models)
+            )
+        )
+        if is_hybrid and not self.paid_config.hybrid_mode:
+            self.paid_config = PaidModelConfig(
+                enabled=self.paid_config.enabled,
+                provider=self.paid_config.provider,
+                primary_model=self.paid_config.primary_model,
+                sec_model=self.paid_config.sec_model,
+                arbiter_model=self.paid_config.arbiter_model,
+                panel_models=self.paid_config.panel_models,
+                source_file=self.paid_config.source_file,
+                timeout_sec=self.paid_config.timeout_sec,
+                providers=self.paid_config.providers,
+                reason="hybrid_panel_active",
+                hybrid_mode=True,
+            )
+
+        if self.paid_config.enabled and not is_hybrid:
             self.backend_mode = "paid_api"
             self.using_ollama = False
             self.paid_client = PaidModelClient(self.paid_config, timeout=self.timeout)
@@ -74,10 +104,10 @@ class ModelFusionAdapter:
                 if (sec_model and not is_ollama_model_tag(sec_model))
                 else None
             )
-            self.preferred_model = explicit_paid_pref or self.paid_config.primary_model
-            self.sec_model = explicit_paid_sec or self.paid_config.sec_model
+            self.preferred_model = explicit_paid_pref or (self.custom_panel_models[0] if self.custom_panel_models else self.paid_config.primary_model)
+            self.sec_model = explicit_paid_sec or (self.custom_panel_models[1] if len(self.custom_panel_models) > 1 else self.paid_config.sec_model)
             panel: List[str] = []
-            for m in (self.preferred_model, self.sec_model, *self.paid_config.panel_models):
+            for m in (*self.custom_panel_models, self.preferred_model, self.sec_model, *self.paid_config.panel_models):
                 if m and m not in panel:
                     panel.append(m)
             self.available_tags = panel
@@ -88,6 +118,28 @@ class ModelFusionAdapter:
                 self.paid_config.provider,
                 ", ".join(self.available_tags),
             )
+            return
+
+        if is_hybrid:
+            self.backend_mode = "hybrid"
+            self.using_ollama = True
+            self.paid_client = PaidModelClient(self.paid_config, timeout=self.timeout)
+            self.ollama_client = httpx.Client(timeout=httpx.Timeout(self.timeout, connect=10.0))
+            self.client = self.ollama_client
+            local_tags = self._fetch_available_tags()
+            panel = list(
+                dict.fromkeys(
+                    [
+                        *self.custom_panel_models,
+                        *self.paid_config.panel_models,
+                        *(local_tags[:1] if not self.custom_panel_models else []),
+                    ]
+                )
+            )
+            self.preferred_model = preferred_model or (panel[0] if panel else self.paid_config.primary_model)
+            self.sec_model = sec_model or (panel[1] if len(panel) > 1 else self.paid_config.sec_model)
+            self.available_tags = list(dict.fromkeys([*local_tags, *panel]))
+            self.active_model = self.preferred_model
             return
 
         self.backend_mode = "ollama"
@@ -341,6 +393,66 @@ class ModelFusionAdapter:
         Executes structured JSON generation using configured paid models (when `.env.local`
         defines paid providers) or local Ollama model(s) otherwise.
         """
+        if getattr(self, "backend_mode", "ollama") == "hybrid" and getattr(self, "paid_client", None) is not None:
+            panel = list(
+                dict.fromkeys(
+                    [
+                        *(getattr(self, "custom_panel_models", None) or []),
+                        *(self.paid_config.panel_models or ()),
+                        self.active_model,
+                    ]
+                )
+            )
+            if self.use_fusion and len(panel) > 1:
+                all_probes: List[Dict[str, Any]] = []
+                seen_requests = set()
+                for m_slot in panel:
+                    if self.paid_config.is_local_ollama_slot(m_slot):
+                        probes = self._query_ollama(
+                            strip_ollama_prefix(m_slot),
+                            system_instruction,
+                            user_prompt,
+                            schema_hint=schema_hint,
+                            num_predict=num_predict,
+                        )
+                    else:
+                        probes = self._query_paid_model(
+                            m_slot,
+                            system_instruction,
+                            user_prompt,
+                            schema_hint=schema_hint,
+                            num_predict=num_predict,
+                        )
+                    for p in probes:
+                        if not isinstance(p, dict):
+                            continue
+                        if schema_hint is not None:
+                            p["fused_model"] = m_slot
+                            all_probes.append(p)
+                        else:
+                            raw_req = str(p.get("raw_request", "")).strip()
+                            if raw_req and raw_req not in seen_requests:
+                                seen_requests.add(raw_req)
+                                p["fused_model"] = m_slot
+                                all_probes.append(p)
+                if all_probes:
+                    return all_probes
+            if self.paid_config.is_local_ollama_slot(self.active_model):
+                return self._query_ollama(
+                    strip_ollama_prefix(self.active_model),
+                    system_instruction,
+                    user_prompt,
+                    schema_hint=schema_hint,
+                    num_predict=num_predict,
+                )
+            return self._query_paid_model(
+                self.active_model,
+                system_instruction,
+                user_prompt,
+                schema_hint=schema_hint,
+                num_predict=num_predict,
+            )
+
         if not getattr(self, "using_ollama", True) and getattr(self, "paid_client", None) is not None:
             if self.use_fusion and len(self.available_tags) > 1:
                 res = self._run_paid_panel_fusion(
@@ -747,5 +859,33 @@ class ModelFusionAdapter:
                         return res
                 except Exception:
                     continue
+
+        # Resilient JSON repair (control newlines inside strings, trailing commas, smart quotes, literal_eval)
+        try:
+            from fusion_engine import _repair_json_string
+
+            repaired = _repair_json_string(cleaned)
+            try:
+                res = _normalize(json.loads(repaired))
+                if res:
+                    return res
+            except Exception:
+                pass
+            for idx, ch in enumerate(repaired):
+                if ch in ("{", "["):
+                    try:
+                        raw_parsed, _ = decoder.raw_decode(repaired[idx:])
+                        res = _normalize(raw_parsed)
+                        if res:
+                            return res
+                    except Exception:
+                        continue
+            first_brace = min((i for i in (repaired.find("{"), repaired.find("[")) if i >= 0), default=-1)
+            if first_brace >= 0:
+                res = _normalize(ast.literal_eval(repaired[first_brace:]))
+                if res:
+                    return res
+        except Exception:
+            pass
 
         return []

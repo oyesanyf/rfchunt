@@ -30,6 +30,7 @@ bin/
 tools/
 generated/
 .pytest_tmp_e2e/
+.pytest_temp/
 engine/research_detectors/
 engine/security_skills_catalog/
 

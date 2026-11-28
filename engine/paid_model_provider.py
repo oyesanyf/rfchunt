@@ -174,10 +174,29 @@ def is_loopback_url(url: str) -> bool:
         return False
 
 
+def is_explicit_ollama_spec(model: Optional[str]) -> bool:
+    """Returns True when a model slot explicitly targets local Ollama (`ollama/<tag>` or `ollama:<tag>`)."""
+    m = (model or "").strip().lower()
+    return m.startswith("ollama/") or m.startswith("ollama:")
+
+
+def strip_ollama_prefix(model: str) -> str:
+    """Strips an explicit `ollama/` or `ollama:` prefix while preserving the underlying Ollama tag."""
+    raw = (model or "").strip()
+    low = raw.lower()
+    if low.startswith("ollama/"):
+        return raw[len("ollama/"):].strip()
+    if low.startswith("ollama:"):
+        return raw[len("ollama:"):].strip()
+    return raw
+
+
 def is_ollama_model_tag(model: Optional[str]) -> bool:
     """Heuristically identifies default local Ollama model tags vs paid cloud model IDs."""
     m = (model or "").strip().lower()
     if not m or m == "auto":
+        return True
+    if is_explicit_ollama_spec(m):
         return True
     return any(marker in m for marker in _OLLAMA_DEFAULT_MODEL_MARKERS)
 
@@ -306,7 +325,7 @@ class PaidProviderEndpoint:
 
 @dataclass(frozen=True)
 class PaidModelConfig:
-    """Resolved paid-model configuration governing Ollama bypass and API routing."""
+    """Resolved paid-model configuration governing Ollama bypass, hybrid routing, and API routing."""
 
     enabled: bool = False
     provider: str = "ollama"
@@ -318,10 +337,34 @@ class PaidModelConfig:
     timeout_sec: float = 120.0
     providers: Dict[str, PaidProviderEndpoint] = field(default_factory=dict)
     reason: str = "no_env_local_paid_models"
+    hybrid_mode: bool = False
 
     @property
     def ollama_bypassed(self) -> bool:
-        return bool(self.enabled)
+        return bool(self.enabled and not self.hybrid_mode)
+
+    def is_local_ollama_slot(self, model_name: Optional[str]) -> bool:
+        """Returns True iff `model_name` should be dispatched to the local Ollama daemon."""
+        if not self.enabled:
+            return True
+        if not self.hybrid_mode:
+            return False
+        raw = (model_name or "").strip()
+        if not raw:
+            return False
+        if is_explicit_ollama_spec(raw):
+            return True
+        # In hybrid mode, treat bare Ollama tags (with no configured cloud provider prefix/family) as local Ollama.
+        low = raw.lower()
+        if low.startswith(("claude-", "gpt-", "o1", "o3", "o4", "chatgpt-", "gemini-")):
+            return False
+        if "/" in raw:
+            pref = raw.split("/", 1)[0].strip().lower()
+            if pref in ("anthropic", "claude", "openai", "azure", "azure_openai", "gemini", "google", "openrouter", "openai_compatible"):
+                return False
+        if "azure_openai" in self.providers and raw == self.providers["azure_openai"].deployment:
+            return False
+        return is_ollama_model_tag(raw)
 
     def all_secrets(self) -> Tuple[str, ...]:
         return tuple(ep.api_key for ep in self.providers.values() if ep.api_key)
@@ -378,11 +421,17 @@ class PaidModelConfig:
 
     def to_safe_dict(self) -> Dict[str, Any]:
         """Returns a secret-free summary safe for JSON reports, CLI banners, and `--dry-run`."""
+        mode_label = (
+            "hybrid"
+            if (self.enabled and self.hybrid_mode)
+            else ("paid_api" if self.enabled else "ollama")
+        )
         return {
-            "mode": "paid_api" if self.enabled else "ollama",
+            "mode": mode_label,
             "enabled": bool(self.enabled),
-            "using_ollama": not bool(self.enabled),
-            "ollama_bypassed": bool(self.enabled),
+            "hybrid_mode": bool(self.enabled and self.hybrid_mode),
+            "using_ollama": (not bool(self.enabled)) or bool(self.hybrid_mode),
+            "ollama_bypassed": bool(self.enabled and not self.hybrid_mode),
             "provider": self.provider if self.enabled else "ollama",
             "primary_model": self.primary_model or None,
             "sec_model": self.sec_model or None,
@@ -618,6 +667,16 @@ def load_paid_model_config(
     except ValueError:
         timeout_sec = 120.0
 
+    explicit_hybrid = _truthy(env_map.get("RFCHUNT_HYBRID_PANEL")) or _truthy(
+        os.environ.get("RFCHUNT_HYBRID_PANEL")
+    )
+    has_ollama_slot = any(
+        is_explicit_ollama_spec(m)
+        for m in (explicit_primary, explicit_sec, explicit_arbiter, *explicit_panel)
+        if m
+    )
+    hybrid_mode = bool(explicit_hybrid or has_ollama_slot)
+
     return PaidModelConfig(
         enabled=True,
         provider=primary_provider,
@@ -628,7 +687,8 @@ def load_paid_model_config(
         source_file=source_file,
         timeout_sec=timeout_sec,
         providers=providers,
-        reason="env_local_paid_models_active",
+        reason="env_local_hybrid_panel_active" if hybrid_mode else "env_local_paid_models_active",
+        hybrid_mode=hybrid_mode,
     )
 
 

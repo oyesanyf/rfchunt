@@ -1832,15 +1832,18 @@ class ExecutionPolicy:
         if resolved_path != temp_root and resolved_path.is_relative_to(temp_root):
             return True
 
-        # Custom pytest --basetemp (pytest.ini: d:/harfile/.pytest_temp) per-test scratch directories
+        # Custom pytest --basetemp (pytest.ini: .pytest_temp or ../pytest_temp) per-test scratch directories
         if os.environ.get("PYTEST_CURRENT_TEST"):
-            pytest_temp_root = (rfchunt_root.parent / ".pytest_temp").resolve()
-            if (
-                resolved_path != pytest_temp_root
-                and resolved_path.parent != pytest_temp_root
-                and resolved_path.is_relative_to(pytest_temp_root)
+            for pytest_temp_root in (
+                (rfchunt_root / ".pytest_temp").resolve(),
+                (rfchunt_root.parent / ".pytest_temp").resolve(),
             ):
-                return True
+                if (
+                    resolved_path != pytest_temp_root
+                    and resolved_path.parent != pytest_temp_root
+                    and resolved_path.is_relative_to(pytest_temp_root)
+                ):
+                    return True
 
         # Check allowed subdirectories within rfchunt root
         for allowed_sub in self.ALLOWED_WRITE_SUBDIRS:

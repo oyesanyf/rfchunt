@@ -175,6 +175,29 @@ def get_free_vram_mb(*, allow_in_tests: bool = False) -> float:
     return 0.0
 
 
+def compute_ollama_concurrency_limits(
+    free_ram_gb: Optional[float] = None,
+    free_vram_mb: Optional[float] = None,
+    *,
+    allow_in_tests: bool = False,
+) -> Tuple[int, int]:
+    """
+    Computes memory-safe `(max_loaded_models, num_parallel)` for local Ollama from runtime
+    FREE RAM/VRAM so 3-model panels do not evict/thrash on high-RAM hosts and <=8 GB CPU-only
+    machines avoid swap thrashing by serializing model execution.
+    """
+    eff_ram = max(0.0, get_free_memory_gb() if free_ram_gb is None else float(free_ram_gb))
+    eff_vram = max(
+        0.0,
+        get_free_vram_mb(allow_in_tests=allow_in_tests) if free_vram_mb is None else float(free_vram_mb),
+    )
+    if eff_ram >= 20.0 or eff_vram >= 14336.0:
+        return (3, 3)
+    if eff_ram >= 8.0 or eff_vram >= 6144.0:
+        return (2, 2)
+    return (1, 1)
+
+
 def get_runtime_free_memory(*, allow_in_tests: bool = False) -> Tuple[float, float]:
     """Returns `(free_ram_gb, free_vram_mb)` strictly from runtime free/available memory."""
     return get_free_memory_gb(), get_free_vram_mb(allow_in_tests=allow_in_tests)
@@ -461,8 +484,9 @@ class OllamaLifecycleManager:
 
             print(f"[*] [Ollama Auto-Start] Starting local Ollama daemon ({ollama_bin} serve)...", file=sys.stderr)
             proc_env = os.environ.copy()
-            proc_env.setdefault("OLLAMA_NUM_PARALLEL", "2")
-            proc_env.setdefault("OLLAMA_MAX_LOADED_MODELS", "2")
+            max_loaded, num_parallel = compute_ollama_concurrency_limits(allow_in_tests=allow_in_tests)
+            proc_env.setdefault("OLLAMA_NUM_PARALLEL", str(num_parallel))
+            proc_env.setdefault("OLLAMA_MAX_LOADED_MODELS", str(max_loaded))
             proc_env.setdefault("OLLAMA_KEEP_ALIVE", "60m")
 
             creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0

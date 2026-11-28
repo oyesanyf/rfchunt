@@ -2745,7 +2745,19 @@ def cmd_aiscan(args):
         print("  Credit: Jonathan Haas (https://github.com/haasonsaas/aiscan)")
         print("=" * 75 + "\n")
 
-        target_path = getattr(args, "aiscan_target", ".") or "."
+        target_path = (
+            getattr(args, "aiscan_target", None)
+            if "aiscan_target" in getattr(args, "_explicit_cli_dests", set())
+            else (
+                getattr(args, "folder", None)
+                or getattr(args, "repo", None)
+                or getattr(args, "path", None)
+                or getattr(args, "raptor_target", None)
+                or getattr(args, "aiscan_target", None)
+                or getattr(args, "target_arg", None)
+                or "."
+            )
+        ) or "."
         print(f"[*] Initiating AI security scan on: {target_path}")
         res = scanner.scan_target(target_path)
 
@@ -3226,7 +3238,7 @@ def cmd_raptor(args):
             return
 
         # 3. Determine Scan Target: Live Host vs Any Local Folder
-        target_repo = getattr(args, "raptor_target", None) or getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "target_arg", None)
+        target_repo = getattr(args, "raptor_target", None) or getattr(args, "folder", None) or getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "target_arg", None)
         host = getattr(args, "host", None)
         raptor_mode = getattr(args, "raptor_mode", None)
 
@@ -3324,6 +3336,7 @@ def cmd_mantis(args):
     args.abliteration = True
     target = (
         getattr(args, "mantis_target", None)
+        or getattr(args, "folder", None)
         or getattr(args, "repo", None)
         or getattr(args, "path", None)
         or getattr(args, "raptor_target", None)
@@ -3790,6 +3803,7 @@ def cmd_phi(
 
     target_path = (
         getattr(args, "phi_target", None)
+        or getattr(args, "folder", None)
         or getattr(args, "repo", None)
         or getattr(args, "path", None)
         or getattr(args, "target_arg", None)
@@ -3875,7 +3889,8 @@ def cmd_preflight(args: Any, *, return_dict_only: bool = False) -> Dict[str, Any
     from engine.preflight_discovery import run_preflight_discovery
 
     target_path = (
-        getattr(args, "repo", None)
+        getattr(args, "folder", None)
+        or getattr(args, "repo", None)
         or getattr(args, "path", None)
         or getattr(args, "raptor_target", None)
         or "."
@@ -3931,7 +3946,7 @@ def cmd_dry_run_plan(
 
     host = getattr(args, "host", None) or getattr(args, "target", None)
     targets = getattr(args, "targets", None) or []
-    repo = getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "raptor_target", None)
+    repo = getattr(args, "folder", None) or getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "raptor_target", None)
     auth_checks: List[Dict[str, Any]] = []
     for cand_h in ([host] if host else []) + list(targets):
         if cand_h:
@@ -3957,6 +3972,14 @@ def cmd_dry_run_plan(
                 "Module-17-ARTEX-DualGraph",
                 "Module-19-PromptSmuggling",
             ]
+        )
+        if not getattr(args, "no_ensemble", False):
+            planned_modules.append(
+                "IntelligentFreeOSSEnsemble(Trivy+TruffleHog+Infisical+SemgrepOSS+SkillSpector+CloudflareLedger+ComplianceMapper|zero-skip)"
+            )
+    elif getattr(args, "enable_ensemble_flag", False) or active_mode in ("ensemble", "essmble", "essamble"):
+        planned_modules.append(
+            "IntelligentFreeOSSEnsemble(Trivy+TruffleHog+Infisical+SemgrepOSS+SkillSpector+CloudflareLedger+ComplianceMapper|zero-skip)"
         )
     elif getattr(args, "preflight_only", False) or active_mode == "preflight":
         planned_modules.append("Module-23-PreflightDiscovery(14-Categories+PQC+HackerOne+SafeSkills)")
@@ -4888,6 +4911,205 @@ def cmd_fuzz_bridge(args):
     )
 
 
+def _collect_ensemble_disabled_tools(args: Any) -> List[str]:
+    disabled: List[str] = []
+    flag_map = (
+        ("no_aiscan", "aiscan"),
+        ("no_trivy", "trivy"),
+        ("no_trufflehog", "trufflehog"),
+        ("no_infisical", "infisical"),
+        ("no_semgrep_cli", "semgrep_oss"),
+        ("no_bumblebee", "bumblebee"),
+        ("no_skillspector", "skillspector"),
+        ("no_mantis", "mantis"),
+        ("no_raptor", "raptor"),
+        ("no_rea", "rea"),
+        ("no_phi", "phi"),
+        ("no_artex", "artex"),
+        ("no_formal", "formal_z3"),
+        ("no_formal", "formal_lean4"),
+        ("no_stride", "stride_threat_model"),
+        ("no_cloudflare_audit", "cloudflare_audit"),
+        ("no_compliance_map", "compliance_mapper"),
+        ("no_codeql", "codeql"),
+    )
+    for attr, tid in flag_map:
+        if getattr(args, attr, False) and tid not in disabled:
+            disabled.append(tid)
+    return disabled
+
+
+def cmd_formal(args: Any) -> Dict[str, Any]:
+    """Runs Z3 SMT automated formal verification AND Lean 4 formal proof checking on `--folder`."""
+    from engine.cli_render import render_json, render_kv_panel, render_table
+    from engine.formal_verifier import run_formal_verification_suite
+
+    as_json = bool(getattr(args, "as_json", False))
+    plain = bool(getattr(args, "plain", False))
+    repo = getattr(args, "folder", None) or getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "target_arg", None) or "."
+    out_dir = Path(getattr(args, "output_dir", None) or "reports")
+    res = run_formal_verification_suite(str(repo), reports_dir=out_dir)
+    if as_json:
+        render_json(res)
+        return res
+    z3_r = res.get("z3_smt") or {}
+    ln_r = res.get("lean4") or {}
+    render_kv_panel(
+        "RFCHunt Formal Verification (Z3 SMT + Lean 4)",
+        {
+            "Target Folder": res.get("target_path", str(repo)),
+            "Z3 SMT Solver": f"{z3_r.get('mode', '?')} | proved={z3_r.get('proved_count', 0)}/{z3_r.get('checks_total', 0)} | counterexamples={z3_r.get('counterexamples_count', 0)}",
+            "Lean 4 Prover": f"{ln_r.get('mode', '?')} | modules={ln_r.get('proof_modules_total', 0)} | machine_checked={ln_r.get('machine_checked_modules', 0)} | theorems={ln_r.get('total_theorems', 0)} | zero_sorry={ln_r.get('zero_sorry_verified', False)}",
+            "Report JSON": res.get("report_path", "-"),
+            "Elapsed": f"{res.get('elapsed_sec', 0)}s",
+        },
+        plain=plain,
+    )
+    rows = [
+        [m["name"], str(m["theorem_count"]), str(m["machine_checked"]), str(not m["has_sorry"]), m["status"]]
+        for m in (ln_r.get("modules") or [])
+    ]
+    if rows:
+        render_table("Lean 4 Proof Verification Matrix", ["Module", "Theorems", "Kernel Checked", "Zero Sorry", "Status"], rows, as_json=False, plain=plain)
+    return res
+
+
+def cmd_stride(args: Any) -> Dict[str, Any]:
+    """Runs Dynamic Per-Component STRIDE, MITRE ATT&CK, Zero Trust, Security Requirements & Attack Trees on `--folder`."""
+    from engine.cli_render import render_json, render_kv_panel, render_table
+    from engine.stride_engine import DynamicStrideThreatEngine
+
+    as_json = bool(getattr(args, "as_json", False))
+    plain = bool(getattr(args, "plain", False))
+    repo = getattr(args, "folder", None) or getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "target_arg", None) or "."
+    out_dir = Path(getattr(args, "output_dir", None) or "reports")
+    res = DynamicStrideThreatEngine.analyze_repository(str(repo), reports_dir=out_dir)
+    if as_json:
+        render_json(res)
+        return res
+    rfiles = res.get("report_files") or {}
+    render_kv_panel(
+        "RFCHunt Dynamic STRIDE Threat Model & Attack Trees",
+        {
+            "Model ID": res.get("model_id", "-"),
+            "Target Folder": res.get("target_repo", str(repo)),
+            "Components Discovered": str(res.get("components_discovered", 0)),
+            "STRIDE Threat Scenarios": str(len(res.get("threat_scenarios") or [])),
+            "MITRE ATT&CK Techniques": str(len(res.get("mitre_attack_mapping") or [])),
+            "Security Requirements": str(len(res.get("security_requirements") or [])),
+            "Attack Trees": str(len(res.get("attack_trees") or [])),
+            "Markdown Report": rfiles.get("markdown_report", "-"),
+            "HTML Report": rfiles.get("html_report", "-"),
+            "Threat Model SVG": rfiles.get("threat_model_svg", "-"),
+            "Attack Tree SVG": rfiles.get("attack_tree_svg", "-"),
+        },
+        plain=plain,
+    )
+    rows = [
+        [s["scenario_id"], s["component_name"][:24], s["stride_category"], s["severity"], s["cwe"], s["mitre_technique"][:28]]
+        for s in (res.get("threat_scenarios") or [])[:20]
+    ]
+    if rows:
+        render_table("Dynamic STRIDE Threat Scenarios", ["ID", "Component", "STRIDE", "Severity", "CWE", "MITRE ATT&CK"], rows, as_json=False, plain=plain)
+    return res
+
+
+def cmd_ensemble(args: Any) -> Dict[str, Any]:
+    """
+    Standalone `--ensemble` (aliases `--essmble`, `--essamble`, `--run-ensemble`):
+    Intelligent stack-aware orchestration wrapping ALL real native defensive security binaries
+    (aiscan.exe, Trivy, TruffleHog --no-verification, Infisical CLI, Semgrep OSS,
+    Perplexity AI Bumblebee, NVIDIA SkillSpector, Cloudflare Coverage Ledger, Comp-AI
+    Compliance Control Mapper, plus CodeQL, Claude/local-Ollama --diff-review, --codex-review,
+    and loopback --pyrit-eval) with mathematical ZERO-SKIP accounting (`dropped_count == 0`).
+    """
+    from engine.cli_render import render_json, render_kv_panel, render_table
+    from engine.ensemble_orchestrator import EnsembleOrchestrator
+
+    as_json = bool(getattr(args, "as_json", False))
+    plain = bool(getattr(args, "plain", False))
+    explicit_local = (
+        getattr(args, "folder", None)
+        or getattr(args, "repo", None)
+        or getattr(args, "raptor_target", None)
+        or getattr(args, "path", None)
+        or getattr(args, "target_arg", None)
+    )
+    repo = explicit_local or "."
+    if explicit_local and not os.path.exists(str(repo)):
+        err_payload = {"error": f"Target local code folder does not exist: {repo}", "target_path": str(repo)}
+        if as_json:
+            render_json(err_payload)
+            return err_payload
+        print(f"[!] Target local code folder does not exist: {repo}")
+        sys.exit(1)
+    out_dir = getattr(args, "output_dir", None) or "reports"
+    raw_tools = getattr(args, "ensemble_tools", None)
+    requested_tools = _parse_csv_list(raw_tools) if raw_tools else None
+    disabled_tools = set(_collect_ensemble_disabled_tools(args))
+    auto_install = bool(getattr(args, "auto_install", True))
+
+    trace_fn = (lambda msg: print(msg, file=sys.stderr, flush=True)) if as_json else (lambda msg: print(msg, flush=True))
+    orch = EnsembleOrchestrator(reports_dir=str(out_dir), on_trace=trace_fn)
+    res = orch.run_standalone(
+        str(repo),
+        requested_tools=requested_tools,
+        disabled_tools=disabled_tools,
+        enable_diff_review=bool(getattr(args, "enable_diff_review", False)),
+        enable_pyrit_eval=bool(getattr(args, "enable_pyrit_eval", False)),
+        enable_codex_review=bool(getattr(args, "enable_codex_review", False)),
+        enable_codeql=not bool(getattr(args, "no_codeql", False)),
+        enable_cloudflare_audit=not bool(getattr(args, "no_cloudflare_audit", False)),
+        enable_compliance_map=not bool(getattr(args, "no_compliance_map", False)),
+        hybrid_panel=bool(getattr(args, "hybrid_panel", False)),
+        auto_install=auto_install,
+    )
+
+    if as_json:
+        render_json(res)
+        return res
+
+    proof = res.get("accounting_proof") or {}
+    caps = res.get("runtime_capabilities") or {}
+    nat = res.get("native_binary_summary") or {}
+    render_kv_panel(
+        "RFCHunt Native-First Intelligent Ensemble (--ensemble | Zero-Skip)",
+        {
+            "Target Folder": res.get("target_path", str(repo)),
+            "Native Binaries Executed": f"{nat.get('native_executed_count', 0)} native / {nat.get('python_fallback_count', 0)} fallback ({', '.join(nat.get('native_tools') or []) or 'none'})",
+            "Total Findings (Zero Dropped)": f"{proof.get('preserved_findings_count', 0)} / {proof.get('input_findings_count', 0)} (dropped={proof.get('dropped_count', 0)})",
+            "Consensus Clusters": f"{proof.get('cluster_count', 0)} (corroborated >=2 scanners: {proof.get('corroborated_clusters_count', 0)})",
+            "Host Free RAM / Workers": f"{caps.get('free_ram_gb', '?')} GB / max_workers={caps.get('max_scanner_workers', '?')}",
+            "Lossless Ledger JSON": (res.get("report_files") or {}).get("ensemble_all_findings_json", "-"),
+            "Lossless SARIF": (res.get("report_files") or {}).get("ensemble_sarif", "-"),
+            "Coverage Ledger": (res.get("report_files") or {}).get("coverage_ledger_json", "-"),
+            "Compliance Evidence": (res.get("report_files") or {}).get("compliance_evidence_json", "-"),
+            "Bumblebee Inventory NDJSON": (res.get("report_files") or {}).get("bumblebee_inventory_ndjson", "-"),
+            "Elapsed": f"{res.get('elapsed_sec', 0)}s",
+        },
+        plain=plain,
+    )
+    rows = []
+    for tid, st in (res.get("scanners") or {}).items():
+        if isinstance(st, dict):
+            rows.append([
+                tid,
+                str(st.get("status", "unknown")),
+                str(st.get("mode", "unknown")),
+                str(st.get("total_findings", 0)),
+                f"{st.get('elapsed_sec', 0)}s",
+            ])
+    if rows:
+        render_table(
+            "Free OSS Ensemble Scanner Execution Matrix",
+            ["Tool", "Status", "Backend Mode", "Findings", "Time"],
+            rows,
+            as_json=False,
+            plain=plain,
+        )
+    return res
+
+
 def cmd_all(args):
     """
     Unified --all orchestrator running Google Mantis, haasonsaas/aiscan, BaaRai/ARTEX Dual-Graph,
@@ -4907,7 +5129,7 @@ def cmd_all(args):
         sys.exit(1)
     host = getattr(args, "host", None) or getattr(args, "target", None)
     targets = getattr(args, "targets", None)
-    repo = getattr(args, "repo", None) or getattr(args, "raptor_target", None)
+    repo = getattr(args, "folder", None) or getattr(args, "repo", None) or getattr(args, "raptor_target", None)
     path = getattr(args, "path", None)
     if not repo and not path and not host and not targets:
         fallback = getattr(args, "mantis_target", None) or getattr(args, "target_arg", None)
@@ -5101,6 +5323,17 @@ def cmd_all(args):
             ),
             "preflight_include_home_skills": not bool(getattr(args, "no_home_skills", False)),
             "preflight_timeout": float(getattr(args, "preflight_timeout", 15.0) or 15.0),
+            "enable_ensemble": not bool(getattr(args, "no_ensemble", False)),
+            "ensemble_tools": _parse_csv_list(getattr(args, "ensemble_tools", None)) or None,
+            "ensemble_disabled_tools": _collect_ensemble_disabled_tools(args),
+            "enable_diff_review": bool(getattr(args, "enable_diff_review", False)),
+            "enable_pyrit_eval": bool(getattr(args, "enable_pyrit_eval", False)),
+            "enable_cloudflare_audit": not bool(getattr(args, "no_cloudflare_audit", False)),
+            "enable_compliance_map": not bool(getattr(args, "no_compliance_map", False)),
+            "panel_models": _parse_csv_list(getattr(args, "panel_models", None)) or None,
+            "fusion_quorum": float(getattr(args, "fusion_quorum", 0.5) or 0.5),
+            "hybrid_panel": True if getattr(args, "hybrid_panel", False) else None,
+            "fallback_timeout": getattr(args, "fallback_timeout", None),
         }
         try:
             _unified_sig = inspect.signature(run_unified_all_scans)
@@ -6150,7 +6383,7 @@ def cmd_rea(args):
     as_json = bool(getattr(args, "as_json", False))
     plain = bool(getattr(args, "plain", False))
     err_stream = sys.stderr if as_json else sys.stdout
-    target_path = getattr(args, "rea_target", None) or getattr(args, "path", None) or getattr(args, "repo", None)
+    target_path = getattr(args, "rea_target", None) or getattr(args, "folder", None) or getattr(args, "path", None) or getattr(args, "repo", None)
     raw_host = getattr(args, "host", None)
     if not target_path and not raw_host:
         target_path = "."
@@ -6937,7 +7170,7 @@ ALL_MODES = [
     "poc", "poc-verify", "poc_verify", "docker-doctor", "docker_doctor", "doctor-docker",
     "deep-audit", "deep_audit",
     "novelty", "novelty-refresh", "novelty_refresh", "swarm-board", "swarm_board", "board",
-    "phi", "preflight", "hackerone", "hackone",
+    "phi", "preflight", "hackerone", "hackone", "ensemble", "essmble", "essamble", "formal", "lean", "lean4", "z3", "stride", "threat-model",
 ]
 
 
@@ -7366,7 +7599,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     # https://github.com/gadievron/raptor
     parser.add_argument("--raptor", "--enable-raptor", dest="enable_raptor", action="store_true", help="Enable RAPTOR Autonomous Framework (Web application & source code pentesting; credit: Gadi Evron, Daniel Cuthbert, Halvar Flake)")
     parser.add_argument("--raptor-mode", type=str, choices=["web", "scan", "agentic", "crypto", "sca", "describe", "all", "full"], default=None, help="RAPTOR analysis mode: 'all'/'full' (runs describe + scan + crypto + sca + agentic), 'web' (live host DAST), 'scan' (fast static), 'agentic' (LLM triage), 'crypto' (PQC), 'sca' (dependencies)")
-    parser.add_argument("--raptor-target", "--folder", "--dir", dest="raptor_target", type=str, default=None, help="Any local folder or repository path to audit with RAPTOR")
+    parser.add_argument("--raptor-target", dest="raptor_target", type=str, default=None, help="Specific local folder or repository path to audit with RAPTOR (defaults to --folder / --repo)")
     parser.add_argument("--raptor-model", type=str, default="fenkohq/foundation-sec-8b:latest", help="Ollama LLM for RAPTOR agentic triage (default: fenkohq/foundation-sec-8b:latest)")
     parser.add_argument("--raptor-status", "--status", dest="raptor_status", action="store_true", help="Check RAPTOR Docker container (danielcuthbert/raptor:latest) and Ollama security model readiness")
     parser.add_argument("--raptor-setup", "--install-raptor", dest="raptor_setup", action="store_true", help="Automatically clone, configure, and pull the RAPTOR Security Framework (https://github.com/gadievron/raptor & danielcuthbert/raptor:latest)")
@@ -7375,7 +7608,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--include-codeql", action="store_true", help="Include deep CodeQL compilation during RAPTOR agentic scan")
     # haasonsaas/aiscan Integration (Module 18)
     parser.add_argument("--aiscan", "--enable-aiscan", dest="enable_aiscan", action="store_true", help="Enable haasonsaas/aiscan AI & model risk scanner (Module 18)")
-    parser.add_argument("--aiscan-target", type=str, default=".", help="Target directory to audit for AI vulnerabilities, prompt injection sinks, and exposed model credentials (default: '.')")
+    parser.add_argument("--aiscan-target", type=str, default=".", action=_TrackExplicitStore, help="Target directory to audit for AI vulnerabilities, prompt injection sinks, and exposed model credentials (defaults to --folder / --repo / '.')")
     parser.add_argument("--aiscan-report", action="store_true", help="Print summary of recent AI security audit findings from terminator.db")
 
     # BaaRai/ARTEX Dual-Graph Attack Chaining (Module 17) & Headless REST/SSE/Proxy Bridge
@@ -7474,8 +7707,8 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
 
     # Google Mantis Integration (Module 20) & Unified --all Multi-Scanner Orchestrator
     parser.add_argument("--all", "--run-all", "--all-scans", dest="run_all_scans", action="store_true", help="Execute ALL integrated scanners (Google Mantis, aiscan, ARTEX Dual-Graph, RAPTOR, Prompt Smuggling, Module 21 REA + rea-agents CLI, and httpx/katana/nuclei for live hosts) with mandatory ModelFusion + Abliterated models")
-    parser.add_argument("--repo", dest="repo", type=str, default=None, help="Repository directory path for --all, --mantis, or --raptor audits")
-    parser.add_argument("--path", dest="path", type=str, default=None, help="Specific file or directory path for --all, --mantis, or --raptor audits")
+    parser.add_argument("--repo", "--folder", "--dir", dest="repo", type=str, default=None, action=_TrackExplicitStore, help="Local code folder or repository path to audit across --folder, --ensemble, --all, --mantis, --raptor, --aiscan, --rea, --phi, deep-audit, and slice")
+    parser.add_argument("--path", dest="path", type=str, default=None, help="Specific file or directory path for --all, --ensemble, --mantis, or --raptor audits")
     parser.add_argument("--mantis", "--enable-mantis", dest="enable_mantis", action="store_true", help="Enable Google Mantis toolkit (Module 20: threat modeling, depth hypotheses, Tier 1/2 repro, CVSS rubric, patching)")
     parser.add_argument("--mantis-mode", type=str, choices=["full", "fast", "threat-model", "scan", "reproduce", "patch"], default="full", help="Google Mantis execution mode (default: full)")
     parser.add_argument("--depth", "--mantis-depth", dest="depth", type=int, default=None, help="Google Mantis audit depth 1..100 (default: 100 for --all, 30 for mantis; scales coverage, passes, and rule tiers)")
@@ -7617,6 +7850,36 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--hackerone-bounties-only", dest="hackerone_bounties_only", action="store_true", default=False, help="Filter HackerOne API campaign discovery to paid bounty programs only")
     parser.add_argument("--hackerone-min-severity", dest="hackerone_min_severity", choices=["low", "medium", "high", "critical"], default="medium", help="Minimum severity eligible for HackerOne porting (default: medium)")
     parser.add_argument("--hackerone-max-reports", dest="hackerone_max_reports", type=int, default=5, help="Maximum eligible drafts to generate per run (default: 5)")
+
+    # Intelligent Native-First Zero-Skip Ensemble (--ensemble) & N-Model Hybrid ModelFusion Flags
+    parser.add_argument("--ensemble", "--essmble", "--essamble", "--run-ensemble", dest="enable_ensemble_flag", action="store_true", default=False, help="Run the native-first zero-skip security ensemble (aiscan.exe, Trivy, TruffleHog --no-verification, Infisical CLI, Semgrep OSS, Perplexity AI Bumblebee, NVIDIA SkillSpector, Cloudflare Coverage Ledger, Comp-AI Compliance Mapper, CodeQL) standalone or with --all (dropped_count==0 guarantee)")
+    parser.add_argument("--no-ensemble", dest="no_ensemble", action="store_true", default=False, help="Disable the multi-tool security ensemble during --all")
+    parser.add_argument("--ensemble-tools", dest="ensemble_tools", type=str, default=None, help="Comma-separated subset of ensemble tools (e.g. aiscan,trivy,trufflehog,infisical,semgrep_oss,bumblebee,skillspector,cloudflare_audit,compliance_mapper,codeql)")
+    parser.add_argument("--no-aiscan", dest="no_aiscan", action="store_true", default=False, help="Disable native Rust aiscan.exe during standalone --ensemble")
+    parser.add_argument("--no-trivy", dest="no_trivy", action="store_true", default=False, help="Disable Aqua Security Trivy during --ensemble / --all")
+    parser.add_argument("--no-trufflehog", dest="no_trufflehog", action="store_true", default=False, help="Disable TruffleHog (--no-verification) during --ensemble / --all")
+    parser.add_argument("--no-infisical", dest="no_infisical", action="store_true", default=False, help="Disable Infisical CLI secret scan during --ensemble / --all")
+    parser.add_argument("--no-semgrep-cli", dest="no_semgrep_cli", action="store_true", default=False, help="Disable standalone Semgrep OSS Lane-2 adapter during --ensemble / --all")
+    parser.add_argument("--no-bumblebee", dest="no_bumblebee", action="store_true", default=False, help="Disable Perplexity AI Bumblebee supply-chain/lockfile/MCP scanner during --ensemble / --all")
+    parser.add_argument("--no-skillspector", dest="no_skillspector", action="store_true", default=False, help="Disable NVIDIA SkillSpector agent-skill auditor during --ensemble / --all")
+    parser.add_argument("--no-cloudflare-audit", dest="no_cloudflare_audit", action="store_true", default=False, help="Disable Cloudflare coverage ledger & schema validation during --ensemble / --all")
+    parser.add_argument("--no-compliance-map", dest="no_compliance_map", action="store_true", default=False, help="Disable SOC2/ISO27001/HIPAA/GDPR compliance evidence mapping during --ensemble / --all")
+    parser.add_argument("--no-codeql", dest="no_codeql", action="store_true", default=False, help="Disable native CodeQL CLI adapter during --ensemble / --all")
+    parser.add_argument("--no-mantis", dest="no_mantis", action="store_true", default=False, help="Disable Module 20 Mantis adapter during standalone --ensemble")
+    parser.add_argument("--no-raptor", dest="no_raptor", action="store_true", default=False, help="Disable Module 15 RAPTOR adapter during standalone --ensemble")
+    parser.add_argument("--no-phi", dest="no_phi", action="store_true", default=False, help="Disable Module 22 PHI adapter during standalone --ensemble")
+    parser.add_argument("--no-artex", dest="no_artex", action="store_true", default=False, help="Disable Module 17 ARTEX adapter during standalone --ensemble")
+    parser.add_argument("--no-formal", dest="no_formal", action="store_true", default=False, help="Disable Z3 SMT + Lean 4 formal verification adapters during --ensemble / --all")
+    parser.add_argument("--no-stride", dest="no_stride", action="store_true", default=False, help="Disable Dynamic STRIDE Threat Model & Attack Trees during --ensemble / --all")
+    parser.add_argument("--formal", "--lean", "--lean4", "--z3", dest="enable_formal_flag", action="store_true", default=False, help="Run standalone Z3 SMT + Lean 4 formal security verification suite on --folder")
+    parser.add_argument("--stride", "--threat-model", dest="enable_stride_flag", action="store_true", default=False, help="Run standalone Dynamic STRIDE, MITRE ATT&CK, Zero Trust & Attack Trees report on --folder")
+    parser.add_argument("--diff-review", dest="enable_diff_review", action="store_true", default=False, help="Opt-in git diff security review (Claude CLI / local Ollama MIT rubric)")
+    parser.add_argument("--codex-review", dest="enable_codex_review", action="store_true", default=False, help="Opt-in OpenAI Codex / OpenAI-compatible security review adapter")
+    parser.add_argument("--pyrit-eval", dest="enable_pyrit_eval", action="store_true", default=False, help="Opt-in defensive loopback/local LLM prompt-safety evaluation hook (MIT PyRIT)")
+    parser.add_argument("--panel-models", dest="panel_models", type=str, default=None, help="Comma-separated arbitrary N-model panel for ModelFusion voting (supports ollama/<tag> mixed with cloud providers)")
+    parser.add_argument("--fusion-quorum", dest="fusion_quorum", type=float, default=0.5, help="Quorum threshold (0.34..1.0) for N-model majority consensus in ModelFusion (default: 0.5)")
+    parser.add_argument("--hybrid-panel", dest="hybrid_panel", action="store_true", default=False, help="Enable hybrid local Ollama + .env.local cloud ModelFusion panel routing")
+    parser.add_argument("--fallback-timeout", dest="fallback_timeout", type=float, default=None, help="Configurable timeout in seconds for ModelFusion fallback Ollama queries (replaces legacy 30s cap)")
 
     return parser
 
@@ -7882,6 +8145,9 @@ def parse_swarm_arguments(argv=None):
         args.raptor_target = getattr(args, "repo", None) or getattr(args, "path", None)
     if not getattr(args, "repo", None) and getattr(args, "raptor_target", None):
         args.repo = args.raptor_target
+    args.folder = getattr(args, "repo", None) or getattr(args, "raptor_target", None) or getattr(args, "path", None)
+    if args.folder and "aiscan_target" not in args._explicit_cli_dests:
+        args.aiscan_target = args.folder
     if getattr(args, "skills_num", None) is None:
         args.skills_num = int(getattr(args, "research_num", 5) or 5)
     return args
@@ -7916,7 +8182,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "harness2_report", "mantis_report", "aiscan_report", "install_tools", "tool_status",
             "deep_audit", "proxy_target", "live_proxy_fuzz", "trust_boundary_review",
             "coverage_fuzz", "enable_poc", "enable_phi", "enable_hackerone", "hackerone_auto",
-            "serve_ui", "network_lifecycle", "dry_run",
+            "serve_ui", "network_lifecycle", "dry_run", "enable_ensemble_flag", "enable_formal_flag", "enable_stride_flag", "folder", "repo",
         )
     ) and getattr(args, "hint", None) is None and not getattr(args, "dispatch", None):
         build_swarm_parser().print_help()
@@ -7963,6 +8229,8 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         active_mode = "setup"
     elif active_mode in ("hackone",):
         active_mode = "hackerone"
+    elif active_mode in ("essmble", "essamble"):
+        active_mode = "ensemble"
 
     # Universal --dry-run guard: works across EVERY flag and subcommand with zero side effects
     if getattr(args, "dry_run", False):
@@ -8107,6 +8375,21 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         cmd_phi(args)
         return
 
+    # Standalone Z3 SMT + Lean 4 Formal Verification (--formal / --lean / --z3 without --all)
+    if (getattr(args, "enable_formal_flag", False) or active_mode in ("formal", "lean", "lean4", "z3")) and not getattr(args, "run_all_scans", False):
+        _dispatch_cmd("cmd_formal", args, check_main_shim=(caller_profile == "main"))
+        return
+
+    # Standalone Dynamic STRIDE Threat Model & Attack Trees (--stride / --threat-model without --all)
+    if (getattr(args, "enable_stride_flag", False) or active_mode in ("stride", "threat-model")) and not getattr(args, "run_all_scans", False):
+        _dispatch_cmd("cmd_stride", args, check_main_shim=(caller_profile == "main"))
+        return
+
+    # Standalone Intelligent Free-OSS Zero-Skip Ensemble (--ensemble without --all)
+    if (getattr(args, "enable_ensemble_flag", False) or active_mode == "ensemble") and not getattr(args, "run_all_scans", False):
+        _dispatch_cmd("cmd_ensemble", args, check_main_shim=(caller_profile == "main"))
+        return
+
     # Standalone CLI-only blackboard hint injection (zero GUI / HTTP server calls)
     has_non_hint_action = explicit_mode_given and active_mode != "hint"
     has_shortcut_action = any(
@@ -8118,7 +8401,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "enable_rea_only", "install_tools", "tool_status",
             "raptor_status", "raptor_findings", "raptor_setup",
             "harness2_report", "mantis_report", "aiscan_report",
-            "preflight_only",
+            "preflight_only", "enable_ensemble_flag",
         )
     )
     if active_mode == "hint" or (
@@ -8339,6 +8622,29 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         elif caller_profile == "main" and has_host_flag and not has_port_flag and not inline_port_extracted:
             args.port = 443
         if not has_host_flag and not has_port_flag and getattr(args, "port", 5006) in (443, 5006):
+            args.port = None
+        _dispatch_cmd("cmd_all", args, check_main_shim=(caller_profile == "main"))
+        return
+
+    # Standalone `--folder <local_code>` (or `--repo` / `--dir`) without explicit mode/host/shortcut:
+    # Automatically run unified local-code audit (--all with --ensemble native binary suite)
+    if (
+        not explicit_mode_given
+        and not has_host_flag
+        and not getattr(args, "targets", None)
+        and (getattr(args, "folder", None) or getattr(args, "repo", None))
+        and not any(
+            getattr(args, fl, False)
+            for fl in (
+                "enable_mantis", "mantis_report", "enable_aiscan", "aiscan_report",
+                "enable_artex", "enable_prompt_smuggle", "enable_raptor",
+                "raptor_status", "raptor_findings", "raptor_setup",
+                "harness2_report", "dream_benchmark", "enable_rea_only",
+            )
+        )
+    ):
+        args.host = None
+        if not has_port_flag and getattr(args, "port", 5006) in (443, 5006):
             args.port = None
         _dispatch_cmd("cmd_all", args, check_main_shim=(caller_profile == "main"))
         return

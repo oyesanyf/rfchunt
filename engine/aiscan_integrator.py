@@ -552,36 +552,56 @@ class AiscanIntegrator:
         findings: List[AIFinding] = []
         endpoints: List[DiscoveredAIEndpoint] = []
         engine_used = "python_ast_fallback"
+        native_inventory_summary: Dict[str, Any] = {}
+        native_recommendations: List[str] = []
 
         # Attempt native Rust binary if installed (or explicitly assigned on the instance)
         if self.binary_path:
             try:
                 cf = CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0
                 proc = subprocess.run(
-                    [str(self.binary_path), "scan", "--format", "json", str(tp)],
+                    [str(self.binary_path), "audit", "--json", str(tp)],
                     shell=False,
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    timeout=60,
+                    timeout=90,
                     check=False,
                     creationflags=cf,
                 )
-                if proc.returncode == 0 and proc.stdout.strip():
-                    data = json.loads(proc.stdout)
-                    engine_used = "haasonsaas/aiscan"
-                    for item in data.get("findings", []):
-                        findings.append(AIFinding(
-                            finding_type=item.get("type", "ai_vulnerability"),
-                            severity=item.get("severity", "MEDIUM").upper(),
-                            file_path=item.get("file", str(tp)),
-                            line_number=item.get("line", 0),
-                            model_or_api=item.get("model", "generic_ai"),
-                            description=item.get("message", ""),
-                            snippet=item.get("snippet", ""),
-                        ))
+                raw_out = (proc.stdout or "").strip()
+                if raw_out:
+                    # Handle optional leading non-JSON log lines safely
+                    json_start = raw_out.find("{")
+                    if json_start >= 0:
+                        data = json.loads(raw_out[json_start:])
+                    else:
+                        data = {}
+                    if isinstance(data, dict) and ("findings" in data or "security_summary" in data or "inventory_summary" in data):
+                        engine_used = "haasonsaas/aiscan"
+                        if isinstance(data.get("inventory_summary"), dict):
+                            native_inventory_summary = dict(data["inventory_summary"])
+                        if isinstance(data.get("recommendations"), list):
+                            native_recommendations = [str(r) for r in data["recommendations"] if r]
+                        for item in data.get("findings") or []:
+                            if not isinstance(item, dict):
+                                continue
+                            issue_type = str(item.get("issue_type") or item.get("type") or item.get("id") or "ai_vulnerability")
+                            desc_text = str(item.get("description") or item.get("message") or issue_type)
+                            fix_text = str(item.get("fix") or item.get("recommendation") or item.get("remediation") or "")
+                            if fix_text and fix_text not in desc_text:
+                                desc_text = f"{desc_text} | Fix: {fix_text}"
+                            findings.append(AIFinding(
+                                finding_type=issue_type,
+                                severity=str(item.get("severity") or "MEDIUM").upper(),
+                                file_path=str(item.get("file") or item.get("file_path") or str(tp)),
+                                line_number=max(1, int(item.get("line") or item.get("line_number") or 1)),
+                                model_or_api=str(item.get("model") or item.get("wrapper") or item.get("id") or "haasonsaas/aiscan"),
+                                description=desc_text,
+                                snippet=str(item.get("snippet") or item.get("context") or ""),
+                            ))
             except Exception as e:
                 logger.warning("aiscan binary execution failed, using Python fallback: %s", e)
 
@@ -634,6 +654,9 @@ class AiscanIntegrator:
         return {
             "target_path": str(tp),
             "engine": engine_used,
+            "native_binary": str(self.binary_path) if self.binary_path else None,
+            "native_inventory_summary": native_inventory_summary,
+            "native_recommendations": native_recommendations,
             "total_findings": len(findings),
             "total_endpoints": len(endpoints),
             "findings": [f.to_dict() for f in findings],

@@ -362,8 +362,19 @@ class RaptorIntegrator:
         is_mocked = getattr(subprocess.run, "__module__", None) != "subprocess"
         ps_exe = _shutil.which("powershell") or _shutil.which("pwsh")
         cf = CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0
+        docker_ok = False
+        if not is_mocked:
+            try:
+                docker_ok = bool(self.check_status().get("docker_ready", False))
+            except Exception:
+                docker_ok = False
 
-        if not is_mocked and not ps_exe and (self.raptor_root / "raptor.py").is_file():
+        run_env = os.environ.copy()
+        py_scripts = str(Path(sys.executable).resolve().parent / ("Scripts" if os.name == "nt" else "bin"))
+        if os.path.isdir(py_scripts) and py_scripts.lower() not in run_env.get("PATH", "").lower():
+            run_env["PATH"] = py_scripts + os.pathsep + run_env.get("PATH", "")
+
+        if not is_mocked and (not ps_exe or not docker_ok) and (self.raptor_root / "raptor.py").is_file():
             cmd = [sys.executable, str(self.raptor_root / "raptor.py"), "describe", "--target", str(target)]
             run_cwd: Optional[str] = str(self.raptor_root)
         else:
@@ -388,6 +399,7 @@ class RaptorIntegrator:
                 shell=False,
                 stdin=subprocess.DEVNULL,
                 cwd=run_cwd,
+                env=run_env,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -474,9 +486,23 @@ class RaptorIntegrator:
         ps_script = self._resolve_invoke_script()
         ps_exe = _shutil.which("powershell") or _shutil.which("pwsh")
         cf = CREATE_NO_WINDOW if (sys.platform == "win32" or os.name == "nt") else 0
+        docker_ok = False
+        if not is_mocked:
+            try:
+                docker_ok = bool(self.check_status().get("docker_ready", False))
+            except Exception:
+                docker_ok = False
+
+        run_env = os.environ.copy()
+        run_env["PYTHONUTF8"] = "1"
+        run_env["SEMGREP_SEND_METRICS"] = "off"
+        py_scripts = str(Path(sys.executable).resolve().parent / ("Scripts" if os.name == "nt" else "bin"))
+        if os.path.isdir(py_scripts) and py_scripts.lower() not in run_env.get("PATH", "").lower():
+            run_env["PATH"] = py_scripts + os.pathsep + run_env.get("PATH", "")
 
         slug = re.sub(r"\s+", "_", target.name)
-        if not is_mocked and not ps_exe and (self.raptor_root / "raptor.py").is_file():
+        direct_out: Optional[Path] = None
+        if not is_mocked and (not ps_exe or not docker_ok) and (self.raptor_root / "raptor.py").is_file():
             direct_out = self.out_root / f"{slug}_{mode}_{int(time.time())}"
             direct_out.mkdir(parents=True, exist_ok=True)
             raptor_sub = "scan" if mode == "all" else mode
@@ -511,6 +537,7 @@ class RaptorIntegrator:
                 shell=False,
                 stdin=subprocess.DEVNULL,
                 cwd=run_cwd,
+                env=run_env,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

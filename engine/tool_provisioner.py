@@ -122,12 +122,33 @@ GITHUB_RELEASE_TOOLS: Dict[str, Dict[str, str]] = {
         "binary": "aiscan",
         "url": "https://github.com/haasonsaas/aiscan",
     },
+    "trivy": {
+        "repo": "aquasecurity/trivy",
+        "binary": "trivy",
+        "url": "https://github.com/aquasecurity/trivy",
+    },
+    "trufflehog": {
+        "repo": "trufflesecurity/trufflehog",
+        "binary": "trufflehog",
+        "url": "https://github.com/trufflesecurity/trufflehog",
+    },
+    "infisical": {
+        "repo": "Infisical/cli",
+        "binary": "infisical",
+        "url": "https://github.com/Infisical/cli",
+    },
+    "bumblebee": {
+        "repo": "perplexityai/bumblebee",
+        "binary": "bumblebee",
+        "url": "https://github.com/perplexityai/bumblebee",
+    },
 }
 
 GO_INSTALL_TARGETS: Dict[str, str] = {
     "httpx": "github.com/projectdiscovery/httpx/cmd/httpx@latest",
     "katana": "github.com/projectdiscovery/katana/cmd/katana@latest",
     "nuclei": "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest",
+    "bumblebee": "github.com/perplexityai/bumblebee/cmd/bumblebee@latest",
 }
 
 PROJECTDISCOVERY_DOCKER_IMAGES: Tuple[Tuple[str, str], ...] = (
@@ -141,6 +162,11 @@ RAPTOR_ARCHIVE_ZIP_URL = "https://github.com/gadievron/raptor/archive/refs/heads
 RAPTOR_DOCKER_IMAGE = "danielcuthbert/raptor:latest"
 AISCAN_REPO_URL = "https://github.com/haasonsaas/aiscan.git"
 AISCAN_LOCAL_SOURCE = Path(r"D:\harfile\aiscan")
+CLOUDFLARE_AUDIT_SKILL_REPO_URL = "https://github.com/cloudflare/security-audit-skill.git"
+CLOUDFLARE_AUDIT_SKILL_ZIP_URL = "https://github.com/cloudflare/security-audit-skill/archive/refs/heads/main.zip"
+BUMBLEBEE_REPO_URL = "https://github.com/perplexityai/bumblebee.git"
+BUMBLEBEE_ZIP_URL = "https://github.com/perplexityai/bumblebee/archive/refs/heads/main.zip"
+SKILLSPECTOR_REPO_URL = "https://github.com/NVIDIA/SkillSpector.git"
 REA_NPM_PACKAGE = "rea-agents"
 RAPTOR_DEFAULT_MODEL = "fenkohq/foundation-sec-8b:latest"
 
@@ -238,6 +264,59 @@ TOOL_CATALOG: Tuple[ToolSpec, ...] = (
         "Offline-cached canonical HTTP/TLS/PQC RFC specifications",
     ),
     ToolSpec(
+        "trivy",
+        "Aqua Security Trivy Scanner",
+        "binary",
+        "Free Apache-2.0 vulnerability, secret, and IaC/misconfiguration filesystem scanner",
+    ),
+    ToolSpec(
+        "trufflehog",
+        "TruffleHog Secret Scanner",
+        "binary",
+        "Free AGPL-3.0 credential and secret scanner (invoked with --no-verification)",
+    ),
+    ToolSpec(
+        "infisical",
+        "Infisical CLI Secret Scanner",
+        "binary",
+        "Free MIT standalone secret scanner CLI (`infisical scan`)",
+    ),
+    ToolSpec(
+        "skillspector",
+        "NVIDIA SkillSpector Skill Auditor",
+        "python",
+        "Free Apache-2.0 AI agent skill (`SKILL.md`) static security scanner",
+        required_for_core=False,
+    ),
+    ToolSpec(
+        "cloudflare_audit_skill",
+        "Cloudflare Security Audit Skill",
+        "repo",
+        "Free MIT security audit skill, report schema, and coverage ledger methodology",
+        required_for_core=False,
+    ),
+    ToolSpec(
+        "bumblebee",
+        "Perplexity AI Bumblebee Supply-Chain Scanner",
+        "binary",
+        "Free Apache-2.0 read-only lockfile, MCP config, extension & supply-chain exposure scanner (perplexityai/bumblebee)",
+        required_for_core=False,
+    ),
+    ToolSpec(
+        "z3_solver",
+        "Z3 SMT Formal Verification Solver",
+        "python",
+        "Automated SMT solver for RBAC policy, RFC 9112 framing, bounds, SSRF CIDR & lattice proofs",
+        required_for_core=False,
+    ),
+    ToolSpec(
+        "lean4",
+        "Lean 4 Formal Theorem Prover",
+        "binary",
+        "Machine-checked theorem prover verifying formal/lean4/*.lean security invariant proofs",
+        required_for_core=False,
+    ),
+    ToolSpec(
         "docker_scanners",
         "ProjectDiscovery Docker Images",
         "docker",
@@ -248,6 +327,25 @@ TOOL_CATALOG: Tuple[ToolSpec, ...] = (
 )
 
 ALL_TOOL_IDS: Tuple[str, ...] = tuple(spec.tool_id for spec in TOOL_CATALOG)
+ENSEMBLE_FREE_TOOL_IDS: Tuple[str, ...] = (
+    "python_deps",
+    "semgrep",
+    "aiscan",
+    "raptor",
+    "trivy",
+    "trufflehog",
+    "infisical",
+    "bumblebee",
+    "z3_solver",
+    "lean4",
+    "skillspector",
+    "cloudflare_audit_skill",
+    "httpx",
+    "katana",
+    "nuclei",
+    "artex",
+    "rfc_cache",
+)
 
 
 @dataclass
@@ -348,13 +446,13 @@ def _detect_os_arch_tokens() -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
         os_tokens = ("linux",)
 
     if machine in ("x86_64", "amd64", "x64"):
-        arch_tokens = ("amd64", "x86_64", "x64")
+        arch_tokens = ("amd64", "x86_64", "x64", "64bit")
     elif machine in ("aarch64", "arm64"):
         arch_tokens = ("arm64", "aarch64")
     elif machine in ("i386", "i686", "x86"):
-        arch_tokens = ("386", "x86")
+        arch_tokens = ("386", "x86", "32bit")
     else:
-        arch_tokens = (machine, "amd64")
+        arch_tokens = (machine, "amd64", "64bit")
     return os_tokens, arch_tokens
 
 
@@ -369,7 +467,7 @@ def _select_release_asset(
     for asset in assets:
         name = str(asset.get("name") or "")
         low = name.lower()
-        if any(skip in low for skip in ("checksum", "sha256", ".sig", ".pem", ".cdx.json", ".sbom")):
+        if any(skip in low for skip in ("checksum", "sha256", ".sig", ".pem", ".cdx.json", ".sbom", ".msi", ".deb", ".rpm", ".apk", ".dmg", ".pkg")):
             continue
         if not any(low.endswith(ext) for ext in preferred_exts):
             continue
@@ -532,12 +630,19 @@ class ToolProvisioner:
         self.npm_prefix = self.tools_dir / "npm"
         self.cargo_root = self.tools_dir / "cargo"
         self.raptor_root = Path(raptor_root) if raptor_root else resolve_default_raptor_root(self.repo_root)
+        self.cloudflare_skill_root = self.tools_dir / "cloudflare-security-audit-skill"
+        self.bumblebee_root = self.tools_dir / "bumblebee"
         self.on_trace = on_trace
         self.allow_in_tests = bool(allow_in_tests)
 
         # Register existing local tool dirs into process-scoped PATH if they exist
+        py_bin_dir = Path(sys.executable).resolve().parent
+        py_scripts_dir = py_bin_dir / ("Scripts" if os.name == "nt" else "bin")
         for existing_dir in (
             self.bin_dir,
+            py_scripts_dir,
+            py_bin_dir,
+            self.tools_dir / "codeql",
             self.cargo_root / "bin",
             Path.home() / ".cargo" / "bin",
             Path.home() / "go" / "bin",
@@ -563,14 +668,19 @@ class ToolProvisioner:
     # ------------------------------------------------------------------
 
     def find_binary(self, tool_stem: str) -> Optional[Path]:
-        """Searches repo-local bin/, cargo/go dirs, D:\\tools, and process PATH."""
+        """Searches repo-local bin/, Python Scripts/, tools/codeql, cargo/go dirs, D:\\tools, and process PATH."""
         exe_names = (f"{tool_stem}.exe", tool_stem) if os.name == "nt" else (tool_stem,)
+        py_bin_dir = Path(sys.executable).resolve().parent
         search_dirs: List[Path] = [
             self.bin_dir,
+            py_bin_dir / ("Scripts" if os.name == "nt" else "bin"),
+            py_bin_dir,
+            self.tools_dir / "codeql",
             self.cargo_root / "bin",
             Path.home() / ".cargo" / "bin",
             Path.home() / "go" / "bin",
             Path.home() / ".pdtm" / "go" / "bin",
+            self.npm_prefix / "node_modules" / ".bin",
         ]
         if os.name == "nt":
             search_dirs.append(Path(r"D:\tools"))
@@ -713,7 +823,8 @@ class ToolProvisioner:
 
         if tool_id == "semgrep":
             has_pkg = importlib.util.find_spec("semgrep") is not None
-            bin_path = shutil.which("semgrep")
+            bin_found = self.find_binary("semgrep")
+            bin_path = str(bin_found) if bin_found else shutil.which("semgrep")
             installed = bool(has_pkg or bin_path)
             ver = None
             if has_pkg:
@@ -728,11 +839,11 @@ class ToolProvisioner:
                 installed=installed,
                 path_or_source=bin_path or (sys.executable if has_pkg else None),
                 version=ver,
-                method="pip" if installed else "missing",
+                method="binary" if bin_path else ("pip" if installed else "missing"),
                 detail="Semgrep SAST ready" if installed else "Semgrep not installed",
             )
 
-        if tool_id in ("aiscan", "httpx", "katana", "nuclei", "artex"):
+        if tool_id in ("aiscan", "httpx", "katana", "nuclei", "artex", "trivy", "trufflehog", "infisical"):
             bin_path = self.find_binary(tool_id)
             return ToolStatus(
                 tool_id=tool_id,
@@ -742,6 +853,108 @@ class ToolProvisioner:
                 path_or_source=str(bin_path) if bin_path else None,
                 method="binary" if bin_path else "missing",
                 detail=f"Found binary at {bin_path}" if bin_path else f"{tool_id} binary not found",
+            )
+
+        if tool_id == "skillspector":
+            has_pkg = importlib.util.find_spec("skillspector") is not None
+            bin_path = self.find_binary("skillspector") or (
+                Path(shutil.which("skillspector")) if shutil.which("skillspector") else None
+            )
+            installed = bool(has_pkg or bin_path)
+            return ToolStatus(
+                tool_id="skillspector",
+                display_name=spec.display_name,
+                category=spec.category,
+                installed=installed,
+                path_or_source=str(bin_path) if bin_path else (sys.executable if has_pkg else None),
+                method="pip" if installed else "python_fallback",
+                detail=(
+                    "NVIDIA SkillSpector CLI/package ready"
+                    if installed
+                    else "Upstream skillspector package not installed (embedded pure-Python SkillSpector fallback active)"
+                ),
+            )
+
+        if tool_id == "cloudflare_audit_skill":
+            cf_skill_md = self.cloudflare_skill_root / "skills" / "security-audit" / "SKILL.md"
+            alt_md = self.cloudflare_skill_root / "SKILL.md"
+            present = cf_skill_md.is_file() or alt_md.is_file() or (
+                self.cloudflare_skill_root.is_dir() and any(self.cloudflare_skill_root.rglob("SKILL.md"))
+            )
+            return ToolStatus(
+                tool_id="cloudflare_audit_skill",
+                display_name=spec.display_name,
+                category=spec.category,
+                installed=present,
+                path_or_source=str(self.cloudflare_skill_root) if present else None,
+                method="git_repo" if present else "python_fallback",
+                detail=(
+                    f"Cloudflare Security Audit Skill ready at {self.cloudflare_skill_root}"
+                    if present
+                    else "Not cloned yet (embedded pure-Python coverage ledger & schema validator active)"
+                ),
+            )
+
+        if tool_id == "bumblebee":
+            bin_path = self.find_binary("bumblebee")
+            ti_dir = self.bumblebee_root / "threat_intel"
+            catalogs = list(ti_dir.glob("*.json")) if ti_dir.is_dir() else []
+            installed = bool(bin_path is not None or len(catalogs) > 0)
+            return ToolStatus(
+                tool_id="bumblebee",
+                display_name=spec.display_name,
+                category=spec.category,
+                installed=installed,
+                path_or_source=str(bin_path) if bin_path else (str(self.bumblebee_root) if catalogs else None),
+                method="binary" if bin_path else ("repo_threat_intel" if catalogs else "missing"),
+                detail=(
+                    f"Bumblebee binary ({bin_path}) + {len(catalogs)} threat_intel exposure catalogs"
+                    if bin_path
+                    else (
+                        f"Bumblebee threat_intel ready ({len(catalogs)} catalogs at {ti_dir}; cross-platform NDJSON engine active)"
+                        if catalogs
+                        else "perplexityai/bumblebee not installed yet"
+                    )
+                ),
+            )
+
+        if tool_id == "z3_solver":
+            has_z3 = importlib.util.find_spec("z3") is not None
+            ver = None
+            if has_z3:
+                try:
+                    ver = importlib.metadata.version("z3-solver")
+                except Exception:
+                    ver = "installed"
+            return ToolStatus(
+                tool_id="z3_solver",
+                display_name=spec.display_name,
+                category=spec.category,
+                installed=has_z3,
+                path_or_source=sys.executable if has_z3 else None,
+                version=ver,
+                method="pip" if has_z3 else "missing",
+                detail=f"z3-solver {ver} SMT formal verification ready" if has_z3 else "z3-solver not installed",
+            )
+
+        if tool_id == "lean4":
+            from engine.formal_verifier import find_lean4_binary
+
+            lean_bin = find_lean4_binary(self.repo_root)
+            proofs_dir = self.repo_root / "formal" / "lean4"
+            proof_cnt = len(list(proofs_dir.glob("*.lean"))) if proofs_dir.is_dir() else 0
+            return ToolStatus(
+                tool_id="lean4",
+                display_name=spec.display_name,
+                category=spec.category,
+                installed=lean_bin is not None,
+                path_or_source=str(lean_bin) if lean_bin else (str(proofs_dir) if proof_cnt else None),
+                method="binary" if lean_bin else ("proof_suite_static" if proof_cnt else "missing"),
+                detail=(
+                    f"Lean 4 compiler ready at {lean_bin} ({proof_cnt} formal proof modules)"
+                    if lean_bin
+                    else f"Lean 4 binary not installed yet ({proof_cnt} formal proof modules in formal/lean4/ ready for verification)"
+                ),
             )
 
         if tool_id == "raptor":
@@ -918,7 +1131,11 @@ class ToolProvisioner:
 
                 specs = TerminatorRFCSelector.get_terminator_specs()
                 total = len(specs)
-                cached = sum(1 for sp in specs if (rfcs_dir / f"rfc{sp.rfc_id}.txt").is_file())
+                cached = 0
+                for sp in specs:
+                    num_str = str(getattr(sp, "num", "") or str(getattr(sp, "rfc_id", "")).upper().replace("RFC", "")).strip()
+                    if (rfcs_dir / f"rfc{num_str}.txt").is_file() or (rfcs_dir / f"rfc{sp.rfc_id}.txt").is_file():
+                        cached += 1
             except Exception:
                 total = 25
                 cached = len(list(rfcs_dir.glob("rfc*.txt"))) if rfcs_dir.is_dir() else 0
@@ -1531,6 +1748,236 @@ class ToolProvisioner:
             installed_now=len(final_tags) > len(tags),
         )
 
+    def _install_cloudflare_audit_skill(self) -> ToolStatus:
+        spec_name = "Cloudflare Security Audit Skill"
+        self.cloudflare_skill_root.parent.mkdir(parents=True, exist_ok=True)
+        errors: List[str] = []
+
+        def _is_present() -> bool:
+            return self.cloudflare_skill_root.is_dir() and any(self.cloudflare_skill_root.rglob("SKILL.md"))
+
+        if not _is_present():
+            git_bin = shutil.which("git")
+            cloned = False
+            if git_bin:
+                self._trace(f"[*] Cloning {CLOUDFLARE_AUDIT_SKILL_REPO_URL} into {self.cloudflare_skill_root}...")
+                proc = _run_quiet_subprocess(
+                    [git_bin, "clone", "--depth", "1", CLOUDFLARE_AUDIT_SKILL_REPO_URL, str(self.cloudflare_skill_root)],
+                    timeout=180,
+                )
+                cloned = proc.returncode == 0 and _is_present()
+                if not cloned:
+                    errors.append(f"git clone exit {proc.returncode}: {(proc.stderr or '')[:160]}")
+
+            if not cloned:
+                try:
+                    self._trace(f"[*] Downloading Cloudflare Security Audit Skill archive...")
+                    zbytes = self._http_download_bytes(CLOUDFLARE_AUDIT_SKILL_ZIP_URL, timeout=120.0)
+                    self.cloudflare_skill_root.mkdir(parents=True, exist_ok=True)
+                    with zipfile.ZipFile(io.BytesIO(zbytes)) as zf:
+                        for info in zf.infolist():
+                            if info.is_dir():
+                                continue
+                            if not _validate_archive_member_name(info.filename):
+                                raise ValueError(f"Unsafe archive entry in Cloudflare skill zip: {info.filename!r}")
+                            rel_parts = info.filename.replace("\\", "/").split("/", 1)
+                            sub_rel = rel_parts[1] if len(rel_parts) > 1 else rel_parts[0]
+                            if not sub_rel:
+                                continue
+                            out_p = self.cloudflare_skill_root / sub_rel
+                            out_p.parent.mkdir(parents=True, exist_ok=True)
+                            out_p.write_bytes(zf.read(info.filename))
+                except Exception as exc:
+                    errors.append(f"zip download failed: {exc}")
+
+        if _is_present():
+            return ToolStatus(
+                tool_id="cloudflare_audit_skill",
+                display_name=spec_name,
+                category="repo",
+                installed=True,
+                path_or_source=str(self.cloudflare_skill_root),
+                method="git_repo",
+                detail=f"Cloudflare Security Audit Skill ready at {self.cloudflare_skill_root}",
+                installed_now=True,
+            )
+        return ToolStatus(
+            tool_id="cloudflare_audit_skill",
+            display_name=spec_name,
+            category="repo",
+            installed=False,
+            method="python_fallback",
+            detail="Repo unavailable; embedded pure-Python coverage ledger & schema validator remains active",
+            error="; ".join(errors) or None,
+        )
+
+    def _install_bumblebee(self) -> ToolStatus:
+        spec_name = "Perplexity AI Bumblebee Supply-Chain Scanner"
+        self.bumblebee_root.parent.mkdir(parents=True, exist_ok=True)
+        errors: List[str] = []
+
+        ti_dir = self.bumblebee_root / "threat_intel"
+        if not (ti_dir.is_dir() and any(ti_dir.glob("*.json"))):
+            git_bin = shutil.which("git")
+            cloned = False
+            if git_bin:
+                self._trace(f"[*] Cloning {BUMBLEBEE_REPO_URL} into {self.bumblebee_root}...")
+                proc = _run_quiet_subprocess(
+                    [git_bin, "clone", "--depth", "1", BUMBLEBEE_REPO_URL, str(self.bumblebee_root)],
+                    timeout=180,
+                )
+                cloned = proc.returncode == 0 and ti_dir.is_dir() and any(ti_dir.glob("*.json"))
+                if not cloned:
+                    errors.append(f"git clone exit {proc.returncode}: {(proc.stderr or '')[:160]}")
+            if not cloned:
+                try:
+                    zbytes = self._http_download_bytes(BUMBLEBEE_ZIP_URL, timeout=120.0)
+                    self.bumblebee_root.mkdir(parents=True, exist_ok=True)
+                    with zipfile.ZipFile(io.BytesIO(zbytes)) as zf:
+                        for info in zf.infolist():
+                            if info.is_dir():
+                                continue
+                            if not _validate_archive_member_name(info.filename):
+                                raise ValueError(f"Unsafe archive entry in bumblebee zip: {info.filename!r}")
+                            rel_parts = info.filename.replace("\\", "/").split("/", 1)
+                            sub_rel = rel_parts[1] if len(rel_parts) > 1 else rel_parts[0]
+                            if not sub_rel:
+                                continue
+                            out_p = self.bumblebee_root / sub_rel
+                            out_p.parent.mkdir(parents=True, exist_ok=True)
+                            out_p.write_bytes(zf.read(info.filename))
+                except Exception as exc:
+                    errors.append(f"zip download failed: {exc}")
+
+        bin_path = self.find_binary("bumblebee")
+        if bin_path is None:
+            try:
+                rel_st = self._install_github_release_binary("bumblebee")
+                if rel_st.installed and rel_st.path_or_source:
+                    bin_path = Path(rel_st.path_or_source)
+            except Exception as exc:
+                errors.append(f"release binary: {exc}")
+                go_res = self._install_go_tool("bumblebee")
+                if go_res is not None and go_res.installed and go_res.path_or_source:
+                    bin_path = Path(go_res.path_or_source)
+
+        catalogs = list(ti_dir.glob("*.json")) if ti_dir.is_dir() else []
+        if bin_path is not None or catalogs:
+            return ToolStatus(
+                tool_id="bumblebee",
+                display_name=spec_name,
+                category="binary",
+                installed=True,
+                path_or_source=str(bin_path) if bin_path else str(self.bumblebee_root),
+                method="binary" if bin_path else "repo_threat_intel",
+                detail=(
+                    f"Bumblebee binary ({bin_path}) + {len(catalogs)} threat_intel exposure catalogs ready"
+                    if bin_path
+                    else f"Cloned {len(catalogs)} upstream Bumblebee threat_intel exposure catalogs (cross-platform NDJSON scanner active)"
+                ),
+                installed_now=True,
+            )
+        return ToolStatus(
+            tool_id="bumblebee",
+            display_name=spec_name,
+            category="binary",
+            installed=False,
+            method="failed",
+            error="; ".join(errors) or "Unable to install perplexityai/bumblebee",
+        )
+
+    def _install_lean4(self) -> ToolStatus:
+        """Installs portable Lean 4 compiler into repo-local `tools/lean4/` (zero global PATH/Registry mutation)."""
+        from engine.formal_verifier import find_lean4_binary
+
+        spec_name = "Lean 4 Formal Theorem Prover"
+        existing = find_lean4_binary(self.repo_root)
+        if existing is not None:
+            return ToolStatus(
+                tool_id="lean4",
+                display_name=spec_name,
+                category="binary",
+                installed=True,
+                path_or_source=str(existing),
+                method="binary",
+                detail=f"Lean 4 compiler ready at {existing}",
+            )
+        lean_dir = self.tools_dir / "lean4"
+        lean_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            rel = self._http_get_json("https://api.github.com/repos/leanprover/lean4/releases/latest", timeout=20.0)
+            assets = rel.get("assets") or []
+            os_tok = "windows" if os.name == "nt" else ("darwin" if sys.platform == "darwin" else "linux")
+            asset = next(
+                (a for a in assets if os_tok in str(a.get("name", "")).lower() and str(a.get("name", "")).lower().endswith(".zip")),
+                None,
+            )
+            if not asset or not asset.get("browser_download_url"):
+                raise FileNotFoundError(f"No portable {os_tok} zip release asset found for leanprover/lean4")
+            self._trace(f"[*] Downloading Lean 4 ({rel.get('tag_name')}) into {lean_dir}...")
+            raw_zip = self._http_download_bytes(str(asset["browser_download_url"]), timeout=600.0)
+            with zipfile.ZipFile(io.BytesIO(raw_zip)) as zf:
+                for info in zf.infolist():
+                    if not _validate_archive_member_name(info.filename):
+                        raise ValueError(f"Unsafe archive entry in Lean 4 zip: {info.filename!r}")
+                zf.extractall(lean_dir)
+            lean_bin = find_lean4_binary(self.repo_root)
+            if lean_bin is not None:
+                register_process_bin_dir(lean_bin.parent)
+                return ToolStatus(
+                    tool_id="lean4",
+                    display_name=spec_name,
+                    category="binary",
+                    installed=True,
+                    path_or_source=str(lean_bin),
+                    version=str(rel.get("tag_name") or ""),
+                    method="github_release_portable",
+                    detail=f"Installed portable Lean 4 at {lean_bin}",
+                    installed_now=True,
+                )
+        except Exception as exc:
+            return ToolStatus(
+                tool_id="lean4",
+                display_name=spec_name,
+                category="binary",
+                installed=False,
+                method="proof_suite_static",
+                error=str(exc)[:240],
+                detail="Lean 4 binary download failed/skipped; formal/lean4/*.lean proofs remain statically audited",
+            )
+        return ToolStatus(tool_id="lean4", display_name=spec_name, category="binary", installed=False, method="missing")
+
+    def _install_skillspector(self) -> ToolStatus:
+        spec_name = "NVIDIA SkillSpector Skill Auditor"
+        self._trace(f"[*] Attempting best-effort install of NVIDIA SkillSpector ({SKILLSPECTOR_REPO_URL})...")
+        proc = _run_quiet_subprocess(
+            [sys.executable, "-m", "pip", "install", "-q", f"git+{SKILLSPECTOR_REPO_URL}"],
+            timeout=300,
+        )
+        importlib.invalidate_caches()
+        has_pkg = importlib.util.find_spec("skillspector") is not None
+        bin_path = self.find_binary("skillspector")
+        if has_pkg or bin_path:
+            return ToolStatus(
+                tool_id="skillspector",
+                display_name=spec_name,
+                category="python",
+                installed=True,
+                path_or_source=str(bin_path) if bin_path else sys.executable,
+                method="pip_git",
+                detail="Installed NVIDIA SkillSpector package",
+                installed_now=True,
+            )
+        return ToolStatus(
+            tool_id="skillspector",
+            display_name=spec_name,
+            category="python",
+            installed=False,
+            method="python_fallback",
+            detail="Upstream SkillSpector package incompatible or unavailable on this Python version; embedded pure-Python SkillSpector engine remains active",
+            error=(proc.stderr or proc.stdout)[-200:] if proc.returncode != 0 else None,
+        )
+
     def _install_rfc_cache(self) -> ToolStatus:
         from rfc_fetcher import RFCFetcher
 
@@ -1601,12 +2048,21 @@ class ToolProvisioner:
             res = self._install_raptor_repo()
         elif tool_id == "raptor_docker":
             res = self._install_docker_image(RAPTOR_DOCKER_IMAGE, "raptor_docker", "RAPTOR Docker Engine Image")
-        elif tool_id in ("httpx", "katana", "nuclei", "artex"):
+        elif tool_id in ("httpx", "katana", "nuclei", "artex", "trivy", "trufflehog", "infisical"):
             try:
                 res = self._install_github_release_binary(tool_id)
                 if tool_id == "nuclei" and res.installed and res.path_or_source:
                     self._trace("[*] Updating Nuclei templates (-update-templates -silent)...")
-                    _run_quiet_subprocess([res.path_or_source, "-update-templates", "-silent"], timeout=300)
+                    try:
+                        _run_quiet_subprocess([res.path_or_source, "-update-templates", "-silent"], timeout=300)
+                    except subprocess.TimeoutExpired:
+                        res.detail = f"{res.detail} (template update timed out; binary ready)"
+                elif tool_id == "trivy" and res.installed and res.path_or_source:
+                    self._trace("[*] Pre-warming Trivy vulnerability DB (image --download-db-only)...")
+                    try:
+                        _run_quiet_subprocess([res.path_or_source, "image", "--download-db-only", "--quiet"], timeout=300)
+                    except subprocess.TimeoutExpired:
+                        res.detail = f"{res.detail} (vuln DB download timed out; secret/misconfig native scan ready)"
             except Exception as exc:
                 go_res = self._install_go_tool(tool_id)
                 if go_res is not None:
@@ -1620,6 +2076,16 @@ class ToolProvisioner:
                         method="failed",
                         error=str(exc),
                     )
+        elif tool_id == "skillspector":
+            res = self._install_skillspector()
+        elif tool_id == "cloudflare_audit_skill":
+            res = self._install_cloudflare_audit_skill()
+        elif tool_id == "bumblebee":
+            res = self._install_bumblebee()
+        elif tool_id == "z3_solver":
+            res = self._install_python_packages([("z3", "z3-solver>=4.12.0")], "z3_solver", "Z3 SMT Formal Verification Solver")
+        elif tool_id == "lean4":
+            res = self._install_lean4()
         elif tool_id == "rea_agents":
             res = self._install_rea_agents()
         elif tool_id == "ollama":
@@ -1738,6 +2204,27 @@ class ToolProvisioner:
         return summary
 
 
+    def ensure_ensemble_tools(
+        self,
+        *,
+        include_models: bool = True,
+        include_docker: bool = False,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """Auto-provisions EVERY free local/OSS tool required for `--all` and `--essmble` / `--ensemble`."""
+        ids = list(ENSEMBLE_FREE_TOOL_IDS)
+        if include_models:
+            ids.extend(["ollama", "ollama_models"])
+        if include_docker and self._docker_available():
+            ids.append("raptor_docker")
+        return self.ensure_all(
+            tool_ids=ids,
+            include_docker=include_docker,
+            include_models=include_models,
+            force=force,
+        )
+
+
 _DEFAULT_PROVISIONER: Optional[ToolProvisioner] = None
 _DEFAULT_LOCK = threading.Lock()
 
@@ -1772,6 +2259,40 @@ def ensure_all_tools(
         include_docker=include_docker,
         include_models=include_models,
         auto_fix_docker=auto_fix_docker,
+        force=force,
+    )
+
+
+def ensure_ensemble_tools(
+    *,
+    include_models: bool = True,
+    include_docker: bool = False,
+    allow_in_tests: bool = False,
+    force: bool = False,
+    on_trace: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    return get_tool_provisioner(allow_in_tests=allow_in_tests, on_trace=on_trace).ensure_ensemble_tools(
+        include_models=include_models,
+        include_docker=include_docker,
+        force=force,
+    )
+
+
+def autoprovision_everything(
+    *,
+    include_docker: bool = True,
+    include_models: bool = True,
+    allow_in_tests: bool = False,
+    force: bool = False,
+    on_trace: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    """One-call auto-provisioner ensuring EVERY RFCHunt dependency, binary, repo, skill, RFC cache, and model is ready."""
+    prov = get_tool_provisioner(allow_in_tests=allow_in_tests, on_trace=on_trace)
+    has_docker = bool(include_docker and prov._docker_available() and prov._docker_daemon_responsive())
+    return prov.ensure_all(
+        include_docker=has_docker,
+        include_models=include_models,
+        auto_fix_docker=has_docker,
         force=force,
     )
 

@@ -783,6 +783,17 @@ def _resolve_host_binary(binary_path: Optional[str], tool_name: str) -> str:
                 f"Unable to safely inspect binary path {validated!r} for {tool_name}: {exc}"
             ) from exc
         if not in_cwd:
+            # Prefer repo-local bin/<tool>(.exe) outside pytest so ProjectDiscovery binaries
+            # provisioned into c:\harfile\rfchunt\bin\ always execute natively without global PATH mutation.
+            if binary_path is None and "PYTEST_CURRENT_TEST" not in os.environ:
+                repo_bin_dir = Path(__file__).resolve().parent.parent / "bin"
+                for cand_name in ((f"{tool_name}.exe", tool_name) if os.name == "nt" else (tool_name,)):
+                    local_cand = repo_bin_dir / cand_name
+                    if local_cand.is_file():
+                        local_valid = _validate_binary_candidate(str(local_cand), tool_name)
+                        if tool_name == "httpx" and _is_python_httpx_cli_binary(local_valid):
+                            continue
+                        return local_valid
             found = shutil.which(validated)
             if found:
                 found_valid = _validate_binary_candidate(found, tool_name)

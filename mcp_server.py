@@ -571,6 +571,7 @@ class TerminatorMCPServer:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "folder": {"type": "string", "description": "Local code folder or repository path to audit (alias for repo)"},
                         "repo": {"type": "string", "description": "Repository directory path to audit"},
                         "path": {"type": "string", "description": "Specific file or folder path to audit"},
                         "host": {"type": "string", "description": "Optional remote hostname or URL to review (e.g. target.example.com)"},
@@ -607,6 +608,53 @@ class TerminatorMCPServer:
                         "artex_intent_turns": {"type": "integer", "default": 0},
                         "artex_intent_tokens": {"type": "integer", "default": 0},
                         "approval_mode": {"type": "string", "enum": ["policy", "deny"], "default": "policy"},
+                        "enable_ensemble": {"type": "boolean", "default": True, "description": "Run the free OSS zero-skip security ensemble (Trivy, TruffleHog --no-verification, Infisical CLI, Semgrep OSS, SkillSpector, Cloudflare Coverage Ledger, Compliance Control Mapper)"},
+                        "ensemble_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional subset of free ensemble tools"},
+                        "enable_diff_review": {"type": "boolean", "default": False, "description": "Opt-in free local-Ollama git diff security review"},
+                        "enable_compliance_map": {"type": "boolean", "default": True, "description": "Export SOC2/ISO27001/HIPAA/GDPR compliance evidence JSON"},
+                        "panel_models": {"type": "array", "items": {"type": "string"}, "description": "Optional N-model panel for ModelFusion voting"},
+                    },
+                },
+            },
+            {
+                "name": "run_ensemble_scan",
+                "description": "[Intelligent Zero-Skip Free OSS Ensemble (--ensemble)] Runs all 100% free local OSS scanners (Trivy, TruffleHog --no-verification, Infisical CLI, Semgrep OSS, NVIDIA SkillSpector, Cloudflare Coverage Ledger, Comp-AI Compliance Control Mapper) with mathematical zero-dropped-findings accounting proof.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "folder": {"type": "string", "description": "Local code folder or cloned repository path to audit (alias for repo)"},
+                        "repo": {"type": "string", "description": "Repository or directory path to audit"},
+                        "path": {"type": "string", "description": "Specific file or folder path to audit"},
+                        "ensemble_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional subset of free ensemble tools"},
+                        "enable_diff_review": {"type": "boolean", "default": False},
+                        "enable_compliance_map": {"type": "boolean", "default": True},
+                        "output_dir": {"type": "string", "default": "reports"},
+                    },
+                },
+            },
+            {
+                "name": "run_formal_verification",
+                "description": "[Z3 SMT + Lean 4 Formal Verification] Runs automated Z3 SMT constraint proofs (RBAC, RFC 9112 framing, numeric bounds, SSRF CIDR bitvectors, meet-semilattice) and machine-checked Lean 4 proofs (`formal/lean4/*.lean` + target obligations).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "folder": {"type": "string", "description": "Local code folder or repository path to verify"},
+                        "repo": {"type": "string"},
+                        "path": {"type": "string"},
+                        "output_dir": {"type": "string", "default": "reports"},
+                    },
+                },
+            },
+            {
+                "name": "run_stride_threat_model",
+                "description": "[Dynamic Per-Component STRIDE, MITRE ATT&CK, Zero Trust & Attack Trees] Generates component-grounded STRIDE scenarios, MITRE ATT&CK mappings, Zero Trust recommendations, Security Requirements, Attack Trees, SVG/Mermaid diagrams, and 5-section Markdown/HTML/JSON reports.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "folder": {"type": "string", "description": "Local code folder or repository path to threat-model"},
+                        "repo": {"type": "string"},
+                        "path": {"type": "string"},
+                        "output_dir": {"type": "string", "default": "reports"},
                     },
                 },
             },
@@ -616,6 +664,7 @@ class TerminatorMCPServer:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "folder": {"type": "string", "description": "Local code folder or repository path to audit (alias for repo)"},
                         "repo": {"type": "string"},
                         "path": {"type": "string"},
                         "host": {"type": "string"},
@@ -652,6 +701,11 @@ class TerminatorMCPServer:
                         "artex_intent_turns": {"type": "integer", "default": 0},
                         "artex_intent_tokens": {"type": "integer", "default": 0},
                         "approval_mode": {"type": "string", "enum": ["policy", "deny"], "default": "policy"},
+                        "enable_ensemble": {"type": "boolean", "default": True, "description": "Run the free OSS zero-skip security ensemble (Trivy, TruffleHog --no-verification, Infisical CLI, Semgrep OSS, SkillSpector, Cloudflare Coverage Ledger, Compliance Control Mapper)"},
+                        "ensemble_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional subset of free ensemble tools"},
+                        "enable_diff_review": {"type": "boolean", "default": False, "description": "Opt-in free local-Ollama git diff security review"},
+                        "enable_compliance_map": {"type": "boolean", "default": True, "description": "Export SOC2/ISO27001/HIPAA/GDPR compliance evidence JSON"},
+                        "panel_models": {"type": "array", "items": {"type": "string"}, "description": "Optional N-model panel for ModelFusion voting"},
                     },
                 },
             },
@@ -1558,7 +1612,7 @@ class TerminatorMCPServer:
             return self.raptor.describe_target(t_path)
 
         elif name == "raptor_scan_project":
-            t_path = args.get("target_path", ".")
+            t_path = args.get("folder") or args.get("target_path") or args.get("repo") or "."
             mode = args.get("mode", "scan")
             model = args.get("model", "fenkohq/foundation-sec-8b:latest")
             pg = args.get("policy_groups", "")
@@ -1597,7 +1651,8 @@ class TerminatorMCPServer:
             from engine.external_scanners import _normalize_nuclei_tags
             from engine.mantis_integrator import DEFAULT_ABLITERATED_MODEL, run_unified_all_scans
 
-            repo = self._parse_strict_str(args, "repo", None)
+            folder_arg = self._parse_strict_str(args, "folder", None)
+            repo = self._parse_strict_str(args, "repo", None) or folder_arg
             path = self._parse_strict_str(args, "path", None)
             remote_host = self._parse_strict_str(args, "host", None)
             targets_arg = self._parse_strict_str(args, "targets", None)
@@ -1662,6 +1717,11 @@ class TerminatorMCPServer:
                 self._parse_strict_bool(args, "rea_use_cli", False)
                 or self._parse_strict_bool(args, "rea_cli", False)
             )
+            enable_ensemble = bool(self._parse_strict_bool(args, "enable_ensemble", True))
+            ensemble_tools = self._parse_str_list(args, "ensemble_tools", None)
+            enable_diff_review = bool(self._parse_strict_bool(args, "enable_diff_review", False))
+            enable_compliance_map = bool(self._parse_strict_bool(args, "enable_compliance_map", True))
+            panel_models = self._parse_str_list(args, "panel_models", None)
 
             if remote_host is not None:
                 self._authorize_mcp_target(
@@ -1762,7 +1822,78 @@ class TerminatorMCPServer:
                     enable_rea=enable_rea,
                     rea_target=rea_target,
                     rea_use_cli=rea_use_cli,
+                    enable_ensemble=enable_ensemble,
+                    ensemble_tools=ensemble_tools,
+                    enable_diff_review=enable_diff_review,
+                    enable_compliance_map=enable_compliance_map,
+                    panel_models=panel_models,
                 )
+
+        elif name == "run_ensemble_scan":
+            self._reject_shell_execution(args)
+            TargetAuthorizationGate.check_rate_limit()
+            from engine.ensemble_orchestrator import EnsembleOrchestrator
+
+            folder_arg = self._parse_strict_str(args, "folder", None)
+            repo = self._parse_strict_str(args, "repo", None) or folder_arg
+            path = self._parse_strict_str(args, "path", None)
+            raw_target = str(repo or path or ".")
+            if "\x00" in raw_target:
+                raise ValueError("Invalid target path containing NUL byte.")
+            resolved = os.path.abspath(raw_target)
+            if not os.path.exists(resolved):
+                return {"error": f"Target path does not exist: {resolved}"}
+            reports_dir = self._parse_strict_str(args, "output_dir", "reports") or "reports"
+            ensemble_tools = self._parse_str_list(args, "ensemble_tools", None)
+            enable_diff_review = bool(self._parse_strict_bool(args, "enable_diff_review", False))
+            enable_compliance_map = bool(self._parse_strict_bool(args, "enable_compliance_map", True))
+            with _suppress_stdout_to_stderr():
+                orch = EnsembleOrchestrator(reports_dir=reports_dir)
+                return orch.run_standalone(
+                    resolved,
+                    requested_tools=ensemble_tools,
+                    enable_diff_review=enable_diff_review,
+                    enable_compliance_map=enable_compliance_map,
+                    auto_install=False,
+                )
+
+        elif name == "run_formal_verification":
+            self._reject_shell_execution(args)
+            TargetAuthorizationGate.check_rate_limit()
+            from pathlib import Path as _Path
+            from engine.formal_verifier import run_formal_verification_suite
+
+            folder_arg = self._parse_strict_str(args, "folder", None)
+            repo = self._parse_strict_str(args, "repo", None) or folder_arg
+            path = self._parse_strict_str(args, "path", None)
+            raw_target = str(repo or path or ".")
+            if "\x00" in raw_target:
+                raise ValueError("Invalid target path containing NUL byte.")
+            resolved = os.path.abspath(raw_target)
+            if not os.path.exists(resolved):
+                return {"error": f"Target path does not exist: {resolved}"}
+            reports_dir = self._parse_strict_str(args, "output_dir", "reports") or "reports"
+            with _suppress_stdout_to_stderr():
+                return run_formal_verification_suite(resolved, reports_dir=_Path(reports_dir))
+
+        elif name == "run_stride_threat_model":
+            self._reject_shell_execution(args)
+            TargetAuthorizationGate.check_rate_limit()
+            from pathlib import Path as _Path
+            from engine.stride_engine import DynamicStrideThreatEngine
+
+            folder_arg = self._parse_strict_str(args, "folder", None)
+            repo = self._parse_strict_str(args, "repo", None) or folder_arg
+            path = self._parse_strict_str(args, "path", None)
+            raw_target = str(repo or path or ".")
+            if "\x00" in raw_target:
+                raise ValueError("Invalid target path containing NUL byte.")
+            resolved = os.path.abspath(raw_target)
+            if not os.path.exists(resolved):
+                return {"error": f"Target path does not exist: {resolved}"}
+            reports_dir = self._parse_strict_str(args, "output_dir", "reports") or "reports"
+            with _suppress_stdout_to_stderr():
+                return DynamicStrideThreatEngine.analyze_repository(resolved, reports_dir=_Path(reports_dir))
 
         elif name == "artex_run_attack_chain":
             self._reject_shell_execution(args)
@@ -2470,7 +2601,7 @@ class TerminatorMCPServer:
         elif name == "mantis_scan":
             from engine.mantis_integrator import DEFAULT_ABLITERATED_MODEL, MantisIntegrator
 
-            raw_target = str(args.get("target_path") or args.get("repo") or args.get("path") or ".")
+            raw_target = str(args.get("folder") or args.get("target_path") or args.get("repo") or args.get("path") or ".")
             if "\x00" in raw_target:
                 raise ValueError("Invalid target path containing NUL byte.")
             resolved = os.path.abspath(raw_target)
@@ -2495,7 +2626,7 @@ class TerminatorMCPServer:
             from engine.rea_integrator import ReaIntegrator
             from engine.safe_network_validator import is_explicit_loopback_host
 
-            target_path = self._parse_strict_str(args, "target_path", None)
+            target_path = self._parse_strict_str(args, "target_path", None) or self._parse_strict_str(args, "folder", None)
             if target_path is None:
                 target_path = self._parse_strict_str(args, "path", None) or self._parse_strict_str(args, "repo", None)
             raw_host = self._parse_strict_str(args, "host", None)
@@ -2819,7 +2950,8 @@ class TerminatorMCPServer:
             self._reject_shell_execution(args)
             from engine.preflight_discovery import run_preflight_discovery
 
-            target_path = self._parse_strict_str(args, "target_path", ".", allow_empty=True) or None
+            folder_arg = self._parse_strict_str(args, "folder", None, allow_empty=True)
+            target_path = self._parse_strict_str(args, "target_path", folder_arg or ".", allow_empty=True) or None
             prompt = self._parse_strict_str(args, "prompt", "", allow_empty=True) or ""
             policy_text = self._parse_strict_str(args, "policy_text", "", allow_empty=True) or ""
             target_host = self._parse_strict_str(args, "target_host", "", allow_empty=True) or None
