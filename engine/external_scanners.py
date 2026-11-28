@@ -576,6 +576,11 @@ def _is_bare_command(raw: str) -> bool:
     return "/" not in raw and "\\" not in raw and ":" not in raw
 
 
+def _is_windows_platform() -> bool:
+    """Return True when running on Windows (isolated helper for deterministic cross-OS testing)."""
+    return os.name == "nt"
+
+
 def _validate_binary_candidate(raw_path: str, tool_name: str) -> str:
     """Strictly validate an explicit or PATH-discovered binary path (fail closed)."""
     if not isinstance(raw_path, str):
@@ -621,7 +626,7 @@ def _validate_binary_candidate(raw_path: str, tool_name: str) -> str:
         elif p.is_file() or p.is_symlink():
             resolved_paths.append(p.resolve())
 
-        if os.name == "nt" and not p.name.lower().endswith(".exe"):
+        if _is_windows_platform() and not p.name.lower().endswith(".exe"):
             exe_p = Path(str(p) + ".exe")
             if exe_p.is_dir():
                 raise PermissionError(
@@ -766,7 +771,7 @@ def _resolve_host_binary(binary_path: Optional[str], tool_name: str) -> str:
     if _is_bare_command(validated):
         try:
             vp = Path(validated)
-            if os.name == "nt":
+            if _is_windows_platform():
                 if validated.lower().endswith(".exe"):
                     in_cwd = vp.is_file() or vp.is_symlink()
                 else:

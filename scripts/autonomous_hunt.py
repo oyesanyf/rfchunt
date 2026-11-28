@@ -99,6 +99,9 @@ NON_DRAFT_MD_NAMES: frozenset[str] = frozenset(
         "remediation_roadmap.md",
         "validation_checklist.md",
         "readme.md",
+        "threat_model_stride.md",
+        "threat_model.md",
+        "preflight_checklist.md",
     }
 )
 NON_DRAFT_MD_PREFIXES: tuple[str, ...] = (
@@ -106,12 +109,14 @@ NON_DRAFT_MD_PREFIXES: tuple[str, ...] = (
     "poc_transcript",
     "cycle_qa_",
     "qa_draft_",
+    "threat_model_",
 )
 NON_DRAFT_PARENT_DIRS: frozenset[str] = frozenset(
     {
         "client_audit_bundle",
         "repos_cache",
         "h1_browser_profile",
+        "stride_threat_model",
         ".git",
     }
 )
@@ -123,6 +128,8 @@ NON_DRAFT_HEADING_PREFIXES: tuple[str, ...] = (
     "# ready to review & click submit",
     "# security audit executive summary",
     "# technical security findings",
+    "# stride threat model",
+    "# advanced stride threat model",
 )
 
 

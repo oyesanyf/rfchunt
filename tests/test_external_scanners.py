@@ -1243,6 +1243,9 @@ def test_bare_binary_path_enforces_shutil_which_and_cwd_validation(
     assert subprocess_recorder.calls[-1]["argv"][0] == str(fake_httpx)
 
     # 4. CWD poisoned httpx.exe -> nmap.exe blocked even when shutil.which returns None
+    import engine.external_scanners as ext_mod
+
+    monkeypatch.setattr(ext_mod, "_is_windows_platform", lambda: True)
     cwd_dir = tmp_path / "cwd_poison"
     cwd_dir.mkdir()
     cwd_httpx = cwd_dir / "httpx.exe"
@@ -1268,6 +1271,9 @@ def test_bare_binary_path_enforces_shutil_which_and_cwd_validation(
 def test_windows_extensionless_binary_path_probes_exe_and_runtime_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, subprocess_recorder: Any
 ) -> None:
+    import engine.external_scanners as ext_mod
+
+    monkeypatch.setattr(ext_mod, "_is_windows_platform", lambda: True)
     extless_dir = tmp_path / "extless"
     extless_dir.mkdir()
     extless_path = extless_dir / "httpx"
