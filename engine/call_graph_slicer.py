@@ -92,6 +92,8 @@ SKIP_DIR_NAMES: Set[str] = {
     "logs",
     "caldera_export",
     "caldera_plugin",
+    ".agents",
+    ".cargo",
 }
 
 CONTROL_KEYWORDS: Set[str] = {

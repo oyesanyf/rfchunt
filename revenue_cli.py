@@ -122,6 +122,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_ens.add_argument("--stride-diagram", dest="stride_diagrams", action="append", default=[], help="Architecture diagram file to ingest into STRIDE analysis (repeatable).")
     p_ens.add_argument("--stride-out", dest="stride_out", default=None, help="Custom output directory for STRIDE report and downloadable SVG/PNG diagrams.")
     p_ens.add_argument("--stride-write-repo", dest="stride_write_repo", action="store_true", default=False, help="Also write generated THREAT_MODEL.md into the target repository root.")
+    p_ens.add_argument("--hybrid", dest="enable_hybrid", action="store_true", default=False, help="Enable hybrid local repository + live remote audit mode with ARTEX multi-turn, strict POE=3, embedded MITM proxy, and .rfca archive export.")
+    p_ens.add_argument("--host", dest="remote_host", default=None, help="Optional remote host or URL for --hybrid live verification alongside local --target.")
+    p_ens.add_argument("--port", dest="remote_port", type=int, default=None, help="Optional remote port for --hybrid live verification.")
+    p_ens.add_argument("--tls", dest="remote_tls", action="store_true", default=False, help="Enable TLS/HTTPS for --hybrid remote target.")
+    p_ens.add_argument("--authorized", dest="authorized", action="store_true", default=False, help="Explicit authorization flag for non-loopback --hybrid remote hosts.")
+    p_ens.add_argument("--export-archive", dest="export_archive", action="store_true", default=False, help="Export AES-256-GCM encrypted .rfca task archive during unified/hybrid scan.")
+    p_ens.add_argument("--export-advisory", dest="export_advisory", action="store_true", default=False, help="Export GHSA-ready Markdown advisories during unified/hybrid scan.")
+    p_ens.add_argument("--export-csv", dest="export_csv", action="store_true", default=False, help="Export formula-safe CSV of findings & chains during unified/hybrid scan.")
 
     p_ooda = sub.add_parser("fast-ooda", help="Run Loop 3 3-stage parallel OODA funnel + Loop 4 auto-PoC submission gate.")
     p_ooda.add_argument("--target", "--repo", dest="target", required=True, help="Target repository directory.")
@@ -599,21 +607,33 @@ def run_revenue_cli(argv: Sequence[str] | None = None) -> int:
                         tempfile.TemporaryDirectory(prefix="rfchunt_unified_") as unified_reports_dir,
                         contextlib.redirect_stdout(sys.stderr) if args.json_out else contextlib.nullcontext(),
                     ):
+                        is_hyb = bool(getattr(args, "enable_hybrid", False))
                         all_res = run_unified_all_scans(
                             repo=str(target_path),
-                            reports_dir=unified_reports_dir,
+                            host=getattr(args, "remote_host", None),
+                            port=getattr(args, "remote_port", None),
+                            use_tls=True if bool(getattr(args, "remote_tls", False)) else None,
+                            authorized=bool(getattr(args, "authorized", False)),
+                            hybrid=is_hyb,
+                            export_advisory=bool(getattr(args, "export_advisory", False)) or is_hyb,
+                            export_csv=bool(getattr(args, "export_csv", False)) or is_hyb,
+                            export_archive=bool(getattr(args, "export_archive", False)) or is_hyb,
+                            reports_dir=str(Path(args.out) / "unified_hybrid") if is_hyb else unified_reports_dir,
                             quiet=True,
                             enable_external_scanners=ext_flag,
                             include_models=False,
                             auto_install_tools=False,
                             preflight_live=False,
-                            enable_h2_desync=False,
+                            enable_h2_desync=is_hyb,
                             confine_reports_to_workspace_root=False,
                         )
                     all_scan_summary = {
                         "status": "completed",
                         "target_path": all_res.get("target_path"),
                         "mode": all_res.get("mode"),
+                        "hybrid_mode": bool(all_res.get("hybrid_mode", False)),
+                        "hybrid_bridge": all_res.get("hybrid_bridge") or {},
+                        "encrypted_archive": all_res.get("encrypted_archive") or {},
                         "total_aggregated_findings": all_res.get("total_aggregated_findings", 0),
                         "primary_findings_count": all_res.get("primary_findings_count", 0),
                         "verified_exploits_count": all_res.get("verified_exploits_count", 0),
@@ -1260,6 +1280,14 @@ def _translate_swarm_argv_to_ensemble(argv: Sequence[str]) -> tuple[list[str], b
     stride_diagrams: list[str] = []
     stride_out: str | None = None
     stride_write_repo = False
+    enable_hybrid = False
+    remote_host: str | None = None
+    remote_port: str | None = None
+    remote_tls = False
+    authorized = False
+    export_archive = False
+    export_advisory = False
+    export_csv = False
 
     i = 0
     while i < len(tokens):
@@ -1268,6 +1296,39 @@ def _translate_swarm_argv_to_ensemble(argv: Sequence[str]) -> tuple[list[str], b
             i += 1
         elif tok in ("--embedded", "--embeded"):
             embedded = True
+            i += 1
+        elif tok == "--hybrid":
+            enable_hybrid = True
+            i += 1
+        elif tok == "--host" and i + 1 < len(tokens):
+            remote_host = tokens[i + 1]
+            i += 2
+        elif tok.startswith("--host="):
+            remote_host = tok.split("=", 1)[1].strip() or None
+            i += 1
+        elif tok == "--port" and i + 1 < len(tokens):
+            remote_port = tokens[i + 1]
+            i += 2
+        elif tok.startswith("--port="):
+            remote_port = tok.split("=", 1)[1].strip() or None
+            i += 1
+        elif tok == "--tls":
+            remote_tls = True
+            i += 1
+        elif tok == "--authorized":
+            authorized = True
+            i += 1
+        elif tok == "--export-archive":
+            export_archive = True
+            if i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+                i += 2
+            else:
+                i += 1
+        elif tok == "--export-advisory":
+            export_advisory = True
+            i += 1
+        elif tok == "--export-csv":
+            export_csv = True
             i += 1
         elif tok == "--stride":
             enable_stride = True
@@ -1437,6 +1498,22 @@ def _translate_swarm_argv_to_ensemble(argv: Sequence[str]) -> tuple[list[str], b
         mapped.extend(["--stride-out", stride_out])
     if stride_write_repo:
         mapped.append("--stride-write-repo")
+    if enable_hybrid:
+        mapped.append("--hybrid")
+    if remote_host:
+        mapped.extend(["--host", remote_host])
+    if remote_port:
+        mapped.extend(["--port", remote_port])
+    if remote_tls:
+        mapped.append("--tls")
+    if authorized:
+        mapped.append("--authorized")
+    if export_archive:
+        mapped.append("--export-archive")
+    if export_advisory:
+        mapped.append("--export-advisory")
+    if export_csv:
+        mapped.append("--export-csv")
     return mapped, dry_run
 
 

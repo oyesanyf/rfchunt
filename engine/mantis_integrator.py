@@ -244,6 +244,10 @@ EXCLUDED_DIRS: Set[str] = {
     ".mypy_cache",
     ".idea",
     ".vs",
+    ".agents",
+    ".cargo",
+    ".swarm_workspaces",
+    "vendor",
 }
 
 SUPPORTED_EXTENSIONS: Set[str] = {
@@ -968,15 +972,27 @@ def discover_candidate_files(target_path: str, max_bytes: int = 1_500_000) -> Li
         return []
 
     discovered: List[str] = []
+    verified_safe_dirs: Set[str] = {ws_cmp_str}
     for root, dirs, files in os.walk(ws_real, followlinks=False):
-        dirs[:] = sorted(
-            d for d in dirs
-            if (
+        root_key = os.path.normcase(root)
+        root_verified = root_key in verified_safe_dirs
+        kept_dirs: List[str] = []
+        for d in sorted(dirs):
+            if not (
                 (d not in EXCLUDED_DIRS and d != ".git" and d != "node_modules" and not d.startswith(".git"))
                 or d == ".github" or d.startswith(".github")
-            )
-            and _within_target_root(os.path.join(root, d))
-        )
+            ):
+                continue
+            sub_dir = os.path.join(root, d)
+            sub_is_link = _is_symlink_or_reparse(Path(sub_dir))
+            if root_verified and not sub_is_link:
+                verified_safe_dirs.add(os.path.normcase(sub_dir))
+                kept_dirs.append(d)
+            elif _within_target_root(sub_dir):
+                if not sub_is_link:
+                    verified_safe_dirs.add(os.path.normcase(sub_dir))
+                kept_dirs.append(d)
+        dirs[:] = kept_dirs
         for fname in sorted(files):
             fl = fname.lower()
             if fl.endswith((".min.js", ".min.css", ".bundle.js")):
@@ -988,8 +1004,9 @@ def discover_candidate_files(target_path: str, max_bytes: int = 1_500_000) -> Li
             if ext not in SUPPORTED_EXTENSIONS and not is_req_txt and not is_dockerfile and not is_env:
                 continue
             full_path = os.path.join(root, fname)
-            if not _within_target_root(full_path):
-                continue
+            if not (root_verified and not _is_symlink_or_reparse(Path(full_path))):
+                if not _within_target_root(full_path):
+                    continue
             try:
                 if os.path.getsize(full_path) <= max_bytes:
                     discovered.append(full_path)
@@ -4138,10 +4155,10 @@ def run_unified_all_scans(
     artex_llm_rotate: bool = False,
     artex_wait_sse: bool = False,
     artex_budget_turns: int = 0,
-    artex_retest: bool = False,
+    artex_retest: Optional[bool] = None,
     artex_workers: int = 3,
     artex_live: Optional[bool] = None,
-    embedded_proxy: bool = False,
+    embedded_proxy: Optional[bool] = None,
     embedded_proxy_port: int = 0,
     auth_profile: Optional[str] = None,
     import_har: Optional[str] = None,
@@ -4149,9 +4166,13 @@ def run_unified_all_scans(
     scope_file: Optional[str] = None,
     approval_mode: str = "policy",
     approval_rules: Optional[str] = None,
-    strict_poe: bool = False,
-    export_advisory: bool = False,
-    export_csv: bool = False,
+    strict_poe: Optional[bool] = None,
+    export_advisory: Optional[bool] = None,
+    export_csv: Optional[bool] = None,
+    export_archive: Optional[bool] = None,
+    archive_path: Optional[Union[str, Path]] = None,
+    archive_key_file: Optional[Union[str, Path]] = None,
+    hybrid: bool = False,
     quiet: bool = False,
     enable_external_scanners: Optional[bool] = None,
     httpx_scan: Optional[bool] = None,
@@ -4159,7 +4180,7 @@ def run_unified_all_scans(
     nuclei_scan: Optional[bool] = None,
     nuclei_tags: Optional[Any] = None,
     scanner_isolation: str = "host",
-    artex_multiturn: bool = False,
+    artex_multiturn: Optional[bool] = None,
     artex_intent_turns: int = 0,
     artex_intent_tokens: int = 0,
     docker_image: Optional[str] = None,
@@ -4250,6 +4271,18 @@ def run_unified_all_scans(
     )
     offline_or_ci = strict_offline or in_test_env
     _approval_deny = str(approval_mode or "policy").strip().lower() == "deny"
+    is_hybrid = bool(hybrid)
+
+    eff_strict_poe = bool(strict_poe) if strict_poe is not None else is_hybrid
+    eff_artex_retest = bool(artex_retest) if artex_retest is not None else is_hybrid
+    eff_export_advisory = bool(export_advisory) if export_advisory is not None else is_hybrid
+    eff_export_csv = bool(export_csv) if export_csv is not None else is_hybrid
+    eff_export_archive = bool(export_archive) if export_archive is not None else (bool(archive_path) or is_hybrid)
+    eff_artex_multiturn = (
+        bool(artex_multiturn)
+        if artex_multiturn is not None
+        else (is_hybrid and not _approval_deny)
+    )
 
     _subproc_mocked = getattr(subprocess.run, "__module__", None) != "subprocess"
     _ext_runner_patched = False
@@ -4375,6 +4408,10 @@ def run_unified_all_scans(
     if scope_file:
         scope_file = _validate_mantis_path(
             scope_file, ws_root=effective_secondary_ws, allow_directory=False, label="scope_file"
+        )
+    if archive_key_file:
+        archive_key_file = _validate_mantis_path(
+            archive_key_file, ws_root=effective_secondary_ws, allow_directory=False, label="archive_key_file"
         )
     if approval_rules:
         approval_rules = _validate_mantis_path(
@@ -4564,8 +4601,17 @@ def run_unified_all_scans(
         )
     remote_target_label = f"{clean_host}:{resolved_port}" if has_remote else None
     target_path = local_target_path if local_target_path else (remote_target_label or os.path.abspath("."))
-    scan_mode = "unified_all_scans_remote" if (has_remote and not has_local) else "unified_all_scans"
-    _log(f"[*] --all Unified Scan initiated on {target_path} | mode={scan_mode} | depth={effective_depth} | local={has_local} | remote={has_remote} | targets={len(resolved_targets)} | fusion={enforced_fusion} | model={enforced_model}")
+    if is_hybrid:
+        scan_mode = "unified_all_scans_hybrid"
+    elif has_remote and not has_local:
+        scan_mode = "unified_all_scans_remote"
+    else:
+        scan_mode = "unified_all_scans"
+    hybrid_remote_skipped_reason = ""
+    if is_hybrid and not has_remote:
+        hybrid_remote_skipped_reason = "no_remote_target"
+        _log("[!] --hybrid invoked without --host/--targets: running full local static, surface-import, STRIDE, and archive stages cleanly.")
+    _log(f"[*] --all Unified Scan initiated on {target_path} | mode={scan_mode} | hybrid={is_hybrid} | depth={effective_depth} | local={has_local} | remote={has_remote} | targets={len(resolved_targets)} | fusion={enforced_fusion} | model={enforced_model}")
 
     # 0. Detect `.env.local` paid models BEFORE provisioning so Ollama is completely bypassed when active
     paid_cfg_summary: Dict[str, Any] = {
@@ -5469,6 +5515,20 @@ def run_unified_all_scans(
             "findings_ingested": 0,
         }
         artex_res: Dict[str, Any] = {"chains_synthesized": 0, "chains": []}
+        hybrid_bridge_summary: Dict[str, Any] = {
+            "hybrid_mode_active": is_hybrid,
+            "local_executed": has_local,
+            "remote_executed": has_remote,
+            "hybrid_remote_skipped_reason": hybrid_remote_skipped_reason,
+            "static_routes_seeded_to_live": 0,
+            "static_ai_sinks_seeded_to_live": 0,
+            "rea_live_only_endpoints": 0,
+            "rea_live_unstripped_sourcemaps": 0,
+            "embedded_proxy_active": False,
+            "multiturn_enabled": False,
+            "strict_poe": eff_strict_poe,
+            "retest_count": 0,
+        }
         try:
             from datetime import datetime, timezone
             import secrets as _secrets
@@ -5513,8 +5573,16 @@ def run_unified_all_scans(
                 loaded_auth_profiles = resolve_auth_profiles_from_cli(auth_profile) if auth_profile else {}
 
             embedded_mitm = None
+            _approval_deny = str(approval_mode or "policy").strip().lower() == "deny"
+            _is_loopback_target = bool(has_remote and clean_host and is_explicit_loopback_host(clean_host))
+            _allow_hybrid_loopback_live = bool(allow_live_sockets or (is_hybrid and _is_loopback_target))
+            eff_embedded_proxy = (
+                bool(embedded_proxy)
+                if embedded_proxy is not None
+                else bool(is_hybrid and has_remote and _allow_hybrid_loopback_live and not artex_proxy and not _approval_deny)
+            )
             try:
-                if embedded_proxy:
+                if eff_embedded_proxy:
                     from engine.local_mitm_proxy import LocalRecordingMITMProxy
                     embedded_mitm = LocalRecordingMITMProxy(
                         host="127.0.0.1",
@@ -5543,13 +5611,16 @@ def run_unified_all_scans(
                 # Pillar 1: Bind LiveWorkerExecutorRegistry for authorized/loopback remote hosts
                 live_executor_fn = None
                 live_registry = None
-                _approval_deny = str(approval_mode or "policy").strip().lower() == "deny"
-                _is_loopback_target = bool(has_remote and clean_host and is_explicit_loopback_host(clean_host))
                 _enable_live = False
                 if not _approval_deny:
                     if artex_live is True and has_remote:
                         _enable_live = bool(authorized or _is_loopback_target)
-                    elif artex_live is None and has_remote and not strict_offline and (authorized or _is_loopback_target):
+                    elif (
+                        artex_live is None
+                        and has_remote
+                        and (authorized or _is_loopback_target)
+                        and ((not strict_offline) or (is_hybrid and _is_loopback_target))
+                    ):
                         # Auto-enable safe non-destructive live verification only when target port is reachable
                         import socket as _sock
                         try:
@@ -5591,7 +5662,7 @@ def run_unified_all_scans(
                     traffic_session=traffic_session,
                     workers=max(1, int(artex_workers or 3)),
                     arbiter=None if strict_offline else arbiter,
-                    strict_poe=bool(strict_poe),
+                    strict_poe=eff_strict_poe,
                     approval_gate=approval_gate,
                     default_executor_fn=live_executor_fn,
                 )
@@ -5602,7 +5673,7 @@ def run_unified_all_scans(
                     live_registry.trace_store = artex.trace_store
                     live_registry.boundary = artex.boundary
                     live_registry.asset_graph = artex.asset_graph
-                    if artex_multiturn:
+                    if eff_artex_multiturn:
                         mt_turns = resolved_intent_turns if resolved_intent_turns > 0 else None
                         live_executor_fn = live_registry.as_multiturn_executor_fn(
                             max_turns=mt_turns,
@@ -5677,7 +5748,7 @@ def run_unified_all_scans(
                         ai_sinks.append(str(f))
 
                 # Optional Module 21 live same-origin JS bundle mining on authorized/loopback remote hosts
-                if enable_rea and has_remote and allow_live_sockets:
+                if enable_rea and has_remote and _allow_hybrid_loopback_live:
                     try:
                         from engine.rea_integrator import ReaIntegrator
                         live_rea_scanner = ReaIntegrator(
@@ -5700,6 +5771,29 @@ def run_unified_all_scans(
                             for e in (rea_res.get("discovered_endpoints") or [])
                             if isinstance(e, dict)
                         }
+                        static_route_set = {r for _, r in existing_rea_routes if r}
+                        live_route_set = {
+                            str(ep_rec.get("route", ""))
+                            for ep_rec in (live_rea_out.get("discovered_endpoints") or [])
+                            if isinstance(ep_rec, dict) and ep_rec.get("route")
+                        }
+                        live_only_routes = sorted(live_route_set - static_route_set)
+                        static_only_routes = sorted(static_route_set - live_route_set)
+                        shared_routes = sorted(static_route_set & live_route_set)
+                        live_sourcemaps = [
+                            str(lf.get("title") or lf.get("file_path") or "")
+                            for lf in (live_rea_out.get("findings") or [])
+                            if isinstance(lf, dict)
+                            and "map" in str(lf.get("rule_id") or lf.get("title") or "").lower()
+                        ]
+                        rea_res["hybrid_drift"] = {
+                            "static_only_endpoints": static_only_routes[:50],
+                            "live_only_endpoints": live_only_routes[:50],
+                            "shared_endpoints": shared_routes[:50],
+                            "live_unstripped_sourcemaps": live_sourcemaps[:25],
+                        }
+                        hybrid_bridge_summary["rea_live_only_endpoints"] = len(live_only_routes)
+                        hybrid_bridge_summary["rea_live_unstripped_sourcemaps"] = len(live_sourcemaps)
                         for ep_rec in live_rea_out.get("discovered_endpoints") or []:
                             if isinstance(ep_rec, dict):
                                 rk = (str(ep_rec.get("method", "GET")).upper(), str(ep_rec.get("route", "")))
@@ -5975,9 +6069,10 @@ def run_unified_all_scans(
                 cycle_res = artex.run_attack_chain_cycle(round_num=max(1, int(artex_rounds)))
 
                 # Optional retest loop after chaining
-                if artex_retest and hasattr(artex, "retester"):
+                retests_done: List[Any] = []
+                if eff_artex_retest and hasattr(artex, "retester"):
                     stored_chains = db.get_attack_chains(limit=25, task_id=artex.task_id) if (db and hasattr(db, "get_attack_chains")) else []
-                    retests = [
+                    retests_done = [
                         artex.retester.retest_chain(
                             ch,
                             live=bool(_enable_live and has_remote),
@@ -5986,7 +6081,7 @@ def run_unified_all_scans(
                         for ch in stored_chains
                     ]
                     if isinstance(cycle_res, dict):
-                        cycle_res["retest_results"] = retests
+                        cycle_res["retest_results"] = retests_done
 
                 # Optional Headless BaaRai/ARTEX REST+SSE sync when --artex-url or ARTEX_API_URL is configured
                 resolved_artex_url = artex_url or os.environ.get("ARTEX_API_URL")
@@ -6024,9 +6119,15 @@ def run_unified_all_scans(
                 artex_res["proxy"] = proxy_cfg.to_dict()
                 artex_res["embedded_proxy_active"] = bool(embedded_mitm is not None)
                 artex_res["live_execution_enabled"] = bool(_enable_live)
-                artex_res["multiturn_enabled"] = bool(artex_multiturn and live_registry is not None)
-                artex_res["strict_poe"] = bool(strict_poe)
+                artex_res["multiturn_enabled"] = bool(eff_artex_multiturn and live_registry is not None)
+                artex_res["strict_poe"] = bool(eff_strict_poe)
                 artex_res["approval_mode"] = approval_mode
+                hybrid_bridge_summary["static_routes_seeded_to_live"] = len(discovered_eps)
+                hybrid_bridge_summary["static_ai_sinks_seeded_to_live"] = len(ai_sinks)
+                hybrid_bridge_summary["embedded_proxy_active"] = bool(embedded_mitm is not None)
+                hybrid_bridge_summary["multiturn_enabled"] = bool(eff_artex_multiturn and live_registry is not None)
+                hybrid_bridge_summary["strict_poe"] = bool(eff_strict_poe)
+                hybrid_bridge_summary["retest_count"] = len(retests_done)
                 if surface_imports:
                     artex_res["surface_imports"] = {
                         k: (
@@ -6726,10 +6827,11 @@ def run_unified_all_scans(
             speculative_sev_breakdown[sev] = speculative_sev_breakdown.get(sev, 0) + 1
 
         extra_report_files: Dict[str, Any] = {}
-        if export_csv or export_advisory:
+        encrypted_archive_summary: Dict[str, Any] = {"status": "disabled", "encrypted": False}
+        if eff_export_csv or eff_export_advisory or eff_export_archive:
             from engine.advisory_exporter import AdvisoryExporter, _safe_filename
             exporter = AdvisoryExporter(reports_dir=out_dir)
-            if export_csv:
+            if eff_export_csv:
                 csv_path = out_dir / "findings_and_chains.csv"
                 non_chain_findings = [
                     f for f in aggregated_findings
@@ -6742,7 +6844,7 @@ def run_unified_all_scans(
                 )
                 extra_report_files["findings_and_chains_csv"] = str(csv_path)
                 extra_report_files["combined_csv"] = str(csv_path)
-            if export_advisory:
+            if eff_export_advisory:
                 adv_paths: List[str] = []
                 seen_adv_paths: Set[str] = set()
                 task_id_val = artex_res.get("task_id")
@@ -6782,6 +6884,47 @@ def run_unified_all_scans(
                     exporter.export_ghsa_markdown(ch_item, traffic_record=trec, retests=rtests, output_path=out_md)
                     adv_paths.append(str(out_md))
                 extra_report_files["advisories"] = adv_paths
+            if eff_export_archive and db is not None:
+                from engine.secret_store import SecretBox
+                task_id_arc = artex_res.get("task_id")
+                arc_stem = _safe_filename(str(task_id_arc or "all_scan"))
+                if archive_path:
+                    req_arc = Path(str(archive_path))
+                    if req_arc.is_absolute():
+                        cand_arc = req_arc.resolve(strict=False)
+                        if explicit_ws_root is not None:
+                            ws_cmp = Path(explicit_ws_root).resolve(strict=False)
+                            if cand_arc != ws_cmp and not cand_arc.is_relative_to(ws_cmp):
+                                raise PermissionError(f"Unsafe archive_path escapes workspace_root: {archive_path}")
+                        arc_dest = cand_arc
+                    else:
+                        arc_dest = (out_dir / req_arc).resolve(strict=False)
+                        out_cmp = out_dir.resolve(strict=False)
+                        if arc_dest != out_cmp and not arc_dest.is_relative_to(out_cmp):
+                            raise PermissionError(f"Unsafe relative archive_path escapes reports_dir: {archive_path}")
+                else:
+                    arc_dest = out_dir / f"task_archive_{arc_stem}.rfca"
+                key_dest = archive_key_file or (out_dir / ".rfchunt_archive.key")
+                box = getattr(db, "secret_box", None) or SecretBox.from_env_or_keyfile(
+                    key_path=key_dest,
+                    create_if_missing=True,
+                )
+                arc_meta = exporter.export_task_archive(
+                    db,
+                    arc_dest,
+                    task_id=task_id_arc,
+                    secret_box=box,
+                )
+                extra_report_files["encrypted_archive_rfca"] = str(arc_meta["path"])
+                encrypted_archive_summary = {
+                    "status": "exported",
+                    "path": str(arc_meta["path"]),
+                    "task_id": arc_meta.get("task_id"),
+                    "sha256": arc_meta.get("sha256"),
+                    "encrypted": True,
+                    "size_bytes": arc_meta.get("size_bytes", 0),
+                    "counts": arc_meta.get("counts") or {},
+                }
 
         # Strict Operational Rigor Gate 1: RFC 6962 Merkle Audit Trail ONLY ingests genuinely
         # verified multi-trial differential wire findings (never speculative poe_level=1 leads
@@ -6902,6 +7045,9 @@ def run_unified_all_scans(
         result_payload = {
             "target_path": target_path,
             "mode": scan_mode,
+            "hybrid_mode": is_hybrid,
+            "hybrid_bridge": hybrid_bridge_summary,
+            "encrypted_archive": encrypted_archive_summary,
             "depth": effective_depth,
             "local_executed": has_local,
             "remote_executed": has_remote,
@@ -7064,6 +7210,8 @@ def run_unified_all_scans(
             f"Prompt Smuggling Probes Synthesized: {smuggle_res.get('probes_generated', 0)}",
             f"Merkle Audit Trail: {merkle_audit_summary.get('status', 'unknown')} (Leaves: {merkle_audit_summary.get('total_leaves', 0)})",
             f"Defensive Signatures: {defensive_export_summary.get('status', 'unknown')} (Rules: {defensive_export_summary.get('rules_published', 0)})",
+            f"Hybrid Mode: {is_hybrid} (Local={has_local}, Remote={has_remote}, Static->Live Routes={hybrid_bridge_summary.get('static_routes_seeded_to_live', 0)}, EmbeddedProxy={hybrid_bridge_summary.get('embedded_proxy_active', False)}, MultiTurn={hybrid_bridge_summary.get('multiturn_enabled', False)})",
+            f"Encrypted Task Archive (.rfca): {encrypted_archive_summary.get('status', 'disabled')} ({encrypted_archive_summary.get('path', '-')})",
         ]
         if has_remote:
             txt_lines.append(f"Active Flaw Prober Findings: {prober_res.get('total_findings', 0)}")

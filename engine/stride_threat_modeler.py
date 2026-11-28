@@ -78,6 +78,10 @@ _SKIP_DIRS: frozenset[str] = frozenset(
         "caldera_export",
         "defense_rules",
         "site-packages",
+        ".agents",
+        ".cargo",
+        ".swarm_workspaces",
+        "vendor",
     }
 )
 

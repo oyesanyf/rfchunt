@@ -971,6 +971,12 @@ class TerminatorMCPServer:
                         "enable_pe_audit": {"type": "boolean", "default": True, "description": "Run PE & .NET Code Integrity Anomaly Auditor during --all"},
                         "pe_include_host_audit": {"type": "boolean", "default": False, "description": "Include Windows KB5127694 and VirtualBox 7.2.18+ host patch audit during --all"},
                         "pe_include_yara": {"type": "boolean", "default": True, "description": "Evaluate defensive PE/.NET YARA rules during --all"},
+                        "hybrid": {"type": "boolean", "default": False, "description": "Enable unified --hybrid local codebase + live remote mode (auto-enables ARTEX multi-turn, strict POE=3, live retester, embedded MITM proxy, REA static+live drift, GHSA/CSV/encrypted .rfca archive)"},
+                        "export_archive": {"type": "boolean", "default": False, "description": "Export AES-256-GCM encrypted .rfca task archive with SHA-256 verification"},
+                        "archive_key_file": {"type": "string", "description": "Optional encryption key file path for encrypted .rfca archive (confined to workspace_root)"},
+                        "enable_stride": {"type": "boolean", "description": "Enable/force Module 26 STRIDE threat modeling (default: auto-generate when repo has no threat model)"},
+                        "stride_diagrams": {"type": "array", "items": {"type": "string"}, "description": "Optional architecture diagram paths to ingest into STRIDE analysis"},
+                        "stride_write_repo": {"type": "boolean", "default": False, "description": "Also write generated THREAT_MODEL.md into target repository root"},
                     },
                 },
             },
@@ -1019,6 +1025,12 @@ class TerminatorMCPServer:
                         "enable_pe_audit": {"type": "boolean", "default": True},
                         "pe_include_host_audit": {"type": "boolean", "default": False},
                         "pe_include_yara": {"type": "boolean", "default": True},
+                        "hybrid": {"type": "boolean", "default": False},
+                        "export_archive": {"type": "boolean", "default": False},
+                        "archive_key_file": {"type": "string"},
+                        "enable_stride": {"type": "boolean"},
+                        "stride_diagrams": {"type": "array", "items": {"type": "string"}},
+                        "stride_write_repo": {"type": "boolean", "default": False},
                     },
                 },
             },
@@ -2284,7 +2296,7 @@ class TerminatorMCPServer:
             docker_image = self._parse_strict_str(args, "docker_image", None)
             docker_network = self._parse_strict_str(args, "docker_network", None)
             artex_live = self._parse_strict_bool(args, "artex_live", None)
-            artex_multiturn = bool(self._parse_strict_bool(args, "artex_multiturn", False))
+            artex_multiturn = self._parse_strict_bool(args, "artex_multiturn", None)
             artex_intent_turns = int(self._parse_strict_int(args, "artex_intent_turns", 0, min_val=0) or 0)
             artex_intent_tokens = int(self._parse_strict_int(args, "artex_intent_tokens", 0, min_val=0) or 0)
             depth = int(self._parse_strict_int(args, "depth", 30, min_val=1, max_val=100) or 30)
@@ -2299,16 +2311,22 @@ class TerminatorMCPServer:
             artex_llm_rotate = bool(self._parse_strict_bool(args, "artex_llm_rotate", False))
             artex_wait_sse = bool(self._parse_strict_bool(args, "artex_wait_sse", False))
             artex_budget_turns = int(self._parse_strict_int(args, "artex_budget_turns", 0, min_val=0) or 0)
-            artex_retest = bool(self._parse_strict_bool(args, "artex_retest", False))
+            artex_retest = self._parse_strict_bool(args, "artex_retest", None)
             artex_workers = int(self._parse_strict_int(args, "artex_workers", 3, min_val=1) or 3)
-            embedded_proxy = bool(self._parse_strict_bool(args, "embedded_proxy", False))
+            embedded_proxy = self._parse_strict_bool(args, "embedded_proxy", None)
             auth_profile = self._parse_strict_str(args, "auth_profile", None)
             import_har = self._parse_strict_str(args, "import_har", None)
             import_openapi = self._parse_strict_str(args, "import_openapi", None)
             scope_file = self._parse_strict_str(args, "scope_file", None)
-            strict_poe = bool(self._parse_strict_bool(args, "strict_poe", False))
-            export_advisory = bool(self._parse_strict_bool(args, "export_advisory", False))
-            export_csv = bool(self._parse_strict_bool(args, "export_csv", False))
+            strict_poe = self._parse_strict_bool(args, "strict_poe", None)
+            export_advisory = self._parse_strict_bool(args, "export_advisory", None)
+            export_csv = self._parse_strict_bool(args, "export_csv", None)
+            hybrid_mode = bool(self._parse_strict_bool(args, "hybrid", False))
+            export_archive = self._parse_strict_bool(args, "export_archive", None)
+            archive_key_file = self._parse_strict_str(args, "archive_key_file", None)
+            enable_stride_arg = self._parse_strict_bool(args, "enable_stride", None)
+            stride_diagrams_arg = self._parse_str_list(args, "stride_diagrams", None) or []
+            stride_write_repo_arg = bool(self._parse_strict_bool(args, "stride_write_repo", False))
             enable_rea = bool(self._parse_strict_bool(args, "enable_rea", True))
             if self._parse_strict_bool(args, "no_rea", False):
                 enable_rea = False
@@ -2417,6 +2435,15 @@ class TerminatorMCPServer:
                 approval_rules = self._validate_mcp_scan_path(
                     approval_rules, workspace_root=primary_ws, allow_directory=False
                 )
+            if archive_key_file is not None:
+                archive_key_file = self._validate_mcp_scan_path(
+                    archive_key_file, workspace_root=primary_ws, allow_directory=False
+                )
+            if stride_diagrams_arg:
+                stride_diagrams_arg = [
+                    self._validate_mcp_scan_path(dp, workspace_root=primary_ws, allow_directory=False)
+                    for dp in stride_diagrams_arg
+                ]
             explicit_out_ws = self._has_explicit_output_confinement(args)
             reports_dir = self._validate_mcp_output_dir(
                 reports_dir,
@@ -2425,7 +2452,7 @@ class TerminatorMCPServer:
             )
 
             with _suppress_stdout_to_stderr():
-                return run_unified_all_scans(
+                scan_result = run_unified_all_scans(
                     repo=resolved_repo,
                     path=resolved_path,
                     depth=depth,
@@ -2461,6 +2488,9 @@ class TerminatorMCPServer:
                     strict_poe=strict_poe,
                     export_advisory=export_advisory,
                     export_csv=export_csv,
+                    export_archive=export_archive,
+                    archive_key_file=archive_key_file,
+                    hybrid=hybrid_mode,
                     quiet=True,
                     enable_external_scanners=enable_ext,
                     httpx_scan=httpx_scan,
@@ -2482,6 +2512,38 @@ class TerminatorMCPServer:
                     workspace_root=explicit_ws_root,
                     confine_reports_to_workspace_root=explicit_out_ws,
                 )
+                local_stride_target = resolved_repo or resolved_path
+                if (
+                    enable_stride_arg is not False
+                    and local_stride_target
+                    and os.path.isdir(local_stride_target)
+                    and isinstance(scan_result, dict)
+                ):
+                    try:
+                        from engine.stride_threat_modeler import StrideThreatModeler
+
+                        mcp_stride_out = Path(reports_dir) / "stride_threat_model"
+                        stride_res = StrideThreatModeler(
+                            use_fusion=(os.environ.get("RFCHUNT_OFFLINE") != "1" and not bool(os.environ.get("CI"))),
+                            embedded=False,
+                        ).analyze_codebase(
+                            local_stride_target,
+                            out_dir=mcp_stride_out,
+                            diagram_paths=stride_diagrams_arg,
+                            existing_findings=list(scan_result.get("findings") or []),
+                            force_generate=(enable_stride_arg is True) or bool(stride_diagrams_arg),
+                            write_to_repo=stride_write_repo_arg,
+                            dry_run=False,
+                        )
+                        scan_result["stride_threat_model"] = stride_res
+                        s_rf = stride_res.get("report_files") or {}
+                        if s_rf.get("markdown"):
+                            scan_result.setdefault("report_files", {})["stride_threat_model_md"] = str(s_rf["markdown"])
+                        if s_rf.get("architecture_svg"):
+                            scan_result.setdefault("report_files", {})["stride_architecture_svg"] = str(s_rf["architecture_svg"])
+                    except Exception as stride_mcp_exc:
+                        scan_result["stride_threat_model"] = {"status": "error", "error": str(stride_mcp_exc)}
+                return scan_result
 
         elif name == "artex_run_attack_chain":
             self._reject_shell_execution(args)

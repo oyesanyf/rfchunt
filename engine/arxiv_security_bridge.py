@@ -399,6 +399,9 @@ _SKIP_DIRS = {
     "caldera_plugin",
     "coverage",
     "vendor",
+    ".agents",
+    ".cargo",
+    ".swarm_workspaces",
 }
 
 _SOURCE_EXTENSIONS = {

@@ -206,7 +206,7 @@ def _has_js_ts_assets(
     js_ts_suffixes = (".js", ".jsx", ".ts", ".tsx", ".mjs", "package.json")
     if active_target_files:
         return any(f.lower().endswith(js_ts_suffixes) for f in active_target_files)
-    skip_dirs = {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache"}
+    skip_dirs = {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", "target", "dist", "build", ".agents", ".cargo"}
     visited = 0
     for _cur_root, dirnames, filenames in os.walk(repo_root):
         dirnames[:] = [d for d in sorted(dirnames) if d not in skip_dirs]
@@ -1018,7 +1018,7 @@ def _discover_formal_spec_files(repo_root: Path, max_files: int = 8) -> dict[str
     for cur_root, dirnames, filenames in os.walk(repo_root):
         dirnames[:] = [
             d for d in dirnames
-            if d not in (".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build")
+            if d not in (".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", "target", ".agents", ".cargo")
         ]
         for fn in filenames:
             scanned += 1

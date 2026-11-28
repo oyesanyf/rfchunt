@@ -20,8 +20,15 @@ Core Mechanisms:
   - Autonomous discovery cascade & Post-Quantum Cryptography (PQC) standards
 """
 
+import os
 import sys
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
 if sys.platform == "win32":
+    import platform as _platform
+    if getattr(_platform, "_wmi", None) is not None:
+        _platform._wmi = None
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -34,7 +41,6 @@ import contextlib
 import hashlib
 import inspect
 import math
-import os
 from pathlib import Path
 import operator
 import re
@@ -4435,7 +4441,7 @@ def cmd_dry_run_plan(
         if isinstance(v, bool) and v and not k.startswith("_")
     )
     planned_modules: List[str] = []
-    if getattr(args, "run_all_scans", False) or active_mode in ("all", "all_scans"):
+    if getattr(args, "run_all_scans", False) or getattr(args, "enable_hybrid", False) or active_mode in ("all", "all_scans", "hybrid"):
         planned_modules.extend(
             [
                 "Module-23-PreflightDiscovery(14-Categories+PQC+HackerOne+SafeSkills)",
@@ -4452,6 +4458,16 @@ def cmd_dry_run_plan(
         )
         if not getattr(args, "no_pe_audit", False):
             planned_modules.append("Module-PE-DotNet-Auditor(UMCI/SEC_COMMIT/YARA/HostPatch)")
+        if getattr(args, "enable_hybrid", False) or active_mode == "hybrid":
+            planned_modules.extend(
+                [
+                    "HybridStaticToLiveBridge(Local+Remote-Simultaneous)",
+                    "LocalRecordingMITMProxy(LocalCA)",
+                    "ARTEX-MultiTurn-StrictPOE3-Retester",
+                    "Module-21-REA-Static+LiveDrift",
+                    "EncryptedArchive(.rfca-AES256GCM)",
+                ]
+            )
     elif getattr(args, "preflight_only", False) or active_mode == "preflight":
         planned_modules.append("Module-23-PreflightDiscovery(14-Categories+PQC+HackerOne+SafeSkills)")
     if getattr(args, "ensemble", False):
@@ -5839,7 +5855,15 @@ def cmd_all(args):
     all_task_id = str(getattr(args, "task_id", None) or "default").strip() or "default"
     if getattr(args, "hint", None) is not None:
         _validate_cli_hint_args(args, default_task_id=all_task_id)
-    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    _db_cls = _resolve_db_cls()
+    _db_key_file = getattr(args, "key_file", None)
+    try:
+        if _db_key_file and "secret_key_path" in inspect.signature(_db_cls.__init__).parameters:
+            db = _db_cls(getattr(args, "db", "terminator.db"), secret_key_path=_db_key_file)
+        else:
+            db = _db_cls(getattr(args, "db", "terminator.db"))
+    except (TypeError, ValueError):
+        db = _db_cls(getattr(args, "db", "terminator.db"))
     try:
         if getattr(args, "hint", None) is not None and hasattr(db, "add_hint"):
             _persist_cli_hint(args, db=db)
@@ -5857,10 +5881,15 @@ def cmd_all(args):
             except Exception:
                 active_hints = []
 
+        is_hybrid = bool(getattr(args, "enable_hybrid", False))
         if not as_json:
             print(f"\n{'='*75}")
-            print(f"[*] UNIFIED --all SECURITY AUDIT (Fusion + Abliterated Models Enforced)")
-            target_disp = f"host={host or targets}" if (host or targets) and not repo and not path else os.path.abspath(str(repo or path))
+            banner_mode = "--hybrid (LOCAL + REMOTE)" if is_hybrid else "--all"
+            print(f"[*] UNIFIED {banner_mode} SECURITY AUDIT (Fusion + Abliterated Models Enforced)")
+            if is_hybrid and (repo or path) and (host or targets):
+                target_disp = f"local={os.path.abspath(str(repo or path))} + remote={host or targets}"
+            else:
+                target_disp = f"host={host or targets}" if (host or targets) and not repo and not path else os.path.abspath(str(repo or path))
             print(f"[*] Target: {target_disp} | Depth: {depth} | Model: {preferred_model}")
             if active_hints:
                 print(f"[*] Active Blackboard Hints: {len(active_hints)}")
@@ -5898,6 +5927,30 @@ def cmd_all(args):
         rea_use_cli_val = True if raw_rea_cli is None else bool(raw_rea_cli)
         include_models_val = bool(getattr(args, "include_models", True))
 
+        eff_embedded_proxy: Optional[bool] = (
+            False
+            if bool(getattr(args, "no_embedded_proxy", False))
+            else (True if bool(getattr(args, "embedded_proxy", False)) else (None if is_hybrid else False))
+        )
+        eff_artex_multiturn: Optional[bool] = (
+            False
+            if bool(getattr(args, "no_artex_multiturn", False))
+            else (True if bool(getattr(args, "artex_multiturn", False)) else (None if is_hybrid else False))
+        )
+        raw_exp_arc = getattr(args, "export_path", None)
+        if bool(getattr(args, "no_export_archive", False)):
+            eff_export_archive: Optional[bool] = False
+            eff_archive_path: Optional[str] = None
+        elif raw_exp_arc == "__AUTO__":
+            eff_export_archive = True
+            eff_archive_path = None
+        elif raw_exp_arc:
+            eff_export_archive = True
+            eff_archive_path = str(raw_exp_arc)
+        else:
+            eff_export_archive = True if is_hybrid else False
+            eff_archive_path = None
+
         unified_kwargs: Dict[str, Any] = dict(
             repo=repo,
             path=path,
@@ -5923,10 +5976,10 @@ def cmd_all(args):
             artex_llm_rotate=bool(getattr(args, "artex_llm_rotate", False)),
             artex_wait_sse=bool(getattr(args, "artex_wait_sse", False)),
             artex_budget_turns=int(getattr(args, "artex_budget_turns", 0) or 0),
-            artex_retest=bool(getattr(args, "artex_retest", False)),
+            artex_retest=True if bool(getattr(args, "artex_retest", False)) else (None if is_hybrid else False),
             artex_workers=int(getattr(args, "artex_workers", 3) or 3),
             artex_live=artex_live_val,
-            embedded_proxy=bool(getattr(args, "embedded_proxy", False)),
+            embedded_proxy=eff_embedded_proxy,
             embedded_proxy_port=int(getattr(args, "embedded_proxy_port", 0) or 0),
             auth_profile=getattr(args, "auth_profile", None),
             import_har=getattr(args, "import_har", None),
@@ -5934,9 +5987,9 @@ def cmd_all(args):
             scope_file=getattr(args, "scope_file", None),
             approval_mode=approval_mode_val,
             approval_rules=getattr(args, "approval_rules", None),
-            strict_poe=bool(getattr(args, "strict_poe", False)),
-            export_advisory=bool(getattr(args, "export_advisory", False)),
-            export_csv=bool(getattr(args, "export_csv", False)),
+            strict_poe=True if bool(getattr(args, "strict_poe", False)) else (None if is_hybrid else False),
+            export_advisory=True if bool(getattr(args, "export_advisory", False)) else (None if is_hybrid else False),
+            export_csv=True if bool(getattr(args, "export_csv", False)) else (None if is_hybrid else False),
             quiet=as_json,
             enable_external_scanners=raw_ext_flag,
             httpx_scan=getattr(args, "httpx_scan", None),
@@ -5946,7 +5999,7 @@ def cmd_all(args):
             scanner_isolation=getattr(args, "scanner_isolation", "host") or "host",
             docker_image=getattr(args, "docker_image", None),
             docker_network=getattr(args, "docker_network", None),
-            artex_multiturn=bool(getattr(args, "artex_multiturn", False)),
+            artex_multiturn=eff_artex_multiturn,
             artex_intent_turns=artex_intent_turns,
             artex_intent_tokens=artex_intent_tokens,
             enable_rea=not bool(getattr(args, "no_rea", False)),
@@ -5996,6 +6049,10 @@ def cmd_all(args):
             "enable_pe_audit": not bool(getattr(args, "no_pe_audit", False)),
             "pe_include_host_audit": bool(getattr(args, "pe_include_host_audit", False)),
             "pe_include_yara": bool(getattr(args, "pe_include_yara", True)),
+            "hybrid": is_hybrid,
+            "export_archive": eff_export_archive,
+            "archive_path": eff_archive_path,
+            "archive_key_file": _db_key_file,
             "workspace_root": str(cli_ws_root) if cli_ws_root is not None else None,
             "confine_reports_to_workspace_root": bool(
                 getattr(args, "workspace_root", None) is not None and str(getattr(args, "workspace_root", "")).strip()
@@ -6022,7 +6079,8 @@ def cmd_all(args):
             os.environ["RFCHUNT_AUTO_PULL_MODELS"] = "0"
         try:
             _stdout_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
-            with _stdout_ctx:
+            _contain_ctx = HostContainmentManager() if (host or targets) else contextlib.nullcontext()
+            with _stdout_ctx, _contain_ctx:
                 res = run_unified_all_scans(**unified_kwargs)
                 _run_all_aixcc_extensions(
                     args,
@@ -6588,6 +6646,44 @@ def cmd_all(args):
             except Exception:
                 pass
 
+        _raw_cli_for_exports = list(getattr(args, "_raw_cli_argv", None) or [])
+        if any(tok == "--export-caldera" or tok.startswith("--export-caldera=") for tok in _raw_cli_for_exports) and not bool(getattr(args, "no_caldera", False)):
+            try:
+                from engine.caldera_bridge import CalderaBridge
+
+                _cal_dir = str(getattr(args, "export_caldera", "caldera_export") or "caldera_export")
+                _cal_res = CalderaBridge(db_path=getattr(args, "db", "terminator.db")).export_plugin(output_dir=_cal_dir)
+                res.setdefault("engines", {})["caldera_export"] = _cal_res
+                res.setdefault("report_files", {})["caldera_export_dir"] = _cal_dir
+            except Exception as _cal_exc:
+                res.setdefault("engines", {})["caldera_export"] = {"status": "error", "error": str(_cal_exc)}
+
+        if any(tok == "--dashboard-out" or tok.startswith("--dashboard-out=") for tok in _raw_cli_for_exports):
+            try:
+                from engine.dashboard_generator import DashboardGenerator
+
+                _dash_out = str(getattr(args, "dashboard_out", "terminator_dashboard.html") or "terminator_dashboard.html")
+                _dash_html = DashboardGenerator.generate_html_dashboard(
+                    target_host=str(host or repo or "."),
+                    target_port=int(port_arg or 443),
+                    scan_stats={
+                        "total_evaluated": max(int(res.get("total_aggregated_findings", 0) or 0), 1),
+                        "passed": 0,
+                        "anomalies": int(res.get("speculative_hypotheses_count", 0) or 0),
+                        "flaws": int(res.get("primary_findings_count", 0) or 0),
+                    },
+                    merkle_audit_log=res.get("merkle_audit") or {},
+                    flaws=list(res.get("findings") or [])[:50],
+                    arm106_count=int((res.get("defensive_intelligence") or {}).get("rules_published", 0) or 0),
+                    arm107_count=int((res.get("defensive_intelligence") or {}).get("regression_tests_published", 0) or 0),
+                    attack_chains=list(res.get("chains") or [])[:50],
+                )
+                Path(_dash_out).parent.mkdir(parents=True, exist_ok=True)
+                Path(_dash_out).write_text(_dash_html, encoding="utf-8")
+                res.setdefault("report_files", {})["dashboard_html"] = _dash_out
+            except Exception as _dash_exc:
+                res.setdefault("engines", {})["dashboard_export"] = {"status": "error", "error": str(_dash_exc)}
+
         if getattr(args, "as_json", False):
             if getattr(args, "enable_autonomous_hunt", False):
                 import io as _all_hunt_io
@@ -6732,10 +6828,20 @@ def cmd_all(args):
         if res["report_files"].get("poc_index_md"):
             print(f"    PoC Triage Index    : {res['report_files'].get('poc_index_md')}")
         print(f"    Combined JSON       : {res['report_files'].get('combined_json')}")
+        if res.get("hybrid_mode"):
+            hb = res.get("hybrid_bridge") or {}
+            print(
+                f"    Hybrid Bridge       : local={hb.get('local_executed', False)}, remote={hb.get('remote_executed', False)}, "
+                f"static->live routes={hb.get('static_routes_seeded_to_live', 0)}, "
+                f"mitm_proxy={hb.get('embedded_proxy_active', False)}, multiturn={hb.get('multiturn_enabled', False)}, "
+                f"strict_poe={hb.get('strict_poe', False)}"
+            )
         if res["report_files"].get("combined_csv"):
             print(f"    Combined CSV        : {res['report_files'].get('combined_csv')}")
         if res["report_files"].get("advisories"):
             print(f"    GHSA Advisories     : {len(res['report_files']['advisories'])} written")
+        if res["report_files"].get("encrypted_archive_rfca"):
+            print(f"    Encrypted Archive   : {res['report_files'].get('encrypted_archive_rfca')}")
         print(f"{'='*75}\n")
         render_poe_summary(
             poe_bd,
@@ -8317,7 +8423,7 @@ ALL_MODES = [
     "deep-audit", "deep_audit",
     "novelty", "novelty-refresh", "novelty_refresh", "swarm", "swarm-board", "swarm_board", "board",
     "phi", "preflight", "hackerone", "hackone", "stride", "threat-model", "threat_model",
-    "pe-audit", "pe_audit", "pe-dotnet", "pe_dotnet",
+    "pe-audit", "pe_audit", "pe-dotnet", "pe_dotnet", "hybrid",
 ]
 
 
@@ -8791,6 +8897,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--artex-live", dest="artex_live", action="store_true", default=None, help="Force live non-destructive ARTEX worker verification")
     parser.add_argument("--no-artex-live", dest="no_artex_live", action="store_true", default=False, help="Disable auto-live ARTEX worker verification")
     parser.add_argument("--embedded-proxy", dest="embedded_proxy", action="store_true", default=False, help="Start embedded pure-CLI recording MITM proxy during scan")
+    parser.add_argument("--no-embedded-proxy", dest="no_embedded_proxy", action="store_true", default=False, help="Disable embedded MITM recording proxy even when --hybrid is enabled")
     parser.add_argument("--embedded-proxy-port", dest="embedded_proxy_port", type=int, default=0, help="Port for embedded MITM proxy (0 = ephemeral)")
     parser.add_argument("--auth-profile", dest="auth_profile", type=str, default=None, action=_SingleOrMultiStoreAction, help="Path(s) to JSON/YAML multi-role auth profiles (repeatable or comma-separated for 2-account BOLA/IDOR differential replay)")
     parser.add_argument("--header", "--bounty-header", dest="headers", action="append", default=[], help="Repeatable custom HTTP header ('Name: Value', e.g. 'X-Bug-Bounty: handle') propagated across all raw sockets, HTTP/2 frames, HTTP clients, and external scanners")
@@ -8838,6 +8945,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--docker-image", dest="docker_image", type=str, default=None, help="Optional explicit OCI image for docker isolation")
     parser.add_argument("--docker-network", dest="docker_network", choices=["bridge", "none"], default=None, help="Docker network mode for external scanner isolation (bridge|none)")
     parser.add_argument("--artex-multiturn", dest="artex_multiturn", action="store_true", default=False, help="Enable bounded multi-turn ArtexWorker adaptive tool loop")
+    parser.add_argument("--no-artex-multiturn", dest="no_artex_multiturn", action="store_true", default=False, help="Disable bounded multi-turn ArtexWorker adaptive tool loop even under --hybrid")
     parser.add_argument("--artex-intent-turns", dest="artex_intent_turns", type=int, default=0, help="Max turns per ARTEX intent (0 = default/unlimited)")
     parser.add_argument("--artex-intent-tokens", dest="artex_intent_tokens", type=int, default=0, help="Max tokens per ARTEX intent (0 = unlimited)")
     parser.add_argument("--json", dest="as_json", action="store_true", default=False, help="Emit machine-readable JSON output")
@@ -8852,7 +8960,8 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--query", "-q", dest="query", type=str, default=None, help="Search query for worker traces")
     parser.add_argument("--out", dest="out", type=str, default="reports", help="Output directory for export-advisory")
     parser.add_argument("--csv", dest="csv", action="store_true", default=False, help="Export formula-safe CSV in export-advisory")
-    parser.add_argument("--export-archive", dest="export_path", type=str, default=None, help="Output encrypted .rfca archive file path")
+    parser.add_argument("--export-archive", dest="export_path", nargs="?", const="__AUTO__", default=None, help="Output AES-256-GCM encrypted .rfca task archive path (omit path under --all/--hybrid to auto-write into output-dir)")
+    parser.add_argument("--no-export-archive", dest="no_export_archive", action="store_true", default=False, help="Disable automatic AES-256-GCM encrypted .rfca task archive export under --hybrid")
     parser.add_argument("--import", "--import-archive", dest="import_path", type=str, default=None, help="Input encrypted .rfca archive file path")
     parser.add_argument("--key-file", dest="key_file", type=str, default=None, help="Optional encryption key file path for archive")
     parser.add_argument("--ca-dir", dest="ca_dir", type=str, default="keys", help="CA directory for proxy mode")
@@ -8868,8 +8977,9 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--prompt-smuggle", dest="enable_prompt_smuggle", action="store_true", help="Synthesize and verify novel cross-layer Desynchronized Prompt Injection attack chains")
     parser.add_argument("--export-sarif", type=str, default=None, help="Export aggregated vulnerability findings to specified SARIF file in reports/")
 
-    # Google Mantis Integration (Module 20) & Unified --all Multi-Scanner Orchestrator
+    # Google Mantis Integration (Module 20) & Unified --all / --hybrid Multi-Scanner Orchestrator
     parser.add_argument("--all", "--run-all", "--all-scans", dest="run_all_scans", action="store_true", help="Execute ALL integrated scanners (Google Mantis, aiscan, ARTEX Dual-Graph, RAPTOR, Prompt Smuggling, Module 21 REA + rea-agents CLI, and httpx/katana/nuclei for live hosts) with mandatory ModelFusion + Abliterated models")
+    parser.add_argument("--hybrid", dest="enable_hybrid", action="store_true", default=False, help="Execute turnkey unified --hybrid local codebase + live remote audit (auto-enables --all, ARTEX multi-turn workers, strict POE=3, live retester, embedded MITM recording proxy, static+live REA drift correlation, GHSA advisories, formula-safe CSV, encrypted .rfca archive, and auto-STRIDE)")
     parser.add_argument("--repo", dest="repo", type=str, default=None, help="Repository directory path for --all, --mantis, or --raptor audits")
     parser.add_argument("--path", dest="path", type=str, default=None, help="Specific file or directory path for --all, --mantis, or --raptor audits")
     parser.add_argument("--mantis", "--enable-mantis", dest="enable_mantis", action="store_true", help="Enable Google Mantis toolkit (Module 20: threat modeling, depth hypotheses, Tier 1/2 repro, CVSS rubric, patching)")
@@ -9124,6 +9234,11 @@ _CURATED_FLAG_EXAMPLES: Dict[str, str] = {
     "--run-now": "python rfc_hunt_swarm.py --hunt --install-schedule --run-now --dry-run",
     "--task-name": "python rfc_hunt_swarm.py --hunt --install-schedule --task-name RFCHunt-Nightly --dry-run",
     "--all": "python rfc_hunt_swarm.py --all --repo . --dry-run",
+    "--hybrid": "python rfc_hunt_swarm.py --hybrid --repo . --host 127.0.0.1 --port 8080 --dry-run",
+    "--no-artex-multiturn": "python rfc_hunt_swarm.py --hybrid --repo . --host 127.0.0.1 --no-artex-multiturn --dry-run",
+    "--no-embedded-proxy": "python rfc_hunt_swarm.py --hybrid --repo . --host 127.0.0.1 --no-embedded-proxy --dry-run",
+    "--export-archive": "python rfc_hunt_swarm.py --all --repo . --export-archive reports/audit.rfca",
+    "--no-export-archive": "python rfc_hunt_swarm.py --hybrid --repo . --no-export-archive --dry-run",
     "--ensemble": "python rfc_hunt_swarm.py --all --ensemble --repo . --program generic --quorum 2",
     "--program": "python rfc_hunt_swarm.py --all --ensemble --repo . --program anthropic",
     "--freshness-hours": "python rfc_hunt_swarm.py --all --ensemble --repo . --freshness-hours 72",
@@ -9794,7 +9909,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "deep_audit", "proxy_target", "live_proxy_fuzz", "trust_boundary_review",
             "coverage_fuzz", "enable_poc", "enable_phi", "enable_hackerone", "hackerone_auto",
             "serve_ui", "network_lifecycle", "dry_run", "enable_pe_audit", "enable_autonomous_hunt",
-            "enable_fast_ooda", "start_modelfusion", "enable_swarm", "enable_stride",
+            "enable_fast_ooda", "start_modelfusion", "enable_swarm", "enable_stride", "enable_hybrid",
         )
     ) and getattr(args, "hint", None) is None and not getattr(args, "dispatch", None):
         build_swarm_parser().print_help()
@@ -9841,6 +9956,10 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         active_mode = "setup"
     elif active_mode in ("hackone",):
         active_mode = "hackerone"
+
+    if getattr(args, "enable_hybrid", False) or active_mode == "hybrid":
+        args.enable_hybrid = True
+        args.run_all_scans = True
 
     # Validate numeric CLI bounds BEFORE --dry-run early return so invalid flags exit rc=1
     _as_json_cli = bool(getattr(args, "as_json", False))
@@ -10156,7 +10275,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "enable_rea_only", "install_tools", "tool_status",
             "raptor_status", "raptor_findings", "raptor_setup",
             "harness2_report", "mantis_report", "aiscan_report",
-            "preflight_only", "enable_pe_audit", "enable_autonomous_hunt", "enable_swarm", "enable_stride",
+            "preflight_only", "enable_pe_audit", "enable_autonomous_hunt", "enable_swarm", "enable_stride", "enable_hybrid",
         )
     )
     if active_mode == "hint" or (
@@ -11098,12 +11217,12 @@ if __name__ == "__main__":
     )
     _has_embedded = any(t in ("--embedded", "--embeded") for t in _cli_argv)
     _has_all_flag = (
-        any(t in ("--all", "--run-all", "--all-scans", "all", "all_scans") for t in _cli_argv)
-        or any(t in ("--mode=all", "--mode=all_scans") for t in _cli_argv)
+        any(t in ("--all", "--run-all", "--all-scans", "--hybrid", "all", "all_scans", "hybrid") for t in _cli_argv)
+        or any(t in ("--mode=all", "--mode=all_scans", "--mode=hybrid") for t in _cli_argv)
         or any(
             _cli_argv[idx] == "--mode"
             and idx + 1 < len(_cli_argv)
-            and _cli_argv[idx + 1] in ("all", "all_scans")
+            and _cli_argv[idx + 1] in ("all", "all_scans", "hybrid")
             for idx in range(len(_cli_argv))
         )
     )

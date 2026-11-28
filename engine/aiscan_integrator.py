@@ -469,6 +469,7 @@ class PythonAIScanner:
             ".git", "node_modules", "target", "venv", ".venv", "__pycache__",
             "out", "reports", "runs", "caldera_export", "caldera_plugin",
             "yara", "rules", "coverage", ".pytest_cache", ".mypy_cache",
+            ".agents", ".cargo", ".swarm_workspaces", "vendor",
         }
         valid_exts = {
             ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".json", ".yaml", ".yml", ".env",
@@ -547,6 +548,7 @@ class PythonAIScanner:
         skip_dirs = {
             ".git", "node_modules", "target", "venv", ".venv", "__pycache__",
             "yara", "rules", "reports", "runs", "logs", "caldera_export", "caldera_plugin",
+            ".agents", ".cargo", ".swarm_workspaces", "vendor",
         }
         try:
             for r_dir, dirs, files in os.walk(root, followlinks=False):

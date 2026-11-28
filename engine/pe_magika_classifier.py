@@ -335,7 +335,9 @@ KB5127694_MIN_WIN11_26H2_UBR = 10008
 _SKIP_SCAN_DIRS = {
     ".git", ".hg", ".svn", "node_modules", ".venv", "venv",
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
-    ".tox", "reports", "runs",
+    ".tox", "reports", "runs", "target", "dist", "build", "out",
+    "vendor", "caldera_export", "caldera_plugin", ".agents", ".cargo",
+    ".swarm_workspaces", ".lake",
 }
 
 

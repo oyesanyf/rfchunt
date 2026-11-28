@@ -143,6 +143,14 @@ SKIP_WALK_DIRS: Set[str] = {
     "runs",
     "caldera_export",
     ".pytest_cache",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "vendor",
+    ".agents",
+    ".cargo",
+    ".swarm_workspaces",
 }
 
 MAX_ASAR_HEADER_BYTES = 16 * 1024 * 1024  # 16 MiB cap against malformed ASAR pickle headers

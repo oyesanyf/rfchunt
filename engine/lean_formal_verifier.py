@@ -1683,7 +1683,7 @@ def _find_pe_candidates_bounded(repo_root: Path, max_files: int = 200, max_depth
         depth = len(cur.parts) - base_depth
         dirnames[:] = [
             d for d in dirnames
-            if d not in (".git", ".lake", "node_modules", "__pycache__", ".venv", "venv")
+            if d not in (".git", ".lake", "node_modules", "__pycache__", ".venv", "venv", "target", "dist", "build", ".agents", ".cargo")
         ]
         if depth >= max_depth:
             dirnames[:] = []

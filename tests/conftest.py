@@ -5,10 +5,18 @@ Ensures zero unclosed SQLite handles and provides retry backoff for directory cl
 
 import gc
 import os
+import platform
 import shutil
 import stat
+import sys
 import time
 import pytest
+
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+if sys.platform == "win32" and getattr(platform, "_wmi", None) is not None:
+    platform._wmi = None
 
 
 def _remove_readonly(func, path, exc_info):

@@ -1566,13 +1566,21 @@ class LocalSkillDiscoveryAndSafetyGate:
         skill_files: List[Tuple[Path, str]] = []
         seen_skill_paths: Set[str] = set()
         for root_p, src_type in unique_roots:
-            for sk_md in root_p.rglob("SKILL.md"):
-                resolved = str(sk_md.resolve(strict=False))
-                if resolved.lower() not in seen_skill_paths:
-                    seen_skill_paths.add(resolved.lower())
-                    skill_files.append((sk_md, src_type))
-                if len(skill_files) >= 250:
-                    break
+            for cur_root, cur_dirs, cur_files in os.walk(root_p, followlinks=False):
+                cur_dirs[:] = [
+                    d for d in sorted(cur_dirs)
+                    if d not in _SKIP_DIRS
+                ]
+                if "SKILL.md" in cur_files:
+                    sk_md = Path(cur_root) / "SKILL.md"
+                    resolved = str(sk_md.resolve(strict=False))
+                    if resolved.lower() not in seen_skill_paths:
+                        seen_skill_paths.add(resolved.lower())
+                        skill_files.append((sk_md, src_type))
+                    if len(skill_files) >= 250:
+                        break
+            if len(skill_files) >= 250:
+                break
 
         active_safe_skills: List[LocalSkillAuditRecord] = []
         blocked_unsafe_skills: List[LocalSkillAuditRecord] = []

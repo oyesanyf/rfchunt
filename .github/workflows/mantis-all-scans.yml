@@ -111,7 +111,9 @@ jobs:
             tests/test_ml_diff_and_recon_ranker.py \
             tests/test_program_compliance_context.py \
             tests/test_freshness_etag_and_diff_scoping.py \
-            tests/test_stride_threat_modeler.py
+            tests/test_stride_threat_modeler.py \
+            tests/test_hybrid_all_integration.py \
+            start.py
           ruff check \
             engine/trufflehog_scanner.py \
             engine/mobile_app_auditor.py \
@@ -147,14 +149,15 @@ jobs:
             tests/test_ml_diff_and_recon_ranker.py \
             tests/test_program_compliance_context.py \
             tests/test_freshness_etag_and_diff_scoping.py \
-            tests/test_stride_threat_modeler.py
+            tests/test_stride_threat_modeler.py \
+            tests/test_hybrid_all_integration.py
 
       - name: Run Mantis, ARTEX Chaining, Fusion, Remote Host & LLM Governance Tests
         env:
           CI: "true"
           RFCHUNT_OFFLINE: "1"
         run: |
-          pytest tests/test_paid_model_provider.py tests/test_preflight_discovery.py tests/test_phi_scanner.py tests/test_hackerone_porter.py tests/test_mission_control_server.py tests/test_all_8_categories_upgrade.py tests/test_code_verification_repair.py tests/test_arxiv_security_bridge.py tests/test_verification_inversion_hunter.py tests/test_bounty_pentest_upgrades.py tests/test_artex_attack_chaining.py tests/test_live_chaining_and_executors.py tests/test_local_mitm_and_sessions.py tests/test_approval_encryption_and_exports.py tests/test_dual_graph_engine.py tests/test_e2e_unified_scans.py tests/test_mantis_integrator.py tests/test_abliteration_fusion.py tests/test_remote_host_and_subcommands.py tests/test_llm_governance_and_schema.py tests/test_ssrf_adversarial_challenge.py tests/test_target_auth.py tests/test_deep_repo_audit.py tests/test_poc_generator.py tests/test_defensive_ensemble_expansion.py tests/test_linux_poc_runner.py tests/test_async_blackboard_runtime.py tests/test_ensemble_orchestrator.py tests/test_bounty_loops_integration.py tests/test_e2e_bounty_loops.py tests/test_tier5_adversarial_hardening.py tests/test_autonomous_hunt_script.py tests/test_ml_program_selector.py tests/test_ml_diff_and_recon_ranker.py tests/test_program_compliance_context.py tests/test_freshness_etag_and_diff_scoping.py tests/test_stride_threat_modeler.py -v --basetemp=/tmp/pytest_rfchunt
+          pytest tests/test_paid_model_provider.py tests/test_preflight_discovery.py tests/test_phi_scanner.py tests/test_hackerone_porter.py tests/test_mission_control_server.py tests/test_all_8_categories_upgrade.py tests/test_code_verification_repair.py tests/test_arxiv_security_bridge.py tests/test_verification_inversion_hunter.py tests/test_bounty_pentest_upgrades.py tests/test_artex_attack_chaining.py tests/test_live_chaining_and_executors.py tests/test_local_mitm_and_sessions.py tests/test_approval_encryption_and_exports.py tests/test_dual_graph_engine.py tests/test_e2e_unified_scans.py tests/test_mantis_integrator.py tests/test_abliteration_fusion.py tests/test_remote_host_and_subcommands.py tests/test_llm_governance_and_schema.py tests/test_ssrf_adversarial_challenge.py tests/test_target_auth.py tests/test_deep_repo_audit.py tests/test_poc_generator.py tests/test_defensive_ensemble_expansion.py tests/test_linux_poc_runner.py tests/test_async_blackboard_runtime.py tests/test_ensemble_orchestrator.py tests/test_bounty_loops_integration.py tests/test_e2e_bounty_loops.py tests/test_tier5_adversarial_hardening.py tests/test_autonomous_hunt_script.py tests/test_ml_program_selector.py tests/test_ml_diff_and_recon_ranker.py tests/test_program_compliance_context.py tests/test_freshness_etag_and_diff_scoping.py tests/test_stride_threat_modeler.py tests/test_artex_multiturn_loop.py tests/test_external_scanners.py tests/test_cli_mcp_scanners_integration.py tests/test_policy_and_budget_guardrails.py tests/test_rea_integrator.py tests/e2e_r1_r4/test_tier1_artex_loop.py tests/e2e_r1_r4/test_tier1_cli_mcp.py tests/e2e_r1_r4/test_tier1_scanners_policy.py tests/test_hybrid_all_integration.py -v --basetemp=/tmp/pytest_rfchunt
 
       - name: Upload Security Reports Artifact
         if: always()

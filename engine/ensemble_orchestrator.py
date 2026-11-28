@@ -2046,7 +2046,7 @@ class EnsembleOrchestrator:
                 dirnames[:] = [
                     d
                     for d in sorted(dirnames)
-                    if d not in (".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build")
+                    if d not in (".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", "target", ".agents", ".cargo")
                 ]
                 for fn in sorted(filenames):
                     scanned += 1
@@ -2111,6 +2111,10 @@ class EnsembleOrchestrator:
                 "reports",
                 ".pytest_cache",
                 "coverage",
+                "target",
+                ".agents",
+                ".cargo",
+                "vendor",
             }
             for cur_root, dirnames, filenames in os.walk(root):
                 dirnames[:] = [d for d in sorted(dirnames) if d not in skip_dirs]
