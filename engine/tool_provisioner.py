@@ -763,7 +763,14 @@ class ToolProvisioner:
     @staticmethod
     def _docker_available() -> Optional[str]:
         found = shutil.which("docker")
-        return found if found else None
+        if found:
+            return found
+        try:
+            from engine.docker_wsl_doctor import find_docker_binary
+
+            return find_docker_binary()
+        except Exception:
+            return None
 
     def _docker_image_id(self, image_ref: str) -> Optional[str]:
         docker_bin = self._docker_available()
@@ -969,7 +976,7 @@ class ToolProvisioner:
             from engine.ensemble_orchestrator import StrixAdapter
 
             strix_bin = self.find_binary("strix")
-            docker_ok = bool(shutil.which("docker") and allow_probes and self._docker_daemon_responsive())
+            docker_ok = bool(self._docker_available() and allow_probes and self._docker_daemon_responsive())
             res_eval = StrixAdapter.evaluate_resources(
                 docker_daemon=docker_ok,
                 strix_binary=str(strix_bin) if strix_bin else None,

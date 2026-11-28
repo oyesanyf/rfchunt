@@ -81,15 +81,15 @@ EXCLUDED_PAID_OR_HEAVY_TOOLS: Dict[str, str] = {}
 
 RESOURCE_BUDGET_PROFILES: Dict[str, Dict[str, Any]] = {
     "docker_runtime": {
-        "min_total_ram_gb": 8.0,
-        "min_free_ram_gb": 3.0,
+        "min_total_ram_gb": 7.5,
+        "min_free_ram_gb": 2.0,
         "min_cpu_cores": 2,
         "min_free_disk_gb": 12.0,
         "docker_required": False,
         "description": "Docker Desktop / Docker Engine auto-provisioning & container execution",
     },
     "strix": {
-        "min_total_ram_gb": 12.0,
+        "min_total_ram_gb": 11.5,
         "min_free_ram_gb": 4.0,
         "min_cpu_cores": 4,
         "min_free_disk_gb": 10.0,
@@ -97,32 +97,32 @@ RESOURCE_BUDGET_PROFILES: Dict[str, Dict[str, Any]] = {
         "description": "Strix autonomous security agent (usestrix/strix)",
     },
     "codeql": {
-        "min_total_ram_gb": 8.0,
-        "min_free_ram_gb": 2.5,
+        "min_total_ram_gb": 7.5,
+        "min_free_ram_gb": 2.0,
         "min_cpu_cores": 2,
         "min_free_disk_gb": 5.0,
         "docker_required": False,
         "description": "GitHub CodeQL CLI database creation & taint query execution",
     },
     "raptor_docker": {
-        "min_total_ram_gb": 8.0,
-        "min_free_ram_gb": 3.0,
+        "min_total_ram_gb": 7.5,
+        "min_free_ram_gb": 2.0,
         "min_cpu_cores": 2,
         "min_free_disk_gb": 8.0,
         "docker_required": True,
         "description": "RAPTOR Docker container mode (falls back to native Python/Semgrep on non-Docker hosts)",
     },
     "poe_container": {
-        "min_total_ram_gb": 8.0,
-        "min_free_ram_gb": 2.5,
+        "min_total_ram_gb": 7.5,
+        "min_free_ram_gb": 2.0,
         "min_cpu_cores": 2,
         "min_free_disk_gb": 5.0,
         "docker_required": True,
         "description": "Isolated --network=none ContainerPOEVerifier (POE==3 runtime verification)",
     },
     "docker_parser_matrix": {
-        "min_total_ram_gb": 8.0,
-        "min_free_ram_gb": 3.0,
+        "min_total_ram_gb": 7.5,
+        "min_free_ram_gb": 2.0,
         "min_cpu_cores": 2,
         "min_free_disk_gb": 6.0,
         "docker_required": True,
@@ -500,8 +500,9 @@ class RuntimeCapabilityProbe:
         else:
             binaries["semgrep"] = None
 
-        docker_bin = shutil.which("docker")
+        docker_bin = prov._docker_available()
         docker_cli = bool(docker_bin)
+        binaries["docker"] = docker_bin
         docker_daemon = bool(docker_cli and allow_daemon_probes and prov._docker_daemon_responsive())
         node_cli = bool(shutil.which("node"))
         cargo_cli = bool(shutil.which("cargo") or (Path.home() / ".cargo" / "bin" / ("cargo.exe" if os.name == "nt" else "cargo")).is_file())
@@ -3073,7 +3074,7 @@ class StrixAdapter:
     """
 
     SCANNER_NAME = "Strix-Agent"
-    MIN_TOTAL_RAM_GB = 12.0
+    MIN_TOTAL_RAM_GB = 11.5
     MIN_FREE_RAM_GB = 4.0
     MIN_CPU_CORES = 4
     MIN_FREE_DISK_GB = 10.0
@@ -3111,7 +3112,7 @@ class StrixAdapter:
             free_disk = float(res["free_disk_gb"])
             prov = ToolProvisioner()
             if docker_daemon is None:
-                docker_ok = bool(shutil.which("docker") and not _is_offline_or_test_env() and prov._docker_daemon_responsive())
+                docker_ok = bool(prov._docker_available() and not _is_offline_or_test_env() and prov._docker_daemon_responsive())
             else:
                 docker_ok = bool(docker_daemon)
             found_bin = prov.find_binary("strix")
