@@ -20,8 +20,15 @@ Core Mechanisms:
   - Autonomous discovery cascade & Post-Quantum Cryptography (PQC) standards
 """
 
+import os
 import sys
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
 if sys.platform == "win32":
+    import platform as _platform
+    if getattr(_platform, "_wmi", None) is not None:
+        _platform._wmi = None
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -34,13 +41,12 @@ import contextlib
 import hashlib
 import inspect
 import math
-import os
 from pathlib import Path
 import operator
 import re
 import threading
 import time
-from typing import Annotated, Any, Dict, List, Optional, Sequence, Tuple, TypedDict
+from typing import Annotated, Any, Dict, List, Optional, Sequence, Tuple, TypedDict, Union
 
 END = "__end__"
 StateGraph = None  # Resolved lazily by _resolve_langgraph() to keep CLI startup fast
@@ -2738,6 +2744,30 @@ def cmd_aiscan(args):
 
     db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
     try:
+        if getattr(args, "aiscan_report", False):
+            target_filter = getattr(args, "aiscan_target", None) or getattr(args, "repo", None) or getattr(args, "path", None)
+            stored = db.get_ai_findings(target_path=target_filter, limit=50)
+            if getattr(args, "as_json", False):
+                from engine.cli_render import render_json
+
+                render_json({"status": "ok", "total_findings": len(stored), "findings": stored})
+                return
+            print(f"\n{'='*75}")
+            print(f"[*] HAASONSAAS/AISCAN STORED AI SECURITY FINDINGS ({len(stored)} rows)")
+            print(f"{'='*75}")
+            if not stored:
+                print("  [+] No stored AI security audit findings in database.")
+            else:
+                for row in stored[:25]:
+                    loc = f"{Path(str(row.get('file_path', ''))).name}:{row.get('line_number', 0)}"
+                    print(
+                        f"  [{str(row.get('severity', 'INFO')):<8}] "
+                        f"{str(row.get('finding_type', '')):<26} {loc:<28} "
+                        f"{str(row.get('description', ''))[:60]}"
+                    )
+            print(f"{'='*75}\n")
+            return
+
         scanner = AiscanIntegrator(db=db)
 
         print("\n" + "=" * 75)
@@ -2779,6 +2809,36 @@ def cmd_aiscan(args):
         print("=" * 75 + "\n")
     finally:
         db.close()
+
+
+def _resolve_cli_workspace_root(args) -> Optional[Path]:
+    ws_raw = (
+        getattr(args, "workspace_root", None)
+        or getattr(args, "repo", None)
+        or getattr(args, "path", None)
+    )
+    if ws_raw is None:
+        return None
+    ws_str = os.fspath(ws_raw) if isinstance(ws_raw, os.PathLike) else str(ws_raw)
+    if not ws_str.strip():
+        return None
+    from engine.execution_policy import (
+        _is_drive_relative_or_colon_unsafe,
+        _is_unc_path,
+        _validate_canonical_path_syntax,
+    )
+
+    if ws_str != ws_str.strip() or any(ord(ch) < 32 or ord(ch) == 127 for ch in ws_str):
+        raise PermissionError("Unsafe CLI workspace_root rejected (whitespace or control characters).")
+    if _is_unc_path(ws_str) or _is_drive_relative_or_colon_unsafe(ws_str):
+        raise PermissionError("Unsafe CLI workspace_root rejected (UNC, NT-device, or drive-relative/ADS path).")
+    err = _validate_canonical_path_syntax(ws_str, allow_trailing_slash=True)
+    if err is not None and ws_str != ".":
+        raise PermissionError(f"Unsafe CLI workspace_root rejected: {err}")
+    resolved = Path(ws_str).resolve(strict=False)
+    if resolved.exists() and resolved.is_file():
+        return resolved.parent
+    return resolved
 
 
 def cmd_artex(args):
@@ -2935,6 +2995,7 @@ def cmd_artex(args):
                 noise_governor=shared_noise,
                 auth_profiles=loaded_auth_profiles,
                 arbiter=arbiter,
+                workspace_root=_resolve_cli_workspace_root(args),
             )
             live_executor_fn = live_registry.as_executor_fn()
 
@@ -3535,6 +3596,76 @@ def _run_all_aixcc_extensions(
     )
     out_root = Path(str(reports_dir or "reports"))
 
+    explicit_fuzz = bool(getattr(args, "fuzz_bridge", False))
+    disable_fuzz = bool(getattr(args, "no_fuzz_bridge", False))
+    exec_fuzz_containers = (not bool(getattr(args, "fuzz_dry_run", False))) and (
+        str(approval_mode or "").strip().lower() != "deny"
+    )
+    eligible_fuzz = local_target_exists and not disable_fuzz and (explicit_fuzz or not in_offline_or_pytest)
+
+    explicit_dpm = bool(getattr(args, "docker_parser_matrix", False))
+    disable_dpm = bool(getattr(args, "no_docker_parser_matrix", False))
+    eligible_dpm = (not disable_dpm) and (explicit_dpm or (bool(host) and not in_offline_or_pytest))
+
+    explicit_inv = bool(getattr(args, "sandbox_invariants", False))
+    disable_inv = bool(getattr(args, "no_sandbox_invariants", False))
+    eligible_inv = local_target_exists and not disable_inv and (explicit_inv or not in_offline_or_pytest)
+
+    explicit_poe = bool(getattr(args, "poe_verify", False))
+    disable_poe = bool(getattr(args, "no_poe_verify", False))
+    eligible_poe = (not disable_poe) and (explicit_poe or not in_offline_or_pytest)
+
+    # Single shared lightweight Docker daemon probe (<=1.0s) when running online with
+    # container-capable AIxCC extensions enabled, preventing 3-4 sequential 2.5s-3.0s
+    # Docker CLI timeouts on Windows hosts where Docker Desktop is stopped/absent.
+    shared_docker_ok: Optional[bool] = None
+    shared_docker_reason = ""
+    if not in_offline_or_pytest and (
+        (eligible_fuzz and exec_fuzz_containers) or eligible_dpm or eligible_inv or eligible_poe
+    ):
+        import shutil as _shutil
+        import subprocess as _subprocess
+        from engine.host_containment import silent_subprocess_run
+
+        _docker_bin = _shutil.which("docker")
+        if not _docker_bin:
+            shared_docker_ok = False
+            shared_docker_reason = "docker binary not found on PATH"
+        else:
+            try:
+                _docker_proc = silent_subprocess_run(
+                    [_docker_bin, "info", "--format", "{{.ServerVersion}}"],
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=1.0,
+                )
+                if _docker_proc.returncode == 0:
+                    shared_docker_ok = True
+                else:
+                    shared_docker_ok = False
+                    shared_docker_reason = (
+                        (_docker_proc.stderr or _docker_proc.stdout or f"exit code {_docker_proc.returncode}").strip()[:240]
+                    )
+            except _subprocess.TimeoutExpired:
+                shared_docker_ok = False
+                shared_docker_reason = "docker daemon probe timed out after 1.0s"
+            except OSError as _docker_exc:
+                shared_docker_ok = False
+                shared_docker_reason = str(_docker_exc)[:240]
+
+    def _unavailable_docker_runner(cmd: Sequence[str], **_kwargs: Any) -> Any:
+        import subprocess as _subprocess
+
+        return _subprocess.CompletedProcess(
+            args=list(cmd),
+            returncode=1,
+            stdout="",
+            stderr=shared_docker_reason or "docker daemon unavailable",
+        )
+
     # 1. Whole-Repo Multi-Language Call-Graph & Taint Slicer + Tiered Model Escalation (AIxCC #2)
     run_slicer = not bool(getattr(args, "no_call_graph_slice", False))
     if local_target_exists and run_slicer:
@@ -3610,29 +3741,55 @@ def _run_all_aixcc_extensions(
         engines["call_graph_slicer"] = {"status": "disabled"}
 
     # 2. Multi-Language LLM-Guided Coverage Fuzzing Bridge (AIxCC #3)
-    explicit_fuzz = bool(getattr(args, "fuzz_bridge", False))
-    disable_fuzz = bool(getattr(args, "no_fuzz_bridge", False))
     if local_target_exists and not disable_fuzz:
         if explicit_fuzz or not in_offline_or_pytest:
             try:
-                from engine.fuzz_bridge import run_fuzz_bridge_scan
+                from engine.fuzz_bridge import FuzzBridgeConfig, LLMFuzzBridge, run_fuzz_bridge_scan
 
-                exec_containers = (not bool(getattr(args, "fuzz_dry_run", False))) and (
-                    str(approval_mode or "").strip().lower() != "deny"
-                )
                 fuzz_langs = _parse_csv_list(getattr(args, "fuzz_languages", None))
                 fuzz_out = out_root / "fuzz_bridge"
-                fuzz_res = run_fuzz_bridge_scan(
-                    str(local_target),
-                    output_dir=str(fuzz_out),
-                    db=db,
-                    task_id=task_id,
-                    languages=fuzz_langs,
-                    timeout_sec=float(getattr(args, "fuzz_timeout", 60.0) or 60.0),
-                    max_total_time_sec=int(getattr(args, "fuzz_max_time", 30) or 30),
-                    cpp_backend=str(getattr(args, "fuzz_cpp_backend", "afl++") or "afl++"),
-                    execute_containers=exec_containers,
-                )
+                fuzz_timeout = float(getattr(args, "fuzz_timeout", 60.0) or 60.0)
+                fuzz_max_time = int(getattr(args, "fuzz_max_time", 30) or 30)
+                fuzz_cpp_backend = str(getattr(args, "fuzz_cpp_backend", "afl++") or "afl++")
+                if (
+                    shared_docker_ok is False
+                    and exec_fuzz_containers
+                    and getattr(run_fuzz_bridge_scan, "__module__", "") == "engine.fuzz_bridge"
+                    and getattr(LLMFuzzBridge, "__module__", "") == "engine.fuzz_bridge"
+                ):
+                    fuzz_cfg = FuzzBridgeConfig(
+                        timeout_sec=fuzz_timeout,
+                        max_total_time_sec=fuzz_max_time,
+                        cpp_backend=fuzz_cpp_backend,
+                        execute_containers=exec_fuzz_containers,
+                        docker_binary="",
+                    )
+                    fuzz_bridge = LLMFuzzBridge(
+                        db=db,
+                        config=fuzz_cfg,
+                        task_id=task_id,
+                        subprocess_runner=_unavailable_docker_runner,
+                    )
+                    fuzz_res = fuzz_bridge.run(
+                        str(local_target),
+                        output_dir=str(fuzz_out),
+                        task_id=task_id,
+                        languages=fuzz_langs,
+                        execute=exec_fuzz_containers,
+                    ).to_dict()
+                else:
+                    fuzz_res = run_fuzz_bridge_scan(
+                        str(local_target),
+                        output_dir=str(fuzz_out),
+                        db=db,
+                        task_id=task_id,
+                        languages=fuzz_langs,
+                        timeout_sec=fuzz_timeout,
+                        max_total_time_sec=fuzz_max_time,
+                        cpp_backend=fuzz_cpp_backend,
+                        execute_containers=exec_fuzz_containers,
+                        **({"docker_binary": ""} if shared_docker_ok is False else {}),
+                    )
                 engines["fuzz_bridge"] = fuzz_res
             except Exception as exc:
                 engines["fuzz_bridge"] = {"status": "error", "error": str(exc)}
@@ -3648,17 +3805,29 @@ def _run_all_aixcc_extensions(
         engines["fuzz_bridge"] = {"status": "disabled"}
 
     # 3. Real Differential Docker Parser Matrix (AIxCC #1a)
-    explicit_dpm = bool(getattr(args, "docker_parser_matrix", False))
-    disable_dpm = bool(getattr(args, "no_docker_parser_matrix", False))
     if not disable_dpm and (explicit_dpm or (bool(host) and not in_offline_or_pytest)):
         try:
-            from engine.differential_oracle import MultiImplementationDifferentialOracle
+            from engine.differential_oracle import DockerParserMatrix, MultiImplementationDifferentialOracle
 
             dpm_parsers = _parse_csv_list(getattr(args, "parsers", None))
             dpm_oracle = MultiImplementationDifferentialOracle()
+            dpm_matrix = (
+                DockerParserMatrix(
+                    parsers=dpm_parsers,
+                    docker_bin="",
+                    subprocess_runner=_unavailable_docker_runner,
+                )
+                if (
+                    shared_docker_ok is False
+                    and getattr(MultiImplementationDifferentialOracle, "__module__", "") == "engine.differential_oracle"
+                    and getattr(DockerParserMatrix, "__module__", "") == "engine.differential_oracle"
+                )
+                else None
+            )
             engines["docker_parser_matrix"] = dpm_oracle.run_docker_parser_matrix(
                 parsers=dpm_parsers,
                 fallback_to_4parsers=bool(getattr(args, "fallback_4parsers", False)),
+                **({"docker_matrix": dpm_matrix} if dpm_matrix is not None else {}),
             )
         except Exception as exc:
             engines["docker_parser_matrix"] = {"status": "error", "error": str(exc)}
@@ -3666,14 +3835,19 @@ def _run_all_aixcc_extensions(
         engines["docker_parser_matrix"] = {"status": "disabled"}
 
     # 4. Sandboxed Repo Invariant Runner (AIxCC #1b)
-    explicit_inv = bool(getattr(args, "sandbox_invariants", False))
-    disable_inv = bool(getattr(args, "no_sandbox_invariants", False))
     if local_target_exists and not disable_inv:
         if explicit_inv or not in_offline_or_pytest:
             try:
                 from engine.sandbox_invariant_runner import SandboxInvariantRunner
 
-                inv_runner = SandboxInvariantRunner()
+                inv_runner = (
+                    SandboxInvariantRunner(docker_bin="", subprocess_runner=_unavailable_docker_runner)
+                    if (
+                        shared_docker_ok is False
+                        and getattr(SandboxInvariantRunner, "__module__", "") == "engine.sandbox_invariant_runner"
+                    )
+                    else SandboxInvariantRunner()
+                )
                 inv_report = inv_runner.run(
                     str(local_target),
                     db=db,
@@ -3695,15 +3869,20 @@ def _run_all_aixcc_extensions(
         engines["sandbox_invariants"] = {"status": "disabled"}
 
     # 5. Containerized Non-Destructive POE==3 Verifier (AIxCC #5a)
-    explicit_poe = bool(getattr(args, "poe_verify", False))
-    disable_poe = bool(getattr(args, "no_poe_verify", False))
     if not disable_poe:
         if explicit_poe or not in_offline_or_pytest:
             try:
                 from engine.poe_container_verifier import ContainerPOEVerifier
 
                 all_findings = res.get("findings") if isinstance(res.get("findings"), list) else []
-                poe_verifier = ContainerPOEVerifier()
+                poe_verifier = (
+                    ContainerPOEVerifier(docker_bin="", subprocess_runner=_unavailable_docker_runner)
+                    if (
+                        shared_docker_ok is False
+                        and getattr(ContainerPOEVerifier, "__module__", "") == "engine.poe_container_verifier"
+                    )
+                    else ContainerPOEVerifier()
+                )
                 poe_batch = poe_verifier.verify_findings(
                     all_findings,
                     repo_path=str(local_target) if local_target_exists else None,
@@ -3773,6 +3952,95 @@ def _run_all_aixcc_extensions(
             raise
         except Exception as exc:
             engines["hackerone_porter"] = {"status": "error", "error": str(exc)}
+
+
+def cmd_stride(
+    args: Any,
+    *,
+    return_dict_only: bool = False,
+    existing_findings: Sequence[Dict[str, Any]] = (),
+) -> Dict[str, Any]:
+    """
+    Executes `--stride`: Fusion-powered STRIDE + MITRE ATT&CK + Zero Trust Threat Modeling,
+    Trust Boundaries, Security Requirements, and Downloadable Attack Tree SVG Diagram Engine.
+    Automatically triggers during `--all` / `--ensemble` when a codebase has no threat model.
+    """
+    from engine.stride_threat_modeler import StrideThreatModeler
+
+    hunt_t = list(getattr(args, "hunt_targets", None) or [])
+    target_path = (
+        getattr(args, "repo", None)
+        or getattr(args, "path", None)
+        or getattr(args, "raptor_target", None)
+        or (hunt_t[0] if hunt_t else None)
+        or getattr(args, "target_arg", None)
+        or "."
+    )
+    out_dir = str(
+        getattr(args, "stride_out", None)
+        or (Path(str(getattr(args, "output_dir", "reports") or "reports")) / "stride_threat_model")
+    )
+    dry_run = bool(getattr(args, "dry_run", False))
+    embedded = bool(getattr(args, "embedded", False))
+    no_llm = bool(getattr(args, "no_llm", False))
+    no_models = not bool(getattr(args, "include_models", True))
+    use_fusion = bool(getattr(args, "fusion", True)) and not embedded and not no_llm and not no_models
+    diagrams = list(getattr(args, "stride_diagrams", None) or [])
+    write_repo = bool(getattr(args, "stride_write_repo", False))
+    force_gen = bool(getattr(args, "enable_stride", False)) or bool(diagrams)
+
+    modeler = StrideThreatModeler(
+        use_fusion=use_fusion,
+        embedded=embedded,
+        model=getattr(args, "model", None),
+        sec_model=getattr(args, "sec_model", None),
+    )
+    result = modeler.analyze_codebase(
+        str(target_path),
+        out_dir=out_dir,
+        diagram_paths=diagrams,
+        existing_findings=existing_findings,
+        force_generate=force_gen,
+        write_to_repo=write_repo,
+        dry_run=dry_run,
+    )
+
+    if return_dict_only:
+        return result
+
+    if getattr(args, "as_json", False):
+        from engine.cli_render import render_json
+
+        render_json(result)
+        return result
+
+    rf = result.get("report_files") or {}
+    print("\n" + "=" * 78)
+    print("  RFCHUNT + MODELFUSION: STRIDE / MITRE ATT&CK / ZERO TRUST THREAT MODEL (--stride)")
+    print("=" * 78)
+    print(f"  Status                : {result.get('status')}")
+    print(f"  Target Path           : {result.get('target_path')}")
+    print(f"  Missing Threat Model  : {result.get('missing_threat_model')} (auto_generated={result.get('auto_generated')})")
+    print(f"  Components Discovered : {result.get('components_count', 0)}")
+    print(f"  Trust Boundaries      : {result.get('trust_boundaries_count', 0)}")
+    print(f"  STRIDE Threat Matrix  : {result.get('threat_scenarios_count', 0)} scenarios {result.get('severity_counts', {})}")
+    print(f"  Security Requirements : {result.get('security_requirements_count', 0)}")
+    print(f"  Attack Trees (SVG)    : {result.get('attack_trees_count', result.get('attack_trees_planned', 0))}")
+    if not dry_run:
+        print(f"  Report Markdown       : {rf.get('markdown', '-')}")
+        print(f"  Architecture Diagram  : {rf.get('architecture_svg', '-')}")
+        if rf.get("architecture_png"):
+            print(f"  Architecture PNG      : {rf.get('architecture_png')}")
+        if rf.get("attack_tree_svgs"):
+            print(f"  Attack Tree Diagrams  : {', '.join(rf['attack_tree_svgs'][:5])}")
+        if rf.get("attack_tree_pngs"):
+            print(f"  Attack Tree PNGs      : {', '.join(rf['attack_tree_pngs'][:5])}")
+        if rf.get("repo_threat_model_md"):
+            print(f"  Repo THREAT_MODEL.md  : {rf.get('repo_threat_model_md')}")
+    else:
+        print("  Dry-Run Mode          : ACTIVE (0 files written, 0 network requests)")
+    print("=" * 78 + "\n")
+    return result
 
 
 def cmd_phi(
@@ -3916,6 +4184,232 @@ def cmd_preflight(args: Any, *, return_dict_only: bool = False) -> Dict[str, Any
     return result
 
 
+def _validate_cli_output_dir(
+    raw_out_dir: Any,
+    *,
+    explicit_ws_root: Optional[Path] = None,
+    inferred_ws_root: Optional[Path] = None,
+    label: str = "output_dir",
+) -> Path:
+    """
+    Validates CLI `--output-dir` against canonical syntax, sensitive host directories,
+    symlinks / NTFS junctions / reparse ancestors, and `workspace_root` confinement:
+    - When `--workspace-root` is explicitly set (`explicit_ws_root`), strictly confines output
+      inside `explicit_ws_root` (no `%TEMP%` fallthrough).
+    - Otherwise allows paths inside `inferred_ws_root`, strict `%TEMP%` subdirectories,
+      `.pytest_temp` (under pytest), or `ExecutionPolicy.ALLOWED_WRITE_SUBDIRS`.
+    """
+    import tempfile as _tempfile
+    from engine.execution_policy import (
+        ExecutionPolicy,
+        _is_drive_relative_or_colon_unsafe,
+        _is_unc_path,
+        _validate_canonical_path_syntax,
+    )
+    from engine.pe_magika_classifier import _reject_reparse_ancestors
+
+    raw_s = os.fspath(raw_out_dir) if isinstance(raw_out_dir, os.PathLike) else raw_out_dir
+    if not isinstance(raw_s, str) or not raw_s.strip():
+        raise ValueError(f"Unsafe {label} rejected: empty path")
+    if raw_s != raw_s.strip() or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_s):
+        raise PermissionError(f"Unsafe {label} rejected (whitespace or control characters).")
+    if _is_unc_path(raw_s) or _is_drive_relative_or_colon_unsafe(raw_s):
+        raise PermissionError(f"Unsafe {label} rejected (UNC, NT-device, or drive-relative/ADS path).")
+    syn_err = _validate_canonical_path_syntax(raw_s, allow_trailing_slash=True)
+    if syn_err is not None and raw_s != ".":
+        raise PermissionError(f"Unsafe {label} rejected: {syn_err}")
+
+    def _reject_sensitive(cand_raw: str, cand_res: Optional[str]) -> None:
+        sensitive_markers = (
+            "/.ssh",
+            "/.aws",
+            "/.gnupg",
+            "/.kube",
+            "/etc/passwd",
+            "/etc/shadow",
+            "/windows/system32",
+            "/windows/syswow64",
+            "/windows/temp",
+        )
+        cands: List[str] = [cand_raw]
+        if cand_raw.startswith("~"):
+            try:
+                exp = os.path.expanduser(cand_raw)
+                cands.extend([exp, str(Path(exp).resolve(strict=False))])
+            except Exception:
+                pass
+        if cand_res:
+            cands.append(cand_res)
+        for c in cands:
+            c_low = c.replace("\\", "/").lower().rstrip("/") or "/"
+            if (
+                any(
+                    c_low == m or c_low.startswith(m + "/") or c_low.endswith(m) or (m + "/" in c_low)
+                    for m in sensitive_markers
+                )
+                or re.match(r"^[a-z]:/windows(?:/|$)", c_low)
+                or re.match(r"^[a-z]:/(?:system32|syswow64)(?:/|$)", c_low)
+            ):
+                raise PermissionError(f"Unsafe {label} rejected: sensitive host path '{raw_out_dir}' is forbidden.")
+
+    _reject_sensitive(raw_s, None)
+
+    pol = ExecutionPolicy.get_instance()
+    if explicit_ws_root is not None:
+        ok_ws, detail_ws = pol.validate_file_path(
+            raw_s,
+            workspace_root=explicit_ws_root,
+            allow_directory=True,
+            allow_nonexistent=True,
+        )
+        if not ok_ws:
+            raise PermissionError(
+                f"Unsafe {label} rejected outside --workspace-root '{explicit_ws_root}': {detail_ws}"
+            )
+        _reject_sensitive(raw_s, detail_ws)
+        return Path(detail_ws)
+
+    if inferred_ws_root is not None:
+        ok_inf, detail_inf = pol.validate_file_path(
+            raw_s,
+            workspace_root=inferred_ws_root,
+            allow_directory=True,
+            allow_nonexistent=True,
+        )
+        if ok_inf:
+            _reject_sensitive(raw_s, detail_inf)
+            return Path(detail_inf)
+
+    _reject_reparse_ancestors(raw_s, label=label)
+    resolved_out = Path(raw_s).resolve(strict=False)
+    _reject_sensitive(raw_s, str(resolved_out))
+
+    out_cmp = Path(os.path.normcase(str(resolved_out)))
+    temp_root = Path(os.path.normcase(str(Path(_tempfile.gettempdir()).resolve(strict=False))))
+    if out_cmp != temp_root and out_cmp.is_relative_to(temp_root):
+        return resolved_out
+
+    rfchunt_root = Path(__file__).resolve().parent
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        pt_root = Path(os.path.normcase(str((rfchunt_root.parent / ".pytest_temp").resolve(strict=False))))
+        if out_cmp != pt_root and out_cmp.is_relative_to(pt_root):
+            return resolved_out
+
+    for allowed_sub in ExecutionPolicy.ALLOWED_WRITE_SUBDIRS:
+        allowed_dir = Path(os.path.normcase(str((rfchunt_root / allowed_sub).resolve(strict=False))))
+        if out_cmp == allowed_dir or out_cmp.is_relative_to(allowed_dir):
+            return resolved_out
+
+    raise PermissionError(
+        f"Unsafe {label} rejected outside workspace_root and designated report/temp directories: '{raw_out_dir}'"
+    )
+
+
+def cmd_pe_audit(args: Any) -> Dict[str, Any]:
+    """
+    Standalone PE & .NET Code Integrity Anomaly Auditor (`pe-audit` / `--pe-audit`):
+    runs Magika hybrid PE classification, CVE-2026-108398, UMCI/SEC_COMMIT flat memory
+    fallback heuristics, defensive YARA rules, and optional KB5127694 / VirtualBox 7.2.18+
+    host patch auditing with strict workspace_root confinement.
+    """
+    from engine.execution_policy import ExecutionPolicy, _validate_canonical_path_syntax
+    from engine.pe_magika_classifier import audit_pe_dotnet_target
+
+    as_json = bool(getattr(args, "as_json", False))
+    if getattr(args, "dry_run", False):
+        return cmd_dry_run_plan(args, active_mode="pe-audit", raw_argv=[])
+
+    target_path = (
+        getattr(args, "path", None)
+        or getattr(args, "repo", None)
+        or getattr(args, "target_arg", None)
+        or "."
+    )
+    explicit_ws_arg = getattr(args, "workspace_root", None)
+    explicit_ws_root: Optional[Path] = None
+    try:
+        ws_root = _resolve_cli_workspace_root(args)
+        if explicit_ws_arg is not None and str(explicit_ws_arg).strip():
+            explicit_ws_root = ws_root
+        pol = ExecutionPolicy.get_instance()
+        if ws_root is not None:
+            ok_tp, detail_tp = pol.validate_file_path(
+                target_path,
+                workspace_root=ws_root,
+                allow_directory=True,
+                allow_nonexistent=True,
+            )
+            if not ok_tp:
+                raise PermissionError(f"Unsafe target_path rejected outside workspace_root: {detail_tp}")
+            resolved_target = detail_tp
+        else:
+            err = _validate_canonical_path_syntax(str(target_path), allow_trailing_slash=True)
+            if err is not None and str(target_path) != ".":
+                raise PermissionError(f"Unsafe target_path rejected: {err}")
+            resolved_target = str(Path(str(target_path)).resolve(strict=False))
+
+        out_dir_raw = getattr(args, "output_dir", None)
+        validated_out_dir: Optional[Path] = None
+        if out_dir_raw:
+            validated_out_dir = _validate_cli_output_dir(
+                out_dir_raw,
+                explicit_ws_root=explicit_ws_root,
+                inferred_ws_root=ws_root,
+                label="PE/.NET audit output_dir",
+            )
+    except (PermissionError, ValueError) as exc:
+        print(f"[!] PE/.NET audit path error: {exc}", file=(sys.stderr if as_json else sys.stdout))
+        sys.exit(1)
+
+    raw_host_audit = getattr(args, "pe_include_host_audit", None)
+    include_host = True if raw_host_audit is None else bool(raw_host_audit)
+    include_yara = bool(getattr(args, "pe_include_yara", True))
+
+    try:
+        result = audit_pe_dotnet_target(
+            resolved_target,
+            include_host_audit=include_host,
+            include_yara=include_yara,
+            workspace_root=ws_root,
+        )
+    except (PermissionError, ValueError) as exc:
+        print(f"[!] PE/.NET audit path error: {exc}", file=(sys.stderr if as_json else sys.stdout))
+        sys.exit(1)
+
+    if validated_out_dir is not None:
+        try:
+            validated_out_dir.mkdir(parents=True, exist_ok=True)
+            report_file = validated_out_dir / "pe_dotnet_audit.json"
+            with open(report_file, "w", encoding="utf-8") as fh:
+                import json as _json
+                _json.dump(result, fh, indent=2)
+            result["report_path"] = str(report_file)
+        except (PermissionError, ValueError, OSError) as exc:
+            print(f"[!] PE/.NET audit output_dir error: {exc}", file=(sys.stderr if as_json else sys.stdout))
+            sys.exit(1)
+
+    if as_json:
+        from engine.cli_render import render_json
+        render_json(result)
+        return result
+
+    print("\n" + "=" * 78)
+    print("  RFCHUNT PE & .NET CODE INTEGRITY ANOMALY AUDITOR (--pe-audit)")
+    print("=" * 78)
+    print(f"  Status              : {result.get('status')}")
+    print(f"  Target Path         : {result.get('target_path')}")
+    print(f"  Files Scanned       : {result.get('files_scanned', 0)} (PE={result.get('pe_files_found', 0)}, .NET={result.get('dotnet_assemblies_found', 0)})")
+    print(f"  CVE-2026-108398     : {result.get('cve_2026_108398_count', 0)}")
+    print(f"  UMCI/SEC_COMMIT     : {result.get('umci_fallback_risk_count', 0)}")
+    print(f"  Masqueraded Files   : {result.get('masqueraded_files_count', 0)}")
+    print(f"  YARA Matches        : {result.get('yara_matches_count', 0)}")
+    print(f"  Total Findings      : {result.get('total_findings', 0)} {result.get('severity_counts', {})}")
+    if result.get("report_path"):
+        print(f"  Report JSON         : {result.get('report_path')}")
+    print("=" * 78 + "\n")
+    return result
+
+
 def cmd_dry_run_plan(
     args: Any,
     *,
@@ -3932,6 +4426,10 @@ def cmd_dry_run_plan(
     host = getattr(args, "host", None) or getattr(args, "target", None)
     targets = getattr(args, "targets", None) or []
     repo = getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "raptor_target", None)
+    if not repo and getattr(args, "target_arg", None):
+        _ta = str(args.target_arg)
+        if not _ta.lower().startswith(("http://", "https://")):
+            repo = _ta
     auth_checks: List[Dict[str, Any]] = []
     for cand_h in ([host] if host else []) + list(targets):
         if cand_h:
@@ -3943,7 +4441,7 @@ def cmd_dry_run_plan(
         if isinstance(v, bool) and v and not k.startswith("_")
     )
     planned_modules: List[str] = []
-    if getattr(args, "run_all_scans", False) or active_mode in ("all", "all_scans"):
+    if getattr(args, "run_all_scans", False) or getattr(args, "enable_hybrid", False) or active_mode in ("all", "all_scans", "hybrid"):
         planned_modules.extend(
             [
                 "Module-23-PreflightDiscovery(14-Categories+PQC+HackerOne+SafeSkills)",
@@ -3958,10 +4456,40 @@ def cmd_dry_run_plan(
                 "Module-19-PromptSmuggling",
             ]
         )
+        if not getattr(args, "no_pe_audit", False):
+            planned_modules.append("Module-PE-DotNet-Auditor(UMCI/SEC_COMMIT/YARA/HostPatch)")
+        if getattr(args, "enable_hybrid", False) or active_mode == "hybrid":
+            planned_modules.extend(
+                [
+                    "HybridStaticToLiveBridge(Local+Remote-Simultaneous)",
+                    "LocalRecordingMITMProxy(LocalCA)",
+                    "ARTEX-MultiTurn-StrictPOE3-Retester",
+                    "Module-21-REA-Static+LiveDrift",
+                    "EncryptedArchive(.rfca-AES256GCM)",
+                ]
+            )
     elif getattr(args, "preflight_only", False) or active_mode == "preflight":
         planned_modules.append("Module-23-PreflightDiscovery(14-Categories+PQC+HackerOne+SafeSkills)")
+    if getattr(args, "ensemble", False):
+        planned_modules.append("EnsembleWhiteboardOrchestrator(Planner-Worker-Verifier+Lean4)")
+    if getattr(args, "enable_swarm", False) or active_mode == "swarm":
+        planned_modules.append("MultiAgentSwarmOrchestrator(Parallel-OODA+Ensemble-Whiteboard+SwarmBoard)")
+    if (
+        getattr(args, "enable_pe_audit", False)
+        or active_mode in ("pe-audit", "pe_audit", "pe-dotnet", "pe_dotnet")
+    ) and "Module-PE-DotNet-Auditor(UMCI/SEC_COMMIT/YARA/HostPatch)" not in planned_modules:
+        planned_modules.append("Module-PE-DotNet-Auditor(UMCI/SEC_COMMIT/YARA/HostPatch)")
     if getattr(args, "enable_phi", False) or active_mode == "phi":
         planned_modules.append("Module-22-PhiScanner(Presidio+GLiNER+RedactX-v3)")
+    if (
+        getattr(args, "enable_stride", False)
+        or active_mode in ("stride", "threat-model", "threat_model")
+        or (
+            not getattr(args, "no_stride", False)
+            and (getattr(args, "run_all_scans", False) or getattr(args, "ensemble", False) or active_mode in ("all", "all_scans"))
+        )
+    ):
+        planned_modules.append("StrideThreatModeler(STRIDE+MITRE-ATT&CK+ZeroTrust+AttackTrees+SVG)")
     if getattr(args, "deep_audit", False) or active_mode in ("deep-audit", "deep_audit") or getattr(args, "proxy_target", None):
         planned_modules.append("DeepRepoAudit(TrustBoundary+LoopbackProxy+CoverageFuzz)")
     if getattr(args, "enable_poc", False):
@@ -3989,6 +4517,15 @@ def cmd_dry_run_plan(
         sub_plans["preflight"] = cmd_preflight(args, return_dict_only=True)
     if getattr(args, "enable_phi", False):
         sub_plans["phi"] = cmd_phi(args, return_dict_only=True)
+    if (
+        getattr(args, "enable_stride", False)
+        or active_mode in ("stride", "threat-model", "threat_model")
+        or (
+            not getattr(args, "no_stride", False)
+            and (getattr(args, "run_all_scans", False) or getattr(args, "ensemble", False) or active_mode in ("all", "all_scans"))
+        )
+    ):
+        sub_plans["stride"] = cmd_stride(args, return_dict_only=True)
     if getattr(args, "enable_hackerone", False):
         sub_plans["hackerone"] = cmd_hackerone(args, findings_override=[], return_dict_only=True)
 
@@ -4010,6 +4547,8 @@ def cmd_dry_run_plan(
     except Exception:
         pass
 
+    _dry_fh_val = getattr(args, "freshness_hours", 72)
+    _dry_q_val = getattr(args, "quorum", 2)
     plan: Dict[str, Any] = {
         "status": "dry_run_plan_ready",
         "dry_run": True,
@@ -4029,6 +4568,12 @@ def cmd_dry_run_plan(
         },
         "planned_modules": planned_modules,
         "enabled_flags": enabled_flags,
+        "ensemble": bool(getattr(args, "ensemble", False)),
+        "swarm": bool(getattr(args, "enable_swarm", False) or active_mode == "swarm"),
+        "swarm_workers": getattr(args, "swarm_workers", None),
+        "program": str(getattr(args, "program", "generic") or "generic"),
+        "freshness_hours": int(_dry_fh_val) if _dry_fh_val is not None else 72,
+        "quorum": max(1, int(_dry_q_val)) if _dry_q_val is not None else 2,
         "sub_plans": sub_plans,
         "side_effects": {
             "network_packets_sent": 0,
@@ -4058,6 +4603,11 @@ def cmd_dry_run_plan(
     else:
         print("  LLM Backend         : Local Ollama (zero-cost local inference)")
     print(f"  Planned Modules     : {', '.join(planned_modules)}")
+    if plan.get("ensemble"):
+        print(
+            f"  Ensemble Whiteboard : enabled (program={plan['program']}, "
+            f"freshness={plan['freshness_hours']}h, quorum={plan['quorum']})"
+        )
     print(f"  Request Hygiene     : headers={plan['request_hygiene']['custom_headers']} | max_rps={plan['request_hygiene']['max_rps']}")
     if auth_checks:
         for ac in auth_checks:
@@ -4888,6 +5438,346 @@ def cmd_fuzz_bridge(args):
     )
 
 
+def _validate_export_sarif_path(
+    export_sarif_arg: Any,
+    *,
+    reports_dir: Union[str, Path],
+    workspace_root: Optional[Path] = None,
+) -> Path:
+    """
+    Validates `--export-sarif` (both relative and absolute paths) against canonical path syntax,
+    reparse/junction/symlink escapes, sensitive host paths, and confinement within `reports_dir`
+    or `workspace_root`.
+    """
+    from engine.execution_policy import (
+        ExecutionPolicy,
+        _is_drive_relative_or_colon_unsafe,
+        _is_unc_path,
+        _validate_canonical_path_syntax,
+    )
+
+    raw_s = os.fspath(export_sarif_arg) if isinstance(export_sarif_arg, os.PathLike) else export_sarif_arg
+    if not isinstance(raw_s, str) or not raw_s.strip():
+        raise ValueError("--export-sarif path must be a non-empty string.")
+    if raw_s != raw_s.strip() or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_s):
+        raise PermissionError("Unsafe --export-sarif path rejected (whitespace or control characters).")
+    if _is_unc_path(raw_s) or _is_drive_relative_or_colon_unsafe(raw_s):
+        raise PermissionError("Unsafe --export-sarif path rejected (UNC, NT-device, or drive-relative/ADS path).")
+    syn_err = _validate_canonical_path_syntax(raw_s, allow_trailing_slash=False)
+    if syn_err is not None:
+        raise PermissionError(f"Unsafe --export-sarif path rejected: {syn_err}")
+
+    candidates: List[str] = [raw_s]
+    if raw_s.startswith("~"):
+        try:
+            exp = os.path.expanduser(raw_s)
+            candidates.extend([exp, str(Path(exp).resolve(strict=False))])
+        except Exception:
+            pass
+    sensitive_markers = (
+        "/.ssh",
+        "/.aws",
+        "/.gnupg",
+        "/.kube",
+        "/etc/passwd",
+        "/etc/shadow",
+        "/windows/system32",
+        "/windows/syswow64",
+        "/windows/temp",
+    )
+    for cand in candidates:
+        cand_low = cand.replace("\\", "/").lower().rstrip("/") or "/"
+        if any(
+            cand_low == m or cand_low.startswith(m + "/") or cand_low.endswith(m) or (m + "/" in cand_low)
+            for m in sensitive_markers
+        ) or re.match(r"^[a-z]:/windows(?:/|$)", cand_low) or re.match(r"^[a-z]:/(?:system32|syswow64)(?:/|$)", cand_low):
+            raise PermissionError(f"Unsafe --export-sarif path rejected: sensitive host path '{export_sarif_arg}' is forbidden.")
+
+    out_dir_resolved = Path(str(reports_dir)).resolve(strict=False)
+    pol = ExecutionPolicy.get_instance()
+    sarif_req = Path(raw_s)
+    if not sarif_req.is_absolute():
+        ok_out, detail_out = pol.validate_file_path(
+            raw_s,
+            workspace_root=out_dir_resolved,
+            allow_directory=False,
+            allow_nonexistent=True,
+        )
+        if not ok_out:
+            raise PermissionError(f"--export-sarif path escapes output directory: {export_sarif_arg} ({detail_out})")
+        return Path(detail_out)
+
+    ok_out, detail_out = pol.validate_file_path(
+        raw_s,
+        workspace_root=out_dir_resolved,
+        allow_directory=False,
+        allow_nonexistent=True,
+    )
+    if ok_out:
+        return Path(detail_out)
+
+    if workspace_root is not None:
+        ok_ws, detail_ws = pol.validate_file_path(
+            raw_s,
+            workspace_root=workspace_root,
+            allow_directory=False,
+            allow_nonexistent=True,
+        )
+        if ok_ws:
+            return Path(detail_ws)
+
+    raise PermissionError(
+        f"--export-sarif absolute path escapes --output-dir and --workspace-root: {export_sarif_arg}"
+    )
+
+
+def build_autonomous_hunt_argv(args, raw_argv: Optional[List[str]] = None) -> List[str]:
+    """
+    Translates unified `rfc_hunt_swarm.py --hunt ...` arguments into `hunt.py` argv,
+    bridging repeatable `--target`/`--hunt-target` and `--repo`/`--hunt-repo` flags
+    and forwarding `--model` / `--out` only when explicitly passed by the caller.
+    """
+    tokens = list(raw_argv) if raw_argv is not None else []
+    explicit_dests = getattr(args, "_explicit_cli_dests", set())
+
+    targets: List[str] = []
+    repos: List[str] = []
+
+    def _add_target(val: str) -> None:
+        v = str(val or "").strip()
+        if v and v not in targets:
+            targets.append(v)
+
+    def _add_repo_or_target(val: str) -> None:
+        v = str(val or "").strip()
+        if not v:
+            return
+        if os.path.isdir(v) or v in (".", "..") or v.startswith(("./", "../", ".\\", "..\\")):
+            _add_target(v)
+        elif v not in repos:
+            repos.append(v)
+
+    if tokens:
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok in ("--target", "--hunt-target", "--folder", "--dir", "--raptor-target", "--path") and i + 1 < len(tokens):
+                _add_target(tokens[i + 1])
+                i += 2
+            elif tok.startswith(("--target=", "--hunt-target=", "--folder=", "--dir=", "--raptor-target=", "--path=")):
+                _add_target(tok.split("=", 1)[1])
+                i += 1
+            elif tok in ("--repo", "--hunt-repo") and i + 1 < len(tokens):
+                _add_repo_or_target(tokens[i + 1])
+                i += 2
+            elif tok.startswith(("--repo=", "--hunt-repo=")):
+                _add_repo_or_target(tok.split("=", 1)[1])
+                i += 1
+            else:
+                i += 1
+    else:
+        for t in getattr(args, "hunt_targets", None) or []:
+            _add_target(t)
+        if "host" in explicit_dests and getattr(args, "host", None):
+            _add_target(str(args.host))
+        for r in getattr(args, "hunt_repos", None) or []:
+            _add_repo_or_target(r)
+        if getattr(args, "repo", None):
+            _add_repo_or_target(str(args.repo))
+        if getattr(args, "raptor_target", None):
+            _add_target(str(args.raptor_target))
+
+    for t in getattr(args, "hunt_targets", None) or []:
+        _add_target(t)
+    for r in getattr(args, "hunt_repos", None) or []:
+        _add_repo_or_target(r)
+    if getattr(args, "path", None) and os.path.isdir(str(args.path)):
+        _add_target(str(args.path))
+    if getattr(args, "target_arg", None):
+        _t_pos = str(args.target_arg).strip()
+        if _t_pos and _t_pos not in ALL_MODES:
+            _add_repo_or_target(_t_pos)
+
+    hunt_argv: List[str] = []
+    for t in targets:
+        hunt_argv.extend(["--target", t])
+    for r in repos:
+        hunt_argv.extend(["--repo", r])
+    if getattr(args, "clone_unlocked", False):
+        hunt_argv.append("--clone-unlocked")
+    if getattr(args, "no_clone_unlocked", False):
+        hunt_argv.append("--no-clone-unlocked")
+
+    prog_val = str(getattr(args, "program", "") or "").strip()
+    h1_prog_val = str(getattr(args, "hackerone_program", "") or "").strip()
+    if prog_val and prog_val != "generic":
+        eff_prog = prog_val
+    elif h1_prog_val:
+        eff_prog = h1_prog_val
+    else:
+        eff_prog = prog_val or "generic"
+    hunt_argv.extend(["--program", eff_prog])
+
+    if getattr(args, "watchlist", None):
+        hunt_argv.extend(["--watchlist", str(args.watchlist)])
+    if getattr(args, "eligibility_db", None):
+        hunt_argv.extend(["--eligibility-db", str(args.eligibility_db)])
+    if getattr(args, "sync_public_directory", False):
+        hunt_argv.append("--sync-public-directory")
+    if getattr(args, "min_efficiency", None) is not None:
+        hunt_argv.extend(["--min-efficiency", str(float(args.min_efficiency))])
+    if getattr(args, "portfolio_capacity", None) is not None:
+        hunt_argv.extend(["--portfolio-capacity", str(max(1, int(args.portfolio_capacity)))])
+    if getattr(args, "max_repos", None) is not None:
+        hunt_argv.extend(["--max-repos", str(max(1, int(args.max_repos)))])
+    if getattr(args, "interval_minutes", None) is not None:
+        hunt_argv.extend(["--interval-minutes", str(float(args.interval_minutes))])
+    if getattr(args, "max_cycles", None) and int(args.max_cycles) > 0:
+        hunt_argv.extend(["--max-cycles", str(int(args.max_cycles))])
+    if getattr(args, "hunt_once", False):
+        hunt_argv.append("--once")
+    if getattr(args, "hunt_url", None):
+        hunt_argv.extend(["--hunt-url", str(args.hunt_url)])
+    if getattr(args, "browser_hunt", False):
+        hunt_argv.append("--browser-hunt")
+    if getattr(args, "no_browser_hunt", False):
+        hunt_argv.append("--no-browser-hunt")
+    if getattr(args, "browser_profile", None):
+        hunt_argv.extend(["--browser-profile", str(args.browser_profile)])
+    if getattr(args, "cdp_url", None):
+        hunt_argv.extend(["--cdp-url", str(args.cdp_url)])
+    if getattr(args, "login_timeout", None) is not None and float(args.login_timeout) != 300.0:
+        hunt_argv.extend(["--login-timeout", str(float(args.login_timeout))])
+    if getattr(args, "probe_report_id", None) is not None and int(args.probe_report_id) != 4243972:
+        hunt_argv.extend(["--probe-report-id", str(int(args.probe_report_id))])
+    if getattr(args, "enable_swarm", False):
+        hunt_argv.append("--swarm")
+    if getattr(args, "swarm_workers", None) is not None:
+        hunt_argv.extend(["--swarm-workers", str(max(1, int(args.swarm_workers)))])
+    if getattr(args, "dedup_db", None):
+        hunt_argv.extend(["--dedup-db", str(args.dedup_db)])
+    if getattr(args, "force_rescan", False):
+        hunt_argv.append("--force-rescan")
+    if getattr(args, "no_stage_drafts", False):
+        hunt_argv.append("--no-stage-drafts")
+    if getattr(args, "headless_only", False):
+        hunt_argv.append("--headless-only")
+    if getattr(args, "embedded", False):
+        hunt_argv.append("--embedded")
+    if getattr(args, "no_llm", False):
+        hunt_argv.append("--no-llm")
+    if getattr(args, "allow_blocked", False):
+        hunt_argv.append("--allow-blocked")
+    if getattr(args, "dry_run", False):
+        hunt_argv.append("--dry-run")
+    if getattr(args, "as_json", False):
+        hunt_argv.append("--json")
+    if getattr(args, "install_schedule", False):
+        hunt_argv.append("--install-schedule")
+    if getattr(args, "uninstall_schedule", False):
+        hunt_argv.append("--uninstall-schedule")
+    if getattr(args, "run_now", False):
+        hunt_argv.append("--run-now")
+    if getattr(args, "task_name", None):
+        hunt_argv.extend(["--task-name", str(args.task_name)])
+
+    # Forward --model only when explicitly provided so hunt.py's dynamic RAM-gated abliterated selector runs by default
+    model_explicit = any(t == "--model" or t.startswith("--model=") for t in tokens)
+    raw_model = getattr(args, "model", None)
+    if (model_explicit or (not tokens and raw_model and raw_model != "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M")) and raw_model:
+        hunt_argv.extend(["--model", str(raw_model)])
+
+    # Forward --out / --output-dir only when explicitly provided so hunt.py preserves default out/autonomous_hunt
+    out_explicit = any(t == "--out" or t.startswith("--out=") for t in tokens)
+    outdir_explicit = any(t == "--output-dir" or t.startswith("--output-dir=") for t in tokens)
+    if out_explicit and getattr(args, "out", None):
+        hunt_argv.extend(["--out", str(args.out)])
+    elif outdir_explicit and getattr(args, "output_dir", None):
+        hunt_argv.extend(["--out", str(args.output_dir)])
+    elif not tokens and getattr(args, "out", None) and str(args.out) != "reports":
+        hunt_argv.extend(["--out", str(args.out)])
+
+    return hunt_argv
+
+
+def cmd_autonomous_hunt(args, raw_argv: Optional[List[str]] = None) -> int:
+    """Master CLI handler for `rfc_hunt_swarm.py --hunt` delegating to the turnkey autonomous hunter (`hunt.py`)."""
+    import hunt as _turnkey_hunt
+
+    hunt_argv = build_autonomous_hunt_argv(args, raw_argv=raw_argv)
+    return int(_turnkey_hunt.main(hunt_argv))
+
+
+def cmd_fast_ooda(args) -> int:
+    """
+    Runs the 3-Stage Parallel OODA Funnel directly from `rfc_hunt_swarm.py --fast-ooda`:
+      Stage 1 (CPU / ms, zero LLM): deterministic static/formal checks via SQLite WAL Blackboard
+      Stage 2 (ACDSO Pareto AutoML, <1s): multi-objective Pareto + anomaly ranking
+      Stage 3 (Abliterated Consensus + HITL): VRAM-gated specialist panel behind OllamaConcurrencyGuard
+    """
+    import json as _ooda_json
+    from engine.ensemble_orchestrator import EnsembleOrchestrator
+    from engine.program_eligibility_db import ProgramEligibilityDB
+
+    target_str = str(
+        getattr(args, "repo", None)
+        or getattr(args, "path", None)
+        or getattr(args, "target_arg", None)
+        or "."
+    )
+    as_json = bool(getattr(args, "as_json", False))
+    embedded = bool(getattr(args, "embedded", False))
+    no_llm = bool(getattr(args, "no_llm", False))
+    cpu_workers_arg = getattr(args, "cpu_workers", None)
+    bb_db = str(getattr(args, "blackboard_db", None) or "reports/ensemble_hunt/blackboard.sqlite3")
+    raw_out = getattr(args, "out", None)
+    out_dir = str(raw_out if (raw_out and str(raw_out) != "reports") else (getattr(args, "output_dir", None) or "out/fast_ooda"))
+    program = str(getattr(args, "program", "generic") or "generic")
+    raw_model = getattr(args, "model", None)
+    eff_model = None if raw_model == "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M" else raw_model
+
+    orch = EnsembleOrchestrator(
+        program=program,
+        embedded=embedded,
+        model=eff_model,
+        enable_llm_verify=(not no_llm and not embedded),
+        max_workers=(max(1, int(cpu_workers_arg)) if cpu_workers_arg else 4),
+    )
+    elig_db_raw = getattr(args, "eligibility_db", None) or os.environ.get("RFCHUNT_ELIGIBILITY_DB")
+    elig_db = (
+        ProgramEligibilityDB(str(elig_db_raw).strip())
+        if elig_db_raw and str(elig_db_raw).strip()
+        else None
+    )
+    _ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+    with _ctx:
+        res = orch.run_fast_parallel_ooda(
+            target_str,
+            program=program,
+            blackboard_db=bb_db,
+            max_cpu_workers=cpu_workers_arg,
+            resume=bool(getattr(args, "resume", False)),
+            signal_score=float(getattr(args, "signal_score", 0.0) or 0.0),
+            eligibility_db=elig_db,
+            out_dir=out_dir,
+            trigger_browser=False,
+        )
+    out_p = Path(out_dir)
+    out_p.mkdir(parents=True, exist_ok=True)
+    (out_p / "fast_ooda_report.json").write_text(_ooda_json.dumps(res, indent=2, default=str), encoding="utf-8")
+    if as_json:
+        print(_ooda_json.dumps(res, indent=2, default=str))
+    else:
+        s1 = res.get("stage1") if isinstance(res.get("stage1"), dict) else {}
+        s2 = res.get("stage2") if isinstance(res.get("stage2"), dict) else {}
+        print(
+            f"[+] 3-Stage Parallel OODA complete ({res.get('status', 'completed')}): "
+            f"stage1_prod={s1.get('production_count', 0)}, noise_dropped={s1.get('noise_dropped', 0)}, "
+            f"stage2_selected={len(s2.get('selected') or [])}, clusters={len(res.get('clusters') or [])} -> {out_dir}"
+        )
+    return 0
+
+
 def cmd_all(args):
     """
     Unified --all orchestrator running Google Mantis, haasonsaas/aiscan, BaaRai/ARTEX Dual-Graph,
@@ -4944,10 +5834,36 @@ def cmd_all(args):
             print(f"[!] Target authorization error for {host}: {reason}", file=(sys.stderr if as_json else sys.stdout))
             sys.exit(1)
 
+    try:
+        cli_ws_root = _resolve_cli_workspace_root(args)
+        export_sarif_arg = getattr(args, "export_sarif", None)
+        if export_sarif_arg:
+            pre_out_dir = (
+                (cli_ws_root / str(reports_dir))
+                if (cli_ws_root is not None and not Path(str(reports_dir)).is_absolute())
+                else Path(str(reports_dir))
+            )
+            _validate_export_sarif_path(
+                export_sarif_arg,
+                reports_dir=pre_out_dir,
+                workspace_root=cli_ws_root,
+            )
+    except (PermissionError, ValueError) as exc:
+        print(f"[!] Invalid workspace_root/repo/path: {exc}", file=(sys.stderr if as_json else sys.stdout))
+        sys.exit(1)
+
     all_task_id = str(getattr(args, "task_id", None) or "default").strip() or "default"
     if getattr(args, "hint", None) is not None:
         _validate_cli_hint_args(args, default_task_id=all_task_id)
-    db = _resolve_db_cls()(getattr(args, "db", "terminator.db"))
+    _db_cls = _resolve_db_cls()
+    _db_key_file = getattr(args, "key_file", None)
+    try:
+        if _db_key_file and "secret_key_path" in inspect.signature(_db_cls.__init__).parameters:
+            db = _db_cls(getattr(args, "db", "terminator.db"), secret_key_path=_db_key_file)
+        else:
+            db = _db_cls(getattr(args, "db", "terminator.db"))
+    except (TypeError, ValueError):
+        db = _db_cls(getattr(args, "db", "terminator.db"))
     try:
         if getattr(args, "hint", None) is not None and hasattr(db, "add_hint"):
             _persist_cli_hint(args, db=db)
@@ -4965,10 +5881,15 @@ def cmd_all(args):
             except Exception:
                 active_hints = []
 
+        is_hybrid = bool(getattr(args, "enable_hybrid", False))
         if not as_json:
             print(f"\n{'='*75}")
-            print(f"[*] UNIFIED --all SECURITY AUDIT (Fusion + Abliterated Models Enforced)")
-            target_disp = f"host={host or targets}" if (host or targets) and not repo and not path else os.path.abspath(str(repo or path))
+            banner_mode = "--hybrid (LOCAL + REMOTE)" if is_hybrid else "--all"
+            print(f"[*] UNIFIED {banner_mode} SECURITY AUDIT (Fusion + Abliterated Models Enforced)")
+            if is_hybrid and (repo or path) and (host or targets):
+                target_disp = f"local={os.path.abspath(str(repo or path))} + remote={host or targets}"
+            else:
+                target_disp = f"host={host or targets}" if (host or targets) and not repo and not path else os.path.abspath(str(repo or path))
             print(f"[*] Target: {target_disp} | Depth: {depth} | Model: {preferred_model}")
             if active_hints:
                 print(f"[*] Active Blackboard Hints: {len(active_hints)}")
@@ -5006,6 +5927,30 @@ def cmd_all(args):
         rea_use_cli_val = True if raw_rea_cli is None else bool(raw_rea_cli)
         include_models_val = bool(getattr(args, "include_models", True))
 
+        eff_embedded_proxy: Optional[bool] = (
+            False
+            if bool(getattr(args, "no_embedded_proxy", False))
+            else (True if bool(getattr(args, "embedded_proxy", False)) else (None if is_hybrid else False))
+        )
+        eff_artex_multiturn: Optional[bool] = (
+            False
+            if bool(getattr(args, "no_artex_multiturn", False))
+            else (True if bool(getattr(args, "artex_multiturn", False)) else (None if is_hybrid else False))
+        )
+        raw_exp_arc = getattr(args, "export_path", None)
+        if bool(getattr(args, "no_export_archive", False)):
+            eff_export_archive: Optional[bool] = False
+            eff_archive_path: Optional[str] = None
+        elif raw_exp_arc == "__AUTO__":
+            eff_export_archive = True
+            eff_archive_path = None
+        elif raw_exp_arc:
+            eff_export_archive = True
+            eff_archive_path = str(raw_exp_arc)
+        else:
+            eff_export_archive = True if is_hybrid else False
+            eff_archive_path = None
+
         unified_kwargs: Dict[str, Any] = dict(
             repo=repo,
             path=path,
@@ -5031,10 +5976,10 @@ def cmd_all(args):
             artex_llm_rotate=bool(getattr(args, "artex_llm_rotate", False)),
             artex_wait_sse=bool(getattr(args, "artex_wait_sse", False)),
             artex_budget_turns=int(getattr(args, "artex_budget_turns", 0) or 0),
-            artex_retest=bool(getattr(args, "artex_retest", False)),
+            artex_retest=True if bool(getattr(args, "artex_retest", False)) else (None if is_hybrid else False),
             artex_workers=int(getattr(args, "artex_workers", 3) or 3),
             artex_live=artex_live_val,
-            embedded_proxy=bool(getattr(args, "embedded_proxy", False)),
+            embedded_proxy=eff_embedded_proxy,
             embedded_proxy_port=int(getattr(args, "embedded_proxy_port", 0) or 0),
             auth_profile=getattr(args, "auth_profile", None),
             import_har=getattr(args, "import_har", None),
@@ -5042,9 +5987,9 @@ def cmd_all(args):
             scope_file=getattr(args, "scope_file", None),
             approval_mode=approval_mode_val,
             approval_rules=getattr(args, "approval_rules", None),
-            strict_poe=bool(getattr(args, "strict_poe", False)),
-            export_advisory=bool(getattr(args, "export_advisory", False)),
-            export_csv=bool(getattr(args, "export_csv", False)),
+            strict_poe=True if bool(getattr(args, "strict_poe", False)) else (None if is_hybrid else False),
+            export_advisory=True if bool(getattr(args, "export_advisory", False)) else (None if is_hybrid else False),
+            export_csv=True if bool(getattr(args, "export_csv", False)) else (None if is_hybrid else False),
             quiet=as_json,
             enable_external_scanners=raw_ext_flag,
             httpx_scan=getattr(args, "httpx_scan", None),
@@ -5054,7 +5999,7 @@ def cmd_all(args):
             scanner_isolation=getattr(args, "scanner_isolation", "host") or "host",
             docker_image=getattr(args, "docker_image", None),
             docker_network=getattr(args, "docker_network", None),
-            artex_multiturn=bool(getattr(args, "artex_multiturn", False)),
+            artex_multiturn=eff_artex_multiturn,
             artex_intent_turns=artex_intent_turns,
             artex_intent_tokens=artex_intent_tokens,
             enable_rea=not bool(getattr(args, "no_rea", False)),
@@ -5101,6 +6046,17 @@ def cmd_all(args):
             ),
             "preflight_include_home_skills": not bool(getattr(args, "no_home_skills", False)),
             "preflight_timeout": float(getattr(args, "preflight_timeout", 15.0) or 15.0),
+            "enable_pe_audit": not bool(getattr(args, "no_pe_audit", False)),
+            "pe_include_host_audit": bool(getattr(args, "pe_include_host_audit", False)),
+            "pe_include_yara": bool(getattr(args, "pe_include_yara", True)),
+            "hybrid": is_hybrid,
+            "export_archive": eff_export_archive,
+            "archive_path": eff_archive_path,
+            "archive_key_file": _db_key_file,
+            "workspace_root": str(cli_ws_root) if cli_ws_root is not None else None,
+            "confine_reports_to_workspace_root": bool(
+                getattr(args, "workspace_root", None) is not None and str(getattr(args, "workspace_root", "")).strip()
+            ),
         }
         try:
             _unified_sig = inspect.signature(run_unified_all_scans)
@@ -5113,9 +6069,18 @@ def cmd_all(args):
         except (TypeError, ValueError):
             unified_kwargs.update(_extra_unified)
 
+        _prev_cmd_all_auto_pull = os.environ.get("RFCHUNT_AUTO_PULL_MODELS")
+        _cmd_all_no_pull = (
+            (not include_models_val)
+            or (not bool(getattr(args, "auto_install", True)))
+            or (os.environ.get("RFCHUNT_AUTO_INSTALL_TOOLS") == "0")
+        )
+        if _cmd_all_no_pull:
+            os.environ["RFCHUNT_AUTO_PULL_MODELS"] = "0"
         try:
             _stdout_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
-            with _stdout_ctx:
+            _contain_ctx = HostContainmentManager() if (host or targets) else contextlib.nullcontext()
+            with _stdout_ctx, _contain_ctx:
                 res = run_unified_all_scans(**unified_kwargs)
                 _run_all_aixcc_extensions(
                     args,
@@ -5134,24 +6099,40 @@ def cmd_all(args):
         except (PermissionError, ValueError) as exc:
             print(f"[!] Target authorization or scanner configuration error for {host or targets or repo or path}: {exc}", file=(sys.stderr if as_json else sys.stdout))
             sys.exit(1)
-
-        export_sarif_arg = getattr(args, "export_sarif", None)
-        if export_sarif_arg:
-            import shutil as _shutil
-            src_sarif = (res.get("report_files") or {}).get("combined_sarif")
-            if src_sarif and os.path.isfile(str(src_sarif)):
-                sarif_req = Path(str(export_sarif_arg))
-                out_dir_resolved = Path(str(reports_dir)).resolve()
-                if sarif_req.is_absolute():
-                    dst_sarif = sarif_req
+        finally:
+            if _cmd_all_no_pull:
+                if _prev_cmd_all_auto_pull is None:
+                    os.environ.pop("RFCHUNT_AUTO_PULL_MODELS", None)
                 else:
-                    dst_sarif = (out_dir_resolved / sarif_req).resolve()
-                    if not dst_sarif.is_relative_to(out_dir_resolved):
-                        raise ValueError(f"--export-sarif path escapes output directory: {export_sarif_arg}")
-                dst_sarif.parent.mkdir(parents=True, exist_ok=True)
-                if Path(str(src_sarif)).resolve() != dst_sarif.resolve():
-                    _shutil.copyfile(str(src_sarif), str(dst_sarif))
-                res.setdefault("report_files", {})["exported_sarif"] = str(dst_sarif)
+                    os.environ["RFCHUNT_AUTO_PULL_MODELS"] = _prev_cmd_all_auto_pull
+
+        try:
+            export_sarif_arg = getattr(args, "export_sarif", None)
+            if export_sarif_arg:
+                import shutil as _shutil
+                src_sarif = (res.get("report_files") or {}).get("combined_sarif")
+                eff_out_dir = (
+                    Path(str(src_sarif)).resolve().parent
+                    if src_sarif and os.path.isfile(str(src_sarif))
+                    else (
+                        (cli_ws_root / str(reports_dir)).resolve(strict=False)
+                        if (cli_ws_root is not None and not Path(str(reports_dir)).is_absolute())
+                        else Path(str(reports_dir)).resolve(strict=False)
+                    )
+                )
+                dst_sarif = _validate_export_sarif_path(
+                    export_sarif_arg,
+                    reports_dir=eff_out_dir,
+                    workspace_root=cli_ws_root,
+                )
+                if src_sarif and os.path.isfile(str(src_sarif)):
+                    dst_sarif.parent.mkdir(parents=True, exist_ok=True)
+                    if Path(str(src_sarif)).resolve() != dst_sarif.resolve():
+                        _shutil.copyfile(str(src_sarif), str(dst_sarif))
+                    res.setdefault("report_files", {})["exported_sarif"] = str(dst_sarif)
+        except (PermissionError, ValueError) as exc:
+            print(f"[!] Target authorization or scanner configuration error for {host or targets or repo or path}: {exc}", file=(sys.stderr if as_json else sys.stdout))
+            sys.exit(1)
 
         if any(
             bool(getattr(args, flag, False))
@@ -5243,6 +6224,386 @@ def cmd_all(args):
             except Exception as poc_exc:
                 res.setdefault("engines", {})["poc_verification"] = {"status": "error", "error": str(poc_exc)}
 
+        if getattr(args, "ensemble", False):
+            import json as _ens_json
+            from engine.ensemble_orchestrator import EnsembleOrchestrator
+            from revenue_cli import unified_findings_to_engine_findings
+
+            ensemble_target = str(repo or path or host or ".")
+            combined_json_str = str((res.get("report_files") or {}).get("combined_json") or "").strip()
+            if combined_json_str:
+                ens_out_dir = Path(combined_json_str).resolve(strict=False).parent
+            else:
+                ens_out_dir = Path(str(reports_dir)).resolve(strict=False)
+
+            ens_offline = (
+                os.environ.get("RFCHUNT_OFFLINE") == "1"
+                or bool(os.environ.get("CI"))
+                or bool(getattr(args, "embedded", False))
+                or (not bool(getattr(args, "preflight_live", True)))
+            )
+            ens_embedded = bool(getattr(args, "embedded", False))
+            no_models_offline = (not bool(getattr(args, "include_models", True))) and (
+                os.environ.get("RFCHUNT_OFFLINE") == "1" or bool(os.environ.get("CI"))
+            )
+            ens_llm_verify = (
+                (not bool(getattr(args, "no_llm", False)))
+                and (not ens_embedded)
+                and (not no_models_offline)
+            )
+            ens_model = getattr(args, "model", None)
+            if ens_model == "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M":
+                ens_model = None
+
+            _fh_val = getattr(args, "freshness_hours", 72)
+            _q_val = getattr(args, "quorum", 2)
+            orch = EnsembleOrchestrator(
+                program=str(getattr(args, "program", "generic") or "generic"),
+                freshness_hours=int(_fh_val) if _fh_val is not None else 72,
+                quorum=max(1, int(_q_val)) if _q_val is not None else 2,
+                exhaustive_default=True,
+                embedded=ens_embedded,
+                model=ens_model,
+                enable_llm_verify=ens_llm_verify,
+                gha_only=bool(getattr(args, "gha_only", False)),
+                no_external_scanners=bool(getattr(args, "no_external_scanners", False)),
+                proxy=getattr(args, "proxy_target", None),
+                db=db,
+                enable_stride=(
+                    False
+                    if bool(getattr(args, "no_stride", False))
+                    else (True if bool(getattr(args, "enable_stride", False)) else None)
+                ),
+                stride_diagrams=list(getattr(args, "stride_diagrams", None) or []),
+                stride_out=getattr(args, "stride_out", None),
+                stride_write_repo=bool(getattr(args, "stride_write_repo", False)),
+            )
+
+            converted_findings = unified_findings_to_engine_findings(
+                res.get("findings") or [],
+                target_root=ensemble_target if (repo or path) else None,
+                exclude_speculative_and_preflight=True,
+            )
+            merged_findings = list(converted_findings)
+            ens_target_p = Path(ensemble_target)
+            is_local_target = bool(repo or path) and (
+                ens_target_p.is_dir()
+                or (ens_target_p.is_file() and ens_target_p.suffix.lower() in (".yml", ".yaml"))
+            )
+            all_scan_summary = {
+                "target_path": res.get("target_path"),
+                "mode": res.get("mode"),
+                "total_aggregated_findings": res.get("total_aggregated_findings", 0),
+                "primary_findings_count": res.get("primary_findings_count", 0),
+                "verified_exploits_count": res.get("verified_exploits_count", 0),
+                "deterministic_static_count": res.get("deterministic_static_count", 0),
+                "speculative_hypotheses_count": res.get("speculative_hypotheses_count", 0),
+                "chains_synthesized": res.get("chains_synthesized", 0),
+                "severity_counts": res.get("severity_counts") or {},
+            }
+
+            _ens_stdout_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+            with _ens_stdout_ctx:
+                if is_local_target:
+                    local_findings, local_tele = EnsembleOrchestrator.run_exhaustive_local_engines(
+                        ens_target_p,
+                        refresh_stix=(not ens_offline),
+                        embedded=ens_embedded,
+                        model=ens_model,
+                        enable_llm_verify=ens_llm_verify,
+                        gha_only=bool(getattr(args, "gha_only", False)) or (ens_target_p.is_file() and ens_target_p.suffix.lower() in (".yml", ".yaml")),
+                        no_external_scanners=bool(getattr(args, "no_external_scanners", False)),
+                        lean_dir=orch.lean_dir,
+                        program=str(getattr(args, "program", "generic") or "generic"),
+                    )
+                    orch.last_telemetry = local_tele
+                    merged_findings.extend(local_findings)
+
+                ens_rep = orch.run(
+                    ensemble_target,
+                    findings=merged_findings,
+                    all_scan_summary=all_scan_summary,
+                    out_dir=ens_out_dir,
+                    package_client_name=getattr(args, "package_client", None),
+                    refresh_stix=(not ens_offline),
+                )
+
+            ens_dict = ens_rep.to_dict()
+            res["ensemble"] = ens_dict
+            res["toolchain_status"] = ens_dict.get("toolchain_status", {})
+            res["lean_verification"] = ens_dict.get("lean_verification", {})
+            res.setdefault("engines", {})["ensemble"] = {
+                "total_clusters": len(ens_rep.clusters),
+                "counts_by_disposition": dict(ens_rep.counts_by_disposition),
+                "whiteboard": ens_dict.get("whiteboard", {}),
+                "lean_verification": res["lean_verification"],
+                "toolchain_status": res["toolchain_status"],
+                "telemetry": orch.last_telemetry,
+            }
+            rf = res.setdefault("report_files", {})
+            rf["ensemble_json"] = str(ens_out_dir / "ensemble_report.json")
+            rf["ensemble_md"] = str(ens_out_dir / "ensemble_summary.md")
+            rf["ensemble_sarif"] = str(ens_out_dir / "ensemble_findings.sarif")
+            if isinstance(ens_dict.get("stride_threat_model"), dict) and ens_dict["stride_threat_model"]:
+                _stm = ens_dict["stride_threat_model"]
+                res["stride_threat_model"] = _stm
+                res.setdefault("engines", {})["stride_threat_model"] = {
+                    "status": _stm.get("status"),
+                    "missing_threat_model": _stm.get("missing_threat_model", False),
+                    "auto_generated": _stm.get("auto_generated", False),
+                    "components_count": _stm.get("components_count", 0),
+                    "threat_scenarios_count": _stm.get("threat_scenarios_count", 0),
+                    "security_requirements_count": _stm.get("security_requirements_count", 0),
+                    "attack_trees_count": _stm.get("attack_trees_count", 0),
+                    "report_files": _stm.get("report_files") or {},
+                }
+                _stm_rf = _stm.get("report_files") or {}
+                if _stm_rf.get("markdown"):
+                    rf["stride_threat_model_md"] = str(_stm_rf["markdown"])
+                if _stm_rf.get("architecture_svg"):
+                    rf["stride_architecture_svg"] = str(_stm_rf["architecture_svg"])
+                if _stm_rf.get("architecture_png"):
+                    rf["stride_architecture_png"] = str(_stm_rf["architecture_png"])
+                if _stm_rf.get("attack_tree_svgs"):
+                    rf["stride_attack_tree_svgs"] = list(_stm_rf["attack_tree_svgs"])
+                if _stm_rf.get("attack_tree_pngs"):
+                    rf["stride_attack_tree_pngs"] = list(_stm_rf["attack_tree_pngs"])
+            if combined_json_str and Path(combined_json_str).parent.exists():
+                Path(combined_json_str).write_text(_ens_json.dumps(res, indent=2), encoding="utf-8")
+        else:
+            # Even when --ensemble and --hunt are NOT passed, --all runs all local defensive tools
+            # (TruffleHog, Mobile/MobSF, API/JWT/SD-JWT, AI Infra Guard, Parity/Invariants,
+            # Zizmor/Actionlint/GHA Agent, Z3 Formal, JS Bundle Analyzer, Lean 4, and ACDSO Stage-2 ranking).
+            _local_target_str = str(repo or path or "").strip()
+            _local_target_p = Path(_local_target_str) if _local_target_str else None
+            if _local_target_p is not None and (
+                _local_target_p.is_dir()
+                or (_local_target_p.is_file() and _local_target_p.suffix.lower() in (".yml", ".yaml"))
+            ):
+                try:
+                    import json as _all_tools_json
+                    from engine.acdso_bridge import rank_stage2_candidates
+                    from engine.ensemble_orchestrator import EnsembleOrchestrator
+
+                    _all_offline = (
+                        os.environ.get("RFCHUNT_OFFLINE") == "1"
+                        or bool(os.environ.get("CI"))
+                        or bool(getattr(args, "embedded", False))
+                        or (not bool(getattr(args, "preflight_live", True)))
+                    )
+                    _all_embedded = bool(getattr(args, "embedded", False))
+                    _all_tools_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+                    with _all_tools_ctx:
+                        _extra_local_findings, _extra_local_tele = EnsembleOrchestrator.run_exhaustive_local_engines(
+                            _local_target_p,
+                            refresh_stix=False,
+                            embedded=_all_embedded,
+                            model=None,
+                            enable_llm_verify=False,
+                            gha_only=bool(getattr(args, "gha_only", False))
+                            or (_local_target_p.is_file() and _local_target_p.suffix.lower() in (".yml", ".yaml")),
+                            no_external_scanners=bool(getattr(args, "no_external_scanners", False)) or _all_offline,
+                            program=str(getattr(args, "program", "generic") or "generic"),
+                        )
+                    _prod_cands = [
+                        ef.to_dict()
+                        for ef in _extra_local_findings
+                        if not getattr(ef, "non_production_noise", False)
+                    ]
+                    _acdso_s2 = (
+                        rank_stage2_candidates(_prod_cands, top_k=5)
+                        if _prod_cands
+                        else {"selected": [], "pareto_count": 0, "total_candidates": 0}
+                    )
+                    res["exhaustive_local_findings"] = [ef.to_dict() for ef in _extra_local_findings]
+                    res.setdefault("engines", {})["exhaustive_local_tools"] = {
+                        "status": "completed",
+                        "engines_executed": list(_extra_local_tele.get("engines_executed") or []),
+                        "total_findings": len(_extra_local_findings),
+                        "production_findings": len(_prod_cands),
+                        "telemetry": _extra_local_tele,
+                        "acdso_stage2": _acdso_s2,
+                    }
+                    _combined_json_p = str((res.get("report_files") or {}).get("combined_json") or "").strip()
+                    if _combined_json_p and Path(_combined_json_p).parent.exists():
+                        Path(_combined_json_p).write_text(_all_tools_json.dumps(res, indent=2, default=str), encoding="utf-8")
+                except Exception as _ext_tools_exc:
+                    res.setdefault("engines", {})["exhaustive_local_tools"] = {
+                        "status": "degraded_error",
+                        "error": str(_ext_tools_exc),
+                    }
+
+            # Auto-generate Fusion-powered STRIDE Threat Model during standalone `--all`
+            # whenever `--stride` is passed OR the codebase has no existing threat model (unless `--no-stride`).
+            if not bool(getattr(args, "no_stride", False)) and _local_target_p is not None and _local_target_p.is_dir():
+                try:
+                    import json as _stride_all_json
+                    from engine.stride_threat_modeler import StrideThreatModeler
+
+                    _stride_offline = (
+                        os.environ.get("RFCHUNT_OFFLINE") == "1"
+                        or bool(os.environ.get("CI"))
+                        or bool(getattr(args, "embedded", False))
+                        or bool(getattr(args, "no_llm", False))
+                        or (not bool(getattr(args, "preflight_live", True)))
+                        or (not bool(getattr(args, "include_models", True)))
+                    )
+                    _stride_out = str(
+                        getattr(args, "stride_out", None)
+                        or (Path(str(reports_dir)) / "stride_threat_model")
+                    )
+                    _stride_modeler = StrideThreatModeler(
+                        use_fusion=(bool(getattr(args, "fusion", True)) and not _stride_offline),
+                        embedded=bool(getattr(args, "embedded", False)),
+                        model=getattr(args, "model", None),
+                        sec_model=getattr(args, "sec_model", None),
+                    )
+                    _stride_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+                    with _stride_ctx:
+                        _stm_all = _stride_modeler.analyze_codebase(
+                            _local_target_p,
+                            out_dir=_stride_out,
+                            diagram_paths=list(getattr(args, "stride_diagrams", None) or []),
+                            existing_findings=list(res.get("findings") or []) + list(res.get("exhaustive_local_findings") or []),
+                            force_generate=bool(getattr(args, "enable_stride", False))
+                            or bool(getattr(args, "stride_diagrams", None)),
+                            write_to_repo=bool(getattr(args, "stride_write_repo", False)),
+                            dry_run=False,
+                        )
+                    res["stride_threat_model"] = _stm_all
+                    res.setdefault("engines", {})["stride_threat_model"] = {
+                        "status": _stm_all.get("status"),
+                        "missing_threat_model": _stm_all.get("missing_threat_model", False),
+                        "auto_generated": _stm_all.get("auto_generated", False),
+                        "components_count": _stm_all.get("components_count", 0),
+                        "threat_scenarios_count": _stm_all.get("threat_scenarios_count", 0),
+                        "security_requirements_count": _stm_all.get("security_requirements_count", 0),
+                        "attack_trees_count": _stm_all.get("attack_trees_count", 0),
+                        "report_files": _stm_all.get("report_files") or {},
+                    }
+                    _stm_rf2 = _stm_all.get("report_files") or {}
+                    _rf_all = res.setdefault("report_files", {})
+                    if _stm_rf2.get("markdown"):
+                        _rf_all["stride_threat_model_md"] = str(_stm_rf2["markdown"])
+                    if _stm_rf2.get("architecture_svg"):
+                        _rf_all["stride_architecture_svg"] = str(_stm_rf2["architecture_svg"])
+                    if _stm_rf2.get("architecture_png"):
+                        _rf_all["stride_architecture_png"] = str(_stm_rf2["architecture_png"])
+                    if _stm_rf2.get("attack_tree_svgs"):
+                        _rf_all["stride_attack_tree_svgs"] = list(_stm_rf2["attack_tree_svgs"])
+                    if _stm_rf2.get("attack_tree_pngs"):
+                        _rf_all["stride_attack_tree_pngs"] = list(_stm_rf2["attack_tree_pngs"])
+                    _cj_p = str(_rf_all.get("combined_json") or "").strip()
+                    if _cj_p and Path(_cj_p).parent.exists():
+                        Path(_cj_p).write_text(_stride_all_json.dumps(res, indent=2, default=str), encoding="utf-8")
+                except Exception as _stride_exc:
+                    res.setdefault("engines", {})["stride_threat_model"] = {
+                        "status": "error",
+                        "error": str(_stride_exc),
+                    }
+
+        if getattr(args, "enable_fast_ooda", False) and (repo or path):
+            _ooda_target = str(repo or path)
+            if os.path.isdir(_ooda_target):
+                try:
+                    import json as _ooda_all_json
+                    from engine.ensemble_orchestrator import EnsembleOrchestrator
+                    from engine.program_eligibility_db import ProgramEligibilityDB
+
+                    _ooda_emb = bool(getattr(args, "embedded", False))
+                    _ooda_llm = (not bool(getattr(args, "no_llm", False))) and (not _ooda_emb)
+                    _ooda_cpu = getattr(args, "cpu_workers", None)
+                    _ooda_orch = EnsembleOrchestrator(
+                        program=str(getattr(args, "program", "generic") or "generic"),
+                        embedded=_ooda_emb,
+                        enable_llm_verify=_ooda_llm,
+                        max_workers=(max(1, int(_ooda_cpu)) if _ooda_cpu else 4),
+                    )
+                    _elig_p = getattr(args, "eligibility_db", None) or os.environ.get("RFCHUNT_ELIGIBILITY_DB")
+                    _elig_obj = ProgramEligibilityDB(str(_elig_p).strip()) if _elig_p and str(_elig_p).strip() else None
+                    _ooda_out = Path(str(reports_dir)) / "fast_ooda"
+                    _ooda_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+                    with _ooda_ctx:
+                        _ooda_res = _ooda_orch.run_fast_parallel_ooda(
+                            _ooda_target,
+                            program=str(getattr(args, "program", "generic") or "generic"),
+                            blackboard_db=str(getattr(args, "blackboard_db", None) or (Path(str(reports_dir)) / "blackboard.sqlite3")),
+                            max_cpu_workers=_ooda_cpu,
+                            resume=bool(getattr(args, "resume", False)),
+                            signal_score=float(getattr(args, "signal_score", 0.0) or 0.0),
+                            eligibility_db=_elig_obj,
+                            out_dir=_ooda_out,
+                            trigger_browser=False,
+                        )
+                    _ooda_out.mkdir(parents=True, exist_ok=True)
+                    (_ooda_out / "fast_ooda_report.json").write_text(
+                        _ooda_all_json.dumps(_ooda_res, indent=2, default=str), encoding="utf-8"
+                    )
+                    res["fast_ooda"] = _ooda_res
+                    res.setdefault("engines", {})["fast_ooda"] = {
+                        "status": _ooda_res.get("status", "completed"),
+                        "stage1_production_count": _ooda_res.get("stage1_production_count", 0),
+                        "stage1_dropped_noise_count": _ooda_res.get("stage1_dropped_noise_count", 0),
+                        "stage2_selected_count": len((_ooda_res.get("stage2") or {}).get("selected") or []),
+                        "clusters_count": len(_ooda_res.get("clusters") or []),
+                    }
+                except Exception as _ooda_exc:
+                    res.setdefault("engines", {})["fast_ooda"] = {"status": "error", "error": str(_ooda_exc)}
+
+        # Audit any additional distinct local folder(s) passed alongside --repo (e.g., --all --repo ./r --folder ./f)
+        _extra_local_dirs: List[str] = []
+        _primary_resolved: Optional[Path] = None
+        if repo and os.path.isdir(str(repo)):
+            _primary_resolved = Path(str(repo)).resolve(strict=False)
+        elif path and os.path.isdir(str(path)):
+            _primary_resolved = Path(str(path)).resolve(strict=False)
+        for _cand_dir in (
+            [getattr(args, "raptor_target", None), getattr(args, "path", None)]
+            + list(getattr(args, "hunt_targets", None) or [])
+        ):
+            if not _cand_dir or not os.path.isdir(str(_cand_dir)):
+                continue
+            _cand_res = Path(str(_cand_dir)).resolve(strict=False)
+            if _primary_resolved is not None and _cand_res == _primary_resolved:
+                continue
+            _cand_s = str(_cand_res)
+            if _cand_s not in _extra_local_dirs:
+                _extra_local_dirs.append(_cand_s)
+        if _extra_local_dirs:
+            from engine.ensemble_orchestrator import EnsembleOrchestrator
+
+            _extra_target_summaries: List[Dict[str, Any]] = []
+            _extra_offline = (
+                os.environ.get("RFCHUNT_OFFLINE") == "1"
+                or bool(os.environ.get("CI"))
+                or bool(getattr(args, "embedded", False))
+            )
+            for _ed in _extra_local_dirs:
+                try:
+                    _ef_list, _ef_tele = EnsembleOrchestrator.run_exhaustive_local_engines(
+                        Path(_ed),
+                        refresh_stix=False,
+                        embedded=bool(getattr(args, "embedded", False)),
+                        model=None,
+                        enable_llm_verify=False,
+                        no_external_scanners=bool(getattr(args, "no_external_scanners", False)) or _extra_offline,
+                        program=str(getattr(args, "program", "generic") or "generic"),
+                    )
+                    _extra_target_summaries.append(
+                        {
+                            "target_path": _ed,
+                            "status": "completed",
+                            "engines_executed": list(_ef_tele.get("engines_executed") or []),
+                            "total_findings": len(_ef_list),
+                            "findings": [ef.to_dict() for ef in _ef_list],
+                        }
+                    )
+                except Exception as _ed_exc:
+                    _extra_target_summaries.append(
+                        {"target_path": _ed, "status": "error", "error": str(_ed_exc)}
+                    )
+            res["additional_local_targets"] = _extra_target_summaries
+
         if hasattr(db, "add_fact"):
             try:
                 total_agg = int(res.get("total_aggregated_findings", 0) or 0)
@@ -5285,7 +6646,58 @@ def cmd_all(args):
             except Exception:
                 pass
 
+        _raw_cli_for_exports = list(getattr(args, "_raw_cli_argv", None) or [])
+        if any(tok == "--export-caldera" or tok.startswith("--export-caldera=") for tok in _raw_cli_for_exports) and not bool(getattr(args, "no_caldera", False)):
+            try:
+                from engine.caldera_bridge import CalderaBridge
+
+                _cal_dir = str(getattr(args, "export_caldera", "caldera_export") or "caldera_export")
+                _cal_res = CalderaBridge(db_path=getattr(args, "db", "terminator.db")).export_plugin(output_dir=_cal_dir)
+                res.setdefault("engines", {})["caldera_export"] = _cal_res
+                res.setdefault("report_files", {})["caldera_export_dir"] = _cal_dir
+            except Exception as _cal_exc:
+                res.setdefault("engines", {})["caldera_export"] = {"status": "error", "error": str(_cal_exc)}
+
+        if any(tok == "--dashboard-out" or tok.startswith("--dashboard-out=") for tok in _raw_cli_for_exports):
+            try:
+                from engine.dashboard_generator import DashboardGenerator
+
+                _dash_out = str(getattr(args, "dashboard_out", "terminator_dashboard.html") or "terminator_dashboard.html")
+                _dash_html = DashboardGenerator.generate_html_dashboard(
+                    target_host=str(host or repo or "."),
+                    target_port=int(port_arg or 443),
+                    scan_stats={
+                        "total_evaluated": max(int(res.get("total_aggregated_findings", 0) or 0), 1),
+                        "passed": 0,
+                        "anomalies": int(res.get("speculative_hypotheses_count", 0) or 0),
+                        "flaws": int(res.get("primary_findings_count", 0) or 0),
+                    },
+                    merkle_audit_log=res.get("merkle_audit") or {},
+                    flaws=list(res.get("findings") or [])[:50],
+                    arm106_count=int((res.get("defensive_intelligence") or {}).get("rules_published", 0) or 0),
+                    arm107_count=int((res.get("defensive_intelligence") or {}).get("regression_tests_published", 0) or 0),
+                    attack_chains=list(res.get("chains") or [])[:50],
+                )
+                Path(_dash_out).parent.mkdir(parents=True, exist_ok=True)
+                Path(_dash_out).write_text(_dash_html, encoding="utf-8")
+                res.setdefault("report_files", {})["dashboard_html"] = _dash_out
+            except Exception as _dash_exc:
+                res.setdefault("engines", {})["dashboard_export"] = {"status": "error", "error": str(_dash_exc)}
+
         if getattr(args, "as_json", False):
+            if getattr(args, "enable_autonomous_hunt", False):
+                import io as _all_hunt_io
+                import json as _all_hunt_json
+
+                _h_buf = _all_hunt_io.StringIO()
+                with contextlib.redirect_stdout(_h_buf):
+                    _h_rc = cmd_autonomous_hunt(args, raw_argv=getattr(args, "_raw_cli_argv", None))
+                _h_raw = _h_buf.getvalue().strip()
+                try:
+                    _h_doc = _all_hunt_json.loads(_h_raw) if _h_raw else {}
+                except ValueError:
+                    _h_doc = {"raw_output": _h_raw[:2000]}
+                res["autonomous_hunt"] = {**_h_doc, "returncode": int(_h_rc)}
             from engine.cli_render import render_json
             render_json(res)
             return
@@ -5306,6 +6718,13 @@ def cmd_all(args):
         print(f"    Module 18 aiscan    : {eng.get('aiscan', {}).get('total_findings', 0)}")
         print(f"    Module 15 RAPTOR    : {eng.get('raptor', {}).get('total_findings', 0)} ({eng.get('raptor', {}).get('mode', 'static')})")
         print(f"    Module 21 REA       : {eng.get('rea_surface', {}).get('total_findings', 0)} ({eng.get('rea_surface', {}).get('status', 'disabled')}, routes={eng.get('rea_surface', {}).get('total_endpoints', 0)})")
+        if "pe_dotnet_auditor" in eng:
+            pe_eng = eng.get("pe_dotnet_auditor") or {}
+            print(
+                f"    PE/.NET Auditor     : {pe_eng.get('total_findings', 0)} findings "
+                f"(status={pe_eng.get('status', 'disabled')}, files={pe_eng.get('files_scanned', 0)}, "
+                f"CVE-2026-108398={pe_eng.get('cve_2026_108398_count', 0)}, UMCI={pe_eng.get('umci_fallback_risk_count', 0)})"
+            )
         print(
             f"    Module 17 ARTEX     : {chaining.get('chains_synthesized', 0)} chains synthesized "
             f"(Verified: {chaining.get('exploits_verified', 0)}, Max Hops: {chaining.get('max_hop_count', 0)}, "
@@ -5379,16 +6798,50 @@ def cmd_all(args):
                 f"(trust_files={tb_i.get('files_reviewed', 0)}, tb_findings={tb_i.get('findings_count', 0)}, "
                 f"proxy={lp_i.get('status', 'disabled')}, fuzz_targets={len(cf_i.get('targets_scanned') or [])})"
             )
+        if "ensemble" in eng:
+            ens_info = eng.get("ensemble") or {}
+            wb_info = ens_info.get("whiteboard") or {}
+            print(
+                f"    Ensemble Whiteboard : {ens_info.get('total_clusters', 0)} clusters "
+                f"(hyps={wb_info.get('total_hypotheses', len(wb_info.get('hypotheses') or []))}, "
+                f"lean={res.get('lean_verification', {}).get('status', 'unknown')})"
+            )
+        elif "exhaustive_local_tools" in eng:
+            elt = eng.get("exhaustive_local_tools") or {}
+            elt_exec = elt.get("engines_executed") or []
+            print(
+                f"    Exhaustive Tools    : {elt.get('status', 'completed')} "
+                f"(engines={len(elt_exec)} [{','.join(elt_exec[:8])}], "
+                f"findings={elt.get('total_findings', 0)}, prod={elt.get('production_findings', 0)})"
+            )
+        if "stride_threat_model" in eng:
+            stm_i = eng.get("stride_threat_model") or {}
+            print(
+                f"    STRIDE Threat Model : {stm_i.get('status', 'completed')} "
+                f"(auto={stm_i.get('auto_generated', False)}, components={stm_i.get('components_count', 0)}, "
+                f"threats={stm_i.get('threat_scenarios_count', 0)}, reqs={stm_i.get('security_requirements_count', 0)}, "
+                f"attack_trees={stm_i.get('attack_trees_count', 0)})"
+            )
         print(f"    Combined SARIF      : {res['report_files'].get('combined_sarif')}")
         if res["report_files"].get("exported_sarif"):
             print(f"    Exported SARIF      : {res['report_files'].get('exported_sarif')}")
         if res["report_files"].get("poc_index_md"):
             print(f"    PoC Triage Index    : {res['report_files'].get('poc_index_md')}")
         print(f"    Combined JSON       : {res['report_files'].get('combined_json')}")
+        if res.get("hybrid_mode"):
+            hb = res.get("hybrid_bridge") or {}
+            print(
+                f"    Hybrid Bridge       : local={hb.get('local_executed', False)}, remote={hb.get('remote_executed', False)}, "
+                f"static->live routes={hb.get('static_routes_seeded_to_live', 0)}, "
+                f"mitm_proxy={hb.get('embedded_proxy_active', False)}, multiturn={hb.get('multiturn_enabled', False)}, "
+                f"strict_poe={hb.get('strict_poe', False)}"
+            )
         if res["report_files"].get("combined_csv"):
             print(f"    Combined CSV        : {res['report_files'].get('combined_csv')}")
         if res["report_files"].get("advisories"):
             print(f"    GHSA Advisories     : {len(res['report_files']['advisories'])} written")
+        if res["report_files"].get("encrypted_archive_rfca"):
+            print(f"    Encrypted Archive   : {res['report_files'].get('encrypted_archive_rfca')}")
         print(f"{'='*75}\n")
         render_poe_summary(
             poe_bd,
@@ -5423,6 +6876,11 @@ def cmd_all(args):
                 pass
     finally:
         db.close()
+
+    if getattr(args, "enable_autonomous_hunt", False):
+        _post_all_hunt_rc = cmd_autonomous_hunt(args, raw_argv=getattr(args, "_raw_cli_argv", None))
+        if _post_all_hunt_rc != 0:
+            sys.exit(_post_all_hunt_rc)
 
 
 def cmd_harness2(args):
@@ -5982,6 +7440,7 @@ def cmd_retest(args):
                     use_tls=bool(use_tls),
                     authorized=authorized,
                     traffic_session=session,
+                    workspace_root=_resolve_cli_workspace_root(args),
                 )
 
                 def _live_fallback_verifier(chain_obj, _reg=reg):
@@ -6140,6 +7599,7 @@ def cmd_rea(args):
     from engine.approval_gate import ApprovalGate
     from engine.cli_render import render_json, render_kv_panel, render_table
     from engine.dual_graph_engine import NoiseGovernor
+    from engine.execution_policy import ExecutionPolicy, _validate_canonical_path_syntax
     from engine.rea_integrator import ReaIntegrator
     from engine.safe_network_validator import (
         is_explicit_loopback_host,
@@ -6150,10 +7610,33 @@ def cmd_rea(args):
     as_json = bool(getattr(args, "as_json", False))
     plain = bool(getattr(args, "plain", False))
     err_stream = sys.stderr if as_json else sys.stdout
-    target_path = getattr(args, "rea_target", None) or getattr(args, "path", None) or getattr(args, "repo", None)
+    rea_target_arg = getattr(args, "rea_target", None)
+    primary_ws = getattr(args, "workspace_root", None) or getattr(args, "repo", None) or getattr(args, "path", None)
+    rea_ws = (
+        str(Path(primary_ws).parent)
+        if (primary_ws and Path(primary_ws).exists() and Path(primary_ws).is_file())
+        else primary_ws
+    )
+    target_path = rea_target_arg or primary_ws
     raw_host = getattr(args, "host", None)
     if not target_path and not raw_host:
         target_path = "."
+    if target_path is not None:
+        raw_tp = str(target_path)
+        tp_err = _validate_canonical_path_syntax(raw_tp, allow_trailing_slash=True)
+        if tp_err is not None and raw_tp != ".":
+            print(f"[!] REA target_path rejected: {tp_err} ('{raw_tp}')", file=err_stream)
+            sys.exit(1)
+    if rea_target_arg and rea_ws:
+        ok_rea, detail_rea = ExecutionPolicy.get_instance().validate_file_path(
+            rea_target_arg,
+            workspace_root=rea_ws,
+            allow_directory=True,
+        )
+        if not ok_rea:
+            print(f"[!] REA target_path outside workspace_root: {detail_rea}", file=err_stream)
+            sys.exit(1)
+        target_path = detail_rea
 
     clean_host = None
     resolved_port = None
@@ -6202,6 +7685,7 @@ def cmd_rea(args):
             reports_dir=reports_dir,
             approval_gate=gate,
             noise_governor=noise_gov,
+            workspace_root=rea_ws,
         )
         _stdout_ctx = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
         with _stdout_ctx:
@@ -6213,6 +7697,7 @@ def cmd_rea(args):
                 authorized=bool(authorized or (clean_host and is_explicit_loopback_host(clean_host))),
                 use_rea_cli=bool(getattr(args, "rea_cli", False)),
                 write_reports=True,
+                workspace_root=rea_ws,
             )
             payload = result.to_dict()
     except (PermissionError, ValueError) as exc:
@@ -6936,8 +8421,9 @@ ALL_MODES = [
     "invariants", "sandbox-invariants", "sandbox_invariants", "poe-verify", "poe_verify",
     "poc", "poc-verify", "poc_verify", "docker-doctor", "docker_doctor", "doctor-docker",
     "deep-audit", "deep_audit",
-    "novelty", "novelty-refresh", "novelty_refresh", "swarm-board", "swarm_board", "board",
-    "phi", "preflight", "hackerone", "hackone",
+    "novelty", "novelty-refresh", "novelty_refresh", "swarm", "swarm-board", "swarm_board", "board",
+    "phi", "preflight", "hackerone", "hackone", "stride", "threat-model", "threat_model",
+    "pe-audit", "pe_audit", "pe-dotnet", "pe_dotnet", "hybrid",
 ]
 
 
@@ -7245,6 +8731,22 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
    docker-doctor [--fix] [--include-all-wsl]
                             Windows Docker Desktop & WSL2 NTFS-compression VHDX diagnostic and self-healing repair
                             Example: python -u rfc_hunt_swarm.py docker-doctor --fix --include-all-wsl --plain
+
+14. UNIFIED LOCAL-FIRST RFCHUNT + MODELFUSION SINGLE-FILE ARCHITECTURE (--hunt, --all, --ensemble, --fast-ooda):
+   --start-modelfusion      Auto-start local ModelFusion (:5000) with VRAM-gated abliterated open-weight models
+                            (Gemma-4-12B, Foundation-Sec-8B, GLM, DeepSeek-R1-8B) + Anti-Junk & Grounding Guards.
+   --fast-ooda              3-Stage Parallel OODA Funnel: Stage 1 (CPU/ms SQLite WAL Blackboard, Lean 4/Z3, AST) ->
+                            Stage 2 (ACDSO 5/6-Objective Pareto AutoML <1s) -> Stage 3 (Abliterated Consensus + HITL).
+   --all / --ensemble       Regular pentest mode (without --hunt): runs Mantis, aiscan, ARTEX, RAPTOR, REA, PE/.NET,
+                            TruffleHog, Mobile/MobSF, API/JWT/SD-JWT, AI Infra Guard, Parity/Invariants, Zizmor/Actionlint/GHA,
+                            Z3 Formal, JS Bundle Analyzer + Recon Clustering, Lean 4 Formal Proofs, ACDSO Stage-2 Pareto,
+                            Strict 3-Lane Evidence Separation, RFC 6962 Merkle proofs, SARIF 2.1.0 / Nuclei / Snort 3 & --phi.
+   --hunt                   Turnkey autonomous bug bounty pipeline (+ --dry-run, --sync-public-directory, --once,
+                            --headless-only, --embedded, --no-llm, --install-schedule; HITL draft-only, never auto-submits).
+   Subcommands (all runnable directly via `python rfc_hunt_swarm.py <subcommand>`):
+                            freshness-watch, fast-ooda, ensemble-audit, lean-verify, rank-programs, sync-directory,
+                            analyze-js, cluster-recon, qa-drafts, check-drafts, atlas-llm-eval, linux-poc,
+                            package-audit, record-outcome, mcp, bugbounty-mcp.
 ===============================================================================
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -7395,6 +8897,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--artex-live", dest="artex_live", action="store_true", default=None, help="Force live non-destructive ARTEX worker verification")
     parser.add_argument("--no-artex-live", dest="no_artex_live", action="store_true", default=False, help="Disable auto-live ARTEX worker verification")
     parser.add_argument("--embedded-proxy", dest="embedded_proxy", action="store_true", default=False, help="Start embedded pure-CLI recording MITM proxy during scan")
+    parser.add_argument("--no-embedded-proxy", dest="no_embedded_proxy", action="store_true", default=False, help="Disable embedded MITM recording proxy even when --hybrid is enabled")
     parser.add_argument("--embedded-proxy-port", dest="embedded_proxy_port", type=int, default=0, help="Port for embedded MITM proxy (0 = ephemeral)")
     parser.add_argument("--auth-profile", dest="auth_profile", type=str, default=None, action=_SingleOrMultiStoreAction, help="Path(s) to JSON/YAML multi-role auth profiles (repeatable or comma-separated for 2-account BOLA/IDOR differential replay)")
     parser.add_argument("--header", "--bounty-header", dest="headers", action="append", default=[], help="Repeatable custom HTTP header ('Name: Value', e.g. 'X-Bug-Bounty: handle') propagated across all raw sockets, HTTP/2 frames, HTTP clients, and external scanners")
@@ -7442,6 +8945,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--docker-image", dest="docker_image", type=str, default=None, help="Optional explicit OCI image for docker isolation")
     parser.add_argument("--docker-network", dest="docker_network", choices=["bridge", "none"], default=None, help="Docker network mode for external scanner isolation (bridge|none)")
     parser.add_argument("--artex-multiturn", dest="artex_multiturn", action="store_true", default=False, help="Enable bounded multi-turn ArtexWorker adaptive tool loop")
+    parser.add_argument("--no-artex-multiturn", dest="no_artex_multiturn", action="store_true", default=False, help="Disable bounded multi-turn ArtexWorker adaptive tool loop even under --hybrid")
     parser.add_argument("--artex-intent-turns", dest="artex_intent_turns", type=int, default=0, help="Max turns per ARTEX intent (0 = default/unlimited)")
     parser.add_argument("--artex-intent-tokens", dest="artex_intent_tokens", type=int, default=0, help="Max tokens per ARTEX intent (0 = unlimited)")
     parser.add_argument("--json", dest="as_json", action="store_true", default=False, help="Emit machine-readable JSON output")
@@ -7456,7 +8960,8 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--query", "-q", dest="query", type=str, default=None, help="Search query for worker traces")
     parser.add_argument("--out", dest="out", type=str, default="reports", help="Output directory for export-advisory")
     parser.add_argument("--csv", dest="csv", action="store_true", default=False, help="Export formula-safe CSV in export-advisory")
-    parser.add_argument("--export-archive", dest="export_path", type=str, default=None, help="Output encrypted .rfca archive file path")
+    parser.add_argument("--export-archive", dest="export_path", nargs="?", const="__AUTO__", default=None, help="Output AES-256-GCM encrypted .rfca task archive path (omit path under --all/--hybrid to auto-write into output-dir)")
+    parser.add_argument("--no-export-archive", dest="no_export_archive", action="store_true", default=False, help="Disable automatic AES-256-GCM encrypted .rfca task archive export under --hybrid")
     parser.add_argument("--import", "--import-archive", dest="import_path", type=str, default=None, help="Input encrypted .rfca archive file path")
     parser.add_argument("--key-file", dest="key_file", type=str, default=None, help="Optional encryption key file path for archive")
     parser.add_argument("--ca-dir", dest="ca_dir", type=str, default="keys", help="CA directory for proxy mode")
@@ -7472,8 +8977,9 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--prompt-smuggle", dest="enable_prompt_smuggle", action="store_true", help="Synthesize and verify novel cross-layer Desynchronized Prompt Injection attack chains")
     parser.add_argument("--export-sarif", type=str, default=None, help="Export aggregated vulnerability findings to specified SARIF file in reports/")
 
-    # Google Mantis Integration (Module 20) & Unified --all Multi-Scanner Orchestrator
+    # Google Mantis Integration (Module 20) & Unified --all / --hybrid Multi-Scanner Orchestrator
     parser.add_argument("--all", "--run-all", "--all-scans", dest="run_all_scans", action="store_true", help="Execute ALL integrated scanners (Google Mantis, aiscan, ARTEX Dual-Graph, RAPTOR, Prompt Smuggling, Module 21 REA + rea-agents CLI, and httpx/katana/nuclei for live hosts) with mandatory ModelFusion + Abliterated models")
+    parser.add_argument("--hybrid", dest="enable_hybrid", action="store_true", default=False, help="Execute turnkey unified --hybrid local codebase + live remote audit (auto-enables --all, ARTEX multi-turn workers, strict POE=3, live retester, embedded MITM recording proxy, static+live REA drift correlation, GHSA advisories, formula-safe CSV, encrypted .rfca archive, and auto-STRIDE)")
     parser.add_argument("--repo", dest="repo", type=str, default=None, help="Repository directory path for --all, --mantis, or --raptor audits")
     parser.add_argument("--path", dest="path", type=str, default=None, help="Specific file or directory path for --all, --mantis, or --raptor audits")
     parser.add_argument("--mantis", "--enable-mantis", dest="enable_mantis", action="store_true", help="Enable Google Mantis toolkit (Module 20: threat modeling, depth hypotheses, Tier 1/2 repro, CVSS rubric, patching)")
@@ -7563,7 +9069,9 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--novelty-threshold", dest="novelty_threshold", type=float, default=0.72, help="Maximum structural similarity threshold below which 3-trial invariant-violating findings are tagged novel (default: 0.72)")
     parser.add_argument("--novelty-export", dest="novelty_export", type=str, default=None, help="Optional output JSON path to export the merged novelty corpus catalog")
 
-    # Pure-CLI Swarm Overview & Live Terminal Status Board (Zero GUI)
+    # Pure-CLI Swarm Overview, Multi-Agent Swarm Mode (--swarm) & Live Terminal Status Board (Zero GUI)
+    parser.add_argument("--swarm", dest="enable_swarm", action="store_true", default=False, help="Enable full multi-agent parallel Swarm orchestration (--all + --ensemble + --fast-ooda + --swarm-board on repos/folders, parallel target fan-out on --hunt, or 12-agent LangGraph protocol swarm on --host)")
+    parser.add_argument("--swarm-workers", dest="swarm_workers", type=int, default=None, help="Bounded concurrent worker count for --swarm target fan-out and parallel CPU checks (1..8)")
     parser.add_argument("--swarm-board", dest="swarm_board", action="store_true", default=False, help="Render live pure-CLI Swarm Overview board with color emojis & pipeline graph during --all and OODA Swarm runs (--plain for ASCII, zero GUI)")
     parser.add_argument("--no-swarm-board", dest="swarm_board", action="store_false", help="Disable pure-CLI Swarm Overview board rendering")
     parser.add_argument("--emoji", dest="board_emoji", action="store_true", default=None, help="Explicitly enable color emoji icons on the Swarm Overview board (auto-enabled on UTF-8 terminals)")
@@ -7602,6 +9110,13 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--phi-model", dest="phi_model", type=str, default="urchade/gliner_multi_pii-v1", help="GLiNER Span NER model identifier for --phi (default: urchade/gliner_multi_pii-v1)")
     parser.add_argument("--no-phi-ml", dest="no_phi_ml", action="store_true", default=False, help="Force deterministic offline RedactX-v3 + GLiNER fallback without loading HuggingFace GLiNER or Presidio ML weights")
 
+    # Module 26: Fusion-Powered STRIDE, MITRE ATT&CK, Zero Trust & Attack Tree Threat Modeler (--stride)
+    parser.add_argument("--stride", dest="enable_stride", action="store_true", default=False, help="Generate an advanced Fusion-powered STRIDE, MITRE ATT&CK, Zero Trust, Trust Boundary, Security Requirements & Attack Tree SVG Threat Model (standalone or chained into --all / --ensemble; auto-runs when a codebase lacks a threat model)")
+    parser.add_argument("--no-stride", dest="no_stride", action="store_true", default=False, help="Disable automatic STRIDE threat model generation during --all / --ensemble when a repository lacks a threat model")
+    parser.add_argument("--stride-diagram", dest="stride_diagrams", action="append", default=[], help="Optional uploaded system architecture diagram (.mmd, .svg, .drawio, .puml, .json, .yaml, .png, .jpg) to include in STRIDE & Trust Boundary analysis (repeatable)")
+    parser.add_argument("--stride-out", dest="stride_out", type=str, default=None, help="Output directory for THREAT_MODEL_STRIDE.md, JSON/SARIF, and downloadable SVG architecture/attack-tree diagrams")
+    parser.add_argument("--stride-write-repo", dest="stride_write_repo", action="store_true", default=False, help="Also write THREAT_MODEL.md directly into the target repository root when generating a STRIDE threat model")
+
     # HackerOne Campaign Finder, RoE Policy Engine & Autonomous HITL Computer-Use Report Porter
     parser.add_argument("--hackerone", "--hackone", dest="enable_hackerone", action="store_true", default=False, help="Discover a HackerOne campaign, parse its 3-tier RoE policy, and port verified/deterministic RFCHunt findings into redacted HackerOne report drafts with HITL review")
     parser.add_argument("--hackerone-auto", "--hackone-auto", dest="hackerone_auto", action="store_true", default=False, help="Policy-aware autonomous HackerOne workflow: after human login, discovers open campaigns, enforces RoE rules/Safe Harbor, audits in-scope repos (--all + --phi), and pre-fills drafts up to final human Submit")
@@ -7618,7 +9133,370 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--hackerone-min-severity", dest="hackerone_min_severity", choices=["low", "medium", "high", "critical"], default="medium", help="Minimum severity eligible for HackerOne porting (default: medium)")
     parser.add_argument("--hackerone-max-reports", dest="hackerone_max_reports", type=int, default=5, help="Maximum eligible drafts to generate per run (default: 5)")
 
+    # Module 24: Reverse-Proxy Config & HTTP Header Conformance Auditor (--crlf-desync / --crlf-conformance)
+    parser.add_argument("--crlf-desync", "--crlf-conformance", dest="enable_crlf_conformance", action="store_true", default=False, help="Run Module 24 static Nginx/OpenResty $uri config audit and safe 3-trial RFC 9112 header conformance checks")
+
+    # Module 25: Web LLM Defensive Security Auditor (--web-llm)
+    parser.add_argument("--web-llm", dest="enable_web_llm", action="store_true", default=False, help="Run Module 25 static Web LLM security auditor (excessive agency, tool-arg taint, insecure output handling, prompt-only authz, RAG scrubbing)")
+
+    # PE & .NET Code Integrity Anomaly Auditor (--pe-audit / --pe-dotnet)
+    parser.add_argument("--workspace-root", dest="workspace_root", type=str, default=None, help="Explicit workspace root directory for strict file_path/target_path confinement")
+    parser.add_argument("--pe-audit", "--pe-dotnet", dest="enable_pe_audit", action="store_true", default=False, help="Run PE & .NET Code Integrity Anomaly Auditor (Magika hybrid PE, CVE-2026-108398, UMCI/SEC_COMMIT fallback, YARA, KB5127694/VirtualBox host patch audit)")
+    parser.add_argument("--no-pe-audit", "--no-pe-dotnet", dest="no_pe_audit", action="store_true", default=False, help="Disable PE & .NET Code Integrity Anomaly Auditor during --all")
+    parser.add_argument("--pe-include-host-audit", dest="pe_include_host_audit", action="store_true", default=None, help="Include Windows KB5127694 & VirtualBox 7.2.18+ host patch audit during --all / --pe-audit")
+    parser.add_argument("--pe-no-host-audit", dest="pe_include_host_audit", action="store_false", help="Disable host patch-level audit during --pe-audit")
+    parser.add_argument("--pe-no-yara", dest="pe_include_yara", action="store_false", default=True, help="Disable defensive YARA rule evaluation during PE & .NET auditing")
+
+    # Planner-Worker-Verifier Whiteboard & Lean 4 Ensemble Orchestration (--ensemble / --essemble / --essample)
+    parser.add_argument("--ensemble", "--essemble", "--essample", dest="ensemble", action="store_true", default=False, help="Enable Planner-Worker-Verifier shared-whiteboard + Lean 4 formal ensemble orchestration in --all")
+    parser.add_argument("--program", dest="program", type=str, default="generic", help="Vendor threat-model profile for --ensemble (generic, shopify, anthropic, arc-bbp, cloudflare, coinbase)")
+    parser.add_argument("--freshness-hours", dest="freshness_hours", type=int, default=72, help="Git commit freshness lookback window in hours for --ensemble (default: 72)")
+    parser.add_argument("--quorum", dest="quorum", type=int, default=2, help="Minimum independent engine quorum for static corroboration in --ensemble (default: 2)")
+    parser.add_argument("--embedded", "--embeded", dest="embedded", action="store_true", default=False, help="Run --ensemble strictly in-process offline without spawning external scanner subprocesses")
+    parser.add_argument("--no-llm", dest="no_llm", action="store_true", default=False, help="Disable optional LLM semantic verification layer in --ensemble")
+    parser.add_argument("--gha-only", dest="gha_only", action="store_true", default=False, help="Restrict --ensemble local engine fan-out to GitHub Actions workflow scanners")
+    parser.add_argument("--package-client", dest="package_client", type=str, default=None, help="Optional client organization name to emit 5-file ClientAuditPackager bundle in --ensemble")
+    parser.add_argument("--start-modelfusion", dest="start_modelfusion", action="store_true", default=False, help="Auto-start local ModelFusion (:5000) server with VRAM-gated abliterated open-weight models and Anti-Junk & Grounding Guards before scanning")
+    parser.add_argument("--fast-ooda", dest="enable_fast_ooda", action="store_true", default=False, help="Run the 3-Stage Parallel OODA Funnel (Stage 1 CPU SQLite WAL Blackboard -> Stage 2 ACDSO Pareto AutoML -> Stage 3 Abliterated Consensus behind OllamaConcurrencyGuard) standalone or chained into --all")
+    parser.add_argument("--cpu-workers", dest="cpu_workers", type=int, default=None, help="Bounded ProcessPoolExecutor CPU workers for --fast-ooda / --ensemble (default: clamped 2..8)")
+    parser.add_argument("--blackboard-db", dest="blackboard_db", type=str, default=None, help="SQLite WAL Blackboard database path for --fast-ooda / --ensemble")
+    parser.add_argument("--resume", dest="resume", action="store_true", default=False, help="Recover stale IN_PROGRESS intents from SQLite WAL Blackboard before running --fast-ooda / --ensemble")
+    parser.add_argument("--signal-score", dest="signal_score", type=float, default=0.0, help="HackerOne Signal score for two-lane scheduling in --fast-ooda / --hunt (default: 0.0)")
+
+    # Turnkey Autonomous Bug Bounty Hunter (--hunt) — unified into rfc_hunt_swarm.py (regular pentests run unchanged without --hunt)
+    parser.add_argument("--hunt", dest="enable_autonomous_hunt", action="store_true", default=False, help="Run the turnkey autonomous RFCHunt + ModelFusion bug bounty pipeline (syncs directory, ranks unlocked programs via ACDSO ML, runs freshness-watch, fast-ooda, ensemble-audit, Lean 4, QA-drafts & HITL Chrome handoff; omit for regular pentesting)")
+    parser.add_argument("--hunt-target", dest="hunt_targets", action="append", default=[], help="Local repository or folder directory to audit during --hunt (repeatable; --target / --repo / --folder / --dir / --path also supported)")
+    parser.add_argument("--hunt-repo", dest="hunt_repos", action="append", default=[], help="Extra 'owner/repo' GitHub slug or local repo to include during --hunt (repeatable)")
+    parser.add_argument("--clone-unlocked", dest="clone_unlocked", action="store_true", default=False, help="Also shallow-clone and hunt UNLOCKED watchlist/EligibilityDB repos alongside local --repo / --folder / --target scans during --hunt")
+    parser.add_argument("--no-clone-unlocked", dest="no_clone_unlocked", action="store_true", default=False, help="Audit only explicitly passed local --repo / --folder / --target paths during --hunt without cloning additional unlocked watchlist repos")
+    parser.add_argument("--sync-public-directory", dest="sync_public_directory", action="store_true", default=False, help="Refresh public HackerOne Program Directory sorted by newest launch date before ML ranking during --hunt")
+    parser.add_argument("--eligibility-db", dest="eligibility_db", type=str, default=None, help="Optional ProgramEligibilityDB SQLite path for --hunt / --all")
+    parser.add_argument("--min-efficiency", dest="min_efficiency", type=float, default=80.0, help="Minimum HackerOne response efficiency %% during --hunt (default: 80.0)")
+    parser.add_argument("--portfolio-capacity", dest="portfolio_capacity", type=int, default=6, help="Daily Two-Phase Knapsack portfolio capacity during --hunt (default: 6)")
+    parser.add_argument("--max-repos", dest="max_repos", type=int, default=4, help="Maximum unlocked watchlist repos to audit per --hunt cycle (default: 4)")
+    parser.add_argument("--watchlist", dest="watchlist", type=str, default=None, help="Optional custom JSON watchlist path for --hunt (omitting uses UNLOCKED ProgramEligibilityDB repos)")
+    parser.add_argument("--interval-minutes", dest="interval_minutes", type=float, default=60.0, help="Minutes between continuous --hunt cycles (default: 60.0)")
+    parser.add_argument("--max-cycles", dest="max_cycles", type=int, default=0, help="Stop --hunt after N cycles (0 = run continuously unless --once or --dry-run)")
+    parser.add_argument("--once", dest="hunt_once", action="store_true", default=False, help="Run a single complete --hunt cycle and exit")
+    parser.add_argument("--hunt-url", "--bug-hunt-url", dest="hunt_url", type=str, default=None, help="Official bug bounty directory or program URL opened in Chromium by --hunt so you log in and RFCHunt runs every /browser workflow automatically (default: https://hackerone.com/opportunities/all)")
+    parser.add_argument("--browser-hunt", dest="browser_hunt", action="store_true", default=False, help="Explicitly enable interactive browser hunt on --hunt-url (auto-enabled by --hunt unless --headless-only, --embedded, or --no-browser-hunt is set)")
+    parser.add_argument("--no-browser-hunt", dest="no_browser_hunt", action="store_true", default=False, help="Disable opening --hunt-url in interactive browser mode during --hunt")
+    parser.add_argument("--browser-profile", dest="browser_profile", type=str, default=None, help="Persistent Chromium profile directory for --hunt so your bug bounty login persists across cycles (default: out/autonomous_hunt/h1_browser_profile)")
+    parser.add_argument("--cdp-url", dest="cdp_url", type=str, default=None, help="Attach --hunt to an already-signed-in Chrome or HugOS Browser CDP endpoint (e.g. http://127.0.0.1:9222)")
+    parser.add_argument("--login-timeout", dest="login_timeout", type=float, default=300.0, help="Maximum seconds --hunt waits for you to complete login, 2FA, and any CAPTCHA directly in the browser (default: 300.0)")
+    parser.add_argument("--probe-report-id", dest="probe_report_id", type=int, default=4243972, help="HackerOne report ID probed read-only during --hunt to check live account cooldown (`can_submit_draft?`, default: 4243972)")
+    parser.add_argument("--dedup-db", dest="dedup_db", type=str, default=None, help="SQLite WAL database path persisting processed target SHAs and drafted/submitted findings to eliminate duplicates (default: <out>/hunt_state.sqlite3)")
+    parser.add_argument("--force-rescan", dest="force_rescan", action="store_true", default=False, help="Re-scan targets during --hunt even if their current commit SHA or folder digest is already recorded in SQLite (duplicate drafts stay blocked)")
+    parser.add_argument("--no-stage-drafts", dest="no_stage_drafts", action="store_true", default=False, help="During --hunt, skip opening /reports/new or saving drafts on HackerOne while keeping browser discovery, scanning, and SQLite dedup active")
+    parser.add_argument("--headless-only", dest="headless_only", action="store_true", default=False, help="During --hunt, skip browser login/discovery, draft staging, and Chrome launch; write READY_TO_CLICK_SUBMIT.md only")
+    parser.add_argument("--allow-blocked", dest="allow_blocked", action="store_true", default=False, help="Allow Signal-blocked programs for local offline research during --hunt")
+    parser.add_argument("--install-schedule", dest="install_schedule", action="store_true", default=False, help="Install recurring native OS schedule for `rfc_hunt_swarm.py --hunt --once` (zero Registry/PATH mutation)")
+    parser.add_argument("--uninstall-schedule", dest="uninstall_schedule", action="store_true", default=False, help="Remove the recurring native OS schedule for --hunt")
+    parser.add_argument("--run-now", dest="run_now", action="store_true", default=False, help="Trigger an immediate scheduled task run right after --hunt --install-schedule")
+    parser.add_argument("--task-name", dest="task_name", type=str, default="RFCHunt-Autonomous-Defensive-Hunt", help="OS Scheduled Task name for --hunt --install-schedule")
+
+    _ensure_help_examples_for_all_flags(parser)
     return parser
+
+
+_CURATED_FLAG_EXAMPLES: Dict[str, str] = {
+    "--swarm": "python rfc_hunt_swarm.py --swarm --repo . --dry-run",
+    "--swarm-workers": "python rfc_hunt_swarm.py --swarm --swarm-workers 4 --repo . --folder ./extra --dry-run",
+    "--hunt": "python rfc_hunt_swarm.py --hunt --hunt-url https://hackerone.com/opportunities/all --dry-run",
+    "--hunt-url": "python rfc_hunt_swarm.py --hunt --hunt-url https://hackerone.com/opportunities/all --dry-run",
+    "--bug-hunt-url": "python rfc_hunt_swarm.py --hunt --bug-hunt-url https://hackerone.com/anthropic --dry-run",
+    "--browser-hunt": "python rfc_hunt_swarm.py --hunt --browser-hunt --hunt-url https://hackerone.com/opportunities/all --dry-run",
+    "--no-browser-hunt": "python rfc_hunt_swarm.py --hunt --no-browser-hunt --once --dry-run",
+    "--browser-profile": "python rfc_hunt_swarm.py --hunt --browser-profile out/autonomous_hunt/h1_browser_profile --dry-run",
+    "--cdp-url": "python rfc_hunt_swarm.py --hunt --cdp-url http://127.0.0.1:9222 --dry-run",
+    "--login-timeout": "python rfc_hunt_swarm.py --hunt --login-timeout 180 --dry-run",
+    "--probe-report-id": "python rfc_hunt_swarm.py --hunt --probe-report-id 4243972 --dry-run",
+    "--dedup-db": "python rfc_hunt_swarm.py --hunt --dedup-db out/autonomous_hunt/hunt_state.sqlite3 --dry-run",
+    "--force-rescan": "python rfc_hunt_swarm.py --hunt --repo ./target_repo --force-rescan --once --dry-run",
+    "--no-stage-drafts": "python rfc_hunt_swarm.py --hunt --hunt-url https://hackerone.com/anthropic --no-stage-drafts --once --dry-run",
+    "--hunt-target": "python rfc_hunt_swarm.py --hunt --hunt-target ./target_repo --program common_codes --once --dry-run",
+    "--hunt-repo": "python rfc_hunt_swarm.py --hunt --hunt-repo Shopify/shopify-app-js --once --dry-run",
+    "--clone-unlocked": "python rfc_hunt_swarm.py --hunt --repo ./my_repo --folder ./my_folder --clone-unlocked --dry-run",
+    "--no-clone-unlocked": "python rfc_hunt_swarm.py --hunt --repo ./my_repo --folder ./my_folder --no-clone-unlocked --once --dry-run",
+    "--sync-public-directory": "python rfc_hunt_swarm.py --hunt --sync-public-directory --min-efficiency 80 --dry-run",
+    "--eligibility-db": "python rfc_hunt_swarm.py --hunt --eligibility-db reports/program_eligibility.sqlite3 --dry-run",
+    "--min-efficiency": "python rfc_hunt_swarm.py --hunt --min-efficiency 85 --dry-run",
+    "--portfolio-capacity": "python rfc_hunt_swarm.py --hunt --portfolio-capacity 6 --dry-run",
+    "--max-repos": "python rfc_hunt_swarm.py --hunt --max-repos 4 --dry-run",
+    "--watchlist": "python rfc_hunt_swarm.py --hunt --watchlist config/freshness_watchlist.example.json --dry-run",
+    "--interval-minutes": "python rfc_hunt_swarm.py --hunt --interval-minutes 60 --max-cycles 2",
+    "--max-cycles": "python rfc_hunt_swarm.py --hunt --max-cycles 1 --headless-only",
+    "--once": "python rfc_hunt_swarm.py --hunt --once --headless-only",
+    "--headless-only": "python rfc_hunt_swarm.py --hunt --once --headless-only --embedded",
+    "--allow-blocked": "python rfc_hunt_swarm.py --hunt --target ./repo --program shopify --allow-blocked --once --dry-run",
+    "--install-schedule": "python rfc_hunt_swarm.py --hunt --install-schedule --interval-minutes 60 --dry-run",
+    "--uninstall-schedule": "python rfc_hunt_swarm.py --hunt --uninstall-schedule --task-name RFCHunt-Autonomous-Defensive-Hunt",
+    "--run-now": "python rfc_hunt_swarm.py --hunt --install-schedule --run-now --dry-run",
+    "--task-name": "python rfc_hunt_swarm.py --hunt --install-schedule --task-name RFCHunt-Nightly --dry-run",
+    "--all": "python rfc_hunt_swarm.py --all --repo . --dry-run",
+    "--hybrid": "python rfc_hunt_swarm.py --hybrid --repo . --host 127.0.0.1 --port 8080 --dry-run",
+    "--no-artex-multiturn": "python rfc_hunt_swarm.py --hybrid --repo . --host 127.0.0.1 --no-artex-multiturn --dry-run",
+    "--no-embedded-proxy": "python rfc_hunt_swarm.py --hybrid --repo . --host 127.0.0.1 --no-embedded-proxy --dry-run",
+    "--export-archive": "python rfc_hunt_swarm.py --all --repo . --export-archive reports/audit.rfca",
+    "--no-export-archive": "python rfc_hunt_swarm.py --hybrid --repo . --no-export-archive --dry-run",
+    "--ensemble": "python rfc_hunt_swarm.py --all --ensemble --repo . --program generic --quorum 2",
+    "--program": "python rfc_hunt_swarm.py --all --ensemble --repo . --program anthropic",
+    "--freshness-hours": "python rfc_hunt_swarm.py --all --ensemble --repo . --freshness-hours 72",
+    "--quorum": "python rfc_hunt_swarm.py --all --ensemble --repo . --quorum 2",
+    "--embedded": "python rfc_hunt_swarm.py --all --ensemble --repo . --embedded --no-llm",
+    "--no-llm": "python rfc_hunt_swarm.py --all --ensemble --repo . --no-llm",
+    "--gha-only": "python rfc_hunt_swarm.py --all --ensemble --repo . --gha-only",
+    "--package-client": 'python rfc_hunt_swarm.py --all --ensemble --repo . --package-client "Acme Corp"',
+    "--start-modelfusion": "python rfc_hunt_swarm.py --all --repo . --start-modelfusion --dry-run",
+    "--fast-ooda": "python rfc_hunt_swarm.py --fast-ooda --repo . --embedded --json",
+    "--cpu-workers": "python rfc_hunt_swarm.py --fast-ooda --repo . --cpu-workers 4 --embedded",
+    "--blackboard-db": "python rfc_hunt_swarm.py --fast-ooda --repo . --blackboard-db reports/blackboard.sqlite3",
+    "--resume": "python rfc_hunt_swarm.py --fast-ooda --repo . --resume --embedded",
+    "--signal-score": "python rfc_hunt_swarm.py --fast-ooda --repo . --signal-score 1.5 --embedded",
+    "--dry-run": "python rfc_hunt_swarm.py --all --repo . --dry-run --json",
+    "--host": "python rfc_hunt_swarm.py --all --host target.example.com --port 443 --tls --authorized --dry-run",
+    "--port": "python rfc_hunt_swarm.py --mode terminator --host 127.0.0.1 --port 3030",
+    "--tls": "python rfc_hunt_swarm.py --mode terminator --host target.example.com --port 443 --tls --authorized",
+    "--authorized": "python rfc_hunt_swarm.py --all --host target.example.com --port 443 --tls --authorized",
+    "--allow-destructive": "python rfc_hunt_swarm.py --all --host target.example.com --authorized --allow-destructive --dry-run",
+    "--repo": "python rfc_hunt_swarm.py --all --repo ./target_repo",
+    "--path": "python rfc_hunt_swarm.py --all --path engine/mantis_integrator.py",
+    "--output-dir": "python rfc_hunt_swarm.py --all --repo . --output-dir reports/audit_run",
+    "--out": "python rfc_hunt_swarm.py export-advisory --out reports/advisories",
+    "--json": "python rfc_hunt_swarm.py --all --repo . --dry-run --json",
+    "--plain": "python rfc_hunt_swarm.py --all --repo . --plain",
+    "--phi": "python rfc_hunt_swarm.py --phi --repo . --phi-redact",
+    "--phi-target": "python rfc_hunt_swarm.py --phi --phi-target ./records",
+    "--phi-redact": "python rfc_hunt_swarm.py --phi --repo . --phi-redact",
+    "--phi-model": "python rfc_hunt_swarm.py --phi --repo . --phi-model urchade/gliner_multi_pii-v1",
+    "--no-phi-ml": "python rfc_hunt_swarm.py --phi --repo . --no-phi-ml",
+    "--stride": "python rfc_hunt_swarm.py --stride --repo . --dry-run",
+    "--no-stride": "python rfc_hunt_swarm.py --all --repo . --no-stride --dry-run",
+    "--stride-diagram": "python rfc_hunt_swarm.py --stride --repo . --stride-diagram docs/architecture.mmd --dry-run",
+    "--stride-out": "python rfc_hunt_swarm.py --stride --repo . --stride-out reports/stride_threat_model",
+    "--stride-write-repo": "python rfc_hunt_swarm.py --stride --repo ./target_repo --stride-write-repo --dry-run",
+    "--hackerone": "python rfc_hunt_swarm.py --hackerone --hackerone-program anthropic --dry-run",
+    "--hackerone-auto": "python rfc_hunt_swarm.py --hackerone-auto --hackerone-max-programs 2 --dry-run",
+    "--crlf-desync": "python rfc_hunt_swarm.py --crlf-desync --repo . --json",
+    "--web-llm": "python rfc_hunt_swarm.py --web-llm --repo . --json",
+    "--pe-audit": "python rfc_hunt_swarm.py --pe-audit --repo . --json",
+    "--no-pe-audit": "python rfc_hunt_swarm.py --all --repo . --no-pe-audit",
+    "--workspace-root": "python rfc_hunt_swarm.py --all --repo . --workspace-root .",
+    "--serve-ui": "python rfc_hunt_swarm.py --serve-ui --ui-host 127.0.0.1 --ui-port 8789",
+    "--network-lifecycle": "python rfc_hunt_swarm.py --network-lifecycle --host target.example.com --authorized --dry-run",
+    "--preflight": "python rfc_hunt_swarm.py --all --repo . --preflight",
+    "--no-preflight": "python rfc_hunt_swarm.py --all --repo . --no-preflight",
+    "--preflight-only": "python rfc_hunt_swarm.py --preflight-only --repo . --json",
+    "--deep-audit": "python rfc_hunt_swarm.py deep-audit --repo . --proxy --poc --plain",
+    "--proxy": "python rfc_hunt_swarm.py --repo . --proxy 127.0.0.1:8080 --plain",
+    "--poc": "python rfc_hunt_swarm.py --all --repo . --poc --output-dir reports",
+    "--header": 'python rfc_hunt_swarm.py --all --host target.example.com --authorized --header "X-Bug-Bounty: researcher"',
+    "--user-agent": 'python rfc_hunt_swarm.py --all --host target.example.com --authorized --user-agent "RFCHunt-Researcher/1.0"',
+    "--max-rps": "python rfc_hunt_swarm.py --all --host target.example.com --authorized --max-rps 2.0",
+    "--env-local": "python rfc_hunt_swarm.py --all --repo . --env-local .env.local",
+    "--force-ollama": "python rfc_hunt_swarm.py --all --repo . --force-ollama",
+}
+
+
+def _synthesize_flag_example(act: argparse.Action) -> str:
+    """Returns a curated or deterministically synthesized runnable CLI example for any parser flag."""
+    opts = [o for o in act.option_strings if o.startswith("--")]
+    if not opts:
+        return "python rfc_hunt_swarm.py --help"
+    primary = opts[0]
+    for o in opts:
+        if o in _CURATED_FLAG_EXAMPLES:
+            return _CURATED_FLAG_EXAMPLES[o]
+
+    # Pick realistic mode/context prefix from flag namespace
+    low = primary.lower()
+    if low.startswith("--hunt"):
+        prefix = "python rfc_hunt_swarm.py --hunt --dry-run"
+    elif low.startswith("--artex"):
+        prefix = "python rfc_hunt_swarm.py --all --repo ."
+    elif low.startswith("--aiscan"):
+        prefix = "python rfc_hunt_swarm.py aiscan"
+    elif low.startswith("--raptor"):
+        prefix = "python rfc_hunt_swarm.py raptor --repo ."
+    elif low.startswith("--mantis"):
+        prefix = "python rfc_hunt_swarm.py --mantis --repo ."
+    elif low.startswith("--harness2"):
+        prefix = "python rfc_hunt_swarm.py harness2 --rfc 9112"
+    elif low.startswith("--dream"):
+        prefix = "python rfc_hunt_swarm.py --mode dream"
+    elif low.startswith("--phi"):
+        prefix = "python rfc_hunt_swarm.py --phi --repo ."
+    elif low.startswith("--hackerone") or low.startswith("--hackone"):
+        prefix = "python rfc_hunt_swarm.py --hackerone --dry-run"
+    elif low.startswith("--preflight"):
+        prefix = "python rfc_hunt_swarm.py --preflight-only --repo ."
+    elif low.startswith("--pe-"):
+        prefix = "python rfc_hunt_swarm.py --pe-audit --repo ."
+    elif low.startswith("--fuzz"):
+        prefix = "python rfc_hunt_swarm.py fuzz-bridge --repo ."
+    elif low.startswith("--slice") or low.startswith("--escalation") or low.startswith("--frontier"):
+        prefix = "python rfc_hunt_swarm.py slice --repo ."
+    elif low.startswith("--poc"):
+        prefix = "python rfc_hunt_swarm.py --all --repo . --poc"
+    elif low.startswith("--proxy") or low.startswith("--live-proxy") or low.startswith("--trust-"):
+        prefix = "python rfc_hunt_swarm.py deep-audit --repo ."
+    elif low.startswith("--mcp"):
+        prefix = "python rfc_hunt_swarm.py mcp"
+    elif low.startswith("--hint"):
+        prefix = 'python rfc_hunt_swarm.py hint --hint "Focus auth boundaries"'
+    elif low.startswith("--caldera"):
+        prefix = "python rfc_hunt_swarm.py caldera"
+    elif low.startswith("--rea"):
+        prefix = "python rfc_hunt_swarm.py rea --path ."
+    elif low.startswith("--board") or low in ("--emoji", "--no-emoji", "--watch", "--interval"):
+        prefix = "python rfc_hunt_swarm.py swarm-board"
+    elif low.startswith("--ui") or low in ("--serve", "--random-port"):
+        prefix = "python rfc_hunt_swarm.py ui"
+    elif low.startswith("--novelty") or low.startswith("--refresh-novelty"):
+        prefix = "python rfc_hunt_swarm.py novelty"
+    elif low.startswith("--arxiv") or low.startswith("--last30days") or low.startswith("--research") or low.startswith("--reseach") or low.startswith("--skill"):
+        prefix = "python rfc_hunt_swarm.py --all --repo ."
+    elif low.startswith("--invariant") or low.startswith("--sandbox"):
+        prefix = "python rfc_hunt_swarm.py sandbox-invariants --repo ."
+    elif low.startswith("--poe") or low.startswith("--drop-unverified") or low.startswith("--findings-json"):
+        prefix = "python rfc_hunt_swarm.py poe-verify --repo ."
+    elif low.startswith("--docker") or low.startswith("--fix") or low.startswith("--include-all-wsl") or low.startswith("--reset-docker"):
+        prefix = "python rfc_hunt_swarm.py docker-doctor"
+    elif low in ("--chain-id", "--min-poe", "--verified-only"):
+        prefix = "python rfc_hunt_swarm.py chains"
+    elif low in ("--all-chains", "--live"):
+        prefix = "python rfc_hunt_swarm.py retest"
+    elif low in ("--worker-id", "--query"):
+        prefix = "python rfc_hunt_swarm.py traces"
+    elif low in ("--export-archive", "--import", "--key-file"):
+        prefix = "python rfc_hunt_swarm.py archive"
+    elif low in ("--ca-dir", "--noise-profile", "--rewrite-rule", "--duration"):
+        prefix = "python rfc_hunt_swarm.py proxy"
+    elif low in ("--sequence", "--name", "--max-size"):
+        prefix = "python rfc_hunt_swarm.py ruler --host 127.0.0.1 --port 3030"
+    elif low in ("--keep-rfcs-on-clean", "--keep-findings-on-clean"):
+        prefix = "python rfc_hunt_swarm.py --clean-db"
+    elif low in ("--include-docker", "--no-docker-tools", "--force-install", "--tools"):
+        prefix = "python rfc_hunt_swarm.py --setup"
+    else:
+        prefix = "python rfc_hunt_swarm.py --all --repo ."
+
+    # Boolean / count / flag-only actions take no argument
+    if act.nargs == 0:
+        return f"{prefix} {primary}"
+
+    # Determine concrete sample value
+    sample: str
+    if act.choices:
+        sample = str(list(act.choices)[0])
+    elif act.type is int:
+        dv = act.default if isinstance(act.default, int) and not isinstance(act.default, bool) and act.default > 0 else 5
+        sample = str(dv)
+    elif act.type is float:
+        dv = act.default if isinstance(act.default, (int, float)) and not isinstance(act.default, bool) and float(act.default) > 0 else 10.0
+        sample = str(dv)
+    elif "url" in low:
+        sample = "http://127.0.0.1:8787"
+    elif "host" in low:
+        sample = "127.0.0.1"
+    elif "model" in low:
+        sample = "hf.co/OBLITERATUS/Gemma-4-12B-OBLITERATED:Q4_K_M"
+    elif "profile" in low and "llm" in low:
+        sample = "profA,profB"
+    elif "har" in low:
+        sample = "traffic.har"
+    elif "openapi" in low:
+        sample = "openapi.yaml"
+    elif "sarif" in low:
+        sample = "reports/audit.sarif"
+    elif "archive" in low or low == "--import":
+        sample = "reports/task_backup.rfca"
+    elif "dir" in low or "folder" in low or "target" in low or "repo" in low:
+        sample = "./reports" if "dir" in low or "out" in low else "."
+    elif "file" in low or "rules" in low or "policy" in low or "cert" in low or "key" in low or "config" in low or "db" in low or "export" in low:
+        sample = str(act.default) if (isinstance(act.default, str) and act.default.strip()) else "config.yaml"
+    elif "rewrite" in low:
+        sample = '"add-hdr:X-Test=1"'
+    elif "sequence" in low:
+        sample = '"\\xc0\\x8a"'
+    elif "probe" in low:
+        sample = '"GET / HTTP/1.1\\r\\n\\r\\n"'
+    elif "query" in low or "topic" in low or "prompt" in low or "keywords" in low:
+        sample = '"auth bypass"'
+    elif "username" in low:
+        sample = "researcher"
+    elif "token" in low or "key" in low:
+        sample = "demo-token"
+    elif "tags" in low:
+        sample = "tech,misconfig,exposure"
+    elif "languages" in low:
+        sample = "python,rust"
+    elif "parsers" in low:
+        sample = "nginx,envoy,haproxy"
+    elif "tools" in low:
+        sample = "aiscan,raptor,httpx"
+    elif "image" in low:
+        sample = "python:3.12-slim"
+    elif "runtime" in low:
+        sample = "python"
+    elif isinstance(act.default, str) and act.default.strip():
+        dv_s = act.default.strip()
+        sample = f'"{dv_s}"' if " " in dv_s else dv_s
+    else:
+        sample = "example"
+
+    return f"{prefix} {primary} {sample}"
+
+
+def _ensure_help_examples_for_all_flags(parser: argparse.ArgumentParser) -> None:
+    """Guarantees every single CLI option in `--help` includes a concrete `Example:` line."""
+    for act in parser._actions:
+        opts = [o for o in act.option_strings if o.startswith("--")]
+        if not opts or "--help" in opts:
+            continue
+        cur_help = act.help or ""
+        if "example:" in cur_help.lower():
+            continue
+        ex = _synthesize_flag_example(act)
+        # Escape literal '%' for argparse %-formatting
+        ex_safe = ex.replace("%", "%%")
+        sep = " " if cur_help and not cur_help.endswith((".", ")")) else (" " if cur_help else "")
+        act.help = f"{cur_help}{sep}Example: `{ex_safe}`"
+
+
+def generate_complete_cli_flags_markdown() -> str:
+    """Generates a 100%-complete Markdown CLI flags + examples reference directly from `build_swarm_parser()`."""
+    parser = build_swarm_parser()
+    lines: List[str] = [
+        "| Flag(s) | Type | Default | Description | Example |",
+        "| :--- | :--- | :--- | :--- | :--- |",
+    ]
+    for act in parser._actions:
+        opts = [o for o in act.option_strings if o.startswith("--")]
+        if not opts or "--help" in opts:
+            continue
+        flag_cell = ", ".join(f"`{o}`" for o in opts)
+        if act.nargs == 0:
+            type_cell = "flag"
+        elif act.choices:
+            type_cell = "choice"
+        elif act.type is int:
+            type_cell = "int"
+        elif act.type is float:
+            type_cell = "float"
+        else:
+            type_cell = "string"
+        default_val = act.default
+        default_cell = f"`{default_val}`" if default_val is not None else "`None`"
+        raw_help = (act.help or "").replace("%%", "%")
+        if " Example: `" in raw_help:
+            desc_part = raw_help.split(" Example: `", 1)[0].strip()
+        else:
+            desc_part = raw_help.strip()
+        desc_cell = desc_part.replace("|", "\\|").replace("\n", " ")
+        ex_cmd = _synthesize_flag_example(act).replace("|", "\\|")
+        lines.append(f"| {flag_cell} | {type_cell} | {default_cell} | {desc_cell} | `{ex_cmd}` |")
+    return "\n".join(lines) + "\n"
 
 
 def print_raptor_help():
@@ -7849,6 +9727,109 @@ RELATED FLAGS:
     print(help_text)
 
 
+def _normalize_all_positional_target(
+    argv_list: List[str],
+    parser: argparse.ArgumentParser,
+) -> Tuple[List[str], Optional[str]]:
+    """
+    Normalizes `["--all", "<target>", ...]` (e.g. from `bugbounty_mcp_server.build_rfchunt_all_argv`)
+    using `parser._option_string_actions` so `<target>` is mapped to `--host` or `--repo`
+    instead of failing `command` (`choices=ALL_MODES`) with `SystemExit(2)`.
+    """
+    opt_actions = getattr(parser, "_option_string_actions", {})
+    has_all_flag = False
+    has_explicit_target_opt = False
+
+    def _consume_option_count(tok: str, idx: int, tokens: List[str]) -> int:
+        if "=" in tok:
+            return 0
+        act = opt_actions.get(tok)
+        if act is None:
+            return 0
+        nargs = getattr(act, "nargs", None)
+        if nargs is None:
+            return 1 if idx + 1 < len(tokens) else 0
+        if isinstance(nargs, int):
+            return min(nargs, max(0, len(tokens) - idx - 1))
+        if nargs == "?":
+            if idx + 1 < len(tokens) and not tokens[idx + 1].startswith("-"):
+                return 1
+            return 0
+        if nargs in ("*", "+"):
+            cnt = 0
+            while idx + 1 + cnt < len(tokens) and not tokens[idx + 1 + cnt].startswith("-"):
+                cnt += 1
+            return cnt
+        return 0
+
+    i = 0
+    while i < len(argv_list):
+        tok = argv_list[i]
+        if tok == "--":
+            break
+        if tok.startswith("-"):
+            opt_key = tok.split("=", 1)[0]
+            if opt_key in ("--all", "--run-all", "--all-scans", "--hunt", "--fast-ooda", "--ensemble", "--essemble", "--essample", "--swarm", "--stride"):
+                has_all_flag = True
+            elif opt_key == "--mode":
+                if "=" in tok:
+                    if tok.split("=", 1)[1] in ("all", "all_scans"):
+                        has_all_flag = True
+                elif i + 1 < len(argv_list) and argv_list[i + 1] in ("all", "all_scans"):
+                    has_all_flag = True
+            if opt_key in ("--repo", "--raptor-target", "--folder", "--dir", "--path", "--host", "--target", "--hunt-target"):
+                has_explicit_target_opt = True
+            i += 1 + _consume_option_count(tok, i, argv_list)
+        else:
+            if tok in ("all", "all_scans"):
+                has_all_flag = True
+            i += 1
+
+    if not has_all_flag:
+        return list(argv_list), None
+
+    has_hunt_mode = any(t == "--hunt" for t in argv_list)
+    out: List[str] = []
+    promoted_target: Optional[str] = None
+    pos_idx = 0
+    i = 0
+    while i < len(argv_list):
+        tok = argv_list[i]
+        if tok == "--":
+            out.extend(argv_list[i:])
+            break
+        if tok.startswith("-"):
+            consume = _consume_option_count(tok, i, argv_list)
+            out.extend(argv_list[i : i + 1 + consume])
+            i += 1 + consume
+            continue
+        if tok not in ALL_MODES:
+            if promoted_target is None:
+                promoted_target = tok
+            if has_hunt_mode:
+                if os.path.isdir(tok) or tok in (".", "..") or tok.startswith(("./", "../", ".\\", "..\\")):
+                    out.extend(["--hunt-target", tok])
+                else:
+                    out.extend(["--hunt-repo", tok])
+                pos_idx += 1
+                i += 1
+                continue
+            if pos_idx == 0:
+                if not has_explicit_target_opt:
+                    if tok.lower().startswith(("http://", "https://")):
+                        out.extend(["--host", tok])
+                    else:
+                        out.extend(["--repo", tok])
+                    has_explicit_target_opt = True
+                pos_idx += 1
+                i += 1
+                continue
+        pos_idx += 1
+        out.append(tok)
+        i += 1
+    return out, promoted_target
+
+
 def parse_swarm_arguments(argv=None):
     """Parses arguments using build_swarm_parser."""
     raw_args = sys.argv[1:] if argv is None else list(argv)
@@ -7868,9 +9849,19 @@ def parse_swarm_arguments(argv=None):
 
     parser = build_swarm_parser()
     norm_args = _normalize_harness2_argv(raw_args)
+    norm_args, promoted_target = _normalize_all_positional_target(norm_args, parser)
     args = parser.parse_args(norm_args)
     if not hasattr(args, "_explicit_cli_dests"):
         args._explicit_cli_dests = set()
+    if promoted_target is not None and not getattr(args, "target_arg", None):
+        args.target_arg = promoted_target
+    if getattr(args, "command", None) in ("all", "all_scans") and getattr(args, "target_arg", None):
+        _t_pos = str(args.target_arg)
+        if _t_pos.lower().startswith(("http://", "https://")) and "host" not in args._explicit_cli_dests:
+            args.host = _t_pos
+            args._explicit_cli_dests.add("host")
+        elif not getattr(args, "repo", None) and not getattr(args, "path", None):
+            args.repo = _t_pos
     if isinstance(args.targets, str):
         args.targets = [t.strip() for t in args.targets.split(",") if t.strip()]
     if isinstance(args.terminators, str):
@@ -7903,6 +9894,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         sys.exit(1)
 
     raw_argv = sys.argv[1:] if argv is None else list(argv)
+    args._raw_cli_argv = list(raw_argv)
     explicit_dests = getattr(args, "_explicit_cli_dests", set())
     explicit_mode_given = bool(args.command) or any(
         arg == "--mode" or arg.startswith("--mode=") for arg in _normalize_harness2_argv(raw_argv)
@@ -7916,7 +9908,8 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "harness2_report", "mantis_report", "aiscan_report", "install_tools", "tool_status",
             "deep_audit", "proxy_target", "live_proxy_fuzz", "trust_boundary_review",
             "coverage_fuzz", "enable_poc", "enable_phi", "enable_hackerone", "hackerone_auto",
-            "serve_ui", "network_lifecycle", "dry_run",
+            "serve_ui", "network_lifecycle", "dry_run", "enable_pe_audit", "enable_autonomous_hunt",
+            "enable_fast_ooda", "start_modelfusion", "enable_swarm", "enable_stride", "enable_hybrid",
         )
     ) and getattr(args, "hint", None) is None and not getattr(args, "dispatch", None):
         build_swarm_parser().print_help()
@@ -7964,8 +9957,137 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
     elif active_mode in ("hackone",):
         active_mode = "hackerone"
 
+    if getattr(args, "enable_hybrid", False) or active_mode == "hybrid":
+        args.enable_hybrid = True
+        args.run_all_scans = True
+
+    # Validate numeric CLI bounds BEFORE --dry-run early return so invalid flags exit rc=1
+    _as_json_cli = bool(getattr(args, "as_json", False))
+    for _turn_attr in ("artex_intent_turns", "artex_intent_tokens", "artex_budget_turns"):
+        _tval = getattr(args, _turn_attr, 0)
+        if isinstance(_tval, bool) or (_tval is not None and int(_tval) < 0):
+            print(
+                "[!] ARTEX budget/turn parameters must be non-negative (>= 0).",
+                file=(sys.stderr if _as_json_cli else sys.stdout),
+            )
+            sys.exit(1)
+    _rounds_val = getattr(args, "artex_rounds", None)
+    if _rounds_val is not None and int(_rounds_val) < 1:
+        print(
+            "[!] --artex-rounds must be >= 1.",
+            file=(sys.stderr if _as_json_cli else sys.stdout),
+        )
+        sys.exit(1)
+    _workers_val = getattr(args, "artex_workers", None)
+    if _workers_val is not None and int(_workers_val) < 1:
+        print(
+            "[!] --artex-workers must be >= 1.",
+            file=(sys.stderr if _as_json_cli else sys.stdout),
+        )
+        sys.exit(1)
+    _max_rps_val = getattr(args, "max_rps", None)
+    if _max_rps_val is not None and float(_max_rps_val) < 0.0:
+        print(
+            "[!] --max-rps must be non-negative (>= 0).",
+            file=(sys.stderr if _as_json_cli else sys.stdout),
+        )
+        sys.exit(1)
+    _swarm_workers_val = getattr(args, "swarm_workers", None)
+    if _swarm_workers_val is not None and int(_swarm_workers_val) < 1:
+        print(
+            "[!] --swarm-workers must be >= 1.",
+            file=(sys.stderr if _as_json_cli else sys.stdout),
+        )
+        sys.exit(1)
+
+    # Multi-Agent Swarm Mode (--swarm / positional `swarm`):
+    # - With `--hunt`: enables parallel multi-agent target fan-out inside `--hunt`.
+    # - With local `--repo` / `--folder` / `--path` (or no explicit network `--host`):
+    #   activates full `--all` + `--ensemble` + `--fast-ooda` + `--swarm-board` orchestration.
+    # - With explicit network `--host` only: routes into 12-Agent LangGraph `ProtocolResearchSwarm` + `--swarm-board`.
+    if getattr(args, "enable_swarm", False) or active_mode == "swarm":
+        args.enable_swarm = True
+        if not any(t == "--no-swarm-board" for t in raw_argv) and not _as_json_cli:
+            args.swarm_board = True
+        if _swarm_workers_val is not None:
+            _bounded_sw = max(1, min(16, int(_swarm_workers_val)))
+            if not getattr(args, "cpu_workers", None):
+                args.cpu_workers = min(8, _bounded_sw)
+            if "concurrency" not in explicit_dests:
+                args.concurrency = _bounded_sw
+        if not getattr(args, "enable_autonomous_hunt", False) and not getattr(args, "dispatch", None):
+            _swarm_has_local = bool(
+                getattr(args, "repo", None)
+                or getattr(args, "path", None)
+                or getattr(args, "raptor_target", None)
+                or getattr(args, "hunt_targets", None)
+                or getattr(args, "additional_local_targets", None)
+            )
+            _swarm_has_net_host = (
+                "host" in explicit_dests
+                or any(
+                    a in ("--host", "--target") or a.startswith(("--host=", "--target="))
+                    for a in raw_argv
+                )
+            ) and bool(getattr(args, "host", None)) and not os.path.isdir(str(getattr(args, "host", "") or ""))
+            if _swarm_has_local or not _swarm_has_net_host:
+                args.run_all_scans = True
+                args.ensemble = True
+                args.enable_fast_ooda = True
+            else:
+                active_mode = "terminator"
+
+    # Turnkey Autonomous Bug Bounty Hunter (--hunt):
+    # - Standalone `--hunt` (without `--all`) dispatches directly BEFORE generic `--dry-run`.
+    # - Combined `--all --hunt` (e.g., `--all --repo ./repo --folder ./folder --hunt`) executes
+    #   BOTH the full `--all` audit on local repo/folder targets AND the `--hunt` pipeline!
+    if getattr(args, "enable_autonomous_hunt", False) and not getattr(args, "run_all_scans", False):
+        _hunt_rc = cmd_autonomous_hunt(args, raw_argv=raw_argv)
+        if _hunt_rc != 0:
+            sys.exit(_hunt_rc)
+        return
+
     # Universal --dry-run guard: works across EVERY flag and subcommand with zero side effects
     if getattr(args, "dry_run", False):
+        if getattr(args, "enable_autonomous_hunt", False) and getattr(args, "run_all_scans", False):
+            # Combined `--all --hunt --dry-run`: preview BOTH --all and --hunt with zero side effects
+            if getattr(args, "as_json", False):
+                import io as _combo_io
+                import json as _combo_json
+
+                _all_buf = _combo_io.StringIO()
+                with contextlib.redirect_stdout(_all_buf):
+                    cmd_dry_run_plan(args, active_mode=active_mode, raw_argv=raw_argv)
+                _hunt_buf = _combo_io.StringIO()
+                with contextlib.redirect_stdout(_hunt_buf):
+                    _hunt_dry_rc = cmd_autonomous_hunt(args, raw_argv=raw_argv)
+                _all_doc = _combo_json.loads(_all_buf.getvalue()) if _all_buf.getvalue().strip() else {}
+                _hunt_doc = _combo_json.loads(_hunt_buf.getvalue()) if _hunt_buf.getvalue().strip() else {}
+                print(
+                    _combo_json.dumps(
+                        {
+                            "status": "dry_run_combined_all_and_hunt_planned",
+                            "dry_run": True,
+                            "all_scan_plan": _all_doc,
+                            "autonomous_hunt_plan": _hunt_doc,
+                            "side_effects": {
+                                "network_packets_sent": 0,
+                                "filesystem_mutations": 0,
+                                "external_submissions": 0,
+                                "browser_launched": False,
+                            },
+                        },
+                        indent=2,
+                    )
+                )
+                if _hunt_dry_rc != 0:
+                    sys.exit(_hunt_dry_rc)
+                return
+            cmd_dry_run_plan(args, active_mode=active_mode, raw_argv=raw_argv)
+            _hunt_dry_rc = cmd_autonomous_hunt(args, raw_argv=raw_argv)
+            if _hunt_dry_rc != 0:
+                sys.exit(_hunt_dry_rc)
+            return
         if (getattr(args, "enable_hackerone", False) or getattr(args, "hackerone_auto", False) or active_mode == "hackerone") and not getattr(args, "run_all_scans", False):
             args.enable_hackerone = True
             cmd_hackerone(args)
@@ -7973,7 +10095,32 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         if (getattr(args, "enable_phi", False) or active_mode == "phi") and not getattr(args, "run_all_scans", False):
             cmd_phi(args)
             return
+        if (getattr(args, "enable_stride", False) or active_mode in ("stride", "threat-model", "threat_model")) and not getattr(args, "run_all_scans", False):
+            cmd_stride(args)
+            return
         cmd_dry_run_plan(args, active_mode=active_mode, raw_argv=raw_argv)
+        return
+
+    # Optional ModelFusion (:5000) local server bootstrap when --start-modelfusion is requested (zero side effects on --dry-run)
+    if getattr(args, "start_modelfusion", False) and not getattr(args, "embedded", False):
+        try:
+            from scripts.autonomous_hunt import ensure_modelfusion_running
+
+            _mf_info = ensure_modelfusion_running(dry_run=False)
+            if not getattr(args, "as_json", False):
+                print(
+                    f"[*] ModelFusion (:5000): status={_mf_info.get('status')} "
+                    f"endpoint={_mf_info.get('endpoint')}"
+                )
+        except Exception as _mf_exc:
+            if not getattr(args, "as_json", False):
+                print(f"[!] ModelFusion auto-start fallback to Ollama: {_mf_exc}")
+
+    # Standalone 3-Stage Parallel OODA Funnel (--fast-ooda without --all)
+    if getattr(args, "enable_fast_ooda", False) and not getattr(args, "run_all_scans", False):
+        _ooda_rc = cmd_fast_ooda(args)
+        if _ooda_rc != 0:
+            sys.exit(_ooda_rc)
         return
 
     if active_mode == "setup":
@@ -8107,6 +10254,16 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         cmd_phi(args)
         return
 
+    # Standalone Module 26 STRIDE + MITRE ATT&CK + Zero Trust Threat Modeler (--stride without --all/--ensemble)
+    if getattr(args, "ensemble", False) and not getattr(args, "run_all_scans", False):
+        args.run_all_scans = True
+    if (
+        getattr(args, "enable_stride", False)
+        or active_mode in ("stride", "threat-model", "threat_model")
+    ) and not getattr(args, "run_all_scans", False) and not getattr(args, "ensemble", False):
+        cmd_stride(args)
+        return
+
     # Standalone CLI-only blackboard hint injection (zero GUI / HTTP server calls)
     has_non_hint_action = explicit_mode_given and active_mode != "hint"
     has_shortcut_action = any(
@@ -8118,7 +10275,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "enable_rea_only", "install_tools", "tool_status",
             "raptor_status", "raptor_findings", "raptor_setup",
             "harness2_report", "mantis_report", "aiscan_report",
-            "preflight_only",
+            "preflight_only", "enable_pe_audit", "enable_autonomous_hunt", "enable_swarm", "enable_stride", "enable_hybrid",
         )
     )
     if active_mode == "hint" or (
@@ -8229,6 +10386,46 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
 
     if active_mode in ("swarm-board", "swarm_board", "board"):
         _dispatch_cmd("cmd_swarm_board", args)
+        return
+
+    if bool(getattr(args, "enable_crlf_conformance", False)) and not getattr(args, "run_all_scans", False):
+        from engine.crlf_desync_engine import audit_nginx_configs, run_conformance_diagnostics
+        target_dir = getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "target_arg", None) or "."
+        rep = audit_nginx_configs(target_dir)
+        if has_host_flag and getattr(args, "host", None):
+            live_rep = run_conformance_diagnostics(
+                host=str(args.host),
+                port=int(getattr(args, "port", 80) or 80),
+                use_tls=bool(getattr(args, "tls", False)),
+            )
+            rep.findings.extend(live_rep.findings)
+        if bool(getattr(args, "as_json", False)):
+            from engine.cli_render import render_json
+            render_json(rep.to_dict())
+        else:
+            print(f"[+] Module 24 (CRLF/Header Conformance): scanned {rep.files_scanned} config(s), found {len(rep.findings)} issue(s).")
+            for f in rep.findings[:25]:
+                print(f"  [{f.severity}] {f.rule_id} {f.location}:{f.line} — {f.title}")
+        return
+
+    if bool(getattr(args, "enable_web_llm", False)) and not getattr(args, "run_all_scans", False):
+        from engine.web_llm_auditor import audit_web_llm_repository
+        target_dir = getattr(args, "repo", None) or getattr(args, "path", None) or getattr(args, "target_arg", None) or "."
+        rep = audit_web_llm_repository(target_dir)
+        if bool(getattr(args, "as_json", False)):
+            from engine.cli_render import render_json
+            render_json(rep.to_dict())
+        else:
+            print(f"[+] Module 25 (Web LLM Security Auditor): scanned {rep.files_scanned} file(s), found {len(rep.findings)} issue(s).")
+            for f in rep.findings[:25]:
+                print(f"  [{f.severity}] {f.rule_id} ({f.owasp_llm}) {f.file_path}:{f.line} — {f.title}")
+        return
+
+    if (
+        active_mode in ("pe-audit", "pe_audit", "pe-dotnet", "pe_dotnet")
+        or (bool(getattr(args, "enable_pe_audit", False)) and not getattr(args, "run_all_scans", False))
+    ):
+        _dispatch_cmd("cmd_pe_audit", args, check_main_shim=False)
         return
 
     if active_mode in ("scanner", "artex-loop", "proxy", "retest", "chains", "traces", "coverage", "export-advisory", "archive", "rea"):
@@ -8347,7 +10544,7 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         _dispatch_cmd("cmd_mantis", args, check_main_shim=(caller_profile == "main"))
         return
 
-    if active_mode in ("aiscan", "ai") or getattr(args, "enable_aiscan", False) and not explicit_mode_given:
+    if active_mode in ("aiscan", "ai") or getattr(args, "aiscan_report", False) or (getattr(args, "enable_aiscan", False) and not explicit_mode_given):
         _dispatch_cmd("cmd_aiscan", args, check_main_shim=(caller_profile == "main"))
         return
 
@@ -9010,5 +11207,32 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
 
 
 if __name__ == "__main__":
+    _cli_argv = sys.argv[1:]
+    _has_hunt_flag = any(t == "--hunt" for t in _cli_argv)
+    _has_fast_ooda_flag = any(t == "--fast-ooda" for t in _cli_argv)
+    _has_swarm_flag = any(t == "--swarm" for t in _cli_argv)
+    _has_stride_flag = any(t == "--stride" for t in _cli_argv)
+    _has_ensemble_trigger = any(
+        t in ("--ensemble", "--essemble", "--essample", "--embedded", "--embeded") for t in _cli_argv
+    )
+    _has_embedded = any(t in ("--embedded", "--embeded") for t in _cli_argv)
+    _has_all_flag = (
+        any(t in ("--all", "--run-all", "--all-scans", "--hybrid", "all", "all_scans", "hybrid") for t in _cli_argv)
+        or any(t in ("--mode=all", "--mode=all_scans", "--mode=hybrid") for t in _cli_argv)
+        or any(
+            _cli_argv[idx] == "--mode"
+            and idx + 1 < len(_cli_argv)
+            and _cli_argv[idx + 1] in ("all", "all_scans", "hybrid")
+            for idx in range(len(_cli_argv))
+        )
+    )
+    if not _has_hunt_flag and not _has_fast_ooda_flag and not _has_swarm_flag and (not _has_stride_flag or _has_ensemble_trigger):
+        from revenue_cli import REVENUE_SUBCOMMANDS, maybe_dispatch_revenue_cli
+
+        _is_rev_subcmd = bool(_cli_argv) and (_cli_argv[0] in REVENUE_SUBCOMMANDS)
+        if _is_rev_subcmd or _has_embedded or not _has_all_flag:
+            _rev_rc = maybe_dispatch_revenue_cli(_cli_argv)
+            if _rev_rc is not None:
+                raise SystemExit(_rev_rc)
     main_swarm()
 

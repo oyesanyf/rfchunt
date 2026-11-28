@@ -705,7 +705,7 @@ def test_all_json_clean_stdout_and_rfc_hunt_swarm_openapi_autodiscovery(tmp_path
     lab = TestLabServer(host="127.0.0.1", port=0)
     lab.start()
     try:
-        spec = tmp_path / "openapi.json"
+        spec = repo / "openapi.json"
         spec.write_text(
             json.dumps({
                 "openapi": "3.0.3",

@@ -1072,6 +1072,7 @@ class MultiImplementationDifferentialOracle:
         *,
         docker_matrix: Optional[DockerParserMatrix] = None,
         max_workers: int = 8,
+        compliance_ctx: Optional[Any] = None,
     ):
         self.targets = targets or [
             TargetEndpoint(name="AgentOctopus", host="127.0.0.1", port=5006),
@@ -1079,19 +1080,52 @@ class MultiImplementationDifferentialOracle:
         ]
         self.docker_matrix: Optional[DockerParserMatrix] = docker_matrix
         self.max_workers: int = max(1, min(int(max_workers), 16))
+        self.compliance_ctx: Optional[Any] = compliance_ctx
 
     def add_target(self, target: TargetEndpoint) -> None:
         self.targets.append(target)
 
     def dispatch_single_target(self, target: TargetEndpoint, raw_probe: bytes) -> TargetResponse:
-        """Sends raw bytes to a single target and records response telemetry."""
+        """
+        Sends raw bytes to a single target and records response telemetry.
+        When `compliance_ctx` (or process-wide `RequestHygieneConfig`) is configured,
+        enforces fail-closed RoE scope allowlists, fractional RPS rate throttling,
+        and non-destructive custom testing header / `User-Agent` injection.
+        """
         from engine.execution_policy import ExecutionPolicy, StructuredIntentProposal, ScannerTask, ActionType
+        from engine.request_hygiene import resolve_hygiene
+
+        wire_probe = raw_probe
+        if self.compliance_ctx is not None:
+            ok_auth, auth_reason = self.compliance_ctx.authorize_live_host(target.host, allow_loopback=True)
+            if not ok_auth:
+                return TargetResponse(
+                    target_name=target.name,
+                    status_code=0,
+                    headers={},
+                    raw_response=b"",
+                    latency=0.0,
+                    socket_state=f"BLOCKED_BY_ROE:{auth_reason}",
+                )
+            limiter = getattr(self.compliance_ctx, "rate_limiter", None)
+            if limiter is not None:
+                limiter.acquire()
+            hygiene = getattr(self.compliance_ctx, "hygiene", None)
+            if hygiene is not None:
+                wire_probe = hygiene.inject_raw_http1(raw_probe)
+        else:
+            active_hygiene, active_limiter = resolve_hygiene()
+            if active_limiter is not None:
+                active_limiter.acquire()
+            if active_hygiene is not None and active_hygiene.is_active:
+                wire_probe = active_hygiene.inject_raw_http1(raw_probe)
+
         proposal = StructuredIntentProposal(
             task=ScannerTask.DIFFERENTIAL_ORACLE,
             action_type=ActionType.NETWORK_SOCKET,
             target_host=target.host,
             target_port=target.port,
-            raw_payload=raw_probe,
+            raw_payload=wire_probe,
             rationale="Differential oracle cross-implementation discrepancy testing",
         )
         ExecutionPolicy.get_instance().validate_intent(proposal)
@@ -1099,7 +1133,7 @@ class MultiImplementationDifferentialOracle:
         sock = None
         try:
             sock = socket.create_connection((target.host, target.port), timeout=target.timeout)
-            sock.sendall(raw_probe)
+            sock.sendall(wire_probe)
 
             framed = HTTPFramingReader.read_response(sock, timeout=target.timeout)
             response_data = framed.raw_response

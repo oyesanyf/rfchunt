@@ -45,6 +45,8 @@ from engine.execution_policy import (
     ExecutionPolicy,
     ScannerTask,
     StructuredIntentProposal,
+    _is_drive_relative_or_colon_unsafe,
+    _is_unc_path,
     _validate_canonical_path_syntax,
 )
 from engine.host_containment import silent_subprocess_run
@@ -141,6 +143,14 @@ SKIP_WALK_DIRS: Set[str] = {
     "runs",
     "caldera_export",
     ".pytest_cache",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "vendor",
+    ".agents",
+    ".cargo",
+    ".swarm_workspaces",
 }
 
 MAX_ASAR_HEADER_BYTES = 16 * 1024 * 1024  # 16 MiB cap against malformed ASAR pickle headers
@@ -501,6 +511,7 @@ class ReaIntegrator:
         max_live_scripts: int = DEFAULT_MAX_LIVE_SCRIPTS,
         max_script_bytes: int = DEFAULT_MAX_SCRIPT_BYTES,
         max_total_live_bytes: int = DEFAULT_MAX_TOTAL_LIVE_BYTES,
+        workspace_root: Optional[Union[str, Path]] = None,
     ) -> None:
         self.db = db
         default_rep = Path(__file__).resolve().parent.parent / "reports"
@@ -513,6 +524,29 @@ class ReaIntegrator:
         self.max_live_scripts = max(1, int(max_live_scripts))
         self.max_script_bytes = max(1024, int(max_script_bytes))
         self.max_total_live_bytes = max(self.max_script_bytes, int(max_total_live_bytes))
+        self.workspace_root: Optional[Path] = self._normalize_workspace_root(workspace_root)
+
+    @staticmethod
+    def _normalize_workspace_root(workspace_root: Optional[Union[str, Path]]) -> Optional[Path]:
+        if workspace_root is None:
+            return None
+        ws_raw = os.fspath(workspace_root) if isinstance(workspace_root, os.PathLike) else workspace_root
+        if not isinstance(ws_raw, str):
+            raise ValueError("workspace_root must be a string or Path.")
+        ws_stripped = ws_raw.strip()
+        if not ws_stripped:
+            return None
+        if ws_raw != ws_stripped or any(ord(ch) < 32 or ord(ch) == 127 for ch in ws_raw):
+            raise PermissionError("Unsafe REA workspace_root rejected (whitespace or control characters).")
+        if _is_unc_path(ws_stripped) or _is_drive_relative_or_colon_unsafe(ws_stripped):
+            raise PermissionError("Unsafe REA workspace_root rejected (UNC, NT-device, or drive-relative/ADS path).")
+        ws_err = _validate_canonical_path_syntax(ws_stripped, allow_trailing_slash=True)
+        if ws_err is not None and ws_stripped != ".":
+            raise PermissionError(f"Unsafe REA workspace_root rejected: {ws_err}")
+        ws_resolved = Path(ws_stripped).resolve(strict=False)
+        if _is_unc_path(str(ws_resolved)) or _is_drive_relative_or_colon_unsafe(str(ws_resolved)):
+            raise PermissionError("Unsafe resolved REA workspace_root rejected.")
+        return ws_resolved
 
     @staticmethod
     def check_rea_cli_status() -> Dict[str, Any]:
@@ -548,13 +582,91 @@ class ReaIntegrator:
             "attribution_url": REA_ATTRIBUTION_URL,
         }
 
-    def _collect_js_artifacts(self, target_path: Path) -> Tuple[List[Path], List[str]]:
-        """Scans target path for JS/TS/Electron/HTML/sourcemap artifacts; rejects native binaries fail-closed."""
+    def _collect_js_artifacts(
+        self,
+        target_path: Path,
+        *,
+        containment_root: Optional[Path] = None,
+    ) -> Tuple[List[Path], List[str]]:
+        """Scans target path for JS/TS/Electron/HTML/sourcemap artifacts; rejects native binaries and symlink escapes fail-closed."""
         limitations: List[str] = []
         if not target_path.exists():
             return [], [f"Target path does not exist: {target_path}"]
 
+        boundary_base = (
+            containment_root.resolve(strict=False)
+            if containment_root is not None
+            else (target_path.parent.resolve(strict=False) if target_path.is_file() else target_path.resolve(strict=False))
+        )
+        boundary_cmp = Path(os.path.normcase(str(boundary_base)))
+
+        def _within_boundary(cand: Path) -> bool:
+            try:
+                from engine.execution_policy import (
+                    _collect_intermediate_reparse_hops,
+                    _is_drive_relative_or_colon_unsafe,
+                    _is_symlink_or_reparse,
+                    _is_unc_path,
+                    _normalize_win_readlink_target,
+                )
+
+                boundary_cmp_str = os.path.normcase(str(boundary_base))
+                cur_anc: Optional[Path] = cand
+                visited_anc: Set[str] = set()
+                while cur_anc is not None:
+                    cur_key = os.path.normcase(str(cur_anc))
+                    if cur_key == boundary_cmp_str or cur_key in visited_anc:
+                        break
+                    visited_anc.add(cur_key)
+                    if not _is_symlink_or_reparse(cur_anc):
+                        try:
+                            if os.path.normcase(str(cur_anc.resolve(strict=False))) == boundary_cmp_str:
+                                break
+                        except OSError:
+                            pass
+                    pending_hops: List[Path] = [cur_anc]
+                    seen_hops: Set[str] = {cur_key}
+                    for _ in range(16):
+                        if not pending_hops:
+                            break
+                        hop_p = pending_hops.pop(0)
+                        if not _is_symlink_or_reparse(hop_p):
+                            continue
+                        norm_link = _normalize_win_readlink_target(os.readlink(hop_p))
+                        if _is_unc_path(norm_link) or _is_drive_relative_or_colon_unsafe(norm_link):
+                            return False
+                        link_t = Path(norm_link)
+                        if not link_t.is_absolute():
+                            link_t = hop_p.parent / link_t
+                        link_res = link_t.resolve(strict=False)
+                        if _is_unc_path(str(link_res)) or _is_drive_relative_or_colon_unsafe(str(link_res)):
+                            return False
+                        lt_cmp = Path(os.path.normcase(str(link_res)))
+                        if lt_cmp != boundary_cmp and not lt_cmp.is_relative_to(boundary_cmp):
+                            return False
+                        cand_hops = _collect_intermediate_reparse_hops(link_t, boundary_cmp, seen_hops)
+                        if link_res != link_t:
+                            cand_hops.extend(_collect_intermediate_reparse_hops(link_res, boundary_cmp, seen_hops))
+                        for ch_p in cand_hops:
+                            ch_key = os.path.normcase(str(ch_p))
+                            if ch_key not in seen_hops:
+                                seen_hops.add(ch_key)
+                                pending_hops.append(ch_p)
+                    if pending_hops:
+                        return False
+                    if cur_anc.parent == cur_anc:
+                        break
+                    cur_anc = cur_anc.parent
+                cand_cmp = Path(os.path.normcase(str(cand.resolve(strict=False))))
+                return cand_cmp == boundary_cmp or cand_cmp.is_relative_to(boundary_cmp)
+            except Exception:
+                return False
+
         if target_path.is_file():
+            if not _within_boundary(target_path):
+                raise PermissionError(
+                    f"Unsafe REA target_path rejected: '{target_path}' resolves outside '{boundary_base}'."
+                )
             ext = target_path.suffix.lower()
             if ext in EXCLUDED_BINARY_EXTENSIONS:
                 raise PermissionError(
@@ -566,12 +678,22 @@ class ReaIntegrator:
             return [], limitations
 
         matched: List[Path] = []
-        for root, dirs, files in os.walk(target_path):
-            dirs[:] = [d for d in dirs if d not in SKIP_WALK_DIRS and not d.startswith(".")]
+        for root, dirs, files in os.walk(target_path, followlinks=False):
+            dirs[:] = [
+                d
+                for d in dirs
+                if d not in SKIP_WALK_DIRS
+                and not d.startswith(".")
+                and _within_boundary(Path(root) / d)
+            ]
             for fname in files:
                 ext = Path(fname).suffix.lower()
                 if ext in JS_ARTIFACT_EXTENSIONS:
-                    matched.append(Path(root) / fname)
+                    cand = Path(root) / fname
+                    if not _within_boundary(cand):
+                        limitations.append(f"Skipped out-of-workspace symlink artifact: {cand}")
+                        continue
+                    matched.append(cand)
         return matched, limitations
 
     def _inspect_text_artifact(
@@ -1114,11 +1236,13 @@ class ReaIntegrator:
         use_rea_cli: bool = False,
         traffic_session: Optional[TrafficCaptureSession] = None,
         write_reports: bool = True,
+        workspace_root: Optional[Union[str, Path]] = None,
     ) -> ReaAnalysisResult:
         """
         Executes Module 21 surface & bundle analysis across local JS/Electron/.asar/.map/HTML artifacts
         and/or bounded same-origin frontend scripts on an authorized live host.
         """
+        eff_ws = self._normalize_workspace_root(workspace_root) if workspace_root is not None else self.workspace_root
         target_label = str(target_path or host or ".")
         seen_endpoints: Set[Tuple[str, str]] = set()
         discovered_endpoints: List[Dict[str, Any]] = []
@@ -1131,13 +1255,112 @@ class ReaIntegrator:
 
         local_artifacts: List[Path] = []
         resolved_tp: Optional[Path] = None
-        if target_path is not None and str(target_path).strip():
-            raw_tp = str(target_path).strip()
-            path_err = _validate_canonical_path_syntax(raw_tp, allow_trailing_slash=True)
-            if path_err is not None and raw_tp != ".":
-                raise PermissionError(f"Unsafe REA target_path rejected: {path_err} ('{raw_tp}')")
-            resolved_tp = Path(raw_tp).resolve()
-            local_artifacts, collect_lims = self._collect_js_artifacts(resolved_tp)
+        if target_path is not None and (eff_ws is not None or str(target_path).strip()):
+            if eff_ws is not None:
+                policy = ExecutionPolicy.get_instance()
+                policy.validate_intent(
+                    StructuredIntentProposal(
+                        task=ScannerTask.REA_SURFACE,
+                        action_type=ActionType.FILE_READ,
+                        file_path=target_path,
+                        workspace_root=eff_ws,
+                        rationale="REA surface target inspection",
+                    )
+                )
+                ok_tp, detail_tp = policy.validate_file_path(
+                    target_path,
+                    workspace_root=eff_ws,
+                    allow_directory=True,
+                )
+                if not ok_tp:
+                    raise PermissionError(f"Unsafe REA target_path rejected: {detail_tp}")
+                resolved_tp = Path(detail_tp)
+            else:
+                raw_tp = os.fspath(target_path) if isinstance(target_path, os.PathLike) else str(target_path)
+                if raw_tp != raw_tp.strip():
+                    raise PermissionError("Unsafe REA target_path rejected: leading/trailing whitespace obfuscation forbidden")
+                path_err = _validate_canonical_path_syntax(raw_tp, allow_trailing_slash=True)
+                if path_err is not None and raw_tp != ".":
+                    raise PermissionError(f"Unsafe REA target_path rejected: {path_err} ('{raw_tp}')")
+                norm_tp = raw_tp.replace("\\", "/")
+                if os.name == "nt" and norm_tp.startswith("/") and not (len(norm_tp) >= 2 and norm_tp[1] == ":"):
+                    raise PermissionError(f"Unsafe REA target_path rejected: rooted POSIX path '{raw_tp}' forbidden on Windows")
+                from engine.execution_policy import (
+                    _collect_intermediate_reparse_hops,
+                    _is_symlink_or_reparse,
+                    _normalize_win_readlink_target,
+                )
+
+                cand_raw = Path(raw_tp)
+                raw_abs = Path(os.path.abspath(raw_tp))
+                cur_anc: Optional[Path] = raw_abs
+                seen_anc: Set[str] = set()
+                while cur_anc is not None:
+                    cur_key = os.path.normcase(str(cur_anc))
+                    if cur_key in seen_anc or cur_anc.parent == cur_anc:
+                        break
+                    seen_anc.add(cur_key)
+                    try:
+                        if cur_anc.exists():
+                            anc_real = Path(os.path.normcase(os.path.realpath(str(cur_anc))))
+                            parent_real = Path(os.path.normcase(os.path.realpath(str(cur_anc.parent))))
+                            if anc_real != parent_real and not anc_real.is_relative_to(parent_real):
+                                raise PermissionError(
+                                    f"Unsafe REA target_path rejected: path '{raw_tp}' escapes parent directory"
+                                )
+                        pending_hops: List[Path] = [cur_anc]
+                        seen_hops: Set[str] = {cur_key}
+                        for _ in range(16):
+                            if not pending_hops:
+                                break
+                            hop_p = pending_hops.pop(0)
+                            if not _is_symlink_or_reparse(hop_p):
+                                continue
+                            raw_parent_cmp = Path(os.path.normcase(str(hop_p.parent)))
+                            anc_parent_res = hop_p.parent.resolve(strict=False)
+                            parent_cmp = Path(os.path.normcase(str(anc_parent_res)))
+                            norm_link = _normalize_win_readlink_target(os.readlink(hop_p))
+                            if _is_unc_path(norm_link) or _is_drive_relative_or_colon_unsafe(norm_link):
+                                raise PermissionError(
+                                    f"Unsafe REA target_path rejected: symlink target '{norm_link}' is unsafe"
+                                )
+                            link_t = Path(norm_link)
+                            if not link_t.is_absolute():
+                                link_t = hop_p.parent / link_t
+                            link_res = link_t.resolve(strict=False)
+                            if _is_unc_path(str(link_res)) or _is_drive_relative_or_colon_unsafe(str(link_res)):
+                                raise PermissionError(
+                                    f"Unsafe REA target_path rejected: symlink target '{link_res}' is unsafe"
+                                )
+                            res_cmp = Path(os.path.normcase(str(link_res)))
+                            if res_cmp != parent_cmp and not res_cmp.is_relative_to(parent_cmp):
+                                raise PermissionError(
+                                    f"Unsafe REA target_path rejected: symlink '{raw_tp}' escapes parent directory"
+                                )
+                            cand_hops = _collect_intermediate_reparse_hops(link_t, raw_parent_cmp, seen_hops)
+                            if link_res != link_t:
+                                cand_hops.extend(_collect_intermediate_reparse_hops(link_res, parent_cmp, seen_hops))
+                            for ch_p in cand_hops:
+                                ch_key = os.path.normcase(str(ch_p))
+                                if ch_key not in seen_hops:
+                                    seen_hops.add(ch_key)
+                                    pending_hops.append(ch_p)
+                        if pending_hops:
+                            raise PermissionError(
+                                f"Unsafe REA target_path rejected: symlink chain '{raw_tp}' exceeded max resolution depth"
+                            )
+                    except PermissionError:
+                        raise
+                    except OSError:
+                        pass
+                    cur_anc = cur_anc.parent
+                resolved_tp = cand_raw.resolve()
+                if _is_unc_path(str(resolved_tp)) or _is_drive_relative_or_colon_unsafe(str(resolved_tp)):
+                    raise PermissionError(f"Unsafe resolved REA target_path rejected: '{resolved_tp}'")
+            local_artifacts, collect_lims = self._collect_js_artifacts(
+                resolved_tp,
+                containment_root=eff_ws,
+            )
             limitations.extend(collect_lims)
 
         # Fast short-circuit for non-JS repositories when no live host is requested

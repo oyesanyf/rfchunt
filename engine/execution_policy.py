@@ -25,6 +25,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import secrets
 import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -94,6 +95,83 @@ _PYTHON_BIN_RE = re.compile(r"^pythonw?(?:\d+(?:\.\d+)*t?)?(?:\.exe)?$")
 
 
 _WIN_DRIVE_PREFIX_RE = re.compile(r"^([a-zA-Z]):(.*)$")
+_WIN_EXTENDED_DRIVE_PREFIX_RE = re.compile(r"^(?:\\\\\?\\|\\\?\?\\)([A-Za-z]:\\.*)$")
+
+
+def _normalize_win_readlink_target(raw_link: str) -> str:
+    """Strips Win32 `\\\\?\\<drive>:\\` or `\\??\\<drive>:\\` prefix from `os.readlink()` junction targets while preserving UNC/device paths."""
+    s = str(raw_link or "")
+    if os.name == "nt":
+        m = _WIN_EXTENDED_DRIVE_PREFIX_RE.match(s)
+        if m:
+            return m.group(1)
+    return s
+
+
+def _is_symlink_or_reparse(p: Path) -> bool:
+    """
+    Returns True if `p` is a symlink OR a Windows NTFS directory junction /
+    mount-point reparse point (catching both live and broken junctions where
+    `Path.is_symlink()` returns False on Windows).
+    """
+    if p.is_symlink():
+        return True
+    isj = getattr(os.path, "isjunction", None)
+    if callable(isj):
+        try:
+            if isj(p):
+                return True
+        except OSError:
+            pass
+    if os.name == "nt":
+        try:
+            st = os.lstat(p)
+            reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+            attrs = getattr(st, "st_file_attributes", 0)
+            if attrs & reparse_flag:
+                tag = getattr(st, "st_reparse_tag", None)
+                if tag is None:
+                    return True
+                symlink_tag = getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C)
+                mount_tag = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+                if tag in (symlink_tag, mount_tag, 0):
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def _collect_intermediate_reparse_hops(
+    cand_p: Path,
+    boundary_cmp: Optional[Path] = None,
+    seen: Optional[Set[str]] = None,
+) -> List[Path]:
+    """
+    Collect `cand_p` and any intermediate ancestor strictly within `boundary_cmp`
+    (or below filesystem root when `boundary_cmp is None`) that is a symlink or
+    Windows reparse point, without inspecting `boundary_cmp` itself, `/`, or `D:\\`.
+    """
+    hits: List[Path] = []
+    boundary_str = os.path.normcase(str(boundary_cmp)) if boundary_cmp is not None else None
+    cur: Optional[Path] = cand_p
+    local_seen: Set[str] = set()
+    while cur is not None:
+        cur_str = os.path.normcase(str(cur))
+        if cur_str in local_seen:
+            break
+        local_seen.add(cur_str)
+        if boundary_cmp is not None:
+            cur_cmp = Path(cur_str)
+            if cur_str == boundary_str or cur_cmp == boundary_cmp or not cur_cmp.is_relative_to(boundary_cmp):
+                break
+        elif cur.parent == cur:
+            break
+        if (seen is None or cur_str not in seen) and _is_symlink_or_reparse(cur):
+            hits.append(cur)
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return hits
 
 
 def _is_unc_path(raw_path: str) -> bool:
@@ -1302,12 +1380,14 @@ class ScannerTask(str, Enum):
     RFC_PROBE_GENERATOR = "rfc_probe_generator"
     DISCOVERY_CASCADE = "discovery_cascade"
     REA_SURFACE = "rea_surface"
+    PE_DOTNET_AUDIT = "pe_dotnet_audit"
 
 
 class ActionType(str, Enum):
     NETWORK_SOCKET = "network_socket"
     SUBPROCESS_EXEC = "subprocess_exec"
     FILE_WRITE = "file_write"
+    FILE_READ = "file_read"
 
 
 @dataclass
@@ -1323,6 +1403,7 @@ class StructuredIntentProposal:
     rationale: str = ""
     is_destructive: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
+    workspace_root: Optional[Union[str, Path]] = None
 
 
 class ExecutionPolicy:
@@ -1522,6 +1603,10 @@ class ExecutionPolicy:
         # Invariant 4: File Write Directory Confinement
         elif act_type == ActionType.FILE_WRITE.value:
             return self._validate_file_write_intent(proposal)
+
+        # Invariant 5: File Read Workspace Root Confinement
+        elif act_type == ActionType.FILE_READ.value:
+            return self._validate_file_read_intent(proposal)
 
         else:
             raise PermissionError(f"Execution rejected: unknown action type '{proposal.action_type}'.")
@@ -1857,38 +1942,301 @@ class ExecutionPolicy:
             f"Allowed directories: {sorted(list(self.ALLOWED_WRITE_SUBDIRS))}."
         )
 
+    def validate_file_path(
+        self,
+        file_path: Any,
+        workspace_root: Optional[Union[str, Path]] = None,
+        *,
+        allow_directory: bool = True,
+        allow_nonexistent: bool = True,
+    ) -> Tuple[bool, str]:
+        """
+        Fail-closed workspace-root confinement check for `file_path` / `target_path` reads.
+        Returns `(True, canonical_resolved_path)` on approval, else `(False, deny_reason)`.
+        """
+        if workspace_root is None:
+            return False, "workspace_root is required for file_path confinement"
 
-def sanitize_for_llm_prompt(untrusted_text: Union[str, bytes], max_chars: int = 1000) -> str:
+        if isinstance(workspace_root, os.PathLike):
+            ws_str = os.fspath(workspace_root)
+        elif isinstance(workspace_root, str):
+            ws_str = workspace_root
+        else:
+            return False, "workspace_root must be a string or Path"
+
+        if not ws_str or not ws_str.strip():
+            return False, "workspace_root is empty"
+        if ws_str != ws_str.strip():
+            return False, "leading/trailing whitespace obfuscation forbidden in workspace_root"
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in ws_str):
+            return False, "control/NUL character forbidden in workspace_root"
+        if _is_unc_path(ws_str) or _is_drive_relative_or_colon_unsafe(ws_str):
+            return False, "unsafe workspace_root (UNC, NT-device, or drive-relative/ADS path forbidden)"
+
+        ws_err = _validate_canonical_path_syntax(ws_str, allow_trailing_slash=True)
+        if ws_err is not None and ws_str != ".":
+            return False, f"invalid workspace_root: {ws_err}"
+
+        try:
+            ws_resolved = Path(ws_str).resolve(strict=False)
+        except Exception as exc:
+            return False, f"cannot resolve workspace_root: {exc}"
+
+        ws_resolved_str = str(ws_resolved)
+        if _is_unc_path(ws_resolved_str) or _is_drive_relative_or_colon_unsafe(ws_resolved_str):
+            return False, f"unsafe resolved workspace_root '{ws_resolved_str}'"
+        if ws_resolved.exists() and not ws_resolved.is_dir():
+            return False, "workspace_root must be a directory"
+
+        if file_path is None:
+            return False, "file_path is required"
+        if isinstance(file_path, os.PathLike):
+            raw_str = os.fspath(file_path)
+        elif isinstance(file_path, str):
+            raw_str = file_path
+        else:
+            return False, "file_path must be a string or Path"
+
+        if not raw_str or not raw_str.strip():
+            return False, "empty file_path"
+        if raw_str != raw_str.strip():
+            return False, "leading/trailing whitespace obfuscation forbidden"
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_str):
+            return False, "control/NUL character forbidden in path"
+        if _is_unc_path(raw_str):
+            return False, "NT/UNC/device path forbidden"
+        if _is_drive_relative_or_colon_unsafe(raw_str):
+            return False, "drive-relative path or ADS/unsafe colon forbidden"
+
+        norm = raw_str.replace("\\", "/")
+        if not allow_directory and norm.endswith("/"):
+            return False, "trailing path separator forbidden"
+
+        seg_str = norm[2:] if _WIN_DRIVE_PREFIX_RE.match(norm) else norm
+        raw_parts = [p for p in seg_str.split("/") if p]
+        if not raw_parts and not allow_directory:
+            return False, "bare root or empty path segments forbidden"
+
+        for part in raw_parts:
+            if (
+                part == ".."
+                or part.rstrip(". ") == ".."
+                or part.endswith(":..")
+                or (part != "." and part.strip(". ") == "")
+            ):
+                return False, "path traversal '..' forbidden"
+            if part != "." and (part.endswith(".") or part.endswith(" ")):
+                return False, "Win32 trailing dot/space obfuscation forbidden"
+
+        if raw_parts and raw_parts[-1] == "." and not allow_directory:
+            return False, "directory '.' target forbidden"
+
+        is_win_drive_abs = bool(_WIN_DRIVE_PREFIX_RE.match(norm))
+        is_posix_rooted = norm.startswith("/")
+        if is_win_drive_abs:
+            cand_path = Path(raw_str)
+        elif is_posix_rooted:
+            if os.name == "nt" or ws_resolved.drive:
+                return False, f"single-slash rooted path '{raw_str}' forbidden outside workspace_root"
+            cand_path = Path(raw_str)
+        else:
+            cand_path = ws_resolved / raw_str
+
+        ws_cmp = Path(os.path.normcase(ws_resolved_str))
+
+        # Catch direct/broken symlink escapes on leaf and all ancestor paths within workspace
+        try:
+            ws_cmp_str = os.path.normcase(ws_resolved_str)
+            cur_anc: Optional[Path] = cand_path
+            visited_anc: Set[str] = set()
+            while cur_anc is not None:
+                cur_anc_cmp_str = os.path.normcase(str(cur_anc))
+                if cur_anc_cmp_str == ws_cmp_str or cur_anc_cmp_str in visited_anc:
+                    break
+                visited_anc.add(cur_anc_cmp_str)
+                try:
+                    if not _is_symlink_or_reparse(cur_anc):
+                        anc_res = cur_anc.resolve(strict=False)
+                        anc_res_cmp_str = os.path.normcase(str(anc_res))
+                        if anc_res_cmp_str == ws_cmp_str:
+                            break
+                        anc_res_cmp = Path(anc_res_cmp_str)
+                        if cur_anc.exists() and anc_res_cmp != ws_cmp and not anc_res_cmp.is_relative_to(ws_cmp):
+                            if Path(cur_anc_cmp_str).is_relative_to(ws_cmp):
+                                return False, f"ancestor '{cur_anc}' resolves outside workspace_root '{ws_resolved}'"
+                except OSError as exc:
+                    return False, f"cannot inspect ancestor '{cur_anc}': {exc}"
+                pending_hops: List[Path] = [cur_anc]
+                seen_hops: Set[str] = {cur_anc_cmp_str}
+                for _ in range(16):
+                    if not pending_hops:
+                        break
+                    hop_p = pending_hops.pop(0)
+                    if not _is_symlink_or_reparse(hop_p):
+                        continue
+                    try:
+                        norm_link = _normalize_win_readlink_target(os.readlink(hop_p))
+                    except OSError as exc:
+                        return False, f"cannot inspect symlink/reparse point '{hop_p}': {exc}"
+                    if _is_unc_path(norm_link) or _is_drive_relative_or_colon_unsafe(norm_link):
+                        return False, f"symlink target '{norm_link}' is unsafe"
+                    link_target = Path(norm_link)
+                    if not link_target.is_absolute():
+                        link_target = hop_p.parent / link_target
+                    link_resolved = link_target.resolve(strict=False)
+                    link_str = str(link_resolved)
+                    if _is_unc_path(link_str) or _is_drive_relative_or_colon_unsafe(link_str):
+                        return False, f"symlink target '{link_str}' is unsafe"
+                    lt_cmp = Path(os.path.normcase(link_str))
+                    if lt_cmp != ws_cmp and not lt_cmp.is_relative_to(ws_cmp):
+                        return False, f"symlink '{raw_str}' escapes workspace_root '{ws_resolved}'"
+                    cand_hops = _collect_intermediate_reparse_hops(link_target, ws_cmp, seen_hops)
+                    if link_resolved != link_target:
+                        cand_hops.extend(_collect_intermediate_reparse_hops(link_resolved, ws_cmp, seen_hops))
+                    for ch_p in cand_hops:
+                        ch_key = os.path.normcase(str(ch_p))
+                        if ch_key not in seen_hops:
+                            seen_hops.add(ch_key)
+                            pending_hops.append(ch_p)
+                if pending_hops:
+                    return False, f"symlink chain for '{raw_str}' exceeded max resolution depth"
+                if cur_anc.parent == cur_anc:
+                    break
+                cur_anc = cur_anc.parent
+        except OSError as exc:
+            return False, f"cannot inspect symlink/reparse ancestors for '{raw_str}': {exc}"
+
+        try:
+            resolved_tp = cand_path.resolve(strict=False)
+        except Exception as exc:
+            return False, f"cannot resolve file_path: {exc}"
+
+        resolved_str = str(resolved_tp)
+        if _is_unc_path(resolved_str) or _is_drive_relative_or_colon_unsafe(resolved_str):
+            return False, f"unsafe resolved path '{resolved_str}'"
+
+        tp_cmp = Path(os.path.normcase(resolved_str))
+        in_root = (tp_cmp == ws_cmp) or tp_cmp.is_relative_to(ws_cmp)
+        if not in_root:
+            return False, f"file_path '{raw_str}' resolves outside workspace_root '{ws_resolved}'"
+
+        if not allow_directory:
+            if tp_cmp == ws_cmp:
+                return False, "directory workspace_root target forbidden when allow_directory=False"
+            if resolved_tp.exists() and resolved_tp.is_dir():
+                return False, f"directory target '{raw_str}' forbidden when allow_directory=False"
+
+        if not allow_nonexistent and not resolved_tp.exists():
+            return False, f"target path does not exist: '{resolved_tp}'"
+
+        return True, resolved_str
+
+    def _validate_file_read_intent(self, proposal: StructuredIntentProposal) -> bool:
+        raw_path = proposal.file_path
+        if raw_path is None or (isinstance(raw_path, str) and not raw_path.strip()):
+            raise ValueError("File read action requires a file_path.")
+        ws_root = proposal.workspace_root
+        if ws_root is None and isinstance(proposal.metadata, dict):
+            ws_root = proposal.metadata.get("workspace_root")
+        meta = proposal.metadata or {}
+        allow_dir = bool(meta.get("allow_directory", True))
+        allow_nonexistent = bool(meta.get("allow_nonexistent", True))
+        ok, detail = self.validate_file_path(
+            raw_path,
+            workspace_root=ws_root,
+            allow_directory=allow_dir,
+            allow_nonexistent=allow_nonexistent,
+        )
+        if not ok:
+            raise PermissionError(f"File read blocked outside workspace_root: {detail}.")
+        return True
+
+
+def sanitize_for_llm_prompt(
+    untrusted_text: Union[str, bytes],
+    max_chars: int = 1000,
+    *,
+    nonce: Optional[str] = None,
+    source: Optional[str] = None,
+) -> str:
     """
-    Sanitizes untrusted remote HTTP response headers and bodies before feeding them into LLM contexts.
-    - Decodes bytes safely
-    - Strips non-printable ASCII control characters
-    - Neutralizes prompt injection directives and instruction tokens
-    - Defuses markdown code fence escapes
-    - Wraps data in strict quarantine tags with random nonce
+    Sanitizes untrusted remote HTTP response headers, bodies, and target snippets before feeding into LLM contexts.
+    - Decodes bytes safely and applies NFKC normalization
+    - Strips Unicode Tag blocks (U+E0000-U+E007F), BiDi overrides, zero-width chars, and ASCII control chars
+    - Neutralizes prompt injection directives, chat-template tokens, and PortSwigger fake turn/system delimiters
+    - Escapes any embedded quarantine fence tags (closed or unclosed) and markdown code fences
+    - Wraps data in randomized XML nonce tags (<untrusted_data nonce="...">...</untrusted_data>)
     """
-    if isinstance(untrusted_text, bytes):
-        text = untrusted_text.decode("latin-1", errors="replace")
+    import unicodedata
+
+    if isinstance(untrusted_text, (bytes, bytearray)):
+        text = bytes(untrusted_text).decode("utf-8", errors="replace")
     else:
         text = str(untrusted_text or "")
 
-    # Truncate to maximum characters
-    text = text[:max_chars]
+    # Strip Unicode Tag smuggling (U+E0000..U+E007F), BiDi overrides, zero-width & Cf format characters
+    _FORBIDDEN_UNICODE = {
+        0x00AD, 0x034F, 0x061C, 0x2060,
+        0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0xFEFF,
+        0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
+        0x2066, 0x2067, 0x2068, 0x2069,
+    }
+    text = "".join(
+        ch for ch in text
+        if not (
+            0xE0000 <= ord(ch) <= 0xE007F
+            or ord(ch) in _FORBIDDEN_UNICODE
+            or unicodedata.category(ch) == "Cf"
+        )
+    )
+
+    # NFKC normalize homoglyphs before truncation and pattern neutralization
+    text = unicodedata.normalize("NFKC", text)
+
+    # Truncate BEFORE escaping so escaping cannot be split across max_chars
+    limit = max(0, int(max_chars))
+    text = text[:limit]
 
     # Strip ASCII control characters except \r, \n, \t
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
 
-    # Neutralize LLM prompt injection tokens & role markers
+    # Escape any embedded quarantine fence breakout attempts (case-insensitive, closed or unclosed)
+    text = re.sub(r"(?i)<\s*/?\s*untrusted_data(?:\b[^>]*)?>?", "[FENCE_ESCAPED]", text)
+    text = re.sub(r"(?i)<\s*/?\s*untrusted_remote_response_data(?:\b[^>]*)?>?", "[FENCE_ESCAPED]", text)
+    text = re.sub(r"(?i)<<<\s*(?:END_)?ARTEX_UNTRUSTED_DATA[^>]*>>>?", "[FENCE_ESCAPED]", text)
+    text = re.sub(r"(?i)<<<\s*(?:END_)?RFCHUNT_FUZZ_CONTEXT[^>]*>>>?", "[FENCE_ESCAPED]", text)
+
+    # Neutralize LLM prompt injection tokens, chat-template markers & fake turn delimiters
     text = re.sub(r"(?i)###\s*(system|instruction|task|human|assistant|prompt)", "[REDACTED_MARKER]", text)
-    text = re.sub(r"(?i)<\|(im_start|im_end|endoftext|system|user|assistant)\|>", "[TOKEN_NEUTRALIZED]", text)
+    text = re.sub(
+        r"(?i)<\|(im_start|im_end|endoftext|eot_id|start_header_id|end_header_id|system|user|assistant)\|>",
+        "[TOKEN_NEUTRALIZED]",
+        text,
+    )
+    text = re.sub(r"(?i)</?(?:system|instructions|developer|start_of_turn|end_of_turn)>", "[TAG_NEUTRALIZED]", text)
+    text = re.sub(r"(?i)\[/?INST\]", "[TOKEN_NEUTRALIZED]", text)
+    text = re.sub(r"(?i)\*{2,3}\s*important\s+system\s+message[^*\n]*\*{0,3}", "[DIRECTIVE_NEUTRALIZED]", text)
+    text = re.sub(r"(?i)-{2,3}\s*(?:user|assistant|system)\s+response\s*-{0,3}", "[TURN_DELIMITER_NEUTRALIZED]", text)
     text = re.sub(r"(?i)(ignore\s+(all\s+)?previous\s+instructions|system\s+prompt\s*:)", "[PROMPT_OVERRIDE_DEFUSED]", text)
     text = re.sub(r"(?i)(admin_override|jailbreak|disregard\s+prior)", "[DIRECTIVE_NEUTRALIZED]", text)
 
     # Defuse markdown code fence injection
     text = text.replace("```", "` ` `")
 
-    nonce = secrets.token_hex(8)
-    return f'<untrusted_remote_response_data nonce="{nonce}">\n{text}\n</untrusted_remote_response_data>'
+    raw_nonce = re.sub(r"[^a-zA-Z0-9_-]", "", str(nonce)) if nonce is not None else ""
+    active_nonce = raw_nonce or secrets.token_hex(12)
+
+    if source is not None and str(source).strip():
+        safe_source = re.sub(r"[^a-zA-Z0-9_.:/-]", "_", str(source).strip())[:64].strip("_") or "untrusted"
+        body = f"[source: {safe_source}]\n{text}"
+    else:
+        body = text
+
+    return (
+        f'<untrusted_data nonce="{active_nonce}">\n'
+        f"{body}\n"
+        "</untrusted_data>"
+    )
 
 
 def validate_llm_json_response(data: Any, schema_type: str = "probe") -> Tuple[bool, Any, Optional[str]]:

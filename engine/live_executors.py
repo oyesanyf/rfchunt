@@ -37,7 +37,7 @@ import re
 import secrets
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import urlparse
 
 import httpx
@@ -404,6 +404,7 @@ class LiveWorkerExecutorRegistry:
         surface_provider: Optional[Callable[..., Any]] = None,
         hygiene_config: Optional[Any] = None,
         rate_limiter: Optional[Any] = None,
+        workspace_root: Optional[Union[str, Path]] = None,
     ):
         self.host = host
         self.port = int(port)
@@ -411,6 +412,8 @@ class LiveWorkerExecutorRegistry:
         self.authorized = bool(authorized)
         self.hygiene_config = hygiene_config
         self.rate_limiter = rate_limiter
+        self._workspace_root: Optional[Path] = None
+        self.workspace_root = workspace_root
         self.traffic_session = traffic_session or TrafficCaptureSession(
             hygiene_config=hygiene_config,
             rate_limiter=rate_limiter,
@@ -431,6 +434,40 @@ class LiveWorkerExecutorRegistry:
         self._desync_cache: Dict[Tuple[Any, ...], Tuple[bool, str, str, Dict[str, Any]]] = {}
         self._boundary_cache: Dict[Tuple[Any, ...], Tuple[bool, str, str, Dict[str, Any]]] = {}
         self.toolbox = ArtexToolBox(self)
+
+    @property
+    def workspace_root(self) -> Optional[Path]:
+        return self._workspace_root
+
+    @workspace_root.setter
+    def workspace_root(self, value: Optional[Union[str, Path]]) -> None:
+        if value is None:
+            self._workspace_root = None
+            return
+        ws_raw = os.fspath(value) if isinstance(value, os.PathLike) else value
+        if not isinstance(ws_raw, str):
+            raise ValueError("workspace_root must be a string or Path.")
+        ws_stripped = ws_raw.strip()
+        if not ws_stripped:
+            self._workspace_root = None
+            return
+        from engine.execution_policy import (
+            _is_drive_relative_or_colon_unsafe,
+            _is_unc_path,
+            _validate_canonical_path_syntax,
+        )
+
+        if ws_raw != ws_stripped or any(ord(ch) < 32 or ord(ch) == 127 for ch in ws_raw):
+            raise PermissionError("Unsafe workspace_root rejected (whitespace or control characters).")
+        if _is_unc_path(ws_stripped) or _is_drive_relative_or_colon_unsafe(ws_stripped):
+            raise PermissionError("Unsafe workspace_root rejected (UNC, NT-device, or drive-relative/ADS path).")
+        ws_err = _validate_canonical_path_syntax(ws_stripped, allow_trailing_slash=True)
+        if ws_err is not None and ws_stripped != ".":
+            raise PermissionError(f"Unsafe workspace_root rejected: {ws_err}")
+        ws_resolved = Path(ws_stripped).resolve(strict=False)
+        if _is_unc_path(str(ws_resolved)) or _is_drive_relative_or_colon_unsafe(str(ws_resolved)):
+            raise PermissionError("Unsafe resolved workspace_root rejected.")
+        self._workspace_root = ws_resolved
 
     def register_surface_provider(self, provider: Optional[Callable[..., Any]]) -> None:
         self.surface_provider = provider
@@ -2532,35 +2569,49 @@ class LiveWorkerExecutorRegistry:
         asset_graph: Optional[Any] = None,
     ) -> Dict[str, Any]:
         q_str = str(query or "")
-        raw_tp = str(target_path) if target_path is not None and str(target_path).strip() else None
-        if raw_tp is not None:
-            from engine.execution_policy import (
-                _is_drive_relative_or_colon_unsafe,
-                _is_unc_path,
-            )
+        tp_str: Optional[str] = None
+        if target_path is not None:
+            from engine.execution_policy import ExecutionPolicy
 
-            tp_norm = raw_tp.strip()
-            has_ctrl = any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_tp)
-            if (
-                has_ctrl
-                or _is_unc_path(tp_norm)
-                or _is_drive_relative_or_colon_unsafe(tp_norm)
-                or tp_norm.startswith(("/\\", "\\/", "\\\\"))
-            ):
+            ok_tp, detail_tp = ExecutionPolicy.get_instance().validate_file_path(
+                target_path,
+                workspace_root=self.workspace_root,
+                allow_directory=True,
+            )
+            if not ok_tp:
                 return {
                     "ok": False,
                     "source": "blocked",
                     "provider": "rfchunt_native",
                     "module21_available": False,
-                    "target_path": raw_tp,
+                    "target_path": str(target_path),
                     "query": q_str,
                     "endpoints": [],
                     "ai_sinks": [],
                     "assets": [],
                     "count": 0,
-                    "error": "Unsafe target_path rejected (UNC, NT-device, drive-relative, or control-character path is forbidden).",
+                    "error": f"Unsafe target_path rejected by workspace_root containment: {detail_tp}",
                 }
-        tp_str = raw_tp
+            _sensitive_seg = {
+                ".ssh", ".aws", ".gnupg", ".kube", ".netrc",
+                "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "authorized_keys",
+            }
+            _tp_parts = {p.lower() for p in Path(detail_tp).parts}
+            if _tp_parts.intersection(_sensitive_seg):
+                return {
+                    "ok": False,
+                    "source": "blocked",
+                    "provider": "rfchunt_native",
+                    "module21_available": False,
+                    "target_path": str(target_path),
+                    "query": q_str,
+                    "endpoints": [],
+                    "ai_sinks": [],
+                    "assets": [],
+                    "count": 0,
+                    "error": f"Unsafe target_path rejected: sensitive credential/key path '{detail_tp}' is forbidden",
+                }
+            tp_str = detail_tp
         fallback_reason = "module21_absent"
         ag = asset_graph if asset_graph is not None else self.asset_graph
 
@@ -2761,7 +2812,78 @@ class LiveWorkerExecutorRegistry:
 
         if tp_str:
             tp = Path(tp_str)
-            if tp.exists():
+            ws_root_resolved = Path(self.workspace_root).resolve() if self.workspace_root else None
+            ws_cmp_root = Path(os.path.normcase(str(ws_root_resolved))) if ws_root_resolved else None
+
+            def _is_confined_child(cand_file: Union[str, Path]) -> bool:
+                if ws_cmp_root is None:
+                    return False
+                try:
+                    from engine.execution_policy import (
+                        _collect_intermediate_reparse_hops,
+                        _is_drive_relative_or_colon_unsafe,
+                        _is_symlink_or_reparse,
+                        _is_unc_path,
+                        _normalize_win_readlink_target,
+                    )
+
+                    cand_p = Path(cand_file)
+                    if not cand_p.is_absolute():
+                        cand_p = (ws_root_resolved / cand_p) if ws_root_resolved is not None else cand_p.resolve(strict=False)
+                    ws_cmp_str = os.path.normcase(str(ws_cmp_root))
+                    cur_anc: Optional[Path] = cand_p
+                    visited_anc: Set[str] = set()
+                    while cur_anc is not None:
+                        cur_key = os.path.normcase(str(cur_anc))
+                        if cur_key == ws_cmp_str or cur_key in visited_anc:
+                            break
+                        visited_anc.add(cur_key)
+                        if not _is_symlink_or_reparse(cur_anc):
+                            try:
+                                anc_res_str = os.path.normcase(str(cur_anc.resolve(strict=False)))
+                                if anc_res_str == ws_cmp_str:
+                                    break
+                            except OSError:
+                                pass
+                        pending_hops: List[Path] = [cur_anc]
+                        seen_hops: Set[str] = {cur_key}
+                        for _ in range(16):
+                            if not pending_hops:
+                                break
+                            hop_p = pending_hops.pop(0)
+                            if not _is_symlink_or_reparse(hop_p):
+                                continue
+                            norm_link = _normalize_win_readlink_target(os.readlink(hop_p))
+                            if _is_unc_path(norm_link) or _is_drive_relative_or_colon_unsafe(norm_link):
+                                return False
+                            link_t = Path(norm_link)
+                            if not link_t.is_absolute():
+                                link_t = hop_p.parent / link_t
+                            link_res = link_t.resolve(strict=False)
+                            if _is_unc_path(str(link_res)) or _is_drive_relative_or_colon_unsafe(str(link_res)):
+                                return False
+                            lt_cmp = Path(os.path.normcase(str(link_res)))
+                            if lt_cmp != ws_cmp_root and not lt_cmp.is_relative_to(ws_cmp_root):
+                                return False
+                            cand_hops = _collect_intermediate_reparse_hops(link_t, ws_cmp_root, seen_hops)
+                            if link_res != link_t:
+                                cand_hops.extend(_collect_intermediate_reparse_hops(link_res, ws_cmp_root, seen_hops))
+                            for ch_p in cand_hops:
+                                ch_key = os.path.normcase(str(ch_p))
+                                if ch_key not in seen_hops:
+                                    seen_hops.add(ch_key)
+                                    pending_hops.append(ch_p)
+                        if pending_hops:
+                            return False
+                        if cur_anc.parent == cur_anc:
+                            break
+                        cur_anc = cur_anc.parent
+                    cand_cmp = Path(os.path.normcase(str(cand_p.resolve(strict=False))))
+                    return cand_cmp == ws_cmp_root or cand_cmp.is_relative_to(ws_cmp_root)
+                except Exception:
+                    return False
+
+            if tp.exists() and _is_confined_child(tp):
                 # Optional OpenAPI / HAR file surface parsing via session_loader
                 if tp.is_file() and tp.suffix.lower() in (".json", ".yaml", ".yml", ".har"):
                     try:
@@ -2807,18 +2929,24 @@ class LiveWorkerExecutorRegistry:
                 try:
                     from engine.mantis_integrator import MantisThreatModeler, discover_candidate_files
 
-                    files = discover_candidate_files(str(tp))
+                    files = [f for f in discover_candidate_files(str(tp)) if _is_confined_child(f)]
                     if files:
                         tm = MantisThreatModeler(fusion_arbiter=None).build_threat_model(str(tp), files)
+                        tp_base = tp.parent if tp.is_file() else tp
                         for ep in (tm.entry_points or []):
                             r_path = ep.get("route")
                             if not r_path:
                                 continue
+                            ep_file = ep.get("file")
+                            if ep_file:
+                                ep_cand = Path(ep_file) if Path(ep_file).is_absolute() else (tp_base / ep_file)
+                                if not _is_confined_child(ep_cand):
+                                    continue
                             _add_record({
                                 "node_type": "ENDPOINT",
                                 "route": str(r_path),
                                 "method": str(ep.get("method") or "GET").upper(),
-                                "file": ep.get("file"),
+                                "file": ep_file,
                                 "function": ep.get("function"),
                                 "line": ep.get("line"),
                                 "source": "mantis_ast",
@@ -2831,11 +2959,46 @@ class LiveWorkerExecutorRegistry:
                     from engine.aiscan_integrator import PythonAIScanner
 
                     py_scanner = PythonAIScanner()
+                    ai_eps = []
                     if tp.is_file():
-                        _, ai_eps = py_scanner.scan_file(tp)
+                        if _is_confined_child(tp):
+                            _, ai_eps = py_scanner.scan_file(tp)
                     else:
-                        _, ai_eps = py_scanner.scan_directory(tp)
+                        skip_ai_dirs = {
+                            ".git", "node_modules", "target", "venv", ".venv", "__pycache__",
+                            "out", "reports", "runs", "caldera_export", "caldera_plugin",
+                            "yara", "rules", "coverage", ".pytest_cache", ".mypy_cache",
+                        }
+                        valid_ai_exts = {
+                            ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".json", ".yaml", ".yml", ".env",
+                            ".rego", ".cedar", ".tf", ".hcl", ".sh", ".ps1", ".toml", ".md",
+                        }
+                        data_ai_exts = {".json", ".yaml", ".yml", ".toml"}
+                        data_scanned = 0
+                        for ai_root, ai_dirs, ai_files in os.walk(tp, followlinks=False):
+                            ai_dirs[:] = [
+                                d for d in ai_dirs
+                                if d not in skip_ai_dirs and _is_confined_child(Path(ai_root) / d)
+                            ]
+                            for ai_fname in ai_files:
+                                cand_ai_p = Path(ai_root) / ai_fname
+                                if not _is_confined_child(cand_ai_p):
+                                    continue
+                                ext_ai = cand_ai_p.suffix.lower()
+                                is_df = ai_fname.lower() in ("dockerfile", "containerfile") or ai_fname.lower().startswith("dockerfile.")
+                                if ext_ai in valid_ai_exts or is_df:
+                                    if ext_ai in data_ai_exts:
+                                        data_scanned += 1
+                                        if data_scanned > 150:
+                                            continue
+                                    _, f_eps = py_scanner.scan_file(cand_ai_p)
+                                    ai_eps.extend(f_eps)
+                    tp_base = tp.parent if tp.is_file() else tp
                     for aep in ai_eps:
+                        if aep.file_path:
+                            aep_cand = Path(aep.file_path) if Path(aep.file_path).is_absolute() else (tp_base / aep.file_path)
+                            if not _is_confined_child(aep_cand):
+                                continue
                         _add_record({
                             "node_type": "AI_SINK",
                             "route": str(aep.route_path),
@@ -3238,6 +3401,7 @@ class LiveWorkerExecutorRegistry:
         confirmed_by_tool = False
         explicit_finish_confirmed = False
         explicit_finish_denied = False
+        llm_finish_override_blocked = False
         best_traffic_id = ""
         last_traffic_id = ""
         best_evidence_quote = ""
@@ -3445,6 +3609,9 @@ class LiveWorkerExecutorRegistry:
                                     or "Finish claimed confirmed=True without confirming tool evidence; failing closed."
                                 )
                                 stop_reason = "finish_uncorroborated"
+                            elif not req_confirmed and confirmed_by_tool:
+                                llm_finish_override_blocked = True
+                                stop_reason = "finish_override_blocked"
                             else:
                                 explicit_finish_denied = True
                                 stop_reason = "finish_not_confirmed"
@@ -3616,16 +3783,26 @@ class LiveWorkerExecutorRegistry:
                         total_turns=turns_executed,
                     )
 
-        if explicit_finish_denied:
+        # Deterministic tool confirmation is authoritative and cannot be suppressed
+        # or have its deterministic evidence overwritten by an injected LLM finish(...) call.
+        if confirmed_by_tool:
+            final_ok = True
+            final_evidence = (
+                best_evidence
+                or finish_evidence
+                or f"Multi-turn loop confirmed by tool ({stop_reason})."
+            )
+        elif explicit_finish_denied:
             final_ok = False
+            final_evidence = (
+                finish_evidence
+                if finish_evidence
+                else (best_evidence or f"Multi-turn loop finished ({stop_reason}).")
+            )
         else:
-            final_ok = bool(confirmed_by_tool)
+            final_ok = False
+            final_evidence = best_evidence or finish_evidence or f"Multi-turn loop finished ({stop_reason})."
 
-        final_evidence = (
-            finish_evidence
-            if (explicit_finish_confirmed or (explicit_finish_denied and finish_evidence))
-            else (best_evidence or finish_evidence or f"Multi-turn loop finished ({stop_reason}).")
-        )
         final_traffic_id = best_traffic_id or last_traffic_id
         return (
             final_ok,
@@ -3641,6 +3818,8 @@ class LiveWorkerExecutorRegistry:
                 "tool_history": tool_history,
                 "stop_reason": stop_reason,
                 "offline_fallback": used_offline_fallback,
+                "confirmed_by_tool": confirmed_by_tool,
+                "llm_override_blocked": llm_finish_override_blocked,
             },
         )
 

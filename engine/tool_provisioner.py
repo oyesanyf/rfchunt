@@ -338,8 +338,17 @@ def is_automated_or_offline_env(*, allow_in_tests: bool = False) -> bool:
 
 
 def _detect_os_arch_tokens() -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-    sys_name = platform.system().lower()
-    machine = platform.machine().lower()
+    if os.name == "nt" or sys.platform == "win32":
+        # Avoid platform.system()/machine() on Windows Python 3.14 where _wmi queries can stall.
+        sys_name = "windows"
+        machine = (
+            os.environ.get("PROCESSOR_ARCHITEW6432")
+            or os.environ.get("PROCESSOR_ARCHITECTURE")
+            or "amd64"
+        ).strip().lower()
+    else:
+        sys_name = platform.system().lower()
+        machine = platform.machine().lower()
     if sys_name.startswith("win"):
         os_tokens = ("windows", "win64", "win32", "win")
     elif sys_name == "darwin":

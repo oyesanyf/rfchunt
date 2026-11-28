@@ -1199,9 +1199,9 @@ def test_t4_s07_adversarial_prompt_injection_and_forbidden_tool_containment(
     # 1. Spoofed breakout never defeats real nonce-tagged outer boundary
     assert len(arbiter.prompts) >= 2
     p2 = arbiter.prompts[1]["user_prompt"]
-    assert f"<<<ARTEX_UNTRUSTED_DATA" in p2
-    assert f"nonce={boundary.nonce}" in p2
-    assert f"<<<END_ARTEX_UNTRUSTED_DATA nonce={boundary.nonce}>>>" in p2
+    assert re.search(r'<untrusted_data nonce="[0-9a-f]{24}">', p2)
+    assert "[source: " in p2
+    assert "</untrusted_data>" in p2
 
     # 2. Zero subprocess invocations and only the legitimate /api/ai/chat request hit loopback_server
     assert len(subprocess_recorder.calls) == 0
@@ -1223,4 +1223,4 @@ def test_t4_s07_adversarial_prompt_injection_and_forbidden_tool_containment(
     # 4. Framed trace persisted cleanly in SQLite
     db_traces = isolated_db.list_worker_traces(task_id="TASK-S07-ADV")
     assert len(db_traces) >= 1
-    assert any(f"nonce={boundary.nonce}" in (t.get("raw_observation") or "") for t in db_traces)
+    assert any(re.search(r'<untrusted_data nonce="[0-9a-f]{24}">', (t.get("raw_observation") or "")) for t in db_traces)

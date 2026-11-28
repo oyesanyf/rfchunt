@@ -647,8 +647,39 @@ def test_model_adapter_unpacking_data_nested(monkeypatch: pytest.MonkeyPatch, sa
 
     fake_arb = FakeNestedArbiter()
     modeler = MantisThreatModeler(fusion_arbiter=fake_arb)
+
+    # 1. Clean/zero-finding targets (has_positive_det=False): nested "data" summary unpacks into raw_summary/executive_summary
+    clean_repo = tmp_path / "clean_repo"
+    clean_repo.mkdir()
+    clean_file = clean_repo / "util.py"
+    clean_file.write_text("x = 1\n", encoding="utf-8")
+    tm_clean = modeler.build_threat_model(str(clean_repo), [str(clean_file)])
+    assert tm_clean.raw_summary == "Deep Nested STRIDE Summary via Data Key"
+    assert tm_clean.llm_override_blocked is False
+    assert tm_clean.llm_advisory_summary == ""
+
+    empty_repo = tmp_path / "empty_repo"
+    empty_repo.mkdir()
+    res_clean = run_unified_all_scans(
+        repo=str(empty_repo),
+        depth=10,
+        arbiter=fake_arb,
+        reports_dir=str(tmp_path / "reports_nested_clean"),
+        enable_rea=False,
+        enable_preflight=False,
+        enable_verification_inversion=False,
+        enable_arxiv_detect=False,
+        enable_last30days_skills=False,
+        enable_phi_scan=False,
+    )
+    assert res_clean["executive_summary"] == "Deep Nested Executive Summary via Data Key"
+    assert res_clean["llm_override_blocked"] is False
+
+    # 2. Vulnerable target (has_positive_det=True): deterministic anchor stays immutable; nested LLM text preserved in llm_advisory_summary
     tm = modeler.build_threat_model(str(sample_repo), files)
-    assert tm.raw_summary == "Deep Nested STRIDE Summary via Data Key"
+    assert tm.raw_summary == tm.deterministic_summary
+    assert tm.llm_override_blocked is True
+    assert tm.llm_advisory_summary == "Deep Nested STRIDE Summary via Data Key"
     assert "APT-Protocol-Attacker" in tm.threat_actors
     assert "AI-Prompt-Smuggler" in tm.threat_actors
 
@@ -658,7 +689,9 @@ def test_model_adapter_unpacking_data_nested(monkeypatch: pytest.MonkeyPatch, sa
         arbiter=fake_arb,
         reports_dir=str(tmp_path / "reports_nested"),
     )
-    assert res["executive_summary"] == "Deep Nested Executive Summary via Data Key"
+    assert res["executive_summary"] == res["deterministic_summary"]
+    assert res["llm_override_blocked"] is True
+    assert res["llm_advisory_summary"] == "Deep Nested Executive Summary via Data Key"
 
 
 def test_mantis_scan_with_zero_day_findings_integrated(monkeypatch: pytest.MonkeyPatch, sample_repo: Path, tmp_path: Path):
@@ -773,7 +806,9 @@ def test_unified_all_scans_none_findings_and_none_threat_model(monkeypatch: pyte
     Scanners returning None for findings, endpoints, and threat_model
     are handled cleanly by run_unified_all_scans without TypeError or AttributeError.
     """
-    from unittest.mock import patch
+    import engine.aiscan_integrator as ai_mod
+    import engine.mantis_integrator as mi_mod
+
     monkeypatch.setenv("RFCHUNT_OFFLINE", "1")
 
     # 1. Test case: all scanner components return None for findings, threat_model, endpoints
@@ -782,9 +817,10 @@ def test_unified_all_scans_none_findings_and_none_threat_model(monkeypatch: pyte
     mock_raptor = {"findings": None, "total_findings": 0}
 
     reports_dir = tmp_path / "reports_none_test"
-    with patch("engine.mantis_integrator.MantisIntegrator.run_scan", return_value=mock_mantis), \
-         patch("engine.aiscan_integrator.AiscanIntegrator.scan_target", return_value=mock_aiscan), \
-         patch("engine.mantis_integrator._run_cross_platform_raptor_fallback", return_value=mock_raptor):
+    with monkeypatch.context() as mp:
+        mp.setattr(mi_mod.MantisIntegrator, "run_scan", lambda *a, **kw: mock_mantis)
+        mp.setattr(ai_mod.AiscanIntegrator, "scan_target", lambda *a, **kw: mock_aiscan)
+        mp.setattr(mi_mod, "_run_cross_platform_raptor_fallback", lambda *a, **kw: mock_raptor)
 
         res = run_unified_all_scans(
             repo=str(sample_repo),
@@ -799,9 +835,10 @@ def test_unified_all_scans_none_findings_and_none_threat_model(monkeypatch: pyte
 
     # 2. Test case: findings present but threat_model is None (Bug 2 reproduction scenario)
     mock_mantis_with_finding = {"findings": ["finding1", {"title": "f2", "rule_id": "M1"}], "threat_model": None, "total_findings": 2}
-    with patch("engine.mantis_integrator.MantisIntegrator.run_scan", return_value=mock_mantis_with_finding), \
-         patch("engine.aiscan_integrator.AiscanIntegrator.scan_target", return_value={"findings": [], "endpoints": []}), \
-         patch("engine.mantis_integrator._run_cross_platform_raptor_fallback", return_value={"findings": []}):
+    with monkeypatch.context() as mp:
+        mp.setattr(mi_mod.MantisIntegrator, "run_scan", lambda *a, **kw: mock_mantis_with_finding)
+        mp.setattr(ai_mod.AiscanIntegrator, "scan_target", lambda *a, **kw: {"findings": [], "endpoints": []})
+        mp.setattr(mi_mod, "_run_cross_platform_raptor_fallback", lambda *a, **kw: {"findings": []})
 
         res2 = run_unified_all_scans(
             repo=str(sample_repo),
@@ -915,7 +952,9 @@ def test_unified_all_scans_string_entry_points_and_sinks_no_slicing(monkeypatch:
     2. Does not truncate findings with [:10] or [:5].
     3. ARTEX dual graph synthesizes chains without error.
     """
-    from unittest.mock import patch
+    import engine.aiscan_integrator as ai_mod
+    import engine.mantis_integrator as mi_mod
+
     monkeypatch.setenv("RFCHUNT_OFFLINE", "1")
 
     mock_tm = {
@@ -946,9 +985,10 @@ def test_unified_all_scans_string_entry_points_and_sinks_no_slicing(monkeypatch:
     }
 
     reports_dir = tmp_path / "reports_str_test"
-    with patch("engine.mantis_integrator.MantisIntegrator.run_scan", return_value=mock_mantis), \
-         patch("engine.aiscan_integrator.AiscanIntegrator.scan_target", return_value=mock_aiscan), \
-         patch("engine.mantis_integrator._run_cross_platform_raptor_fallback", return_value=mock_raptor):
+    with monkeypatch.context() as mp:
+        mp.setattr(mi_mod.MantisIntegrator, "run_scan", lambda *a, **kw: mock_mantis)
+        mp.setattr(ai_mod.AiscanIntegrator, "scan_target", lambda *a, **kw: mock_aiscan)
+        mp.setattr(mi_mod, "_run_cross_platform_raptor_fallback", lambda *a, **kw: mock_raptor)
 
         res = run_unified_all_scans(
             repo=str(sample_repo),

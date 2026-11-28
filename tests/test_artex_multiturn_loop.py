@@ -20,6 +20,7 @@ import importlib.abc
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -637,10 +638,10 @@ def test_f5_untrusted_output_boundary_frames_tool_outputs_errors_and_reused_trac
     assert len(arbiter.prompts) == 2
     p0 = arbiter.prompts[0]["user_prompt"]
     p1 = arbiter.prompts[1]["user_prompt"]
-    assert f"nonce={boundary.nonce}" in p0 and "source=reused_trace_0" in p0
-    assert f"nonce={boundary.nonce}" in p1 and "<<<ARTEX_UNTRUSTED_DATA" in p1
+    assert re.search(r'<untrusted_data nonce="[0-9a-f]{24}">', p0) and "[source: reused_trace_0]" in p0
+    assert re.search(r'<untrusted_data nonce="[0-9a-f]{24}">', p1) and "</untrusted_data>" in p1
     traces = list(store.traces.values())
-    assert len(traces) >= 1 and f"nonce={boundary.nonce}" in traces[0].raw_observation
+    assert len(traces) >= 1 and re.search(r'<untrusted_data nonce="[0-9a-f]{24}">', traces[0].raw_observation)
 
 
 def test_f5_multiturn_fails_closed_on_uncorroborated_finish_dunder_tools_and_malformed_arbiter(
@@ -755,7 +756,8 @@ def test_f5_confirmed_tool_before_max_intent_turns_expiry_still_promotes_and_cus
         seen_keys.extend(attrs.keys())
         return True, "Custom OK", "GET /api/public"
 
-    assert eng.worker.execute_candidate(cand_custom, executor_fn=_custom) is True
+    assert eng.worker.execute_candidate(cand_custom, executor_fn=_custom) is False
+    assert "LEAD-CAND-CUSTOM" in eng.exploration_graph.nodes
     assert "_worker_context" not in seen_keys
 
 
@@ -817,7 +819,12 @@ def test_budget_ledger_per_turn_and_concurrent_multiturn_workers_no_overshoot(
 def test_f6_surface_mining_module21_present_dynamic_toggle_and_provider_hook(
     module21_toggle: Any, loopback_app: Any, tmp_path: Path
 ) -> None:
-    reg = LiveWorkerExecutorRegistry(host=loopback_app.host, port=loopback_app.port, authorized=True)
+    reg = LiveWorkerExecutorRegistry(
+        host=loopback_app.host,
+        port=loopback_app.port,
+        authorized=True,
+        workspace_root=tmp_path,
+    )
 
     module21_toggle(True, endpoints=[{"route": "/v2/m21-secret", "method": "POST", "source": "module21"}], target_module="morluto.rea")
     r1 = reg.surface_mining(target_path=str(tmp_path), query="secret")
@@ -843,7 +850,13 @@ def test_f6_surface_mining_fallback_on_absent_exception_malformed_and_repo_opena
     ag.add_asset("EP-DENY-R", "ENDPOINT", "/api/blocked", {"host": "127.0.0.1", "route": "/api/blocked", "method": "GET"})
     ag.add_asset("EP-DENY-H", "ENDPOINT", "/secret", {"host": "blocked.local", "route": "/secret", "method": "GET"})
 
-    reg = LiveWorkerExecutorRegistry(host=loopback_app.host, port=loopback_app.port, authorized=True, asset_graph=ag)
+    reg = LiveWorkerExecutorRegistry(
+        host=loopback_app.host,
+        port=loopback_app.port,
+        authorized=True,
+        asset_graph=ag,
+        workspace_root=tmp_path,
+    )
 
     for bad in ([], None, "bad-string", {"unexpected": 123}):
         module21_toggle(True, raw_payload=bad)
@@ -1830,6 +1843,7 @@ def test_r3_f5_as_executor_fn_honors_engine_and_composite_approval_gates(
         host=loopback_app.host,
         port=loopback_app.port,
         authorized=True,
+        traffic_session=eng_allow.traffic_session,
         approval_gate=perm_gate,
         auth_profiles={
             "end_user": AuthProfile(
@@ -1880,7 +1894,8 @@ def test_r3_f5_as_executor_fn_honors_engine_and_composite_approval_gates(
         attributes={"target_host": loopback_app.host, "target_route": "/api/public"},
         status="PENDING",
     )
-    assert eng_allow.worker.execute_candidate(c_custom, executor_fn=_custom_exec) is True
+    assert eng_allow.worker.execute_candidate(c_custom, executor_fn=_custom_exec) is False
+    assert "LEAD-CAND-CUSTOM-1ARG" in eng_allow.exploration_graph.nodes
     assert "_worker_context" not in seen_custom_keys
 
 
@@ -2177,9 +2192,27 @@ def test_r4_f5_reserve_worker_slot_concurrency_after_cheap_worker(
         attributes={"target_host": loopback_app.host, "target_route": "/api/public", "attack_type": "RECON"},
         status="PENDING",
     )
+    ex_cheap = eng.traffic_session.record_exchange(
+        method="GET",
+        url=f"http://{loopback_app.host}:{loopback_app.port}/api/public",
+        host=loopback_app.host,
+        port=loopback_app.port,
+        status_code=200,
+        response_body=b"cheap_ok_quote",
+    )
     assert eng.worker.execute_candidate(
         cheap,
-        executor_fn=lambda _a: (True, "ok", "p", {"tokens_used": 500, "turns_used": 1}),
+        executor_fn=lambda _a: (
+            True,
+            "ok",
+            "p",
+            {
+                "tokens_used": 500,
+                "turns_used": 1,
+                "traffic_id": ex_cheap.traffic_id,
+                "evidence_quote": "cheap_ok_quote",
+            },
+        ),
     ) is True
     # Raw moving average property remains intact
     assert eng.budget_ledger.estimated_worker_tokens == 500
@@ -2424,6 +2457,7 @@ def test_r4_f5_gate_cache_key_argv_prefix_and_unhashable_rules_across_capabiliti
         task_id="TASK-R4-ARGV-COMP",
         approval_gate=eng_gate,
     )
+    reg.traffic_session = eng.traffic_session
     for cid, cap, route, extra in (
         ("C-AUTH", "AUTH_BOUNDARY", "/api/admin", {"method": "GET"}),
         ("C-AI", "AI_INJECTION", "/api/ai/chat", {"has_ai_sink": True}),
@@ -2534,6 +2568,7 @@ def test_r4_f5_gate_cache_key_invalidates_on_inplace_method_scope_and_rule_type_
         task_id="TASK-R4-COMP-MUT",
         approval_gate=eng_gate,
     )
+    reg_perm.traffic_session = eng.traffic_session
     c1 = eng.exploration_graph.add_intent(
         node_id="C-COMP-1",
         node_type="CANDIDATE_INTENT",
@@ -3438,6 +3473,7 @@ def test_r6_f5_concurrent_gate_cache_key_and_freeze_cache_val_stress(
         port=loopback_app.port,
         authorized=True,
         asset_graph=ag_conc,
+        workspace_root=tmp_path,
     )
     stop_ag = threading.Event()
     ag_errors: List[str] = []
@@ -3504,10 +3540,10 @@ def test_multiturn_worker_frames_candidate_attrs_with_nonce_boundary(loopback_ap
     )
     assert len(arb.prompts) == 1
     up = arb.prompts[0]["user_prompt"]
-    start_tag = f"<<<ARTEX_UNTRUSTED_DATA source=candidate_attrs nonce={boundary.nonce}>>>"
-    end_tag = f"<<<END_ARTEX_UNTRUSTED_DATA nonce={boundary.nonce}>>>"
+    start_tag = f'<untrusted_data nonce="{boundary.nonce}">\n[source: candidate_attrs]\n'
+    end_tag = "</untrusted_data>"
     assert start_tag in up and end_tag in up
-    assert up.index(start_tag) < up.index("IGNORE ALL PREVIOUS INSTRUCTIONS") < up.index(end_tag)
+    assert up.index(start_tag) < up.index("[PROMPT_OVERRIDE_DEFUSED]") < up.index("[FENCE_ESCAPED]") < up.index(end_tag)
 
 
 

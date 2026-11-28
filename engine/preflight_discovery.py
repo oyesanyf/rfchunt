@@ -1440,7 +1440,7 @@ _UNSAFE_PIPED_EXEC_RE = re.compile(
     re.IGNORECASE,
 )
 _UNSAFE_PROMPT_OVERRIDE_RE = re.compile(
-    r"(?:(?:ignore|disregard|override)\s+(?:(?:all|any|the|previous|prior|above|system|developer)\s+){1,4}(?:instructions?|prompts?|rules?|safety\s+policies?)[^\n]{0,160}\b(?:exfiltrate|send|upload|execute|disable|bypass|reveal|dump)\b|silently\s+(?:send|post|exfiltrate|upload)\s+[^\n]{0,100}\b(?:env|secret|token|api[_-]?key|cookie|credential))",
+    r"(?:(?:ignore|disregard|override)\s+(?:(?:all|any|the|previous|prior|above|system|developer)\s+){1,4}(?:instructions?|prompts?|rules?|safety\s+policies?)[\s\S]{0,200}\b(?:exfiltrate|send|upload|execute|disable|bypass|reveal|dump)\b|silently\s+(?:send|post|exfiltrate|upload)\s+[\s\S]{0,120}\b(?:env|secret|token|api[_-]?key|cookie|credential)|\*{2,3}\s*important\s+system\s+message|-{2,3}\s*(?:user|assistant|system)\s+response\s*-{2,3})",
     re.IGNORECASE,
 )
 _UNSAFE_PATH_MUTATION_RE = re.compile(
@@ -1566,13 +1566,21 @@ class LocalSkillDiscoveryAndSafetyGate:
         skill_files: List[Tuple[Path, str]] = []
         seen_skill_paths: Set[str] = set()
         for root_p, src_type in unique_roots:
-            for sk_md in root_p.rglob("SKILL.md"):
-                resolved = str(sk_md.resolve(strict=False))
-                if resolved.lower() not in seen_skill_paths:
-                    seen_skill_paths.add(resolved.lower())
-                    skill_files.append((sk_md, src_type))
-                if len(skill_files) >= 250:
-                    break
+            for cur_root, cur_dirs, cur_files in os.walk(root_p, followlinks=False):
+                cur_dirs[:] = [
+                    d for d in sorted(cur_dirs)
+                    if d not in _SKIP_DIRS
+                ]
+                if "SKILL.md" in cur_files:
+                    sk_md = Path(cur_root) / "SKILL.md"
+                    resolved = str(sk_md.resolve(strict=False))
+                    if resolved.lower() not in seen_skill_paths:
+                        seen_skill_paths.add(resolved.lower())
+                        skill_files.append((sk_md, src_type))
+                    if len(skill_files) >= 250:
+                        break
+            if len(skill_files) >= 250:
+                break
 
         active_safe_skills: List[LocalSkillAuditRecord] = []
         blocked_unsafe_skills: List[LocalSkillAuditRecord] = []

@@ -1,0 +1,63 @@
+{
+  "description": "Default in-scope GitHub bug bounty freshness watchlist (24-72h releases, merged PRs, and commits).",
+  "freshness_hours": 72,
+  "min_surface_score": 25,
+  "targets": [
+    {
+      "program": "shopify",
+      "repo": "Shopify/function-runner",
+      "bounty_tier": "Medium-High",
+      "scope_asset": "https://github.com/Shopify/*",
+      "notes": "Wasmtime Shopify Functions runner (Rust)"
+    },
+    {
+      "program": "shopify",
+      "repo": "Shopify/deterministic-wasi-ctx",
+      "bounty_tier": "Medium-High",
+      "scope_asset": "https://github.com/Shopify/*",
+      "notes": "WASI determinism host functions (Rust)"
+    },
+    {
+      "program": "shopify",
+      "repo": "Shopify/shopify-app-js",
+      "bounty_tier": "Medium",
+      "scope_asset": "https://github.com/Shopify/*",
+      "notes": "OAuth, JWT session tokens, Express/Remix/React Router"
+    },
+    {
+      "program": "shopify",
+      "repo": "Shopify/hydrogen",
+      "bounty_tier": "Medium",
+      "scope_asset": "https://github.com/Shopify/*",
+      "notes": "Hydrogen storefront routing & proxy interceptors"
+    },
+    {
+      "program": "anthropic",
+      "repo": "anthropics/sandbox-runtime",
+      "bounty_tier": "High",
+      "scope_asset": "https://github.com/anthropics/sandbox-runtime",
+      "notes": "OS sandbox (Windows/Linux/macOS) + HTTP/TLS proxy"
+    },
+    {
+      "program": "arc-bbp",
+      "repo": "circlefin/malachite",
+      "bounty_tier": "High-Critical",
+      "scope_asset": "https://github.com/circlefin/malachite",
+      "notes": "Tendermint/BFT consensus engine (Rust)"
+    },
+    {
+      "program": "cloudflare",
+      "repo": "cloudflare/pingora",
+      "bounty_tier": "High-Critical",
+      "scope_asset": "https://github.com/cloudflare/pingora",
+      "notes": "HTTP/1.1 & HTTP/2 reverse proxy framework (Rust)"
+    },
+    {
+      "program": "coinbase",
+      "repo": "coinbase/cb-mpc",
+      "bounty_tier": "Critical",
+      "scope_asset": "https://github.com/coinbase/cb-mpc",
+      "notes": "Multiparty computation cryptography library"
+    }
+  ]
+}

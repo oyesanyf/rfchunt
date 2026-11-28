@@ -10,9 +10,9 @@ import json
 import os
 from pathlib import Path
 import struct
+import subprocess
 import threading
 from typing import Dict, Tuple
-from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -289,34 +289,40 @@ def test_rea_execution_policy_confinement_and_cli_fallback(tmp_path: Path, monke
 
     integrator = ReaIntegrator(reports_dir=tmp_path / "reports")
     monkeypatch.setenv("RFCHUNT_OFFLINE", "0")
-    fake_proc = MagicMock(
-        returncode=0,
-        stdout=json.dumps(
-            {
-                "endpoints": [{"route": "/service/rea-cli-discovered", "method": "POST"}],
-                "findings": [
-                    {
-                        "rule_id": "REA-ROUTE-001",
-                        "title": "CLI Discovered Route",
-                        "severity": "MEDIUM",
-                        "file_path": str(bin_dir / "bundle.js"),
-                        "line_number": 1,
-                    }
-                ],
-            }
-        ),
-        stderr="",
+    fake_stdout = json.dumps(
+        {
+            "endpoints": [{"route": "/service/rea-cli-discovered", "method": "POST"}],
+            "findings": [
+                {
+                    "rule_id": "REA-ROUTE-001",
+                    "title": "CLI Discovered Route",
+                    "severity": "MEDIUM",
+                    "file_path": str(bin_dir / "bundle.js"),
+                    "line_number": 1,
+                }
+            ],
+        }
     )
-    with patch.object(integrator, "check_rea_cli_status", return_value={"installed": True, "binary_path": "/usr/local/bin/rea"}):
-        with patch("engine.rea_integrator.silent_subprocess_run", return_value=fake_proc) as mock_run:
-            res = integrator.analyze(target_path=bin_dir, use_rea_cli=True, write_reports=False)
-            assert res.mode == "hybrid"
-            routes = {ep["route"] for ep in res.discovered_endpoints}
-            assert "/internal/admin/audit" in routes
-            assert "/service/rea-cli-discovered" in routes
-            called_argv = mock_run.call_args[0][0]
-            assert called_argv[1] == "analyze-javascript-application"
-            assert mock_run.call_args[1]["shell"] is False
+    run_calls = []
+
+    def _fake_silent_run(argv, **kwargs):
+        run_calls.append((list(argv), dict(kwargs)))
+        return subprocess.CompletedProcess(argv, 0, stdout=fake_stdout, stderr="")
+
+    import engine.rea_integrator as rea_mod
+
+    with monkeypatch.context() as mp:
+        mp.setattr(integrator, "check_rea_cli_status", lambda: {"installed": True, "binary_path": "/usr/local/bin/rea"})
+        mp.setattr(rea_mod, "silent_subprocess_run", _fake_silent_run)
+        res = integrator.analyze(target_path=bin_dir, use_rea_cli=True, write_reports=False)
+        assert res.mode == "hybrid"
+        routes = {ep["route"] for ep in res.discovered_endpoints}
+        assert "/internal/admin/audit" in routes
+        assert "/service/rea-cli-discovered" in routes
+        assert len(run_calls) == 1
+        called_argv, called_kw = run_calls[0]
+        assert called_argv[1] == "analyze-javascript-application"
+        assert called_kw["shell"] is False
 
 
 def test_unified_all_scans_and_mcp_rea_integration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -416,17 +422,25 @@ def test_codebase_logic_bug_regressions(tmp_path: Path, monkeypatch: pytest.Monk
         ollama_manager.OllamaLifecycleManager._failed_pulls.clear()
         ollama_manager.OllamaLifecycleManager._cached_by_endpoint.clear()
         ollama_manager.OllamaLifecycleManager._cached_tags.clear()
-    with patch.object(ollama_manager.OllamaLifecycleManager, "find_ollama_binary", return_value="/usr/bin/ollama"):
-        with patch.object(ollama_manager.OllamaLifecycleManager, "probe_ollama", return_value=["huihui_ai/foundation-sec-abliterated:8b"]):
-            with patch("ollama_manager.subprocess.run", return_value=MagicMock(returncode=0)) as mock_pull:
-                pulled = ollama_manager.ensure_model_installed(
-                    "huihui_ai/foundation-sec-abliterated:8b",
-                    allow_in_tests=True,
-                )
-                assert pulled is True
-                called_cmd = mock_pull.call_args[0][0]
-                assert called_cmd == ["/usr/bin/ollama", "pull", "huihui_ai/foundation-sec-abliterated:8b"]
-                assert mock_pull.call_args[1].get("shell", False) is False
+    pull_calls = []
+
+    def _fake_pull_run(argv, **kwargs):
+        pull_calls.append((list(argv), dict(kwargs)))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(ollama_manager.OllamaLifecycleManager, "find_ollama_binary", staticmethod(lambda: "/usr/bin/ollama"))
+        mp.setattr(ollama_manager.OllamaLifecycleManager, "probe_ollama", staticmethod(lambda *a, **kw: ["huihui_ai/foundation-sec-abliterated:8b"]))
+        mp.setattr(ollama_manager.subprocess, "run", _fake_pull_run)
+        pulled = ollama_manager.ensure_model_installed(
+            "huihui_ai/foundation-sec-abliterated:8b",
+            allow_in_tests=True,
+        )
+        assert pulled is True
+        assert len(pull_calls) == 1
+        called_cmd, called_kw = pull_calls[0]
+        assert called_cmd == ["/usr/bin/ollama", "pull", "huihui_ai/foundation-sec-abliterated:8b"]
+        assert called_kw.get("shell", False) is False
 
     # 2. FusionArbiter._parse_json(unwrap_lists=False) preserves {"intents": [...]} envelope
     monkeypatch.setenv("RFCHUNT_OFFLINE", "1")

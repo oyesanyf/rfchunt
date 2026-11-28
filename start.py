@@ -88,6 +88,11 @@ USAGE EXAMPLES:
     parser.add_argument("--keep-findings-on-clean", "--keep-findings", dest="keep_findings_on_clean", action="store_true", help="Retain confirmed findings when cleaning the database")
     parser.add_argument("--random-port", "--high-port", action="store_true", help="Use a high random available port for the test lab server / UI")
     parser.add_argument("--ui", action="store_true", help="Launch the interactive research dashboard web UI on a high random available port")
+    parser.add_argument("--all", dest="run_all_scans", action="store_true", default=False, help="Delegate directly to unified `rfc_hunt_swarm.py --all` security audit")
+    parser.add_argument("--hybrid", dest="enable_hybrid", action="store_true", default=False, help="Delegate directly to unified `rfc_hunt_swarm.py --hybrid` local + live remote audit")
+    parser.add_argument("--repo", dest="repo", default=None, help="Local repository directory for --all / --hybrid delegation")
+    parser.add_argument("--authorized", dest="authorized", action="store_true", default=False, help="Explicit authorization flag for remote --all / --hybrid delegation")
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true", default=False, help="Zero-side-effect dry-run preview when delegating --all / --hybrid")
     return parser
 
 
@@ -106,6 +111,27 @@ def parse_arguments(argv=None):
 
 def main():
     args = parse_arguments()
+
+    # Unified --all / --hybrid delegation to rfc_hunt_swarm.py (shell=False, in-process entrypoint)
+    if getattr(args, "run_all_scans", False) or getattr(args, "enable_hybrid", False):
+        import rfc_hunt_swarm
+
+        fwd: list[str] = ["--hybrid"] if getattr(args, "enable_hybrid", False) else ["--all"]
+        if getattr(args, "repo", None):
+            fwd.extend(["--repo", str(args.repo)])
+        if getattr(args, "host", None) and (args.host != "127.0.0.1" or getattr(args, "enable_hybrid", False)):
+            fwd.extend(["--host", str(args.host), "--port", str(args.port)])
+        if getattr(args, "tls", False):
+            fwd.append("--tls")
+        if getattr(args, "authorized", False):
+            fwd.append("--authorized")
+        if getattr(args, "targets", None):
+            t_str = ",".join(args.targets) if isinstance(args.targets, list) else str(args.targets)
+            fwd.extend(["--targets", t_str])
+        if getattr(args, "dry_run", False):
+            fwd.append("--dry-run")
+        rfc_hunt_swarm.main_swarm(fwd)
+        return
 
     # Determine TLS requirement (automatic for port 443)
     use_tls = args.tls or (args.port == 443)
