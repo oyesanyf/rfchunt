@@ -221,3 +221,106 @@ def test_standalone_folder_dry_run_reports_local_all_mode(tmp_path: Path):
     assert plan["target_host"] is None
     assert plan["dry_run"] is True
     assert str(tmp_path.resolve()) in str(plan["target_repo_or_path"])
+
+
+def test_frozen_six_case_rubric_and_strict_3of3_reproducibility_gates(tmp_path: Path) -> None:
+    """
+    Verifies the frozen 6-case pre-execution rubric manifest with full per-case provenance
+    (pinned file SHA-256, frozen ground truth, independent vs. correlated oracles, raw stdout)
+    AND directly confirms 2/3 flaky reproductions downgrade across merkle_audit, poc_generator,
+    and epistemic_state while 3/3 deterministic reproductions promote.
+    """
+    from benchmarks.eval_epistemic_rigor import run_frozen_six_case_rubric_suite
+    from engine.epistemic_state import EpistemicStatus, derive_epistemic_status
+    from engine.merkle_audit import MerkleAuditTrail
+    from engine.poc_generator import (
+        VERDICT_UNVERIFIED_CANDIDATE,
+        VERDICT_VERIFIED_REPRODUCIBLE,
+        generate_poc_bundle,
+    )
+
+    rubric_res = run_frozen_six_case_rubric_suite()
+    assert rubric_res["total_cases"] == 6
+    assert rubric_res["passed_cases"] == 6
+    assert rubric_res["all_cases_passed"] is True
+    assert len(rubric_res["rubric_manifest_sha256"]) == 64
+
+    for entry in rubric_res["cases"]:
+        assert entry["passed"] is True
+        assert len(entry["pinned_file_sha256"]) == 64
+        assert "expected_epistemic_status" in entry["frozen_ground_truth"]
+        assert isinstance(entry["independent_oracles"], list)
+        assert isinstance(entry["correlated_oracles"], list)
+        assert bool(entry["raw_stdout"])
+
+    # Direct boundary assertion: 2/3 (0.667) with 4-parser divergence MUST fail closed everywhere
+    trail = MerkleAuditTrail()
+    leaf_2of3 = trail.record_finding(
+        entry_id="TEST-2OF3",
+        target_engine="127.0.0.1:8080",
+        raw_probe=b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        raw_response=b"HTTP/1.1 400 Bad Request\r\n\r\n",
+        reproducibility_rate=round(2 / 3, 4),
+        verification_attempts=3,
+        successful_reproductions=2,
+        four_parser_differential={"Strict_RFC9112": {"status": 400}, "Permissive_Legacy": {"status": 200}},
+        status="CONFIRMED_VULNERABILITY",
+    )
+    assert leaf_2of3.status == "NON_REPRODUCIBLE_TRANSIENT"
+
+    poc_2of3 = generate_poc_bundle(
+        [
+            {
+                "vuln_id": "TEST-2OF3",
+                "rule_id": "RFC-9112-2OF3",
+                "title": "Flaky 2/3 framing",
+                "severity": "HIGH",
+                "rfc_num": 9112,
+                "verification_attempts": 3,
+                "successful_reproductions": 2,
+                "reproducibility_rate": 0.667,
+                "raw_probe": "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            }
+        ],
+        output_dir=tmp_path / "poc_2of3",
+    )
+    assert poc_2of3.records[0].verdict == VERDICT_UNVERIFIED_CANDIDATE
+    assert poc_2of3.records[0].poe_level == 1
+    assert poc_2of3.records[0].disclosure_worthy is False
+
+    # Even if poe_level=3 bridged into epistemic_state, 2/3 stays UNRESOLVED
+    ep_2of3 = derive_epistemic_status(
+        {
+            "scanner": "LiveH2DesyncProber",
+            "poe_level": 3,
+            "verification_attempts": 3,
+            "successful_reproductions": 2,
+            "reproducibility_rate": 0.667,
+            "runtime_poe_verified": True,
+            "independent_oracles": ["runtime_3trial_wire"],
+        },
+        runtime_poe_verified=True,
+    )
+    assert ep_2of3["epistemic_status"] == EpistemicStatus.UNRESOLVED.value
+    assert "flaky_reproduction_below_3of3" in ep_2of3["missing_evidence"]
+
+    # Deterministic 3/3 (1.0) promotes cleanly
+    poc_3of3 = generate_poc_bundle(
+        [
+            {
+                "vuln_id": "TEST-3OF3",
+                "rule_id": "RFC-9112-3OF3",
+                "title": "Deterministic 3/3 framing",
+                "severity": "HIGH",
+                "rfc_num": 9112,
+                "verification_attempts": 3,
+                "successful_reproductions": 3,
+                "reproducibility_rate": 1.0,
+                "raw_probe": "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            }
+        ],
+        output_dir=tmp_path / "poc_3of3",
+    )
+    assert poc_3of3.records[0].verdict == VERDICT_VERIFIED_REPRODUCIBLE
+    assert poc_3of3.records[0].poe_level == 3
+

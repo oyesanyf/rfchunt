@@ -178,8 +178,13 @@ class ProtocolResearchOrchestrator:
                 return cycle_result
 
             # Step 6: Mod 8 Automated Delta Debugging and Reproducibility Verification
+            # Strict deterministic 3/3 (100%) reproducibility gate: flaky 2/3 stays NON_REPRODUCIBLE_TRANSIENT
             vuln = self.debugger.minimize_and_reproduce(anomaly, max_verification_trials=3)
-            if vuln.reproducibility_rate >= 0.66:
+            if (
+                vuln.verification_attempts >= 3
+                and vuln.successful_reproductions >= vuln.verification_attempts
+                and vuln.reproducibility_rate >= 1.0
+            ):
                 cycle_result["vulnerability_confirmed"] = True
                 reward = 1.0
 

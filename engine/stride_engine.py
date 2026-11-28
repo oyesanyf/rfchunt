@@ -54,7 +54,11 @@ STRIDE_CATEGORIES: Tuple[str, ...] = (
 COMPONENT_SIGNATURES: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
     ("api_routes", "Web & API Entry Points", ("@app.", "@router.", "fastapi", "flask", "express", "handlefunc", "route(", "/api/", "graphql", "http.server")),
     ("auth_identity", "Authentication & Access Control", ("jwt", "oauth", "auth", "login", "session", "rbac", "token", "bearer", "password", "permission", "policy")),
-    ("ai_llm_mcp", "AI / LLM & MCP Agent Layer", ("openai", "anthropic", "ollama", "langchain", "mcp", "prompt", "system_prompt", "embedding", "rag", "skill.md", "transformers")),
+    ("oauth_jwt_tenant_boundary", "OAuth / JWT & Multi-Tenant Identity Boundary", ("oidc", "webauthn", "passkey", "storefront", "merchant", "iss", "audience", "hmac", "oauth_callback", "tenant_id", "escalation", "api_key")),
+    ("wasm_sandbox_isolation", "WASM / Sandbox & Guest-to-Host Isolation", ("wasmtime", "wasi", "resourcelimiter", "poll_oneoff", "seatbelt", "seccomp", "sandbox", "ntfs", "reparse", "jobobject", "javascriptinterface", "ptr::read", "unreachable!", "maybeuninit")),
+    ("consensus_bft_crypto", "BFT Consensus, Validator & Enclave Signer", ("malachite", "tendermint", "cometbft", "validator", "started_round", "undecided", "gossipsub", "prevote", "precommit", "nitro", "enclave", "attestation", "precompile", "wal")),
+    ("parser_framing_differential", "Parser, Framing & Proxy Canonicalization", ("splitlines(", "urlsearchparams", "transfer-encoding", "content-length", "clienthello", "sni", "apiproxy", "sfapiproxy", "percent", "sanitize", "governanceenvelope", "routingseal")),
+    ("ai_llm_mcp", "AI / LLM & MCP Agent Layer", ("openai", "anthropic", "ollama", "langchain", "mcp", "prompt", "system_prompt", "embedding", "rag", "skill.md", "transformers", "model_armor", "tool_calls")),
     ("data_storage", "Database & State Persistence", ("sqlite", "postgres", "mysql", "redis", "mongo", "cursor.execute", "sqlalchemy", "orm", "database", ".db")),
     ("os_subprocess", "OS / Subprocess & File Execution", ("subprocess", "os.system", "popen", "exec(", "eval(", "pickle.", "yaml.load", "shutil.", "tempfile")),
     ("network_framing", "Network, HTTP Framing & Proxy", ("socket", "ssl", "tls", "http/1.1", "http/2", "h2", "transfer-encoding", "content-length", "proxy", "requests.", "httpx.")),
@@ -221,6 +225,91 @@ _COMPONENT_THREAT_CATALOG: Dict[str, List[Dict[str, Any]]] = {
             "zero_trust_pillar": "Data",
         },
     ],
+    "oauth_jwt_tenant_boundary": [
+        {
+            "stride": "Spoofing",
+            "title": "JWT / OIDC Token Domain Confusion (Missing iss/aud/dest or Service-vs-User Conflation)",
+            "mitre_tactic": "TA0004 Privilege Escalation",
+            "mitre_technique": "T1550 Use Alternate Authentication Material",
+            "cwe": "CWE-287",
+            "severity": "HIGH",
+            "requirement": "Bind token verification strictly to expected issuer (`iss`), audience (`aud`/`dest`), and key domain; never accept end-user/buyer tokens on admin or service-key routes.",
+            "asvs": "ASVS 3.5.3",
+            "zero_trust_pillar": "Identity",
+        },
+        {
+            "stride": "Tampering",
+            "title": "OAuth Callback HMAC / State / Replay Bypass via Parameter Differential",
+            "mitre_tactic": "TA0001 Initial Access",
+            "mitre_technique": "T1528 Steal Application Access Token",
+            "cwe": "CWE-345",
+            "severity": "HIGH",
+            "requirement": "Reject duplicate query parameters fail-closed before HMAC calculation and verify single-use `state`, `timestamp`, and WebAuthn presence binding.",
+            "asvs": "ASVS 3.4.1",
+            "zero_trust_pillar": "Identity",
+        },
+    ],
+    "wasm_sandbox_isolation": [
+        {
+            "stride": "Information Disclosure",
+            "title": "Guest-to-Host Memory Disclosure, Unsafe UB, or ResourceLimiter Exhaustion in Sandbox Runtime",
+            "mitre_tactic": "TA0004 Privilege Escalation",
+            "mitre_technique": "T1611 Escape to Host",
+            "cwe": "CWE-908",
+            "severity": "HIGH",
+            "requirement": "Zero-initialize all host-to-guest buffers, forbid unaligned `ptr::read` / reachable `unreachable!()` on untrusted guest input, and enforce strict `ResourceLimiter` caps.",
+            "asvs": "ASVS 5.4.1",
+            "zero_trust_pillar": "Workloads",
+        },
+        {
+            "stride": "Elevation of Privilege",
+            "title": "Sandbox Filesystem / Path-Prefix / Symlink-Junction Escape Across Guest-Host Boundary",
+            "mitre_tactic": "TA0004 Privilege Escalation",
+            "mitre_technique": "T1611 Escape to Host",
+            "cwe": "CWE-22",
+            "severity": "CRITICAL",
+            "requirement": "Canonicalize paths against NTFS ADS (`:stream`), `\\??\\` / `\\Device\\` prefixes, ancestor renames, and startup dotfiles before applying deny rules.",
+            "asvs": "ASVS 12.3.1",
+            "zero_trust_pillar": "Workloads",
+        },
+    ],
+    "consensus_bft_crypto": [
+        {
+            "stride": "Denial of Service",
+            "title": "Byzantine Consensus State-Machine Bricking, Sync Deadlock, or Unmetered Precompile Halt",
+            "mitre_tactic": "TA0040 Impact",
+            "mitre_technique": "T1499 Endpoint Denial of Service",
+            "cwe": "CWE-841",
+            "severity": "CRITICAL",
+            "requirement": "Enforce explicit state-machine invariants (`may_be_stored_as_undecided()` / round monotonicity) and meter all cryptographic/PQC precompile decoding before allocation.",
+            "asvs": "ASVS 11.1.4",
+            "zero_trust_pillar": "Workloads",
+        },
+        {
+            "stride": "Spoofing",
+            "title": "Remote Signer / Nitro Enclave KMS Attestation Binding Bypass",
+            "mitre_tactic": "TA0006 Credential Access",
+            "mitre_technique": "T1552 Unsecured Credentials",
+            "cwe": "CWE-345",
+            "severity": "CRITICAL",
+            "requirement": "Cryptographically bind KMS decrypt policies and signing requests to verified PCR attestation measurements and nonce freshness.",
+            "asvs": "ASVS 6.2.4",
+            "zero_trust_pillar": "Identity",
+        },
+    ],
+    "parser_framing_differential": [
+        {
+            "stride": "Tampering",
+            "title": "Parser / Framing / Canonicalization Differential Bypassing Security Middleware or Signing",
+            "mitre_tactic": "TA0005 Defense Evasion",
+            "mitre_technique": "T1036 Masquerading",
+            "cwe": "CWE-436",
+            "severity": "HIGH",
+            "requirement": "Canonicalize inputs once before policy inspection and signature generation; align line-splitting/URL-decoding strictly with WHATWG/RFC framing rules.",
+            "asvs": "ASVS 5.1.3",
+            "zero_trust_pillar": "Applications",
+        },
+    ],
     "supply_chain_iac": [
         {
             "stride": "Elevation of Privilege",
@@ -235,6 +324,117 @@ _COMPONENT_THREAT_CATALOG: Dict[str, List[Dict[str, Any]]] = {
         },
     ],
 }
+
+# Precision STRIDE Threat-Model Extraction & Boundary Verification Patterns
+_THREAT_DOC_CANDIDATES: Tuple[str, ...] = (
+    "SECURITY.md",
+    "THREAT_MODEL.md",
+    "THREAT-MODEL.md",
+    "SECURITY_MODEL.md",
+    "docs/SECURITY.md",
+    "docs/THREAT_MODEL.md",
+    "docs/threat-model.md",
+    "docs/security.md",
+    "README.md",
+)
+
+_NON_GOAL_LINE_RX = re.compile(
+    r"(?:out\s+of\s+(?:scope|threat\s+model)|non[- ]?goal|not\s+(?:a\s+)?(?:security\s+)?boundary|"
+    r"working\s+as\s+designed|accepted\s+risk|explicitly\s+excluded|not\s+considered\s+a\s+vulnerabilit|"
+    r"does\s+not\s+protect\s+against|trusts?\s+(?:the\s+)?local\s+(?:user|operator|host|process))",
+    re.IGNORECASE,
+)
+
+_TRUST_BOUNDARY_LINE_RX = re.compile(
+    r"(?:trust\s+boundary|security\s+boundary|isolates?\s+|sandboxes?\s+|prevents?\s+(?:untrusted|guest|buyer|remote|byzantine))",
+    re.IGNORECASE,
+)
+
+_LOCAL_CLI_SELF_EXEC_RX = re.compile(
+    r"\b(?:local\s+cli|command[- ]line\s+flag|--set\b|self[- ]execution|same[- ]user\s+local\s+cli|"
+    r"developer\s+machine\s+cli|local\s+user\s+running\s+cli)\b",
+    re.IGNORECASE,
+)
+
+_HARDENING_FALLBACK_RX = re.compile(
+    r"\b(?:hardening\s+candidate|opaque\s+tunnel|fragmented\s+tls|absent\s+sni|"
+    r"defense[- ]in[- ]depth\s+hardening|best[- ]practice\s+hardening|legacy\s+record\s+version\s+fallback)\b",
+    re.IGNORECASE,
+)
+
+_HIGH_VALUE_BOUNDARY_SIGNALS: Tuple[Tuple[str, str, re.Pattern[str]], ...] = (
+    (
+        "Cross-Tenant / Privilege Identity Boundary",
+        "Spoofing",
+        re.compile(
+            r"\b(?:cross[- ]tenant|storefront.{0,30}admin|buyer.{0,30}merchant|oidc.{0,30}api[- ]?key|"
+            r"missing\s+iss|missing\s+dest|webauthn.{0,25}bypass|jwt.{0,25}(?:confusion|bypass)|"
+            r"oauth.{0,25}(?:hmac|csrf|bypass)|privilege\s+escalation|rbac\s+bypass|bola|idor)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Guest-to-Host Sandbox / WASI Isolation Boundary",
+        "Elevation of Privilege",
+        re.compile(
+            r"\b(?:sandbox\s+(?:escape|bypass)|uninitialized\s+host\s+(?:stack|memory)|ptr::read|"
+            r"resourcelimiter\s+bypass|host\s+heap\s+allocation|host\s+panic|ntfs\s+(?:ads|junction)|"
+            r"alternate\s+data\s+stream|ancestor\s+rename|seatbelt\s+bypass|seccomp|@javascriptinterface|"
+            r"rce|command\s+injection|arbitrary\s+code\s+execution)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Byzantine Peer -> Validator Consensus & Enclave Signer Boundary",
+        "Denial of Service",
+        re.compile(
+            r"\b(?:validator\s+bricking|chain\s+halt|consensus.{0,25}(?:halt|deadlock|safety)|"
+            r"malachite|may_be_stored_as_undecided|p2p\s+eclipse|gossipsub|nitro.{0,25}attestation|"
+            r"kms\s+attestation|precompile.{0,25}(?:unmetered|decode))\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Untrusted Input -> Parser / Proxy / Egress Policy Boundary",
+        "Tampering",
+        re.compile(
+            r"\b(?:framing\s+differential|splitlines|request\s+smuggling|duplicate\s+query\s+param|"
+            r"double[- ]decode|pre[- ]sanitized|unrestricted\s+proxy|proxy\s+bypass|egress\s+(?:bypass|inspection)|"
+            r"ssrf|path\s+traversal|sql\s+injection)\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+@dataclass
+class TargetThreatModelSpec:
+    """Target-specific threat model parsed from SECURITY.md / THREAT_MODEL.md / README.md / RoE policy."""
+
+    deployment_model: str = "multi_tenant_service"  # multi_tenant_service | sandbox_host | consensus_node | sdk_library | local_cli_tool
+    source_docs: List[str] = field(default_factory=list)
+    explicit_trust_boundaries: List[str] = field(default_factory=list)
+    explicit_non_goals: List[str] = field(default_factory=list)
+    high_value_assets: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class StrideBoundaryVerdict:
+    """Per-finding precision STRIDE boundary verification verdict."""
+
+    verdict: str  # CASH_GRADE_BOUNDARY_VIOLATION | BOUNDARY_NOT_CROSSED | DOCUMENTED_AS_DESIGNED | HARDENING_CANDIDATE_NOT_BOUNTY
+    stride_category: str
+    target_boundary: str
+    crosses_trust_boundary: bool
+    matched_non_goal: str = ""
+    rationale: str = ""
+    recommended_channel: str = "hackerone_bounty"  # hackerone_bounty | github_hardening_pr | do_not_submit
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass
@@ -265,6 +465,239 @@ class DynamicStrideThreatEngine:
         return {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}.get(str(sev or "INFO").upper(), 0)
 
     @classmethod
+    def extract_target_threat_model_spec(
+        cls,
+        target_path: str,
+        *,
+        policy_text: str = "",
+        component_ids: Optional[Sequence[str]] = None,
+    ) -> TargetThreatModelSpec:
+        """
+        Parses SECURITY.md, THREAT_MODEL.md, README.md security notes, and HackerOne RoE policy text
+        to extract target-specific trust boundaries, explicit non-goals/accepted risks,
+        high-value assets, and deployment model.
+        """
+        root = Path(target_path).resolve(strict=False)
+        source_docs: List[str] = []
+        corpus_chunks: List[str] = []
+
+        if root.is_dir():
+            for rel_doc in _THREAT_DOC_CANDIDATES:
+                doc_p = root / rel_doc
+                if doc_p.is_file():
+                    try:
+                        txt = doc_p.read_text(encoding="utf-8", errors="ignore")[:24_000]
+                        if txt.strip():
+                            source_docs.append(rel_doc)
+                            corpus_chunks.append(txt)
+                    except OSError:
+                        continue
+        if policy_text and str(policy_text).strip():
+            source_docs.append("hackerone_program_policy")
+            corpus_chunks.append(str(policy_text)[:24_000])
+
+        boundaries: List[str] = []
+        non_goals: List[str] = []
+        for chunk in corpus_chunks:
+            for raw_line in chunk.splitlines():
+                line = " ".join(raw_line.strip(" -*•\t").split())
+                if len(line) < 12 or len(line) > 260:
+                    continue
+                if _NON_GOAL_LINE_RX.search(line) and line not in non_goals:
+                    non_goals.append(line)
+                elif _TRUST_BOUNDARY_LINE_RX.search(line) and line not in boundaries:
+                    boundaries.append(line)
+
+        cids = set(component_ids or ())
+        full_text_low = "\n".join(corpus_chunks).lower()
+        name_low = root.name.lower()
+
+        if "consensus_bft_crypto" in cids or any(k in full_text_low for k in ("malachite", "validator", "byzantine", "tendermint")):
+            dep_model = "consensus_node"
+        elif "wasm_sandbox_isolation" in cids or any(k in full_text_low for k in ("sandbox-runtime", "wasi", "wasmtime", "seatbelt")):
+            dep_model = "sandbox_host"
+        elif any(k in name_low for k in ("-cli", "_cli")) and "api_routes" not in cids:
+            dep_model = "local_cli_tool"
+        elif "api_routes" in cids or "oauth_jwt_tenant_boundary" in cids or "network_framing" in cids:
+            dep_model = "multi_tenant_service"
+        else:
+            dep_model = "sdk_library"
+
+        assets: List[str] = []
+        asset_map = (
+            ("oauth_jwt_tenant_boundary", "Cross-tenant admin/merchant tokens, OIDC/JWT signing keys & WebAuthn sessions"),
+            ("wasm_sandbox_isolation", "Host runtime memory, host filesystem & host OS execution outside guest sandbox"),
+            ("consensus_bft_crypto", "Validator liveness/safety state, BFT WAL & Nitro Enclave KMS signing keys"),
+            ("parser_framing_differential", "Security middleware enforcement, canonical request framing & signed envelopes"),
+            ("ai_llm_mcp", "Agent tool-execution policy, system prompts & egress DLP/Model Armor filters"),
+            ("data_storage", "Persistent customer/tenant database records & PHI/PII stores"),
+            ("crypto_secrets", "Cryptographic private keys, HMAC secrets & cloud credentials"),
+        )
+        for cid, desc in asset_map:
+            if cid in cids:
+                assets.append(desc)
+        if not assets:
+            assets.append("Application integrity, confidentiality, and authorization boundaries")
+
+        return TargetThreatModelSpec(
+            deployment_model=dep_model,
+            source_docs=source_docs[:10],
+            explicit_trust_boundaries=boundaries[:20],
+            explicit_non_goals=non_goals[:25],
+            high_value_assets=assets[:10],
+        )
+
+    @classmethod
+    def evaluate_finding_against_threat_model(
+        cls,
+        finding: Dict[str, Any],
+        stride_model: Optional[Dict[str, Any]] = None,
+        *,
+        policy_text: str = "",
+    ) -> StrideBoundaryVerdict:
+        """
+        Precision STRIDE per-finding trust-boundary & non-goal gate:
+          - Rejects `DOCUMENTED_AS_DESIGNED` findings matching explicit non-goals in
+            SECURITY.md / THREAT_MODEL.md / program policy (prevents Informative reports).
+          - Rejects `BOUNDARY_NOT_CROSSED` local CLI self-execution where attacker == victim.
+          - Routes `HARDENING_CANDIDATE_NOT_BOUNTY` fallbacks (without PoE=3 exploit impact)
+            to public GitHub PRs instead of burning HackerOne slots.
+          - Promotes verified cross-boundary findings to `CASH_GRADE_BOUNDARY_VIOLATION`.
+        """
+        title = str(finding.get("title") or "")
+        desc = str(finding.get("description") or "")
+        ev = str(finding.get("evidence") or "")
+        fp = str(finding.get("file_path") or finding.get("file") or "")
+        cwe = str(finding.get("cwe") or finding.get("cwe_id") or "").upper()
+        poe_level = int(finding.get("poe_level", 1) or 1)
+        ep_status = str(finding.get("epistemic_status") or "").strip().upper()
+        blob = " ".join([title, desc, ev, fp, cwe])
+        blob_low = blob.lower()
+
+        spec_dict = (stride_model or {}).get("target_threat_model_spec") or {}
+        non_goals: List[str] = list(spec_dict.get("explicit_non_goals") or [])
+        dep_model = str(spec_dict.get("deployment_model") or "")
+        if policy_text:
+            for raw_line in str(policy_text).splitlines():
+                line = " ".join(raw_line.strip(" -*•\t").split())
+                if len(line) >= 12 and _NON_GOAL_LINE_RX.search(line) and line not in non_goals:
+                    non_goals.append(line)
+
+        # Infer primary STRIDE category and trust boundary
+        matched_boundary = "External Untrusted Actor -> Application Trust Boundary"
+        stride_cat = "Elevation of Privilege"
+        for b_label, b_stride, rx in _HIGH_VALUE_BOUNDARY_SIGNALS:
+            if rx.search(blob):
+                matched_boundary = b_label
+                stride_cat = b_stride
+                break
+        else:
+            cwe_stride = {
+                "CWE-287": "Spoofing",
+                "CWE-306": "Spoofing",
+                "CWE-345": "Spoofing",
+                "CWE-89": "Tampering",
+                "CWE-436": "Tampering",
+                "CWE-444": "Tampering",
+                "CWE-172": "Tampering",
+                "CWE-1321": "Tampering",
+                "CWE-778": "Repudiation",
+                "CWE-200": "Information Disclosure",
+                "CWE-908": "Information Disclosure",
+                "CWE-918": "Information Disclosure",
+                "CWE-798": "Information Disclosure",
+                "CWE-359": "Information Disclosure",
+                "CWE-770": "Denial of Service",
+                "CWE-789": "Denial of Service",
+                "CWE-841": "Denial of Service",
+                "CWE-78": "Elevation of Privilege",
+                "CWE-22": "Elevation of Privilege",
+                "CWE-863": "Elevation of Privilege",
+                "CWE-284": "Elevation of Privilege",
+                "CWE-749": "Elevation of Privilege",
+            }
+            stride_cat = cwe_stride.get(cwe, "Elevation of Privilege")
+
+        # 1. Explicit Non-Goal / Working-As-Designed Check (e.g., Anthropic #4235888 OpenProcess)
+        stop_words = {
+            "this", "that", "with", "from", "into", "against", "does", "working", "designed",
+            "model", "threat", "scope", "security", "boundary", "explicitly", "excluded",
+            "accepted", "risk", "goal", "non", "out", "not", "the", "and", "for", "per",
+            "vulnerability", "vulnerabilities", "considered", "protect", "trusts", "trust",
+        }
+        finding_tokens = {
+            t for t in re.findall(r"[a-z0-9_]{4,}", blob_low) if t not in stop_words
+        }
+        for ng in non_goals:
+            ng_tokens = {
+                t for t in re.findall(r"[a-z0-9_]{4,}", ng.lower()) if t not in stop_words
+            }
+            overlap = finding_tokens & ng_tokens
+            if len(overlap) >= 2:
+                return StrideBoundaryVerdict(
+                    verdict="DOCUMENTED_AS_DESIGNED",
+                    stride_category=stride_cat,
+                    target_boundary=matched_boundary,
+                    crosses_trust_boundary=False,
+                    matched_non_goal=ng[:200],
+                    rationale=f"Matches documented threat-model non-goal ({', '.join(sorted(overlap)[:4])}); high Informative risk.",
+                    recommended_channel="do_not_submit",
+                )
+
+        # 2. Local CLI Self-Execution Check (attacker == victim; e.g., Shopify #24 ucp-cli)
+        has_remote_vector = bool(
+            re.search(
+                r"\b(?:remote|network|http|https|webhook|oauth|browser|webview|untrusted\s+(?:guest|peer|repo|input|payload)|cross[- ]tenant|multi[- ]tenant)\b",
+                blob_low,
+            )
+        )
+        is_local_cli_path = bool(
+            _LOCAL_CLI_SELF_EXEC_RX.search(blob)
+            or (
+                (dep_model == "local_cli_tool" or re.search(r"(?:^|/)(?:cli|[^/]*-cli)/", fp.replace("\\", "/").lower()))
+                and not has_remote_vector
+                and cwe in ("CWE-1321", "CWE-78", "CWE-94", "CWE-22")
+            )
+        )
+        if is_local_cli_path and not has_remote_vector:
+            return StrideBoundaryVerdict(
+                verdict="BOUNDARY_NOT_CROSSED",
+                stride_category=stride_cat,
+                target_boundary="Local Operator -> Own Local CLI Process (attacker == victim)",
+                crosses_trust_boundary=False,
+                rationale="Local CLI self-execution crosses no privilege or tenant boundary without a remote untrusted input path.",
+                recommended_channel="do_not_submit",
+            )
+
+        # 3. Hardening-Only / Fallback Candidate Check (e.g., Anthropic #4235866 / #4235876)
+        has_direct_exploit_impact = bool(
+            ep_status == "PROVEN_RUNTIME"
+            and poe_level >= 3
+            and re.search(
+                r"\b(?:exfiltrat|credential\s+theft|account\s+takeover|rce|host\s+escape|memory\s+disclosure|chain\s+halt|auth\s+bypass)\b",
+                blob_low,
+            )
+        )
+        if _HARDENING_FALLBACK_RX.search(blob) and not has_direct_exploit_impact:
+            return StrideBoundaryVerdict(
+                verdict="HARDENING_CANDIDATE_NOT_BOUNTY",
+                stride_category=stride_cat,
+                target_boundary=matched_boundary,
+                crosses_trust_boundary=False,
+                rationale="Valid defense-in-depth hardening fallback without proven direct exploitation; route to public GitHub PR rather than a paid HackerOne slot.",
+                recommended_channel="github_hardening_pr",
+            )
+
+        return StrideBoundaryVerdict(
+            verdict="CASH_GRADE_BOUNDARY_VIOLATION",
+            stride_category=stride_cat,
+            target_boundary=matched_boundary,
+            crosses_trust_boundary=True,
+            rationale=f"Crosses {matched_boundary} ({stride_cat} / {cwe or 'security invariant'}).",
+            recommended_channel="hackerone_bounty",
+        )
+
+    @classmethod
     def analyze_repository(
         cls,
         target_path: str,
@@ -274,6 +707,7 @@ class DynamicStrideThreatEngine:
         trust_boundaries: Optional[Sequence[Dict[str, Any]]] = None,
         data_flows: Optional[Sequence[Dict[str, Any]]] = None,
         findings: Optional[Sequence[Dict[str, Any]]] = None,
+        policy_text: str = "",
         reports_dir: Optional[Path] = None,
     ) -> Dict[str, Any]:
         resolved = str(Path(target_path).resolve())
@@ -513,7 +947,14 @@ class DynamicStrideThreatEngine:
                 ],
             })
 
-        # 5. Pure-Python Mermaid & Visual SVG Diagrams + 5-Section Downloadable Reports
+        # 5. Precision Target Threat-Model Spec & Per-Finding Boundary Verdicts
+        target_spec = cls.extract_target_threat_model_spec(
+            resolved,
+            policy_text=policy_text,
+            component_ids=[c.component_id for c in components],
+        )
+
+        # 6. Pure-Python Mermaid & Visual SVG Diagrams + 5-Section Downloadable Reports
         threat_mermaid = cls._build_threat_model_mermaid(root.name, components, threat_scenarios)
         attack_tree_mermaid = cls._build_attack_tree_mermaid(attack_trees)
         threat_svg = cls._render_threat_model_svg(root.name, components, threat_scenarios)
@@ -527,6 +968,8 @@ class DynamicStrideThreatEngine:
             "files_indexed": len(files_list),
             "components_discovered": len(components),
             "components": [c.to_dict() for c in components],
+            "target_threat_model_spec": target_spec.to_dict(),
+            "finding_boundary_verdicts": [],
             "stride_matrix": stride_matrix,
             "threat_scenarios": threat_scenarios,
             "mitre_attack_mapping": sorted(mitre_techniques.values(), key=lambda m: m["technique_id"]),
@@ -539,6 +982,18 @@ class DynamicStrideThreatEngine:
             },
             "report_files": {},
         }
+        if findings_list:
+            verdicts: List[Dict[str, Any]] = []
+            for f_item in findings_list[:100]:
+                v = cls.evaluate_finding_against_threat_model(f_item, result, policy_text=policy_text)
+                verdicts.append(
+                    {
+                        "rule_id": str(f_item.get("rule_id") or ""),
+                        "file_path": str(f_item.get("file_path") or f_item.get("file") or ""),
+                        **v.to_dict(),
+                    }
+                )
+            result["finding_boundary_verdicts"] = verdicts
 
         if reports_dir is not None:
             reports_dir.mkdir(parents=True, exist_ok=True)

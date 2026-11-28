@@ -3977,7 +3977,7 @@ def cmd_dry_run_plan(
             planned_modules.append(
                 "IntelligentFreeOSSEnsemble(Trivy+TruffleHog+Infisical+SemgrepOSS+SkillSpector+CloudflareLedger+ComplianceMapper|zero-skip)"
             )
-    elif getattr(args, "enable_ensemble_flag", False) or active_mode in ("ensemble", "essmble", "essamble"):
+    elif getattr(args, "enable_ensemble_flag", False) or active_mode in ("ensemble", "esemble", "essmble", "essamble"):
         planned_modules.append(
             "IntelligentFreeOSSEnsemble(Trivy+TruffleHog+Infisical+SemgrepOSS+SkillSpector+CloudflareLedger+ComplianceMapper|zero-skip)"
         )
@@ -4120,12 +4120,163 @@ def cmd_hackerone(
     from engine.hackerone_porter import (
         HackerOneAutonomousRunner,
         HackerOnePorter,
+        HackerOneTicketStore,
+        is_cool_off_env_enabled,
         load_findings_for_hackerone,
     )
 
     out_root = str(Path(getattr(args, "output_dir", "reports") or "reports") / "hackerone")
     dry_run = bool(getattr(args, "dry_run", False))
+    as_json = bool(getattr(args, "as_json", False))
+    store = HackerOneTicketStore(Path(out_root) / "hackerone_tickets.db")
+
+    # 0a. Seed 39-finding historical inventory + verified paid bounty programs into SQLite
+    if getattr(args, "hackerone_seed_inventory", False):
+        from engine.cash_bounty_tuner import seed_historical_findings_inventory
+
+        res_seed = (
+            {"status": "dry_run_would_seed_inventory", "dry_run": True, "db_path": str(store.db_path)}
+            if dry_run
+            else seed_historical_findings_inventory(store)
+        )
+        if return_dict_only:
+            return res_seed
+        if as_json:
+            from engine.cli_render import render_json
+            render_json(res_seed)
+            return res_seed
+        print("\n" + "=" * 78)
+        print("  RFCHUNT HACKERONE SQLITE INVENTORY SEED (--hackerone-seed-inventory)")
+        print("=" * 78)
+        print(f"  Status          : {res_seed.get('status')}")
+        print(f"  SQLite DB       : {store.db_path}")
+        if not dry_run:
+            print(f"  Programs Seeded : {res_seed.get('programs_seeded', 0)}")
+            print(f"  Tickets Seeded  : {res_seed.get('tickets_seeded', 0)}")
+            print(f"  By State        : {(res_seed.get('summary') or {}).get('by_state')}")
+        print("=" * 78 + "\n")
+        return res_seed
+
+    # 0b. Transition a single ticket state in SQLite with full history audit
+    state_pair = getattr(args, "hackerone_ticket_state", None)
+    if state_pair and len(state_pair) == 2:
+        draft_id_arg, new_state_arg = str(state_pair[0]), str(state_pair[1])
+        bounty_arg = getattr(args, "hackerone_bounty_usd", None)
+        remote_arg = str(getattr(args, "hackerone_remote_id", "") or "")
+        updated = store.transition_state(
+            draft_id_arg,
+            new_state_arg,
+            reason="cli_state_transition",
+            remote_report_id=remote_arg,
+            bounty_amount_usd=float(bounty_arg) if bounty_arg is not None else None,
+            actor="researcher_cli",
+        )
+        res_tr = {"status": "ticket_state_updated", "ticket": updated, "summary": store.get_state_summary()}
+        if return_dict_only:
+            return res_tr
+        if as_json:
+            from engine.cli_render import render_json
+            render_json(res_tr)
+            return res_tr
+        print(f"[+] Updated {draft_id_arg} -> state={updated.get('state')} (remote={updated.get('remote_report_id') or '-'}, bounty=${updated.get('bounty_amount_usd', 0):.2f})")
+        return res_tr
+
+    # 0c. Inspect SQLite tickets / Cash EV queue / Ranked paid programs / Dedup-scored drafts
+    if (
+        getattr(args, "hackerone_tickets", False)
+        or getattr(args, "hackerone_queue", False)
+        or getattr(args, "hackerone_programs", False)
+        or getattr(args, "hackerone_score_drafts", False)
+    ):
+        from engine.cash_bounty_tuner import rank_submission_queue
+        from engine.dedup_gate import score_draft_batch
+
+        prog_filter = getattr(args, "hackerone_program", None)
+        state_filter = getattr(args, "hackerone_state", None)
+        tickets = store.list_tickets(program_handle=prog_filter, state=state_filter, limit=200)
+        programs = store.list_bounty_programs(
+            bounties_only=True,
+            source_code_only=bool(getattr(args, "source_code_only", False)),
+            limit=50,
+        )
+        summary = store.get_state_summary()
+        queue = rank_submission_queue(tickets)
+        scored_drafts: List[Dict[str, Any]] = []
+        if getattr(args, "hackerone_score_drafts", False):
+            local_repo_opt = getattr(args, "folder", None) or getattr(args, "repo", None) or getattr(args, "path", None)
+            all_sigs = store.list_report_signatures(program_handle=prog_filter)
+            rc_map = {str(p["handle"]): int(p.get("resolved_count") or 25) for p in programs}
+            scored_drafts = score_draft_batch(
+                tickets,
+                prior_signatures=all_sigs,
+                program_resolved_counts=rc_map,
+                local_repo_path=str(local_repo_opt) if local_repo_opt else None,
+                allow_network=bool(getattr(args, "dedup_live_github", False)),
+                dry_run=dry_run,
+            )
+
+        res_view = {
+            "status": "completed",
+            "db_path": str(store.db_path),
+            "summary": summary,
+            "tickets": tickets,
+            "submission_queue": queue,
+            "dedup_scored_drafts": scored_drafts,
+            "bounty_programs": programs,
+        }
+        if return_dict_only:
+            return res_view
+        if as_json:
+            from engine.cli_render import render_json
+            render_json(res_view)
+            return res_view
+
+        print("\n" + "=" * 78)
+        print("  RFCHUNT HACKERONE SQLITE TICKET, CASH-EV QUEUE & DEDUP VIEW")
+        print("=" * 78)
+        print(f"  SQLite DB        : {store.db_path} (exists={summary.get('exists')})")
+        print(f"  Total Tickets    : {summary.get('total_tickets', 0)} | Cool-Off Held: {summary.get('cool_off_held_count', 0)} | Site Drafts: {summary.get('site_drafts_saved_count', 0)} | Bounty USD: ${summary.get('total_bounty_usd', 0.0):.2f}")
+        print(f"  States           : {summary.get('by_state')}")
+        if getattr(args, "hackerone_programs", False):
+            print("\n  Top Ranked Paid Bounty Programs (by Payout + Freshness + SOURCE_CODE Fit):")
+            for idx_p, p in enumerate(programs[:15], start=1):
+                print(
+                    f"    {idx_p:2d}. {p['handle']:<16} | score={p['payout_score']:5.1f} | "
+                    f"avg=${p['avg_bounty_low_usd']:.0f}-${p['avg_bounty_high_usd']:.0f} | "
+                    f"resolved={p['resolved_count']:<4} | src={bool(p['has_source_code_scope'])} | {p['name']}"
+                )
+        if getattr(args, "hackerone_score_drafts", False):
+            print("\n  Dedup, Congestion & Freshness Ranked Drafts (Best Next Submission First):")
+            for sd in scored_drafts[:20]:
+                print(
+                    f"    #{sd['dedup_rank']:2d} [{sd['dedup_gate_verdict']:<28}] {sd['draft_id']:<20} | "
+                    f"adjEV=${sd['adjusted_cash_ev_usd']:7.1f} | cong={sd['congestion_score']:.2f} | "
+                    f"p_dup={sd['adjusted_p_duplicate']:.2f} | poc={bool(sd.get('poc_verified_runtime'))} | {sd['title'][:46]}"
+                )
+        elif getattr(args, "hackerone_queue", False):
+            print("\n  Cash EV Priority Submission Queue:")
+            for q_item in queue[:20]:
+                print(
+                    f"    #{q_item['queue_rank']:2d} [{q_item['state']:<18}] {q_item['draft_id']:<20} | "
+                    f"EV=${q_item.get('cash_ev_usd', 0.0):7.1f} | {q_item['severity_rating'].upper():<8} | "
+                    f"poc={bool(q_item.get('poc_verified_runtime'))} | {q_item['title'][:48]}"
+                )
+        else:
+            print("\n  Tracked Tickets:")
+            for tk in tickets[:30]:
+                print(
+                    f"    -> [{tk['state']:<19}] {tk['draft_id']:<20} | {tk['program_handle']:<12} | "
+                    f"{tk['severity_rating'].upper():<8} | EV=${tk.get('cash_ev_usd', 0.0):6.0f} | {tk['title'][:45]}"
+                )
+        print("=" * 78 + "\n")
+        return res_view
+
     auto_mode = bool(getattr(args, "hackerone_auto", False))
+    cool_off_mode = bool(getattr(args, "hackerone_cool_off", False) or is_cool_off_env_enabled())
+    save_draft_on_site = bool(getattr(args, "hackerone_save_site_draft", False))
+    enforce_signal_filter = bool(getattr(args, "hackerone_signal_filter", True))
+    cash_tune = bool(getattr(args, "cash_tune", True))
+    dedup_live_github = bool(getattr(args, "dedup_live_github", False))
     researcher_username = str(getattr(args, "hackerone_username", "") or "").strip()
     include_ai_disclosure = bool(getattr(args, "hackerone_ai_disclosure", False))
     policy_text_override = ""
@@ -4135,7 +4286,7 @@ def cmd_hackerone(
 
     if auto_mode:
         runner = HackerOneAutonomousRunner(output_dir=out_root)
-        local_repo = getattr(args, "repo", None) or getattr(args, "path", None)
+        local_repo = getattr(args, "folder", None) or getattr(args, "repo", None) or getattr(args, "path", None)
         result = runner.run_campaign_workflow(
             program_handle=getattr(args, "hackerone_program", None),
             query=str(getattr(args, "hackerone_query", "") or ""),
@@ -4144,11 +4295,16 @@ def cmd_hackerone(
             policy_text_override=policy_text_override,
             researcher_username=researcher_username,
             use_api=bool(getattr(args, "hackerone_api", False)),
-            use_browser=bool(getattr(args, "hackerone_browser", False)),
+            use_browser=bool(getattr(args, "hackerone_browser", False) or save_draft_on_site),
             enable_phi_scan=bool(getattr(args, "enable_phi", False)),
+            enable_ensemble=not bool(getattr(args, "no_ensemble", False)),
             min_severity=str(getattr(args, "hackerone_min_severity", "medium") or "medium"),
             max_reports=int(getattr(args, "hackerone_max_reports", 5) or 5),
             include_ai_disclosure=include_ai_disclosure,
+            cool_off_mode=cool_off_mode,
+            save_draft_on_site=save_draft_on_site,
+            strict_epistemic=True,
+            enforce_signal_filter=enforce_signal_filter,
             dry_run=dry_run,
         )
         if return_dict_only:
@@ -4161,7 +4317,8 @@ def cmd_hackerone(
         print("  RFCHUNT HACKERONE POLICY-AWARE AUTONOMOUS RUNNER (--hackerone --hackerone-auto)")
         print("=" * 78)
         print(f"  Status              : {result.get('status')} (dry_run={result.get('dry_run')})")
-        print(f"  Safe Harbor & RoE   : ENFORCED (3-Tier Policy Parser + No Cross-Scope Redirects)")
+        print(f"  Cool-Off Draft Lock : {'ACTIVE (Submissions Hard-Blocked)' if cool_off_mode else 'Standard HITL'} | Save Site Draft: {save_draft_on_site}")
+        print(f"  Safe Harbor & RoE   : ENFORCED (3-Tier RoE + 4-State Epistemic Gate + Signal Filter + Cash/Dedup Tuner)")
         print(f"  Programs Evaluated  : {result.get('programs_evaluated', 0)}")
         for pr in result.get("program_results") or []:
             roe = pr.get("roe_compliance") or {}
@@ -4170,7 +4327,12 @@ def cmd_hackerone(
             print(f"     RoE Tier         : {roe.get('automation_tier')} | Safe Harbor: {roe.get('safe_harbor_status')}")
             print(f"     Live Scan Policy : {roe.get('live_scan_policy_decision')} | max_rps={roe.get('max_rps')}")
             print(f"     Required Headers : {roe.get('required_headers') or ['none']}")
-            print(f"     Eligible Drafts  : {pr_port.get('eligible_drafts_count', 0)} (Rejected: {pr_port.get('rejected_findings_count', 0)})")
+            print(
+                f"     Eligible Drafts  : {pr_port.get('eligible_drafts_count', 0)} "
+                f"(Local Saved: {pr_port.get('local_drafts_saved', 0)}, "
+                f"Site Drafts Saved: {pr_port.get('site_drafts_saved', 0)}, "
+                f"Rejected: {pr_port.get('rejected_findings_count', 0)})"
+            )
         print("=" * 78 + "\n")
         return result
 
@@ -4183,6 +4345,11 @@ def cmd_hackerone(
         )
     )
     submit_api = bool(getattr(args, "hackerone_submit_api", False))
+    if cool_off_mode and submit_api and not dry_run:
+        raise PermissionError(
+            "Refusing --hackerone-submit-api while --hackerone-cool-off / --hackerone-draft-only "
+            "(or RFCHUNT_HACKERONE_COOL_OFF=1) is active."
+        )
     hitl_approved = False
     if submit_api and not dry_run:
         confirm = input(
@@ -4199,13 +4366,20 @@ def cmd_hackerone(
         min_severity=str(getattr(args, "hackerone_min_severity", "medium") or "medium"),
         max_reports=int(getattr(args, "hackerone_max_reports", 5) or 5),
         use_api=bool(getattr(args, "hackerone_api", False) or submit_api),
-        use_browser=bool(getattr(args, "hackerone_browser", False)),
+        use_browser=bool(getattr(args, "hackerone_browser", False) or save_draft_on_site),
         submit_api=submit_api,
         hitl_approved=hitl_approved,
         bounties_only=bool(getattr(args, "hackerone_bounties_only", False)),
         researcher_username=researcher_username,
         include_ai_disclosure=include_ai_disclosure,
         policy_text_override=policy_text_override,
+        cool_off_mode=cool_off_mode,
+        draft_only=cool_off_mode,
+        save_draft_on_site=save_draft_on_site,
+        strict_epistemic=True,
+        enforce_signal_filter=enforce_signal_filter,
+        cash_tune=cash_tune,
+        allow_network_dup_check=dedup_live_github,
         dry_run=dry_run,
     )
 
@@ -4223,20 +4397,21 @@ def cmd_hackerone(
     print("  RFCHUNT HACKERONE CAMPAIGN FINDER & HITL REPORT PORTER (--hackerone)")
     print("=" * 78)
     print(f"  Status              : {result.get('status')} (dry_run={result.get('dry_run')})")
+    print(f"  Cool-Off Draft Lock : {'ACTIVE (Submissions Hard-Blocked)' if result.get('cool_off_mode') else 'Standard HITL'} | Save Site Draft: {result.get('save_draft_on_site', False)}")
     print(f"  Campaign Handle     : {camp.get('handle')} ({camp.get('url')})")
     print(f"  Submit Report URL   : {camp.get('submit_url')}")
     if roe_rules:
         print(f"  RoE Compliance Tier : {roe_rules.get('automation_tier')} | max_rps={roe_rules.get('max_rps')} | headers={roe_rules.get('required_headers')}")
-    print(f"  Anti-Slop PoC Gate  : ENFORCED (Lane 1 + Lane 2 only; Lane 3 speculative rejected; Secrets + PHI redacted)")
-    print(f"  Eligible Drafts     : {result.get('eligible_drafts_count', 0)}")
+    print(f"  Epistemic & Signal  : ENFORCED (PROVEN_* only; REFUTED/UNRESOLVED/LLM-only/Low-Signal/DoS rejected; Secrets + PHI redacted)")
+    print(f"  Eligible Drafts     : {result.get('eligible_drafts_count', 0)} (Local Saved: {result.get('local_drafts_saved', 0)}, Site Saved: {result.get('site_drafts_saved', 0)})")
     print(f"  Rejected Findings   : {result.get('rejected_findings_count', 0)}")
     print(f"  Bundle JSON         : {result.get('bundle_path')}")
     for d in result.get("drafts") or []:
-        print(f"    -> [{d['severity_rating'].upper():<8}] {d['draft_id']} | {d['weakness_cwe']} | {d['title'][:65]}")
-        print(f"       Draft Markdown : {d['markdown_path']}")
+        print(f"    -> [{d['severity_rating'].upper():<8}] {d['draft_id']} | {d.get('epistemic_status', 'PROVEN_STATIC_INVARIANT')} | {d['weakness_cwe']} | {d['title'][:55]}")
+        print(f"       Draft Markdown : {d['markdown_path']} (site_draft_saved={d.get('site_draft_saved', False)})")
     if result.get("browser_session"):
         bs = result["browser_session"]
-        print(f"  HITL Browser Status : {bs.get('status')} (Final Submit Held for Human Review)")
+        print(f"  HITL Browser Status : {bs.get('status')} (Final Submit Hard-Blocked for Human Review)")
         if bs.get("install_hint"):
             print(f"  Playwright Setup    : {bs.get('install_hint')}")
     print("=" * 78 + "\n")
@@ -7185,7 +7360,7 @@ ALL_MODES = [
     "poc", "poc-verify", "poc_verify", "docker-doctor", "docker_doctor", "doctor-docker",
     "deep-audit", "deep_audit",
     "novelty", "novelty-refresh", "novelty_refresh", "swarm-board", "swarm_board", "board",
-    "phi", "preflight", "hackerone", "hackone", "ensemble", "essmble", "essamble", "formal", "lean", "lean4", "z3", "stride", "threat-model",
+    "phi", "preflight", "hackerone", "hackone", "ensemble", "esemble", "essmble", "essamble", "formal", "lean", "lean4", "z3", "stride", "threat-model",
 ]
 
 
@@ -7860,6 +8035,23 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--hackerone-policy-file", dest="hackerone_policy_file", type=str, default=None, help="Optional local policy text file for offline RoE compliance evaluation & dry-run testing")
     parser.add_argument("--hackerone-ai-disclosure", dest="hackerone_ai_disclosure", action="store_true", default=False, help="Include explicit RFCHunt research-assistance & manual PoC verification disclosure section in drafts")
     parser.add_argument("--hackerone-browser", "--hackone-browser", dest="hackerone_browser", action="store_true", default=False, help="Launch visible HITL Playwright browser session for HackerOne login (human completes 2FA/CAPTCHA) and report form pre-fill (stops before final Submit)")
+    parser.add_argument("--hackerone-cool-off", "--hackerone-draft-only", "--hackone-cool-off", "--hackone-draft-only", dest="hackerone_cool_off", action="store_true", default=False, help="Enforce HackerOne cool-off / draft-only lock: hard-blocks all API/UI submissions (also activated via RFCHUNT_HACKERONE_COOL_OFF=1) and saves local/on-site drafts only")
+    parser.add_argument("--hackerone-save-site-draft", "--hackone-save-site-draft", dest="hackerone_save_site_draft", action="store_true", default=False, help="Save redacted drafts BOTH locally (reports/hackerone/) AND on hackerone.com via HITL browser 'Save draft' button ONLY (never clicks Submit; respects cool-off & 2FA/CAPTCHA)")
+    parser.add_argument("--no-hackerone-signal-filter", dest="hackerone_signal_filter", action="store_false", default=True, help="Disable standard HackerOne low-signal/non-qualifying vulnerability exclusion filter (enabled by default to protect Signal)")
+    parser.add_argument("--cash-tune", "--hackerone-cash-tune", dest="cash_tune", action="store_true", default=True, help="Enable precision STRIDE trust-boundary filtering, Cash EV scoring, runtime PoE gating, and 3-pillar dedup/congestion scoring (enabled by default)")
+    parser.add_argument("--no-cash-tune", dest="cash_tune", action="store_false", help="Disable Cash EV / STRIDE boundary tuning during HackerOne porting")
+    parser.add_argument("--dedup-live-github", dest="dedup_live_github", action="store_true", default=False, help="Enable live keyless GitHub commits/PRs/issues/advisories upstream duplicate pre-check (read-only; automatically skipped when RFCHUNT_OFFLINE=1 or --dry-run)")
+    parser.add_argument("--fresh-hours", dest="fresh_hours", type=int, default=72, help="Diff-scoped fresh-code window in hours for commit-velocity targeting (default: 72)")
+    parser.add_argument("--hackerone-tickets", dest="hackerone_tickets", action="store_true", default=False, help="Inspect persistent SQLite HackerOne ticket states (reports/hackerone/hackerone_tickets.db)")
+    parser.add_argument("--hackerone-queue", dest="hackerone_queue", action="store_true", default=False, help="Display Cash EV prioritized HackerOne submission queue from SQLite")
+    parser.add_argument("--hackerone-score-drafts", dest="hackerone_score_drafts", action="store_true", default=False, help="Score and rank pending SQLite drafts by 3-pillar dedup gate, surface congestion, freshness, and adjusted Cash EV")
+    parser.add_argument("--hackerone-programs", dest="hackerone_programs", action="store_true", default=False, help="List tracked paid HackerOne bounty programs from SQLite ranked by Cash ROI")
+    parser.add_argument("--source-code-only", dest="source_code_only", action="store_true", default=False, help="Filter --hackerone-programs to programs with open-source SOURCE_CODE in scope")
+    parser.add_argument("--hackerone-state", dest="hackerone_state", type=str, default=None, help="Filter --hackerone-tickets by ticket state (e.g. queued_cooldown, needs_live_poc, held_cool_off, duplicate)")
+    parser.add_argument("--hackerone-ticket-state", dest="hackerone_ticket_state", nargs=2, metavar=("DRAFT_ID", "NEW_STATE"), default=None, help="Transition a ticket's state in SQLite with audit history")
+    parser.add_argument("--hackerone-bounty-usd", dest="hackerone_bounty_usd", type=float, default=None, help="Optional bounty amount in USD when updating a ticket via --hackerone-ticket-state")
+    parser.add_argument("--hackerone-remote-id", dest="hackerone_remote_id", type=str, default="", help="Optional HackerOne report ID (e.g. #4234525) when updating a ticket via --hackerone-ticket-state")
+    parser.add_argument("--hackerone-seed-inventory", dest="hackerone_seed_inventory", action="store_true", default=False, help="Idempotently seed the 39-finding historical RFCHunt inventory + verified paid HackerOne bounty programs into SQLite")
     parser.add_argument("--hackerone-api", "--hackone-api", dest="hackerone_api", action="store_true", default=False, help="Query HackerOne Hacker API v1 for live campaign/scope/policy discovery using HACKERONE_API_USERNAME and HACKERONE_API_TOKEN")
     parser.add_argument("--hackerone-submit-api", dest="hackerone_submit_api", action="store_true", default=False, help="Explicit opt-in to submit eligible drafts via HackerOne API v1 after interactive HITL confirmation")
     parser.add_argument("--hackerone-bounties-only", dest="hackerone_bounties_only", action="store_true", default=False, help="Filter HackerOne API campaign discovery to paid bounty programs only")
@@ -7867,7 +8059,7 @@ EXHAUSTIVE FLAG-BY-FLAG REFERENCE & EXAMPLES FOR EVERY FLAG:
     parser.add_argument("--hackerone-max-reports", dest="hackerone_max_reports", type=int, default=5, help="Maximum eligible drafts to generate per run (default: 5)")
 
     # Intelligent Native-First Zero-Skip Ensemble (--ensemble) & N-Model Hybrid ModelFusion Flags
-    parser.add_argument("--ensemble", "--essmble", "--essamble", "--run-ensemble", dest="enable_ensemble_flag", action="store_true", default=False, help="Run the native-first zero-skip security ensemble (aiscan.exe, Trivy, TruffleHog --no-verification, Infisical CLI, Semgrep OSS, Perplexity AI Bumblebee, NVIDIA SkillSpector, Cloudflare Coverage Ledger, Comp-AI Compliance Mapper, CodeQL) standalone or with --all (dropped_count==0 guarantee)")
+    parser.add_argument("--ensemble", "--esemble", "--essmble", "--essamble", "--run-ensemble", dest="enable_ensemble_flag", action="store_true", default=False, help="Run the native-first zero-skip security ensemble (aiscan.exe, Trivy, TruffleHog --no-verification, Infisical CLI, Semgrep OSS, Perplexity AI Bumblebee, NVIDIA SkillSpector, Cloudflare Coverage Ledger, Comp-AI Compliance Mapper, CodeQL) standalone or with --all (dropped_count==0 guarantee)")
     parser.add_argument("--no-ensemble", dest="no_ensemble", action="store_true", default=False, help="Disable the multi-tool security ensemble during --all")
     parser.add_argument("--ensemble-tools", dest="ensemble_tools", type=str, default=None, help="Comma-separated subset of ensemble tools (e.g. aiscan,trivy,trufflehog,infisical,semgrep_oss,bumblebee,skillspector,cloudflare_audit,compliance_mapper,codeql)")
     parser.add_argument("--no-aiscan", dest="no_aiscan", action="store_true", default=False, help="Disable native Rust aiscan.exe during standalone --ensemble")
@@ -8200,6 +8392,8 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             "harness2_report", "mantis_report", "aiscan_report", "install_tools", "tool_status",
             "deep_audit", "proxy_target", "live_proxy_fuzz", "trust_boundary_review",
             "coverage_fuzz", "enable_poc", "enable_phi", "enable_hackerone", "hackerone_auto",
+            "hackerone_tickets", "hackerone_queue", "hackerone_programs", "hackerone_score_drafts",
+            "hackerone_ticket_state", "hackerone_seed_inventory",
             "serve_ui", "network_lifecycle", "dry_run", "enable_ensemble_flag", "enable_formal_flag", "enable_stride_flag", "folder", "repo",
         )
     ) and getattr(args, "hint", None) is None and not getattr(args, "dispatch", None):
@@ -8247,12 +8441,25 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
         active_mode = "setup"
     elif active_mode in ("hackone",):
         active_mode = "hackerone"
-    elif active_mode in ("essmble", "essamble"):
+    elif active_mode in ("esemble", "essmble", "essamble"):
         active_mode = "ensemble"
 
     # Universal --dry-run guard: works across EVERY flag and subcommand with zero side effects
     if getattr(args, "dry_run", False):
-        if (getattr(args, "enable_hackerone", False) or getattr(args, "hackerone_auto", False) or active_mode == "hackerone") and not getattr(args, "run_all_scans", False):
+        _h1_dry = any(
+            bool(getattr(args, k, False))
+            for k in (
+                "enable_hackerone",
+                "hackerone_auto",
+                "hackerone_tickets",
+                "hackerone_queue",
+                "hackerone_programs",
+                "hackerone_score_drafts",
+                "hackerone_ticket_state",
+                "hackerone_seed_inventory",
+            )
+        ) or active_mode == "hackerone"
+        if _h1_dry and not getattr(args, "run_all_scans", False):
             args.enable_hackerone = True
             cmd_hackerone(args)
             return
@@ -8404,8 +8611,21 @@ def main_swarm(argv=None, caller_profile: str = "swarm"):
             args.enable_external_discovery = True
             args.enable_external_nuclei = True
 
-    # Standalone HackerOne Campaign Finder & HITL Report Porter (--hackerone / --hackone / --hackerone-auto without --all)
-    if (getattr(args, "enable_hackerone", False) or getattr(args, "hackerone_auto", False) or active_mode == "hackerone") and not getattr(args, "run_all_scans", False):
+    # Standalone HackerOne Campaign Finder, SQLite Ticket Store & HITL Report Porter (--hackerone / --hackone / --hackerone-auto without --all)
+    _h1_standalone = any(
+        bool(getattr(args, k, False))
+        for k in (
+            "enable_hackerone",
+            "hackerone_auto",
+            "hackerone_tickets",
+            "hackerone_queue",
+            "hackerone_programs",
+            "hackerone_score_drafts",
+            "hackerone_ticket_state",
+            "hackerone_seed_inventory",
+        )
+    ) or active_mode == "hackerone"
+    if _h1_standalone and not getattr(args, "run_all_scans", False):
         args.enable_hackerone = True
         cmd_hackerone(args)
         return

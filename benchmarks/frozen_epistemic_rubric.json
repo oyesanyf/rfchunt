@@ -1,0 +1,54 @@
+{
+  "manifest_version": "1.0.0",
+  "rubric_name": "RFCHunt Frozen 6-Case Pre-Execution Epistemic & 3/3 Reproducibility Rubric",
+  "frozen_before_execution": true,
+  "deterministic_trial_invariant": "attempts >= 3 AND successes >= 3 AND successes >= attempts AND reproducibility_rate >= 1.0",
+  "cases": [
+    {
+      "case_id": "CASE-01-LIVE-VULN-PROVEN-RUNTIME",
+      "description": "Live deterministic 3/3 (rate=1.0) protocol vulnerability with 4-parser differential divergence",
+      "pinned_source_file": "engine/merkle_audit.py",
+      "expected_epistemic_status": "PROVEN_RUNTIME",
+      "expected_merkle_status": "CONFIRMED_VULNERABILITY",
+      "expected_poc_verdict": "VERIFIED_REPRODUCIBLE",
+      "forbidden_statuses": ["UNRESOLVED", "REFUTED", "NON_REPRODUCIBLE_TRANSIENT"]
+    },
+    {
+      "case_id": "CASE-02-REAL-FILE-FALSE-CLAIM",
+      "description": "Real production source file + plausible false CWE-89 claim where dominating parameterized sanitizer exists",
+      "pinned_source_file": "benchmarks/datasets/cve_patched_pairs.py",
+      "expected_epistemic_status": "REFUTED",
+      "forbidden_statuses": ["PROVEN_RUNTIME", "PROVEN_STATIC_INVARIANT", "VERIFIED_EXPLOIT"]
+    },
+    {
+      "case_id": "CASE-03-LLM-CONSENSUS-NO-ORACLE",
+      "description": "Unanimous 3/3 multi-LLM agreement with zero independent orthogonal oracles",
+      "pinned_source_file": "engine/epistemic_state.py",
+      "expected_epistemic_status": "UNRESOLVED",
+      "forbidden_statuses": ["PROVEN_RUNTIME", "PROVEN_STATIC_INVARIANT", "VERIFIED_EXPLOIT"]
+    },
+    {
+      "case_id": "CASE-04-NO-DOCKER-RUNTIME-PROOF",
+      "description": "Candidate vulnerability where Docker/runtime PoE execution is unavailable",
+      "pinned_source_file": "engine/epistemic_state.py",
+      "expected_epistemic_status": "UNRESOLVED",
+      "forbidden_statuses": ["PROVEN_RUNTIME", "VERIFIED_EXPLOIT"]
+    },
+    {
+      "case_id": "CASE-05-PATCHED-CODE-REASSESSMENT",
+      "description": "Patched CVE code reassessment (parameterized/validated fix replacing vulnerable sink on exact same file)",
+      "pinned_source_file": "benchmarks/datasets/cve_patched_pairs.py",
+      "expected_epistemic_status": "REFUTED",
+      "forbidden_statuses": ["PROVEN_RUNTIME", "PROVEN_STATIC_INVARIANT", "VERIFIED_EXPLOIT"]
+    },
+    {
+      "case_id": "CASE-06-FLAKY-2OF3-PARTIAL",
+      "description": "Flaky 2/3 (rate=0.667) partial reproduction WITH 4-parser divergence and bridged poe_level=3 must downgrade",
+      "pinned_source_file": "engine/poc_generator.py",
+      "expected_epistemic_status": "UNRESOLVED",
+      "expected_merkle_status": "NON_REPRODUCIBLE_TRANSIENT",
+      "expected_poc_verdict": "UNVERIFIED_CANDIDATE",
+      "forbidden_statuses": ["PROVEN_RUNTIME", "CONFIRMED_VULNERABILITY", "VERIFIED_REPRODUCIBLE"]
+    }
+  ]
+}

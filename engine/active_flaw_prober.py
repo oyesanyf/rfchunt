@@ -306,7 +306,11 @@ class ActiveFlawProber:
             for detected_anomaly in detected_anomalies:
                 self.on_trace(f"      [*] Verifying reproducibility across 3 trials (Protocol Research Reproducibility Invariant)...")
                 vuln = self.debugger.minimize_and_reproduce(detected_anomaly, max_verification_trials=3)
-                if vuln.reproducibility_rate >= 0.66:
+                if (
+                    vuln.verification_attempts >= 3
+                    and vuln.successful_reproductions >= vuln.verification_attempts
+                    and vuln.reproducibility_rate >= 1.0
+                ):
                     self.on_trace(f"      [+] VULNERABILITY CONFIRMED: {vuln.vuln_id} ({vuln.impact.value}) - Repro Rate: {vuln.reproducibility_rate*100:.0f}%")
                     confirmed_vulns.append(vuln)
                     if self.db:

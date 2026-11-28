@@ -18,7 +18,10 @@ from engine.hackerone_porter import (
     HackerOneComputerUsePorter,
     HackerOnePorter,
     build_hackerone_report_draft,
+    check_hackerone_signal_exclusions,
+    detect_cool_off_notice,
     filter_eligible_findings,
+    is_safe_save_draft_button_label,
     parse_hackerone_program_policy,
     validate_hackerone_handle,
     validate_hackerone_url,
@@ -393,3 +396,447 @@ def test_hackerone_autonomous_runner_enforces_roe_redacts_phi_and_supports_dry_r
     assert "623-45-6789" not in first_draft["vulnerability_information"]
     assert "1234567893" not in first_draft["vulnerability_information"]
     assert Path(live_res["summary_path"]).is_file()
+
+
+def test_cool_off_draft_only_lock_blocks_all_submissions_even_with_hitl(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # CLI flags for cool-off / draft-only + site draft saving
+    args = parse_swarm_arguments(
+        [
+            "--hackerone",
+            "--hackerone-program",
+            "example-bounty",
+            "--hackerone-cool-off",
+            "--hackerone-save-site-draft",
+        ]
+    )
+    assert args.hackerone_cool_off is True
+    assert args.hackerone_save_site_draft is True
+    assert args.hackerone_signal_filter is True
+
+    args_alias = parse_swarm_arguments(["--hackone", "--hackerone-draft-only", "--no-hackerone-signal-filter"])
+    assert args_alias.hackerone_cool_off is True
+    assert args_alias.hackerone_signal_filter is False
+
+    finding = {
+        "rule_id": "INV-AUTHZ-BYPASS-01",
+        "title": "Tenant authorization bypass in policy evaluator",
+        "severity": "HIGH",
+        "evidence_lane": "DETERMINISTIC_STATIC",
+        "epistemic_status": "PROVEN_STATIC_INVARIANT",
+        "independent_oracles": ["ast_invariant", "z3_smt"],
+        "scanner": "VerificationInversionHunter",
+        "cwe": "CWE-863",
+        "file_path": "src/auth/policy.py",
+        "line_number": 42,
+        "poe_level": 2,
+        "evidence": "Z3 counterexample: role=viewer bypasses admin check",
+    }
+
+    camp = HackerOneCampaign(
+        handle="example-bounty",
+        name="Example Bounty",
+        url="https://hackerone.com/example-bounty",
+        submit_url="https://hackerone.com/example-bounty/reports/new",
+    )
+    draft = build_hackerone_report_draft(finding, camp, cool_off_mode=True)
+    client = HackerOneApiClient(username="researcher", api_token="tok_example_123")
+
+    # Even with hitl_approved=True, cool-off mode MUST fail closed
+    with pytest.raises(PermissionError, match="cool-off"):
+        client.submit_report_api(draft, hitl_approved=True, cool_off_mode=True)
+
+    # Dry-run must report blocked_by_cool_off_draft_only_mode
+    dry_api = client.submit_report_api(draft, hitl_approved=True, cool_off_mode=True, dry_run=True)
+    assert dry_api["status"] == "blocked_by_cool_off_draft_only_mode"
+    assert dry_api["submitted"] is False
+
+    # Environment variable lock RFCHUNT_HACKERONE_COOL_OFF=1 also blocks submission unconditionally
+    monkeypatch.setenv("RFCHUNT_HACKERONE_COOL_OFF", "1")
+    draft_plain = build_hackerone_report_draft(finding, camp, cool_off_mode=False)
+    with pytest.raises(PermissionError, match="cool-off"):
+        client.submit_report_api(draft_plain, hitl_approved=True)
+
+    porter = HackerOnePorter(output_dir=str(tmp_path / "h1_cooloff"))
+    with pytest.raises(PermissionError, match="cool-off"):
+        porter.port_findings([finding], program_handle="example-bounty", submit_api=True, hitl_approved=True)
+
+    # Local draft save succeeds cleanly under cool-off and tags Markdown banner
+    res = porter.port_findings([finding], program_handle="example-bounty", cool_off_mode=True)
+    assert res["cool_off_mode"] is True
+    assert res["draft_only_enforced"] is True
+    assert res["local_drafts_saved"] == 1
+    md_text = Path(res["drafts"][0]["markdown_path"]).read_text(encoding="utf-8")
+    assert "DRAFT ONLY — COOL-OFF ACTIVE" in md_text
+    assert "PROVEN_STATIC_INVARIANT" in md_text
+
+
+def test_four_state_epistemic_gate_rejects_refuted_unresolved_and_llm_only() -> None:
+    findings = [
+        {
+            "rule_id": "REFUTED-01",
+            "title": "Sanitized SQL query",
+            "severity": "CRITICAL",
+            "evidence_lane": "DETERMINISTIC_STATIC",
+            "epistemic_status": "REFUTED",
+            "scanner": "ClaimPreconditionVerifier",
+            "file_path": "src/db/query.py",
+            "line_number": 10,
+            "evidence": "parameterized query",
+        },
+        {
+            "rule_id": "UNRESOLVED-01",
+            "title": "Unverified SSRF candidate",
+            "severity": "HIGH",
+            "evidence_lane": "DETERMINISTIC_STATIC",
+            "epistemic_status": "UNRESOLVED",
+            "scanner": "RAPTOR",
+            "file_path": "src/net/fetch.py",
+            "line_number": 25,
+            "evidence": "docker unavailable",
+        },
+        {
+            "rule_id": "LLM-CONSENSUS-01",
+            "title": "3-LLM unanimous RCE claim without independent oracle",
+            "severity": "CRITICAL",
+            "evidence_lane": "VERIFIED_EXPLOIT",
+            "epistemic_status": "PROVEN_RUNTIME",  # spoofed label with only correlated LLM voters
+            "scanner": "ModelFusion",
+            "corroborated_by_models": ["gemma4", "qwen3", "llama3"],
+            "file_path": "src/app.py",
+            "line_number": 12,
+            "poe_level": 3,
+            "evidence": "All 3 LLMs agreed",
+        },
+        {
+            "rule_id": "Z3-UNSAT-01",
+            "title": "Disproved integer underflow",
+            "severity": "HIGH",
+            "evidence_lane": "DETERMINISTIC_STATIC",
+            "scanner": "VerificationInversionHunter",
+            "z3_status": "unsat",
+            "file_path": "src/math/bounds.py",
+            "line_number": 55,
+            "evidence": "unsat",
+        },
+        {
+            "rule_id": "PROVEN-RT-01",
+            "title": "Command injection verified in isolated container",
+            "severity": "CRITICAL",
+            "evidence_lane": "VERIFIED_EXPLOIT",
+            "epistemic_status": "PROVEN_RUNTIME",
+            "independent_oracles": ["runtime_poe_container", "claim_precondition_ast"],
+            "scanner": "PoEContainerVerifier",
+            "cwe": "CWE-78",
+            "file_path": "src/exec/runner.py",
+            "line_number": 88,
+            "poe_level": 3,
+            "runtime_poe_verified": True,
+            "evidence": "Isolated container PoE marker RFCHUNT_POE_OK observed",
+        },
+    ]
+
+    eligible, rejected = filter_eligible_findings(findings, program_handle="example-bounty", min_severity="medium")
+    assert [f["rule_id"] for f in eligible] == ["PROVEN-RT-01"]
+    assert eligible[0]["epistemic_status"] == "PROVEN_RUNTIME"
+
+    reasons = {r["rule_id"]: r["reason"] for r in rejected}
+    assert reasons["REFUTED-01"] == "rejected_epistemic_refuted"
+    assert reasons["UNRESOLVED-01"] == "rejected_epistemic_unresolved"
+    assert reasons["LLM-CONSENSUS-01"] == "rejected_epistemic_llm_only_no_independent_oracle"
+    assert reasons["Z3-UNSAT-01"] == "rejected_epistemic_refuted"
+
+
+def test_hackerone_signal_and_safe_harbor_exclusion_filter() -> None:
+    policy = parse_hackerone_program_policy(
+        "example-bounty",
+        "Non-qualifying vulnerabilities: graphql introspection, swagger exposure, and missing CSP.",
+    )
+    assert "graphql introspection" in policy.excluded_vuln_classes
+
+    findings = [
+        {
+            "rule_id": "HDR-01",
+            "title": "Missing Content-Security-Policy security header",
+            "severity": "MEDIUM",
+            "evidence_lane": "DETERMINISTIC_STATIC",
+            "scanner": "Semgrep",
+            "file_path": "src/http/middleware.py",
+            "line_number": 14,
+            "evidence": "No CSP header configured",
+        },
+        {
+            "rule_id": "DOS-01",
+            "title": "Regular Expression DoS (ReDoS) in email parser",
+            "severity": "HIGH",
+            "evidence_lane": "VERIFIED_EXPLOIT",
+            "epistemic_status": "PROVEN_RUNTIME",
+            "independent_oracles": ["runtime_poe_container"],
+            "scanner": "PoEContainerVerifier",
+            "file_path": "src/util/email.py",
+            "line_number": 30,
+            "poe_level": 3,
+            "runtime_poe_verified": True,
+            "evidence": "Backtracking latency spike",
+        },
+        {
+            "rule_id": "TEST-FIX-01",
+            "title": "Hardcoded SQL string in unit test fixture",
+            "severity": "HIGH",
+            "evidence_lane": "DETERMINISTIC_STATIC",
+            "scanner": "Semgrep",
+            "file_path": "tests/fixtures/mock_db.py",
+            "line_number": 9,
+            "evidence": "SELECT * FROM users WHERE id=" + "'1'",
+        },
+        {
+            "rule_id": "GQL-01",
+            "title": "GraphQL introspection enabled on public endpoint",
+            "severity": "MEDIUM",
+            "evidence_lane": "DETERMINISTIC_STATIC",
+            "scanner": "Semgrep",
+            "file_path": "src/api/schema.py",
+            "line_number": 11,
+            "evidence": "introspection=True",
+        },
+        {
+            "rule_id": "OR-CHAIN-01",
+            "title": "Open redirect chained to OAuth token theft",
+            "severity": "HIGH",
+            "evidence_lane": "VERIFIED_EXPLOIT",
+            "epistemic_status": "PROVEN_RUNTIME",
+            "independent_oracles": ["runtime_poe_container"],
+            "scanner": "PoEContainerVerifier",
+            "file_path": "src/oauth/callback.py",
+            "line_number": 77,
+            "poe_level": 3,
+            "runtime_poe_verified": True,
+            "evidence": "OAuth access_token leaked to attacker redirect_uri in 3/3 trials",
+        },
+    ]
+
+    eligible, rejected = filter_eligible_findings(
+        findings,
+        program_handle="example-bounty",
+        policy_rules=policy,
+        min_severity="medium",
+    )
+    # Only the PROVEN_RUNTIME chained exploit passes; DoS is blocked EVEN at PoE=3!
+    assert [f["rule_id"] for f in eligible] == ["OR-CHAIN-01"]
+    reasons = {r["rule_id"]: r["reason"] for r in rejected}
+    assert reasons["HDR-01"] == "rejected_h1_non_qualifying_missing_security_headers"
+    assert reasons["DOS-01"] == "rejected_h1_safe_harbor_excluded_dos_ddos_resource_exhaustion"
+    assert reasons["TEST-FIX-01"] == "rejected_h1_non_qualifying_test_or_fixture_path"
+    assert reasons["GQL-01"].startswith("rejected_h1_program_policy_excluded_graphql_introspection")
+
+
+def test_site_draft_button_guard_cool_off_banner_detection_and_dry_run_plan(tmp_path: Path) -> None:
+    # Strict button label validation: ONLY explicit Save Draft, NEVER Submit
+    assert is_safe_save_draft_button_label("Save draft") is True
+    assert is_safe_save_draft_button_label("Save as draft") is True
+    assert is_safe_save_draft_button_label("Submit report") is False
+    assert is_safe_save_draft_button_label("Save draft and submit") is False
+    assert is_safe_save_draft_button_label("Publish") is False
+    assert is_safe_save_draft_button_label("") is False
+
+    # Cool-off banner detector
+    assert detect_cool_off_notice("You are currently in a cool-off period until Dec 5.") is not None
+    assert detect_cool_off_notice("Submission limit reached for this program.") is not None
+    assert detect_cool_off_notice("Welcome to HackerOne report form.") is None
+
+    # Dual local + on-site draft dry-run plan guarantees submission_hard_blocked
+    porter = HackerOnePorter(output_dir=str(tmp_path / "h1_site_draft"))
+    finding = {
+        "rule_id": "INV-PATH-TRAVERSAL-01",
+        "title": "Path traversal in artifact extractor",
+        "severity": "HIGH",
+        "evidence_lane": "DETERMINISTIC_STATIC",
+        "epistemic_status": "PROVEN_STATIC_INVARIANT",
+        "independent_oracles": ["claim_precondition_ast"],
+        "scanner": "ClaimPreconditionVerifier",
+        "cwe": "CWE-22",
+        "file_path": "src/archive/extract.py",
+        "line_number": 31,
+        "evidence": "os.path.join(base_dir, member.name) without realpath prefix check",
+    }
+    res = porter.port_findings(
+        [finding],
+        program_handle="example-bounty",
+        cool_off_mode=True,
+        save_draft_on_site=True,
+        dry_run=True,
+    )
+    assert res["cool_off_mode"] is True
+    assert res["save_draft_on_site"] is True
+    assert res["browser_session"]["site_draft_action"] == "fill_and_save_draft_only_never_submit"
+    assert res["browser_session"]["submission_hard_blocked"] is True
+    assert res["browser_session"]["final_submit_blocked_for_hitl"] is True
+
+
+def test_site_draft_mocked_playwright_saves_both_locally_and_on_site_never_submits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Verifies local Markdown+JSON save AND clicking ONLY 'Save draft' (never 'Submit report')."""
+    clicked_buttons: list[str] = []
+    filled_values: dict[str, str] = {}
+
+    class _FakeLocator:
+        def __init__(self, selector: str, page_mode: str = "normal") -> None:
+            self.selector = selector
+            self.page_mode = page_mode
+
+        @property
+        def first(self) -> "_FakeLocator":
+            return self
+
+        def count(self) -> int:
+            if self.page_mode == "cool_off_blocked":
+                return 1 if self.selector == "body" else 0
+            if self.selector in (
+                "body",
+                'input[name*="title"]',
+                'textarea[name*="vulnerability_information"]',
+                'textarea[name*="impact"]',
+                'button:has-text("Save draft")',
+            ):
+                return 1
+            return 0
+
+        def inner_text(self) -> str:
+            if self.selector == "body":
+                if self.page_mode == "cool_off_blocked":
+                    return "You are currently in a cool-off period and cannot submit new reports right now."
+                return "Submit a vulnerability report — You may Save draft while in cool-off period."
+            if "Save draft" in self.selector:
+                return "Save draft"
+            return ""
+
+        def get_attribute(self, name: str) -> str:
+            return ""
+
+        def fill(self, value: str) -> None:
+            filled_values[self.selector] = value
+
+        def click(self) -> None:
+            clicked_buttons.append(self.inner_text())
+
+    class _FakePage:
+        def __init__(self, mode: str) -> None:
+            self.mode = mode
+            self.urls: list[str] = []
+
+        def goto(self, url: str, **kwargs) -> None:
+            self.urls.append(url)
+
+        def wait_for_timeout(self, ms: int) -> None:
+            pass
+
+        def locator(self, selector: str) -> _FakeLocator:
+            return _FakeLocator(selector, page_mode=self.mode)
+
+    class _FakeContext:
+        def __init__(self, mode: str) -> None:
+            self.page = _FakePage(mode)
+
+        def new_page(self) -> _FakePage:
+            return self.page
+
+        def close(self) -> None:
+            pass
+
+    class _FakeBrowser:
+        def __init__(self, mode: str) -> None:
+            self.mode = mode
+
+        def new_context(self) -> _FakeContext:
+            return _FakeContext(self.mode)
+
+        def close(self) -> None:
+            pass
+
+    class _FakePlaywrightCM:
+        def __init__(self, mode: str) -> None:
+            self.mode = mode
+
+        def __enter__(self):
+            class _P:
+                def __init__(inner_self) -> None:
+                    class _Chromium:
+                        def launch(c_self, headless: bool = False):
+                            assert headless is False  # Always visible HITL window
+                            return _FakeBrowser(self.mode)
+
+                    inner_self.chromium = _Chromium()
+
+            return _P()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    import sys
+    import types
+
+    def _install_fake_playwright(mode: str) -> None:
+        fake_sync_api = types.ModuleType("playwright.sync_api")
+        fake_sync_api.sync_playwright = lambda: _FakePlaywrightCM(mode)  # type: ignore[attr-defined]
+        fake_pkg = types.ModuleType("playwright")
+        fake_pkg.sync_api = fake_sync_api  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "playwright", fake_pkg)
+        monkeypatch.setitem(sys.modules, "playwright.sync_api", fake_sync_api)
+        monkeypatch.setattr(HackerOneComputerUsePorter, "_is_playwright_available", staticmethod(lambda: True))
+
+    finding = {
+        "rule_id": "INV-SSRF-01",
+        "title": "SSRF metadata bypass in webhook fetcher",
+        "severity": "HIGH",
+        "evidence_lane": "DETERMINISTIC_STATIC",
+        "epistemic_status": "PROVEN_STATIC_INVARIANT",
+        "independent_oracles": ["claim_precondition_ast"],
+        "scanner": "ClaimPreconditionVerifier",
+        "cwe": "CWE-918",
+        "file_path": "src/webhooks/fetch.py",
+        "line_number": 44,
+        "evidence": "requests.get(user_url) with no RFC1918/metadata block",
+    }
+
+    # Case 1: Normal /reports/new form with Save draft button -> saves locally AND clicks Save draft (never Submit)
+    _install_fake_playwright("normal")
+    porter = HackerOnePorter(output_dir=str(tmp_path / "h1_both"))
+    res = porter.port_findings(
+        [finding],
+        program_handle="example-bounty",
+        cool_off_mode=True,
+        save_draft_on_site=True,
+        wait_for_human_fn=lambda prompt: "",
+    )
+    assert res["local_drafts_saved"] == 1
+    assert res["site_drafts_saved"] == 1
+    assert Path(res["drafts"][0]["markdown_path"]).is_file()
+    assert Path(res["bundle_path"]).is_file()
+    assert clicked_buttons == ["Save draft"]
+    assert res["browser_session"]["status"] == "hitl_browser_site_drafts_saved"
+    assert res["browser_session"]["filled_drafts"][0]["auto_submitted"] is False
+    assert res["browser_session"]["filled_drafts"][0]["site_draft_saved"] is True
+    assert res["browser_session"]["submission_hard_blocked"] is True
+
+    # Case 2: Site blocks /reports/new completely during cool-off -> preserves local draft cleanly, zero clicks
+    clicked_buttons.clear()
+    _install_fake_playwright("cool_off_blocked")
+    porter2 = HackerOnePorter(output_dir=str(tmp_path / "h1_blocked"))
+    res2 = porter2.port_findings(
+        [finding],
+        program_handle="example-bounty",
+        cool_off_mode=True,
+        save_draft_on_site=True,
+        wait_for_human_fn=lambda prompt: "",
+    )
+    assert res2["local_drafts_saved"] == 1
+    assert res2["site_drafts_saved"] == 0
+    assert Path(res2["drafts"][0]["markdown_path"]).is_file()
+    assert clicked_buttons == []
+    assert res2["browser_session"]["status"] == "hitl_browser_blocked_by_cool_off_local_preserved"
+    assert res2["browser_session"]["filled_drafts"][0]["site_draft_status"] == (
+        "blocked_by_site_cool_off_banner_local_draft_preserved"
+    )
+

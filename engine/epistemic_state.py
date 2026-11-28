@@ -416,7 +416,25 @@ def derive_epistemic_status(
         else:
             failed.append("claim_refuted_by_verifier")
 
-    # Determine independent runtime execution evidence (NEVER satisfied by LLM consensus alone)
+    # Fail closed on flaky < 3/3 trial reproductions (e.g., 2/3 = 0.667 must stay UNRESOLVED)
+    v_attempts = int(finding.get("verification_attempts") or 0)
+    v_successes = finding.get("successful_reproductions")
+    v_rate = finding.get("reproducibility_rate")
+    diff_trials = finding.get("differential_trials_passed")
+    flaky_repro = False
+    if v_attempts > 0:
+        if v_attempts < 3:
+            flaky_repro = True
+        elif v_rate is not None and float(v_rate) < 1.0:
+            flaky_repro = True
+        elif v_successes is not None and (int(v_successes) < 3 or int(v_successes) < v_attempts):
+            flaky_repro = True
+    if diff_trials is not None and 0 < int(diff_trials) < 3:
+        flaky_repro = True
+    if flaky_repro:
+        missing.append("flaky_reproduction_below_3of3")
+
+    # Determine independent runtime execution evidence (NEVER satisfied by LLM consensus alone or flaky 2/3 trials)
     rt_executed = bool(
         runtime_poe_verified
         or finding.get("runtime_poe_executed") is True
@@ -426,7 +444,7 @@ def derive_epistemic_status(
         or (int(finding.get("differential_trials_passed") or 0) >= 3)
         or (poe_level >= 3 and bool(finding.get("reproduced")) and bool(indep))
     )
-    rt_passed = bool(
+    rt_passed = (not flaky_repro) and bool(
         runtime_poe_verified
         or finding.get("runtime_poe_passed") is True
         or finding.get("runtime_poe_verified") is True
@@ -434,7 +452,7 @@ def derive_epistemic_status(
         or (int(finding.get("differential_trials_passed") or 0) >= 3)
         or (poe_level >= 3 and bool(finding.get("verified") is True or finding.get("reproduced") is True) and bool(indep))
     )
-    if runtime_poe_verified:
+    if runtime_poe_verified and not flaky_repro:
         poe_level = max(poe_level, 3)
         if "runtime_poe_container" not in indep and "runtime_3trial_wire" not in indep:
             indep.append("runtime_poe_container")

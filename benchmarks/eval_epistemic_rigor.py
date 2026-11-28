@@ -29,7 +29,10 @@ exact replay commands (replacing broad "0 FP" claims with auditable measurements
 from __future__ import annotations
 
 import argparse
+import contextlib
 from datetime import datetime, timezone
+import hashlib
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -49,14 +52,24 @@ from benchmarks.datasets.cve_patched_pairs import (
 from engine.claim_verifier import ClaimPreconditionVerifier
 from engine.epistemic_state import (
     EpistemicStatus,
+    derive_epistemic_status,
     evaluate_epistemic_transition,
 )
 from engine.formal_verifier import find_lean4_binary
+from engine.merkle_audit import MerkleAuditTrail
+from engine.poc_generator import generate_poc_bundle
 from engine.verification_inversion_hunter import (
     VerificationInversionHunter,
     verify_trusted_closure_lean4,
 )
 from fusion_engine import FusionArbiter
+
+
+def _sha256_file(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return "missing"
 
 
 def _git_commit_sha() -> str:
@@ -340,6 +353,273 @@ def run_lean4_epistemic_conformance_audit(*, use_native_lean: bool = True) -> Di
     }
 
 
+def run_frozen_six_case_rubric_suite() -> Dict[str, Any]:
+    """
+    Runs Suite D: Frozen 6-Case Pre-Execution Epistemic & 3/3 Reproducibility Rubric
+    loaded from `benchmarks/frozen_epistemic_rubric.json`, recording full per-case
+    provenance (pinned file SHA-256, frozen ground truth, independent vs. correlated
+    oracle provenance, and captured raw stdout).
+    """
+    manifest_path = REPO_ROOT / "benchmarks" / "frozen_epistemic_rubric.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_sha256 = _sha256_file(manifest_path)
+
+    with patch.object(
+        FusionArbiter,
+        "_fetch_available_tags",
+        return_value=["gemma4:12b", "qwen2.5:7b", "llama3.1:8b"],
+    ):
+        arbiter = FusionArbiter(db=None, preferred_model="gemma4:12b")
+
+    entries: List[Dict[str, Any]] = []
+    passed_count = 0
+
+    with tempfile.TemporaryDirectory(prefix="rfchunt_rubric6_") as tmp:
+        tmp_root = Path(tmp)
+        for spec in manifest.get("cases") or []:
+            cid = str(spec["case_id"])
+            pinned_rel = str(spec.get("pinned_source_file") or "")
+            pinned_path = (REPO_ROOT / pinned_rel).resolve()
+            pinned_sha = _sha256_file(pinned_path)
+
+            stdout_buf = io.StringIO()
+            observed_ep = ""
+            extra_obs: Dict[str, Any] = {}
+            indep_oracles: List[str] = []
+            corr_oracles: List[str] = []
+
+            with contextlib.redirect_stdout(stdout_buf):
+                if cid == "CASE-01-LIVE-VULN-PROVEN-RUNTIME":
+                    trail = MerkleAuditTrail()
+                    leaf = trail.record_finding(
+                        entry_id="RUBRIC-3OF3",
+                        target_engine="127.0.0.1:8080",
+                        raw_probe=b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+                        raw_response=b"HTTP/1.1 400 Bad Request\r\n\r\n",
+                        reproducibility_rate=1.0,
+                        verification_attempts=3,
+                        successful_reproductions=3,
+                        four_parser_differential={"Strict_RFC9112": {"status": 400}, "Permissive_Legacy": {"status": 200}},
+                        status="CONFIRMED_VULNERABILITY",
+                    )
+                    poc_rep = generate_poc_bundle(
+                        [
+                            {
+                                "vuln_id": "RUBRIC-3OF3",
+                                "rule_id": "RFC-9112-TE-CL",
+                                "title": "Deterministic 3/3 CL.TE framing divergence",
+                                "severity": "HIGH",
+                                "rfc_num": 9112,
+                                "verification_attempts": 3,
+                                "successful_reproductions": 3,
+                                "reproducibility_rate": 1.0,
+                                "raw_probe": "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+                            }
+                        ],
+                        output_dir=tmp_root / "poc_case1",
+                    )
+                    j = derive_epistemic_status(
+                        {
+                            "scanner": "LiveH2DesyncProber",
+                            "poe_level": 3,
+                            "verification_attempts": 3,
+                            "successful_reproductions": 3,
+                            "reproducibility_rate": 1.0,
+                            "differential_trials_passed": 3,
+                            "runtime_poe_verified": True,
+                            "independent_oracles": ["runtime_3trial_wire", "differential_oracle"],
+                        },
+                        runtime_poe_verified=True,
+                    )
+                    observed_ep = str(j["epistemic_status"])
+                    indep_oracles = list(j["independent_oracles"])
+                    corr_oracles = list(j["correlated_oracles"])
+                    extra_obs = {
+                        "merkle_status": leaf.status,
+                        "poc_verdict": poc_rep.records[0].verdict,
+                        "poc_poe_level": poc_rep.records[0].poe_level,
+                    }
+                    print(f"CASE-01 merkle={leaf.status} poc={poc_rep.records[0].verdict} epistemic={observed_ep}")
+
+                elif cid == "CASE-02-REAL-FILE-FALSE-CLAIM":
+                    sample = ADVERSARIAL_FALSE_CLAIM_CASES[0]
+                    fp = tmp_root / sample.filename
+                    fp.write_text(sample.safe_code, encoding="utf-8")
+                    out = arbiter.arbitrate_finding_epistemic(
+                        {
+                            "rule_id": sample.case_id,
+                            "title": sample.title,
+                            "cwe": sample.cwe,
+                            "file_path": str(fp),
+                            "line_number": sample.cited_line,
+                            "severity": "CRITICAL",
+                            "poe_level": 3,
+                            "evidence_lane": "VERIFIED_EXPLOIT",
+                        },
+                        llm_votes=sample.mock_llm_models,
+                        independent_oracles=[],
+                        repo_root=str(tmp_root),
+                        run_refutation=True,
+                        use_llm_refutation=False,
+                    )
+                    observed_ep = str(out["epistemic_status"])
+                    just = out["status_justification"]
+                    indep_oracles = list(just.get("independent_oracles") or [])
+                    corr_oracles = list(just.get("correlated_oracles") or [])
+                    print(f"CASE-02 file={sample.filename} epistemic={observed_ep} failed={just.get('failed_checks')}")
+
+                elif cid == "CASE-03-LLM-CONSENSUS-NO-ORACLE":
+                    j = derive_epistemic_status(
+                        {
+                            "rule_id": "LLM-ONLY-001",
+                            "scanner": "ModelFusion",
+                            "evidence_lane": "VERIFIED_EXPLOIT",
+                            "poe_level": 3,
+                            "corroborated_by_models": ["gemma4:12b", "qwen2.5:7b", "llama3.1:8b"],
+                            "runtime_poe_verified": False,
+                        }
+                    )
+                    observed_ep = str(j["epistemic_status"])
+                    indep_oracles = list(j["independent_oracles"])
+                    corr_oracles = list(j["correlated_oracles"])
+                    print(f"CASE-03 llm_voters={len(corr_oracles)} indep={len(indep_oracles)} epistemic={observed_ep}")
+
+                elif cid == "CASE-04-NO-DOCKER-RUNTIME-PROOF":
+                    j = derive_epistemic_status(
+                        {
+                            "rule_id": "NODOCKER-001",
+                            "scanner": "PoEContainerVerifier",
+                            "poe_verification_status": "skipped_docker_unavailable",
+                            "poe_level": 2,
+                            "independent_oracles": ["ast_rule"],
+                        }
+                    )
+                    observed_ep = str(j["epistemic_status"])
+                    indep_oracles = list(j["independent_oracles"])
+                    corr_oracles = list(j["correlated_oracles"])
+                    extra_obs = {"missing_evidence": list(j.get("missing_evidence") or [])}
+                    print(f"CASE-04 missing={j.get('missing_evidence')} epistemic={observed_ep}")
+
+                elif cid == "CASE-05-PATCHED-CODE-REASSESSMENT":
+                    pair = CVE_PATCHED_PAIRS[0]
+                    pdir = tmp_root / "case5_patched"
+                    pdir.mkdir(parents=True, exist_ok=True)
+                    pfile = pdir / pair.filename
+                    pfile.write_text(pair.patched_code, encoding="utf-8")
+                    cv = ClaimPreconditionVerifier.verify_claim(
+                        {
+                            "rule_id": pair.case_id,
+                            "title": pair.title,
+                            "cwe": pair.cwe,
+                            "file_path": str(pfile),
+                            "line_number": pair.patched_line,
+                            "severity": "HIGH",
+                        },
+                        repo_root=pdir,
+                    )
+                    observed_ep = str(cv.epistemic_status)
+                    indep_oracles = list(cv.independent_oracles)
+                    corr_oracles = []
+                    extra_obs = {"patched_pair_id": pair.case_id, "reason": cv.reason}
+                    print(f"CASE-05 pair={pair.case_id} epistemic={observed_ep} reason={cv.reason}")
+
+                elif cid == "CASE-06-FLAKY-2OF3-PARTIAL":
+                    trail = MerkleAuditTrail()
+                    leaf_flaky = trail.record_finding(
+                        entry_id="RUBRIC-2OF3",
+                        target_engine="127.0.0.1:8080",
+                        raw_probe=b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+                        raw_response=b"HTTP/1.1 400 Bad Request\r\n\r\n",
+                        reproducibility_rate=round(2 / 3, 4),
+                        verification_attempts=3,
+                        successful_reproductions=2,
+                        four_parser_differential={"Strict_RFC9112": {"status": 400}, "Permissive_Legacy": {"status": 200}},
+                        status="CONFIRMED_VULNERABILITY",
+                    )
+                    poc_flaky = generate_poc_bundle(
+                        [
+                            {
+                                "vuln_id": "RUBRIC-2OF3",
+                                "rule_id": "RFC-9112-TE-CL-FLAKY",
+                                "title": "Flaky 2/3 CL.TE framing divergence",
+                                "severity": "HIGH",
+                                "rfc_num": 9112,
+                                "verification_attempts": 3,
+                                "successful_reproductions": 2,
+                                "reproducibility_rate": round(2 / 3, 4),
+                                "raw_probe": "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+                            }
+                        ],
+                        output_dir=tmp_root / "poc_case6",
+                    )
+                    # Even if an upstream component bridged poe_level=3 + runtime_poe_verified=True on a 2/3 run, epistemic_state MUST hold UNRESOLVED
+                    j_flaky = derive_epistemic_status(
+                        {
+                            "scanner": "LiveH2DesyncProber",
+                            "poe_level": 3,
+                            "verification_attempts": 3,
+                            "successful_reproductions": 2,
+                            "reproducibility_rate": round(2 / 3, 4),
+                            "differential_trials_passed": 2,
+                            "runtime_poe_verified": True,
+                            "independent_oracles": ["runtime_3trial_wire", "differential_oracle"],
+                        },
+                        runtime_poe_verified=True,
+                    )
+                    observed_ep = str(j_flaky["epistemic_status"])
+                    indep_oracles = list(j_flaky["independent_oracles"])
+                    corr_oracles = list(j_flaky["correlated_oracles"])
+                    extra_obs = {
+                        "merkle_status": leaf_flaky.status,
+                        "poc_verdict": poc_flaky.records[0].verdict,
+                        "poc_poe_level": poc_flaky.records[0].poe_level,
+                        "missing_evidence": list(j_flaky.get("missing_evidence") or []),
+                    }
+                    print(
+                        f"CASE-06 merkle={leaf_flaky.status} poc={poc_flaky.records[0].verdict} "
+                        f"epistemic={observed_ep} missing={j_flaky.get('missing_evidence')}"
+                    )
+
+            exp_ep = str(spec["expected_epistemic_status"])
+            forbidden = set(spec.get("forbidden_statuses") or [])
+            ok = observed_ep == exp_ep and observed_ep not in forbidden
+            if "expected_merkle_status" in spec:
+                ok = ok and extra_obs.get("merkle_status") == spec["expected_merkle_status"]
+            if "expected_poc_verdict" in spec:
+                ok = ok and extra_obs.get("poc_verdict") == spec["expected_poc_verdict"]
+            if ok:
+                passed_count += 1
+
+            entries.append(
+                {
+                    "case_id": cid,
+                    "pinned_source_file": pinned_rel,
+                    "pinned_file_sha256": pinned_sha,
+                    "frozen_ground_truth": {
+                        "expected_epistemic_status": exp_ep,
+                        **({"expected_merkle_status": spec["expected_merkle_status"]} if "expected_merkle_status" in spec else {}),
+                        **({"expected_poc_verdict": spec["expected_poc_verdict"]} if "expected_poc_verdict" in spec else {}),
+                        "forbidden_statuses": list(spec.get("forbidden_statuses") or []),
+                    },
+                    "independent_oracles": indep_oracles,
+                    "correlated_oracles": corr_oracles,
+                    "observed_epistemic_status": observed_ep,
+                    "observed_details": extra_obs,
+                    "raw_stdout": stdout_buf.getvalue().strip(),
+                    "passed": ok,
+                }
+            )
+
+    return {
+        "rubric_manifest_path": "benchmarks/frozen_epistemic_rubric.json",
+        "rubric_manifest_sha256": manifest_sha256,
+        "total_cases": len(entries),
+        "passed_cases": passed_count,
+        "all_cases_passed": passed_count == len(entries) and len(entries) == 6,
+        "cases": entries,
+    }
+
+
 def render_scorecard_markdown(scorecard: Dict[str, Any]) -> str:
     adv = scorecard["suite_a_adversarial_false_claims"]
     cve = scorecard["suite_b_patched_vs_unpatched"]
@@ -375,6 +655,26 @@ def render_scorecard_markdown(scorecard: Dict[str, Any]) -> str:
     for cwe_id, stats in sorted(cve["per_cwe"].items()):
         lines.append(f"| `{cwe_id}` | {stats['tp']} | {stats['fp']} | {stats['tn']} | {stats['fn']} |")
 
+    rubric6 = scorecard.get("suite_d_frozen_6case_rubric") or {}
+    if rubric6:
+        lines.extend([
+            "",
+            "## Suite D: Frozen 6-Case Pre-Execution Rubric (Full Per-Case Provenance)",
+            "",
+            f"- **Manifest**: `{rubric6.get('rubric_manifest_path')}` (`sha256={rubric6.get('rubric_manifest_sha256', '')[:16]}...`)",
+            f"- **Passed**: **{rubric6.get('passed_cases', 0)} / {rubric6.get('total_cases', 0)}** (`all_cases_passed={rubric6.get('all_cases_passed')}`)",
+            "",
+            "| Case ID | Pinned File SHA-256 (12) | Frozen Expected | Observed | Independent Oracles | Correlated Oracles | Pass |",
+            "|---|---|---|---|---|---|---|",
+        ])
+        for rc in rubric6.get("cases") or []:
+            gt = (rc.get("frozen_ground_truth") or {}).get("expected_epistemic_status", "")
+            lines.append(
+                f"| `{rc['case_id']}` | `{str(rc.get('pinned_file_sha256', ''))[:12]}` | `{gt}` | "
+                f"`{rc.get('observed_epistemic_status')}` | `{', '.join(rc.get('independent_oracles') or []) or 'none'}` | "
+                f"`{', '.join(rc.get('correlated_oracles') or []) or 'none'}` | `{'PASS' if rc.get('passed') else 'FAIL'}` |"
+            )
+
     lines.extend([
         "",
         "## Exact Replay Commands",
@@ -396,10 +696,11 @@ def run_full_evaluation(
     adv = run_adversarial_false_claim_suite()
     cve = run_patched_vs_unpatched_benchmark()
     lean = run_lean4_epistemic_conformance_audit(use_native_lean=use_native_lean)
+    rubric6 = run_frozen_six_case_rubric_suite()
 
     lean_bin = find_lean4_binary(REPO_ROOT)
     scorecard: Dict[str, Any] = {
-        "schema_version": "1.0.0",
+        "schema_version": "1.1.0",
         "metadata": {
             "git_commit_sha": _git_commit_sha(),
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -414,6 +715,7 @@ def run_full_evaluation(
         "suite_a_adversarial_false_claims": adv,
         "suite_b_patched_vs_unpatched": cve,
         "suite_c_lean4_conformance": lean,
+        "suite_d_frozen_6case_rubric": rubric6,
     }
 
     if output_dir is not None:
@@ -458,9 +760,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"states_checked={lean['conformance_states_checked']} | violations={lean['conformance_violations']} | "
         f"lean4_proved={lean['lean4_kernel_verification'].get('all_modules_proved')}"
     )
+    rubric6 = sc["suite_d_frozen_6case_rubric"]
+    print(
+        f"[+] Suite D (Frozen 6-Case Rubric + Full Provenance): "
+        f"passed={rubric6['passed_cases']}/{rubric6['total_cases']} | "
+        f"manifest_sha256={rubric6['rubric_manifest_sha256'][:16]}..."
+    )
     if sc.get("report_files"):
         print(f"[+] Scorecard written: {sc['report_files']['json']} & {sc['report_files']['markdown']}")
-    return 0 if (adv["false_promotion_rate"] == 0.0 and lean["conformance_passed"]) else 1
+    return 0 if (adv["false_promotion_rate"] == 0.0 and lean["conformance_passed"] and rubric6["all_cases_passed"]) else 1
 
 
 if __name__ == "__main__":

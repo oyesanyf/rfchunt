@@ -822,6 +822,35 @@ class MissionControlServer:
                     self._send_json(HTTPStatus.OK, {"approvals": server_ref.orchestrator.list_approvals()})
                     return
 
+                if path == "/api/hackerone/tickets":
+                    from engine.cash_bounty_tuner import rank_submission_queue
+                    from engine.hackerone_porter import HackerOneTicketStore
+
+                    store = HackerOneTicketStore(server_ref.orchestrator.reports_root / "hackerone" / "hackerone_tickets.db")
+                    prog_q = (qs.get("program_handle") or [None])[0]
+                    state_q = (qs.get("state") or [None])[0]
+                    t_list = store.list_tickets(program_handle=prog_q, state=state_q, limit=200)
+                    self._send_json(
+                        HTTPStatus.OK,
+                        {
+                            "summary": store.get_state_summary(),
+                            "tickets": t_list,
+                            "submission_queue": rank_submission_queue(t_list),
+                        },
+                    )
+                    return
+
+                if path == "/api/hackerone/programs":
+                    from engine.hackerone_porter import HackerOneTicketStore
+
+                    store = HackerOneTicketStore(server_ref.orchestrator.reports_root / "hackerone" / "hackerone_tickets.db")
+                    src_only = (qs.get("source_code_only") or ["0"])[0] in ("1", "true", "yes")
+                    self._send_json(
+                        HTTPStatus.OK,
+                        {"programs": store.list_bounty_programs(bounties_only=True, source_code_only=src_only, limit=50)},
+                    )
+                    return
+
                 if path == "/api/events":
                     once = (qs.get("once") or ["0"])[0] == "1"
                     init_frame = f"data: {json.dumps({'event': 'connected', 'timestamp': _utc_now_iso()})}\n\n".encode("utf-8")
@@ -925,6 +954,11 @@ class MissionControlServer:
                             max_reports=int(body.get("max_reports") or 5),
                             use_api=bool(body.get("use_api", False)),
                             use_browser=False,
+                            cool_off_mode=bool(body.get("cool_off_mode", True)),
+                            draft_only=True,
+                            strict_epistemic=True,
+                            enforce_signal_filter=bool(body.get("enforce_signal_filter", True)),
+                            cash_tune=bool(body.get("cash_tune", True)),
                             submit_api=False,
                             researcher_username=str(body.get("researcher_username") or ""),
                             policy_text_override=str(body.get("policy_text") or ""),

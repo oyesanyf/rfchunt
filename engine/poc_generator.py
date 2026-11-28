@@ -372,9 +372,17 @@ def _triage_single_finding(
     # 1. Protocol RFC finding
     if _is_protocol_finding(finding):
         attempts = int(finding.get("verification_attempts") or 0)
+        has_successes = finding.get("successful_reproductions") is not None
+        successes = int(finding.get("successful_reproductions") or 0)
         repro_rate = float(finding.get("reproducibility_rate") or 0.0)
-        poe = int(finding.get("poe_level") or (3 if attempts >= 3 and repro_rate >= 0.66 else 1))
-        if attempts >= 3 and repro_rate >= 0.66:
+        # Strict deterministic 3/3 (100%) gate: flaky 2/3 must stay UNRESOLVED / NON_REPRODUCIBLE_TRANSIENT
+        deterministic_3of3 = (
+            attempts >= 3
+            and repro_rate >= 1.0
+            and (not has_successes or (successes >= 3 and successes >= attempts))
+        )
+        poe = int(finding.get("poe_level") or (3 if deterministic_3of3 else 1))
+        if deterministic_3of3:
             return PoCTriageRecord(
                 finding_id=finding_id,
                 rule_id=rule_id,
@@ -387,7 +395,7 @@ def _triage_single_finding(
                 poe_level=max(poe, 3),
                 disclosure_worthy=True,
                 rationale=(
-                    f"Confirmed reproducible RFC protocol anomaly ({attempts} trials, "
+                    f"Confirmed deterministic 3/3 RFC protocol anomaly ({attempts} trials, "
                     f"{repro_rate * 100:.1f}% reproducibility). Loopback-only conformance "
                     "reproducer and ModSecurity/Suricata defenses generated."
                 ),
@@ -412,13 +420,14 @@ def _triage_single_finding(
             poe_level=min(poe, 1),
             disclosure_worthy=False,
             rationale=(
-                f"Protocol anomaly has fewer than 3 confirmed trials (attempts={attempts}, "
-                f"rate={repro_rate:.2f}); requires 3-trial loopback reproduction before disclosure."
+                f"Protocol anomaly failed strict deterministic 3/3 reproducibility "
+                f"(attempts={attempts}, successes={successes if has_successes else 'n/a'}, "
+                f"rate={repro_rate:.2f}); downgraded to NON_REPRODUCIBLE_TRANSIENT / UNRESOLVED."
             ),
-            remediation="Re-run against an authorized local test lab (`127.0.0.1`) with >=3 trials.",
+            remediation="Re-run against an authorized local test lab (`127.0.0.1`) until deterministic 3/3 reproduction is achieved.",
             evidence_snippet=_redact_secrets(str(finding.get("raw_probe") or "")[:300]),
             category="protocol",
-            verification_status="needs_3trial_confirmation",
+            verification_status="non_reproducible_transient",
         )
 
     # 2. Test-fixture gate

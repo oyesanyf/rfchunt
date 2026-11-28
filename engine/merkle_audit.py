@@ -130,7 +130,8 @@ class MerkleAuditTrail:
         rate = float(reproducibility_rate or 0.0)
         diff_ok = self._is_differential_verified(four_parser_differential)
 
-        passes_gate = attempts >= 3 and successes >= 2 and rate >= 0.66 and diff_ok
+        # Strict deterministic 3/3 (100%) reproducibility gate: flaky 2/3 stays NON_REPRODUCIBLE_TRANSIENT
+        passes_gate = attempts >= 3 and successes >= 3 and successes >= attempts and rate >= 1.0 and diff_ok
         resolved_status = (
             str(status or "CONFIRMED_VULNERABILITY")
             if passes_gate and str(status or "") in ("CONFIRMED_VULNERABILITY", "ANOMALY_VERIFIED")
